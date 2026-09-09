@@ -1,0 +1,39 @@
+# GeeWiki —— Docker Compose 部署编排（Compose V2 规范，不使用已废弃的 version 字段）
+#
+# 默认体验（开箱即用）：docker compose up -d
+#   - 仅启动 geewiki-app，SQLite 数据持久化于 ./data，无需任何外部数据库服务。
+#
+# 生产部署（启用 PostgreSQL 数据库插件）：docker compose --profile production up -d
+#   - 同时启动 postgres 服务，应用内将激活 @geewiki/db-pg 互斥插件。
+#   - 需先在 .env 中提供 DB_PASSWORD（本项目不提交 .env，避免泄露密钥，见 postgres 服务注释）。
+
+services:
+  geewiki-app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      GEEWIKI_BASE_PLUGINS: /app/config/plugins.base.json
+      GEEWIKI_SESSION_PLUGINS: /app/config/plugins.session.json
+    volumes:
+      - ./data:/app/data        # SQLite 数据库与运行时数据（持久化）
+      - ./plugins:/app/plugins  # 外部插件挂载点（运行时挂载第三方插件）
+      - ./config:/app/config    # 基础层 / 会话层插件清单（plugins.base.json / plugins.session.json）
+    restart: unless-stopped
+    # 自愈逻辑（由应用内启动脚本实现）：若进程崩溃且退出码为 1，
+    # 自动删除会话层配置（session 配置，即 GEEWIKI_SESSION_PLUGINS 指向的文件）并重启，
+    # 系统将忽略会话层、自动回滚至基础层（Base Layer）稳定状态。
+
+  postgres:
+    image: postgres:15
+    profiles: ["production"]   # 仅当启用 PostgreSQL 插件（--profile production）时才启动该服务
+    environment:
+      POSTGRES_DB: geewiki
+      POSTGRES_USER: geewiki
+      POSTGRES_PASSWORD: ${DB_PASSWORD}   # DB_PASSWORD 由部署者在 .env 中提供（本仓库不提交 .env）
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:   # PostgreSQL 数据卷（named volume）

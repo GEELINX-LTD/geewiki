@@ -1,0 +1,28 @@
+# 依赖
+node_modules/
+
+# 构建产物与缓存
+dist/
+coverage/
+.vite/
+.cache/
+tmp/
+
+# 环境变量（.env.example 除外，可作为模板提交）
+.env
+.env.*
+!.env.example
+
+# 本地数据（SQLite 数据库及运行期数据，data/ 为未来规划预留）
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# 日志
+logs/
+*.log
+
+# 系统文件
+.DS_Store
