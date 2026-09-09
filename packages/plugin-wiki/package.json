@@ -1,0 +1,20 @@
+{
+  "name": "@geewiki/wiki",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki Wiki 核心插件：页面 CRUD + 版本历史（REST）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

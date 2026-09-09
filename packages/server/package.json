@@ -17,6 +17,7 @@
     "@geewiki/db-sqlite": "workspace:*",
     "cordis": "^4.0.0-rc.10",
     "@geewiki/echo": "workspace:*",
-    "@geewiki/manager": "workspace:*"
+    "@geewiki/manager": "workspace:*",
+    "@geewiki/wiki": "workspace:*"
   }
 }

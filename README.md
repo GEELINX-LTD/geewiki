@@ -4,14 +4,28 @@
 
 核心哲学：**万物皆插件，积木式搭建** —— 极致轻量、高可扩展、安全可控。系统默认仅依赖一个 SQLite 数据库即可运行（开箱即用），亦可一键切换至 PostgreSQL 等生产级数据库。
 
-**当前状态：Phase 0（骨架初始化）** —— 本仓库目前仅含文档与配置资产，尚无程序代码。开发路线与阶段进度见 [docs/roadmap.md](docs/roadmap.md)。
+**当前状态：Phase 2（可交互 MVP 完成）** —— 插件管理器（依赖图/冲突组/会话层/看门狗）、Wiki CRUD + 版本历史、React 19 管理台与依赖图均已落地，浏览器可完整交互。开发路线与阶段进度见 [docs/roadmap.md](docs/roadmap.md)。
+
+## 快速开始
+
+```bash
+pnpm install                       # 安装依赖（含 better-sqlite3 预编译二进制）
+pnpm --filter @geewiki/web build   # 构建知识库与管理界面（→ packages/web/dist）
+pnpm dev                           # 启动服务 → http://127.0.0.1:3000
+```
+
+- 零外部依赖默认配置：数据落在 `data/geewiki.db`（WAL + 自动迁移建表）。
+- 界面（hash 路由）：`#/wiki` 知识库（列表/编辑/Markdown/版本历史）· `#/plugins` 插件管理（会话层热启停、JSON 配置、应用并持久化）· `#/graph` 依赖图（React Flow DAG）。
+- 插件热操作示例：在「插件管理」启用 `@geewiki/echo` 即时挂载 `GET /api/echo`，停用即摘除；「应用并持久化」把会话变更合并进 `config/plugins.base.json`。
+- REST 面：`/api/health`（健康/库表/迁移）· `/api/plugins*` · `/api/pages*`。
+- 前端开发热更：`pnpm --filter @geewiki/web dev`（vite :5173，`/api` 自动代理后端）。
 
 ## 特性亮点
 
 - **开箱即用**：默认仅依赖一个 SQLite 数据库（better-sqlite3）即可运行，实现 0 外部依赖部署；亦可一键切换至 PostgreSQL 等生产级数据库。
 - **数据库即互斥插件**：系统通过标准 `DatabaseAdapter` 接口抽象数据库层，SQLite ↔ PostgreSQL 以互斥插件（conflictGroup）方式一键切换，业务代码零改动。
-- **插件管理器（核心大脑）**：热插拔引擎（显式授权）、会话层沙箱自愈、广义冲突组互斥、迁移控制器、看门狗熔断、配置热更新，六大机制保证系统稳定可控。
-- **React 19 前端 Slot 插槽**：通过 `ctx.slot()` 动态渲染第三方插件注入的 UI 组件；插件被热卸载时 Suspense 自动触发 Fallback UI，主界面不白屏。
+- **插件管理器（核心大脑）**：依赖拓扑/环检测、会话层沙箱热启停（显式热授权 + 试用期看门狗 + 熔断）、广义冲突组互斥、迁移控制器、持久化清单合并。配置热更新与前端 Slot 插槽机制列 Phase 3（见 roadmap）。
+- **管理面可视化**：React 19 管理台 —— 插件状态/层/热能力一览、会话层热操作、依赖图（React Flow DAG）、Wiki 页面编辑与版本历史。
 
 ## 技术栈
 

@@ -1,6 +1,7 @@
 {
   "enabled": [
     { "name": "@geewiki/db-sqlite" },
-    { "name": "@geewiki/http" }
+    { "name": "@geewiki/http" },
+    { "name": "@geewiki/wiki" }
   ]
 }
