@@ -1,0 +1,21 @@
+{
+  "name": "geewiki",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki —— AI-Native 插件化知识库系统（Phase 0 骨架）",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev": "tsx packages/server/src/index.ts",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "build": "pnpm -r --if-present run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "tsx": "^4.23.13",
+    "typescript": "~5.9.3"
+  }
+}

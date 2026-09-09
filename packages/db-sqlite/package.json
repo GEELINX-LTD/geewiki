@@ -1,0 +1,21 @@
+{
+  "name": "@geewiki/db-sqlite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 默认数据库插件：better-sqlite3 + SQL 迁移机制",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "better-sqlite3": "^13.0.3",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0"
+  }
+}

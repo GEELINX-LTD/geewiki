@@ -1,0 +1,11 @@
+packages:
+  - packages/*
+
+# pnpm 默认阻止依赖的 postinstall 构建脚本，此处显式批准需要的原生/工具构建
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+
+# 沙箱环境：store/cache 置于仓库内（已被 .gitignore 排除），避免写工作区外路径
+storeDir: /root/dev/geewiki/.pnpm-store
+cacheDir: /root/dev/geewiki/.npm-cache

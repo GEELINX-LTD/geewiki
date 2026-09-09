@@ -1,0 +1,13 @@
+{
+  "name": "@geewiki/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 共享类型与常量：manifest 规范、DatabaseAdapter 接口",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

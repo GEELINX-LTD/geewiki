@@ -6,6 +6,9 @@ dist/
 coverage/
 .vite/
 .cache/
+.npm-cache/
+.pnpm-store/
+.pnpm-cache/
 tmp/
 
 # 环境变量（.env.example 除外，可作为模板提交）
@@ -26,3 +29,6 @@ logs/
 
 # 系统文件
 .DS_Store
+
+# 本地沙箱 pnpm/npm 配置（store/cache 置于仓库内，仅本地环境需要）
+.npmrc
