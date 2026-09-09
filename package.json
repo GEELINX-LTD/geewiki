@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "tsx packages/server/src/index.ts",
     "typecheck": "pnpm -r --if-present run typecheck",
-    "build": "pnpm -r --if-present run build"
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test"
   },
   "engines": {
     "node": ">=22"

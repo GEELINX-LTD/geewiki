@@ -2,75 +2,214 @@
  * @geewiki/server —— GeeWiki 组合根（应用宿主）
  *
  * 职责：
- * 1. 创建 cordis 应用（Context）并装配基础插件（当前为 @geewiki/db-sqlite）；
- * 2. 提供 HTTP 服务（node:http 极简 JSON 路由）与健康检查端点；
- * 3. 处理 SIGINT/SIGTERM 优雅退出（先关 HTTP，再按逆序卸载插件 fiber）。
- *
- * Phase 1 起，装配将演进为"按插件清单（Base/Session 双层状态）驱动"，
- * 由插件管理器接管本文件中的装配职责。
+ * 1. 创建 cordis 应用并引导插件管理器（@geewiki/manager）；
+ * 2. 内置插件注册表：@geewiki/db-sqlite / @geewiki/http / @geewiki/echo；
+ *    激活与否由 plugins.base.json + plugins.session.json 双层清单决定
+ *    （默认 config/ 目录，可用 GEEWIKI_CONFIG_DIR 覆盖）；
+ * 3. HTTP 服务（@geewiki/http）：路由注册服务（其他插件经 ctx.get('http')
+ *    挂载 JSON 路由）+ 健康检查端点 + 请求统计（看门狗数据源）；
+ * 4. SIGINT/SIGTERM 优雅退出：逆序卸载全部插件后退出。
  */
-import { createServer, type Server, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from 'cordis'
-import { SqliteDbPlugin, type FiberLike } from '@geewiki/db-sqlite'
-import { DEFAULT_PORT, HEALTH_PATH } from '@geewiki/core'
+import {
+  DEFAULT_PORT,
+  HEALTH_PATH,
+  type GeeWikiManifest,
+  type HttpRouterService,
+  type HttpRouterStats,
+  type RouteHandler,
+  type RouteHandlerContext,
+} from '@geewiki/core'
+import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
+import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
+import { PluginManagerPlugin, type RegisteredPlugin } from '@geewiki/manager'
 
-/* ============================== 工具 ============================== */
+/* =========================== HTTP 路由服务 =========================== */
 
-function json(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
+/** @geewiki/http 的 Manifest（提供 http-service 路由服务，核心冷插件） */
+export const httpManifest: GeeWikiManifest = {
+  name: '@geewiki/http',
+  version: '0.1.0',
+  geewiki: {
+    provides: 'http-service',
+    requires: [],
+    runtime: {
+      supportsHotReload: false, // 核心通信层：冷操作，仅支持持久化安装 + 进程重启
+      drainTimeout: 5,
+    },
+  },
 }
 
-/* =========================== HTTP 服务 ============================ */
+interface RouteEntry {
+  method: string
+  /** 路径段：':xxx' 开头为参数段 */
+  segments: string[]
+  handler: RouteHandler
+}
+
+class HttpRouter implements HttpRouterService {
+  private readonly routes: RouteEntry[] = []
+  private readonly counters = { total: 0, ok: 0, fail: 0, consecutiveFailures: 0 }
+  private msHistory: number[] = []
+  private lastMs = 0
+
+  constructor(private readonly healthHandler: RouteHandler) {}
+
+  register(
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
+    path: string,
+    handler: RouteHandler,
+  ): () => void {
+    const entry: RouteEntry = { method, segments: path.split('/').filter(Boolean), handler }
+    this.routes.push(entry)
+    let removed = false
+    return () => {
+      if (removed) return
+      removed = true
+      const idx = this.routes.indexOf(entry)
+      if (idx >= 0) this.routes.splice(idx, 1)
+    }
+  }
+
+  stats(): HttpRouterStats {
+    const avgMs = this.msHistory.length
+      ? this.msHistory.reduce((a, b) => a + b, 0) / this.msHistory.length
+      : 0
+    return {
+      total: this.counters.total,
+      ok: this.counters.ok,
+      fail: this.counters.fail,
+      consecutiveFailures: this.counters.consecutiveFailures,
+      lastMs: this.lastMs,
+      avgMs: Math.round(avgMs * 10) / 10,
+    }
+  }
+
+  /** 请求分发入口（node:http server 回调） */
+  dispatch(req: IncomingMessage, res: ServerResponse): void {
+    const started = Date.now()
+    this.counters.total++
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+    const method = req.method ?? 'GET'
+    const finish = (status: number): void => {
+      const ms = Date.now() - started
+      this.lastMs = ms
+      this.msHistory.push(ms)
+      if (this.msHistory.length > 100) this.msHistory.shift()
+      if (status >= 500) {
+        this.counters.fail++
+        this.counters.consecutiveFailures++
+      } else {
+        this.counters.ok++
+        this.counters.consecutiveFailures = 0
+      }
+    }
+
+    const json = (status: number, body: unknown): void => {
+      finish(status)
+      if (!res.headersSent) {
+        res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+      }
+      res.end(JSON.stringify(body))
+    }
+
+    // 内置健康检查（路由表之外常驻，保证看门狗探针永不因插件卸载而缺失）
+    if (method === 'GET' && url.pathname === HEALTH_PATH) {
+      try {
+        this.healthHandler({ req, res, url, params: {}, json })
+      } catch (err) {
+        console.error('[http] 健康检查异常:', err)
+        json(500, { ok: false, error: 'health_check_failed' })
+      }
+      return
+    }
+
+    // 路径段按 URL 解码（pathname 保留百分号编码，如 %2F 需还原为 '/'）后再与路由模式匹配
+    const rawSegments = url.pathname.split('/').filter(Boolean)
+    const segments = rawSegments.map((s) => {
+      try {
+        return decodeURIComponent(s)
+      } catch {
+        return s // 非法编码序列按原样参与匹配（最终落入 404）
+      }
+    })
+    for (const route of this.routes) {
+      if (route.method !== method || route.segments.length !== segments.length) continue
+      const params: Record<string, string> = {}
+      let matched = true
+      for (let i = 0; i < segments.length; i++) {
+        const pattern = route.segments[i]
+        const actual = segments[i]
+        if (pattern?.startsWith(':')) {
+          params[pattern.slice(1)] = actual ?? ''
+        } else if (pattern !== actual) {
+          matched = false
+          break
+        }
+      }
+      if (!matched) continue
+      const h: RouteHandlerContext = { req, res, url, params, json }
+      try {
+        const result = route.handler(h)
+        if (result instanceof Promise) {
+          result.catch((err) => {
+            console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
+            json(500, { ok: false, error: 'internal', message: (err as Error).message })
+          })
+        }
+      } catch (err) {
+        console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
+        json(500, { ok: false, error: 'internal', message: (err as Error).message })
+      }
+      return
+    }
+
+    json(404, { ok: false, error: 'not_found', path: url.pathname })
+  }
+}
 
 export interface HttpConfig {
   port: number
   host?: string
 }
 
-/**
- * HTTP 服务插件：注册极简 JSON 路由表。
- * 不声明 inject: ['db']——健康检查需容忍 db 缺失（降级报告而非启动失败）。
- */
+/** HTTP 服务插件：提供 http 路由服务（ctx.get('http')），常驻内核插件 */
 export const HttpPlugin = {
   name: '@geewiki/http',
 
-  apply(ctx: Context, config: HttpConfig) {
+  apply(ctx: Context, config: Partial<HttpConfig> = {}) {
+    // 端口来源优先级：清单配置 > GEEWIKI_PORT 环境变量 > 默认 3000
+    const port = config.port ?? Number(process.env.GEEWIKI_PORT ?? DEFAULT_PORT)
+    const host = config.host ?? '0.0.0.0'
     const startedAt = Date.now()
-    const server: Server = createServer((req, res) => {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-      const method = req.method ?? 'GET'
-
-      // GET /api/health —— 看门狗探针端点：报告进程与数据库健康度
-      if (method === 'GET' && url.pathname === HEALTH_PATH) {
-        const db = ctx.get('db')
-        const health = {
-          ok: true,
-          uptime: Math.round((Date.now() - startedAt) / 1000),
-          timestamp: new Date().toISOString(),
-          db: db
-            ? { present: true, tables: db.listTables(), migrations: db.appliedMigrations() }
-            : { present: false },
-        }
-        json(res, 200, health)
-        return
-      }
-
-      json(res, 404, { error: 'not_found', path: url.pathname })
+    const router = new HttpRouter((h) => {
+      const db = ctx.get('db')
+      h.json(200, {
+        ok: true,
+        uptime: Math.round((Date.now() - startedAt) / 1000),
+        timestamp: new Date().toISOString(),
+        db: db
+          ? { present: true, tables: db.listTables(), migrations: db.appliedMigrations() }
+          : { present: false },
+      })
     })
 
+    const server: Server = createServer((req, res) => router.dispatch(req, res))
     server.on('error', (err) => {
       console.error('[@geewiki/http] 监听失败:', err)
     })
-
-    server.listen(config.port, config.host, () => {
-      const shown = config.host === '0.0.0.0' ? '127.0.0.1' : (config.host ?? '127.0.0.1')
-      console.log(`[@geewiki/http] 服务已启动: http://${shown}:${config.port}`)
+    server.listen(port, host, () => {
+      const shown = host === '0.0.0.0' ? '127.0.0.1' : host
+      console.log(`[@geewiki/http] 服务已启动: http://${shown}:${port}`)
     })
 
+    const unprovide = ctx.provide('http', router)
     return () =>
       new Promise<void>((resolveClose) => {
+        unprovide()
         server.close(() => resolveClose())
       })
   },
@@ -81,25 +220,42 @@ export const HttpPlugin = {
 export interface ServerOptions {
   port?: number
   host?: string
+  /** 插件清单目录（默认取 GEEWIKI_CONFIG_DIR 或 ./config） */
+  configDir?: string
+  registry?: RegisteredPlugin[]
 }
 
-/** 启动应用宿主：装配插件并监听端口。返回清理句柄。 */
+/** 内置插件注册表（default registry：服务器引导时注册的全部可管插件） */
+export function defaultRegistry(): RegisteredPlugin[] {
+  return [
+    {
+      name: '@geewiki/db-sqlite',
+      manifest: dbSqliteManifest as GeeWikiManifest,
+      module: SqliteDbPlugin,
+      migrationsDir: DB_SQLITE_MIGRATIONS_DIR,
+    },
+    { name: '@geewiki/http', manifest: httpManifest, module: HttpPlugin },
+    { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin },
+  ]
+}
+
+/** 启动应用宿主：引导插件管理器（管理器按双层清单激活全部插件）。返回清理句柄。 */
 export async function startServer(options: ServerOptions = {}): Promise<{ app: Context; dispose: () => Promise<void> }> {
   const app = new Context()
   const port = options.port ?? Number(process.env.GEEWIKI_PORT ?? DEFAULT_PORT)
   const host = options.host ?? '0.0.0.0'
+  const configDir = options.configDir ?? process.env.GEEWIKI_CONFIG_DIR ?? 'config'
 
-  // 装配顺序：db-sqlite 在前（无依赖），HTTP 在后
-  const fibers: FiberLike[] = []
-  fibers.push(await app.plugin(SqliteDbPlugin))
-  fibers.push(await app.plugin(HttpPlugin, { port, host }))
+  const managerFiber = await app.plugin(PluginManagerPlugin, {
+    registry: options.registry ?? defaultRegistry(),
+    baseFile: resolve(configDir, 'plugins.base.json'),
+    sessionFile: resolve(configDir, 'plugins.session.json'),
+  })
 
   return {
     app,
     dispose: async () => {
-      for (const fiber of fibers.reverse()) {
-        await fiber.dispose()
-      }
+      await managerFiber.dispose()
     },
   }
 }

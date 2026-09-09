@@ -10,8 +10,6 @@ import { mkdirSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
-import './augment.js'
-export type { FiberLike } from './augment.js'
 import type { Context } from 'cordis'
 import {
   DEFAULT_DATA_DIR,
@@ -57,7 +55,7 @@ export class SqliteDatabase implements DatabaseAdapter {
 
   /** 包内置迁移脚本目录（src/migrations，随源码分发） */
   private get defaultMigrationDir(): string {
-    return join(dirname(fileURLToPath(import.meta.url)), 'migrations')
+    return DB_SQLITE_MIGRATIONS_DIR
   }
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
@@ -129,6 +127,9 @@ export class SqliteDatabase implements DatabaseAdapter {
 }
 
 /* ============================ 插件本体 ============================ */
+
+/** 包内置迁移目录（绝对路径，供插件管理器迁移控制器读取） */
+export const DB_SQLITE_MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'migrations')
 
 /**
  * cordis 插件：@geewiki/db-sqlite

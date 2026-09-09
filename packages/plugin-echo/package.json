@@ -1,16 +1,17 @@
 {
-  "name": "@geewiki/core",
+  "name": "@geewiki/echo",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "GeeWiki 共享类型与常量：manifest 规范、DatabaseAdapter 接口",
+  "description": "GeeWiki 示例插件：无状态 echo 服务（演示会话层热插拔）",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
-  "devDependencies": {
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
     "cordis": "^4.0.0-rc.10"
   }
 }

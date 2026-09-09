@@ -4,6 +4,14 @@
  * 类型定义与 docs/architecture.md 第 7 节"插件元数据规范（Manifest）"逐字段对齐。
  */
 
+/* 引入 cordis 类型面补充（cordis-env.ts 自包含声明，见该文件头注释）。
+   此 import type 仅用于让 cordis 模块进入本 program 的类型解析
+   （缺少时 declare module 'cordis' 会报 TS2664 cannot be found）。 */
+import type { Context } from 'cordis'
+import './cordis-env.js'
+
+export type { FiberLike } from './cordis-env.js'
+
 /* ============================== 插件 Manifest ============================== */
 
 /** `geewiki.runtime`：运行期能力声明 */
@@ -134,3 +142,51 @@ export const HEALTH_PATH = '/api/health'
 
 /** 迁移登记表名 */
 export const MIGRATION_TABLE = '_migrations'
+
+/* ========================= HTTP 路由服务（插件间共享） ========================= */
+
+/**
+ * HTTP 路由处理器上下文：由 @geewiki/http 路由服务构造后交给已注册的路由。
+ * 处理器可同步返回或返回 Promise（异步错误统一转 500）。
+ */
+export interface RouteHandlerContext {
+  /** 原始请求（node:http IncomingMessage） */
+  req: import('node:http').IncomingMessage
+  /** 响应对象（node:http ServerResponse） */
+  res: import('node:http').ServerResponse
+  /** 已解析的请求 URL（含 query） */
+  url: URL
+  /** 路径参数（注册路径中的 :param 段 → 实际值） */
+  params: Record<string, string>
+  /** 发送 JSON 响应并结束 */
+  json(status: number, body: unknown): void
+}
+
+/** 路由处理器 */
+export type RouteHandler = (h: RouteHandlerContext) => void | Promise<void>
+
+/** 路由服务统计（供看门狗健康监测使用） */
+export interface HttpRouterStats {
+  total: number
+  ok: number
+  fail: number
+  /** 连续失败次数（看门狗熔断依据） */
+  consecutiveFailures: number
+  /** 最近一次请求耗时（毫秒） */
+  lastMs: number
+  /** 平均请求耗时（毫秒） */
+  avgMs: number
+}
+
+/**
+ * HTTP 路由服务（由 @geewiki/http 提供，经 ctx.get('http') 获取）：
+ * 其他插件通过 register 挂载 JSON 路由，卸载时调用返回的注销函数。
+ * path 支持 `:param` 段（如 '/api/plugins/:name/enable'），实际值经
+ * RouteHandlerContext.params 获取。
+ */
+export interface HttpRouterService {
+  /** 注册路由（method 大写，path 精确或带 :param 匹配）；返回注销函数 */
+  register(method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH', path: string, handler: RouteHandler): () => void
+  /** 请求统计（看门狗探针数据源） */
+  stats(): HttpRouterStats
+}
