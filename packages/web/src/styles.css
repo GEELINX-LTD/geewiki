@@ -316,3 +316,52 @@ h2 + .empty { padding: 8px; }
 .replace-prompt h3 { margin: 0 0 4px; font-size: 13px; color: #b45309; }
 .replace-prompt p { margin: 0 0 8px; font-size: 12px; }
 .replace-prompt .chip { background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 6px; }
+
+/* ---------- 检索与 AI 问答（宿主原生 UI） ---------- */
+
+.wiki-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.search-form, .ask-form { display: flex; gap: 8px; align-items: center; flex: 1; min-width: 260px; }
+.search-input, .ask-input {
+  flex: 1; min-width: 200px; border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 12px; font-size: 14px; background: #fff; color: var(--ink);
+}
+.search-input:focus, .ask-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 12%); outline: none; }
+.search-input:disabled { background: #f1f5f9; color: var(--muted); cursor: not-allowed; }
+
+.search-meta, .ask-meta { padding: 0 2px; }
+
+.search-hit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.search-hit { padding: 10px 0; border-bottom: 1px solid #eef2f6; display: flex; flex-direction: column; gap: 4px; }
+.search-hit:last-child { border-bottom: 0; }
+.search-hit-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.search-hit-title, .ask-source-title {
+  border: 0; background: transparent; padding: 0; cursor: pointer;
+  font-size: 14px; font-weight: 600; color: var(--accent); text-align: left;
+}
+.search-hit-title:hover, .ask-source-title:hover { text-decoration: underline; }
+.search-snippet, .ask-snippet { margin: 0; font-size: 13px; color: #33415c; line-height: 1.7; overflow-wrap: anywhere; }
+
+/* 服务端高亮：必须给 <mark> 可见样式，否则高亮"生效了却看不出来" */
+.search-snippet mark, .ask-snippet mark, .md-body mark {
+  background: #fef08a; color: #713f12; padding: 0 2px; border-radius: 3px;
+}
+
+.ask-card { display: flex; flex-direction: column; gap: 10px; }
+.ask-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ask-head h2 { margin: 0; }
+.ask-answer { font-size: 14px; }
+.ask-answer-plain { white-space: pre-wrap; line-height: 1.75; overflow-wrap: anywhere; }
+
+/* 降级提示条：信息性，不用 error 配色淹没结果 */
+.ask-degraded { border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+.ask-degraded-info { background: #eff6ff; border: 1px solid #bfdbfe; color: #1d4ed8; }
+.ask-degraded-warn { background: #fffbeb; border: 1px solid #fde68a; color: #b45309; }
+
+.ask-sources { display: flex; flex-direction: column; gap: 6px; }
+.ask-sources h3 { margin: 0; font-size: 13px; color: var(--muted); }
+.ask-source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.ask-source { padding: 8px 0; border-bottom: 1px solid #eef2f6; display: flex; flex-direction: column; gap: 4px; }
+.ask-source:last-child { border-bottom: 0; }
+.ask-source-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ask-source-unused { opacity: 0.62; }

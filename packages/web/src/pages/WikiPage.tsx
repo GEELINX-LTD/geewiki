@@ -1,6 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { api, type PageDetail, type PageSummary } from '../api'
+import { ApiError, api, type PageDetail, type PageSummary } from '../api'
+import { AskPanel } from '../components/AskPanel'
+import { SearchView } from '../components/SearchView'
 import { mdToHtml } from '../lib/sanitize'
+import { checkQuery } from '../lib/searchPlan'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -11,20 +14,58 @@ function slugOk(slug: string): boolean {
   return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(slug)
 }
 
-/** Wiki 页：sub 为 hash 中 'wiki/' 之后的子路径（'' = 列表，'new' = 新建，slug = 详情） */
+/** hash 段里的查询串解码（用户可能在地址栏手输，容错返回原文） */
+function decodeSegment(raw: string): string {
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
+}
+
+/**
+ * Wiki 页：sub 为 hash 中 'wiki/' 之后的子路径。
+ * 保留段：'' | 'list'（列表）、'new'（新建）、'search/<q>'（检索）、'ask[/<q>]'（问答）、
+ * `<slug>[/edit]`（详情/编辑）。**检索与问答是宿主原生 UI**（见 lib/slots.tsx 的冻结裁决：
+ * 插件组件不接收 props），因此不走 Slot，而是这里自己的路由。
+ */
 export function WikiPage(props: { sub: string; onNavigate: (path: string) => void }): ReactNode {
   const { sub, onNavigate } = props
   const seg = sub.split('/').filter(Boolean)
+  const first = seg[0] ?? ''
+  // 允许作为第二段的保留字（其余深层路径视为未知 → 回列表）
+  const allowedSecond = seg[1] === 'edit' || first === 'search' || first === 'ask'
+  const unknownDeep = seg.length >= 2 && !allowedSecond
   // 未知深层路径 → 导航副作用收敛到 useEffect（不在 render 期改 location）
-  const unknownDeep = seg.length >= 2 && seg[1] !== 'edit'
   useEffect(() => {
     if (unknownDeep) onNavigate('')
   }, [unknownDeep, onNavigate])
   if (unknownDeep) return null
-  if (seg.length === 0 || seg[0] === 'list') return <WikiList onOpen={(slug) => onNavigate(slug)} onNew={() => onNavigate('new')} />
-  if (seg[0] === 'new') return <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
-  // 20 行起 seg.length ≥ 1 且首段非 list/new：非空 slug
-  const slug = seg[0] ?? ''
+
+  if (seg.length === 0 || first === 'list') {
+    return <WikiList onOpen={(slug) => onNavigate(slug)} onNew={() => onNavigate('new')} onSearch={(q) => onNavigate(`search/${encodeURIComponent(q)}`)} onAsk={(q) => onNavigate(q === '' ? 'ask' : `ask/${encodeURIComponent(q)}`)} />
+  }
+  if (first === 'search') {
+    const q = decodeSegment(seg[1] ?? '')
+    return <SearchView key={q} query={q} onOpen={(slug) => onNavigate(slug)} onSearch={(next) => onNavigate(`search/${encodeURIComponent(next)}`)} />
+  }
+  if (first === 'ask') {
+    const q = decodeSegment(seg[1] ?? '')
+    return (
+      <div className="page">
+        <div className="page-head">
+          <h1>问答</h1>
+          <div className="page-actions">
+            <button className="btn" onClick={() => onNavigate('')}>← 返回列表</button>
+          </div>
+        </div>
+        <AskPanel key={q} initialQuery={q} onOpenPage={(slug) => onNavigate(slug)} />
+      </div>
+    )
+  }
+  if (first === 'new') return <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
+  // 到这里 seg.length ≥ 1 且首段非保留字：非空 slug
+  const slug = first
   if (seg.length === 1) return <WikiDetail key={slug} slug={slug} onEdit={() => onNavigate(`${slug}/edit`)} onDeleted={() => onNavigate('')} onNavigate={onNavigate} />
   if (seg[1] === 'edit') return <WikiEdit key={slug} slug={slug} onDone={() => onNavigate(slug)} onCancel={() => onNavigate(slug)} />
   return null
@@ -32,10 +73,29 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
 
 /* ============================ 列表 ============================ */
 
-function WikiList(props: { onOpen: (slug: string) => void; onNew: () => void }): ReactNode {
-  const { onOpen, onNew } = props
+function WikiList(props: {
+  onOpen: (slug: string) => void
+  onNew: () => void
+  onSearch: (q: string) => void
+  onAsk: (q: string) => void
+}): ReactNode {
+  const { onOpen, onNew, onSearch, onAsk } = props
   const [pages, setPages] = useState<PageSummary[] | null>(null)
   const [err, setErr] = useState('')
+  const [q, setQ] = useState('')
+  const [queryNotice, setQueryNotice] = useState('')
+  /**
+   * 检索/问答插件**可能未启用**（默认部署下 `@geewiki/search` 与 `@geewiki/ai` 都不在基础层
+   * 清单里，它们的端点会 404）。探测用**两路**：
+   * 1. `GET /api/plugins`（恒可用）——插件是否 active，这是权威判据，**不产生 404**；
+   * 2. `GET /api/ai/capabilities`（按契约要求调用）——用于拿到"模型是否就绪"的说明；
+   *    若插件未启用它会 404，这里**静默**降级（只 console.debug）。
+   * 三态：null=探测中、true=可用、false=不可用（隐藏入口）。
+   */
+  const [searchReady, setSearchReady] = useState<boolean | null>(null)
+  const [aiReady, setAiReady] = useState<boolean | null>(null)
+  /** 模型是否就绪（来自 capabilities）；null = 未知（未启用或探测失败） */
+  const [modelReady, setModelReady] = useState<boolean | null>(null)
 
   const load = (): void => {
     setErr('')
@@ -45,6 +105,41 @@ function WikiList(props: { onOpen: (slug: string) => void; onNew: () => void }):
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
   }
   useEffect(load, [])
+
+  useEffect(() => {
+    api
+      .plugins()
+      .then((r) => {
+        const stateOf = (name: string): string | undefined => r.plugins.find((p) => p.name === name)?.state
+        setSearchReady(stateOf('@geewiki/search') === 'active')
+        setAiReady(stateOf('@geewiki/ai') === 'active')
+      })
+      .catch((e: unknown) => {
+        // 列表本身失败：不阻塞页面，入口按"不可用"处理（用户仍能正常读写页面）
+        console.debug('[geewiki-wiki] 插件列表不可用，隐藏检索/问答入口：', e instanceof Error ? e.message : e)
+        setSearchReady(false)
+        setAiReady(false)
+      })
+    // 能力探测：未启用 @geewiki/ai 时该端点 404 —— 按契约静默降级，绝不产生 console error
+    api
+      .aiCapabilities()
+      .then((c) => setModelReady(c.available))
+      .catch((e: unknown) => {
+        console.debug('[geewiki-wiki] 问答能力探测跳过：', e instanceof Error ? e.message : e)
+        setModelReady(null)
+      })
+  }, [])
+
+  const submitSearch = (): void => {
+    // 与检索视图共用同一套校验（空串 / 超长），这样超长查询在**原地**就给出提示、不必先跳转
+    const checked = checkQuery(q)
+    if (!checked.ok) {
+      setQueryNotice(checked.message)
+      return
+    }
+    setQueryNotice('')
+    onSearch(checked.value)
+  }
 
   return (
     <div className="page">
@@ -56,6 +151,50 @@ function WikiList(props: { onOpen: (slug: string) => void; onNew: () => void }):
           <button className="btn primary" onClick={onNew}>＋ 新建页面</button>
         </div>
       </div>
+
+      {/* 检索与问答入口（宿主原生 UI；插件未启用时隐藏对应入口） */}
+      <div className="wiki-tools">
+        <form
+          className="search-form"
+          onSubmit={(e) => {
+            e.preventDefault()
+            submitSearch()
+          }}
+        >
+          <input
+            className="search-input"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={searchReady === false ? '检索插件未启用' : '检索知识库内容…'}
+            aria-label="检索知识库"
+            disabled={searchReady === false}
+          />
+          <button className="btn primary" type="submit" disabled={searchReady === false}>
+            搜索
+          </button>
+        </form>
+        {aiReady === true && (
+          <button
+            className="btn"
+            onClick={() => onAsk('')}
+            title={
+              modelReady === false
+                ? '未配置模型密钥：问答将以检索结果与抽取式摘要形式提供'
+                : '基于知识库检索的问答'
+            }
+          >
+            💬 AI 问答
+            {modelReady === false && <span className="muted small">（无模型）</span>}
+          </button>
+        )}
+        {aiReady === false && (
+          <span className="muted small" title="问答插件 @geewiki/ai 未激活（端点 /api/ai/ask 会 404）">
+            问答插件未启用
+          </span>
+        )}
+        {queryNotice && <span className="notice err">{queryNotice}</span>}
+      </div>
+
       <section className="card">
         <table className="table">
           <thead>

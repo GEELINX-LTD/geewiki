@@ -176,6 +176,103 @@ export interface SaveResult {
   version: number
 }
 
+/* ------------------------- 检索与 AI 问答 ------------------------- */
+
+/**
+ * 检索路径：`fts`（查询 ≥3 字符，走 FTS5/BM25）/ `like`（<3 字符的兜底全表扫描）。
+ * 中文 2 字词（如「检索」）属于后者——这是 trigram 分词器的硬缺口，不是错误。
+ */
+export type SearchMode = 'fts' | 'like'
+
+export interface SearchHit {
+  slug: string
+  title: string
+  /**
+   * **服务端已 HTML 转义**的片段，且只含 `<mark>`。
+   * 渲染时必须按 HTML 注入（见 `lib/snippet.ts` 的 `snippetToHtml`），**不得二次转义**
+   * ——那会把 `<mark>` 显示成字面文本；也不得当纯文本插入（会丢高亮）。
+   */
+  snippet: string
+  /** 取负后的 BM25（越大越相关）；**仅同一次查询内可比**，`mode === 'like'` 时恒为 0 */
+  score: number
+  updated_at: string
+}
+
+export interface SearchResponse {
+  ok: true
+  query: string
+  mode: SearchMode
+  /** 全量命中数（不受 limit 影响） */
+  total: number
+  hits: SearchHit[]
+}
+
+/** 降级原因：**按它分支文案，绝不按 message 文本分支**（上游 message 可能变化/被脱敏） */
+export type DegradedReason =
+  | 'no_provider'
+  | 'missing_credential'
+  | 'invalid_credential'
+  | 'rate_limit'
+  | 'timeout'
+  | 'context_window_exceeded'
+  | 'network'
+  | 'provider_error'
+  | 'search_unavailable'
+  | 'empty_query'
+
+export interface Degraded {
+  reason: DegradedReason
+  /** 上游错误码（本插件自身原因时为 null，如 search_unavailable） */
+  code: string | null
+  /** 已脱敏的人类可读说明 */
+  message: string
+}
+
+export type AskMode = 'retrieval-only' | 'rag' | 'rag-partial'
+
+export interface AskSource {
+  /** 引用编号（只对 used:true 连续编号）；null = 该条未进模型上下文（被截断丢弃） */
+  n: number | null
+  slug: string
+  title: string
+  /** 同 SearchHit.snippet：已转义、只含 `<mark>`，按 HTML 渲染 */
+  snippet: string
+  score: number
+  updated_at: string
+  /** 是否真的进了模型上下文 */
+  used: boolean
+}
+
+/**
+ * `POST /api/ai/ask` / `GET /api/ai/ask` 的响应体。
+ * **200 一律正常**——包含「没有模型密钥」与「检索无结果」两种情况（降级信息在 `degraded` 里）。
+ * 只有 `400 empty_query` / `400 too_long` 才是输入问题。
+ */
+export interface AskResponse {
+  ok: true
+  query: string
+  mode: AskMode
+  degraded: Degraded | null
+  /** 无模型时为抽取式摘要；模型不可用且无来源时为 null */
+  answer: string | null
+  answerFormat: 'markdown' | 'plain'
+  sources: AskSource[]
+  retrieval: { mode: SearchMode; total: number; limit: number }
+  usage: unknown
+  elapsedMs: number
+  /** 回答是否被中断/截断 */
+  partial: boolean
+}
+
+/** `GET /api/ai/capabilities`：仅在 `@geewiki/ai` **已激活**时才有此端点（未启用时 404） */
+export interface AiCapabilitiesResponse {
+  ok: true
+  available: boolean
+  degraded: boolean
+  providers: { route: string; label: string; vendor: string; model: string; available: boolean }[]
+  message: string
+}
+
 export const api = {
   /* 插件管理 */
   plugins: () =>
@@ -206,4 +303,18 @@ export const api = {
       'GET',
       `/api/pages/${encodeURIComponent(slug)}/versions/${id}`,
     ),
+
+  /* 检索与 AI 问答（后端插件未启用时这两个端点会 404，调用方须优雅降级） */
+  search: (q: string, limit?: number) =>
+    request<SearchResponse>(
+      'GET',
+      `/api/search?q=${encodeURIComponent(q)}${limit === undefined ? '' : `&limit=${encodeURIComponent(String(limit))}`}`,
+    ),
+  aiAsk: (q: string, opts?: { limit?: number; extractive?: boolean }) =>
+    request<AskResponse>('POST', '/api/ai/ask', {
+      q,
+      ...(opts?.limit === undefined ? {} : { limit: opts.limit }),
+      ...(opts?.extractive === undefined ? {} : { extractive: opts.extractive }),
+    }),
+  aiCapabilities: () => request<AiCapabilitiesResponse>('GET', '/api/ai/capabilities'),
 }
