@@ -34,6 +34,7 @@ import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest 
 import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
+import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
 import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
 import {
@@ -762,6 +763,12 @@ export function defaultRegistry(
     // 与 @geewiki/echo / @geewiki/llm 同形态：**只登记、不写进默认基础层清单**（已注册未启用），
     // 由使用者在管理台按需热启用；是否默认启用见 docs 的部署建议。
     { name: '@geewiki/ai', manifest: aiManifest as GeeWikiManifest, module: AiPlugin, source: 'builtin' },
+    // OpenAI 兼容 adapter（第一个真实 provider）：只往 llm-service 注册一条路由，故**无 provides**；
+    // requires 点名 llm-service（服务 token，不是插件名），由管理器保证注册表先就绪。
+    // conflictGroup 'llm-provider'：与将来的其它厂商 adapter 同组互斥——这正是该冲突组的用途。
+    // 与 @geewiki/llm / @geewiki/ai 同形态：**只登记、不写进默认基础层清单**（已注册未启用）——
+    // 它需要外部提供凭据才有意义，且与其它 provider 互斥，属于"按需显式启用"的插件。
+    { name: '@geewiki/openai', manifest: openAiManifest as GeeWikiManifest, module: OpenAiPlugin, source: 'builtin' },
   ]
 }
 

@@ -110,6 +110,25 @@ importers:
         specifier: ^22.0.0
         version: 22.20.1
 
+  packages/plugin-openai:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      '@geewiki/llm':
+        specifier: workspace:*
+        version: link:../plugin-llm
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
   packages/plugin-search:
     dependencies:
       '@geewiki/core':
@@ -165,6 +184,9 @@ importers:
       '@geewiki/manager':
         specifier: workspace:*
         version: link:../manager
+      '@geewiki/openai':
+        specifier: workspace:*
+        version: link:../plugin-openai
       '@geewiki/search':
         specifier: workspace:*
         version: link:../plugin-search

@@ -1,0 +1,23 @@
+{
+  "name": "@geewiki/openai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki OpenAI 兼容 LLM adapter：向 llm-service 注册 /chat/completions 流式路由（零新依赖）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "@geewiki/llm": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
