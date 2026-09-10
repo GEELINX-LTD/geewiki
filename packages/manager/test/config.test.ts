@@ -730,6 +730,11 @@ test('boot 叠加失败：非法配置 / apply 抛错 → 只记 bootErrors 并�
     assert.deepEqual(log, ['apply:@t/cfg:{"message":"base-ok","count":1}'], '非法配置不得被 apply')
     assert.equal(manager.snapshot().find((p) => p.name === '@t/cfg')?.state, 'active', '插件仍以基础层配置运行')
     assert.deepEqual(manager.configOf('@t/cfg').config, { message: 'base-ok', count: 1 })
+    // layer 报的是"实际生效的配置来自哪一层"：叠加失败后进程内跑的就是基础层配置，
+    // 若仍按"条目写在会话层"报 session，运维/前端会误判"会话层配置已生效"。
+    const got = manager.configOf('@t/cfg')
+    assert.equal(got.layer, 'base', `叠加失败后 layer 必须回落 base: ${JSON.stringify(got)}`)
+    assert.equal(got.activeLayer, 'base', '激活层仍是基础层')
     const errors = manager.sessionState().bootErrors
     assert.equal(errors.length, 1, `应记录一条叠加失败: ${JSON.stringify(errors)}`)
     assert.match(errors[0] ?? '', /叠加失败/)

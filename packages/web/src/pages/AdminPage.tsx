@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
-import { ApiError, api, type ConfigIssue, type ListEntry, type PluginInfo, type SessionState } from '../api'
+import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState } from '../api'
 import { SchemaForm } from '../components/SchemaForm'
 import { describeRoot, type FieldDescriptor } from '../lib/configSchema'
 
@@ -61,12 +61,15 @@ export function AdminPage(): ReactNode {
   const [configText, setConfigText] = useState('')
   const [editor, setEditor] = useState<ConfigEditorState | null>(null)
   const [configErrors, setConfigErrors] = useState<Map<string, string[]>>(new Map())
+  /** 外部插件发现期被跳过的目录（清单缺失/入口缺失/路径越界/重名/加载抛错等） */
+  const [issues, setIssues] = useState<DiscoveryIssueInfo[]>([])
 
   const load = useCallback(async () => {
     try {
       const [p, s] = await Promise.all([api.plugins(), api.session()])
       setPlugins(p.plugins)
       setSession(s)
+      setIssues(p.issues ?? [])
     } catch (err) {
       setNotice({ kind: 'err', text: `加载失败: ${fmtError(err)}` })
     }
@@ -208,6 +211,21 @@ export function AdminPage(): ReactNode {
           </button>
         </div>
       </div>
+
+      {issues.length > 0 && (
+        <section className="discovery-issues">
+          <h3>外部插件发现期有 {issues.length} 条问题（这些插件未加载）</h3>
+          <ul>
+            {issues.map((issue, i) => (
+              <li key={`${issue.code}:${issue.dir}:${i}`}>
+                <code className="chip">{issue.code}</code>
+                <span className="muted small"> {issue.dir}</span>
+                <div className="err-text small">{issue.message}</div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {counts && (
         <div className="stat-bar">

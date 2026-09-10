@@ -196,14 +196,21 @@ function writeList(file: string, list: PluginListFile): void {
   // 坏清单会让下次启动丢失全部插件装配（readList 抛 invalid_list_file）。
   // 临时名带 pid + 随机后缀并以 wx 独占创建：多实例共用同一 config 目录时互不覆盖。
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  // ownsTmp 表示"本次调用确实创建了这个临时文件"：wx 独占创建失败（EEXIST）时临时名属于
+  // 别的进程/上一次残留，清理阶段绝不能把不属于自己的文件删掉。
+  let ownsTmp = false
   try {
     writeFileSync(tmp, `${JSON.stringify(list, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+    ownsTmp = true
     renameSync(tmp, file)
+    ownsTmp = false // rename 成功后临时名已不存在
   } catch (err) {
-    try {
-      unlinkSync(tmp)
-    } catch {
-      // 清理失败不得掩盖原始错误
+    if (ownsTmp) {
+      try {
+        unlinkSync(tmp)
+      } catch {
+        // 清理失败不得掩盖原始错误
+      }
     }
     throw err
   }
@@ -239,6 +246,12 @@ export class GeeWikiManager {
   /** 最近一次会话层激活的插件（看门狗试用期回滚归因目标） */
   private lastEnabledName: string | null = null
   private lastEnabledAt: number | null = null
+  /**
+   * 会话层配置**叠加失败**的插件名（boot 阶段 {@link applySessionOverlay} 抛出的出口登记）。
+   * 这些插件进程内仍以基础层配置运行（activeLayer 也是 base），因此 `configOf` 的 layer
+   * 必须回落 base，否则会报出"layer=session 但生效值来自 base"的自相矛盾。
+   */
+  private readonly overlayFailed = new Set<string>()
 
   constructor(ctx: Context, config: ManagerConfig) {
     this.ctx = ctx
@@ -453,6 +466,8 @@ export class GeeWikiManager {
 
     managed.config = config
     if (layer === 'session') {
+      // 会话层配置已成功热更新：清除"叠加失败"标记（同一进程内先失败后成功不得残留）
+      this.overlayFailed.delete(name)
       // 与 enable 对称：会话层插件热更新后进入试用期，探针失败可被看门狗回滚
       this.lastEnabledName = name
       this.lastEnabledAt = Date.now()
@@ -476,7 +491,12 @@ export class GeeWikiManager {
    */
   private effectiveConfigLayerOf(name: string): Layer {
     const inSession = this.session.enabled.find((e) => e.name === name)
-    return inSession?.config !== undefined ? 'session' : 'base'
+    if (inSession?.config === undefined) return 'base'
+    // 报"实际生效的配置来自哪一层"，而不是"条目写在哪一层"：会话层叠加失败的条目
+    // 进程内仍以基础层配置运行（activeLayer 也是 base），此时报 session 会自相矛盾。
+    // 仅在插件确实处于激活态时才回落（未激活时展示的就是持久化值，按条目所在层报即可）。
+    if (this.overlayFailed.has(name) && this.plugins.get(name)?.active) return 'base'
+    return 'session'
   }
 
   /**
@@ -837,12 +857,16 @@ export class GeeWikiManager {
     config: Record<string, unknown>,
   ): Promise<void> {
     const fiber = managed.fiber
-    if (!fiber?.update) throw new Error('运行期句柄不支持 fork.update，无法叠加会话层配置')
+    if (!fiber?.update) {
+      this.overlayFailed.add(name)
+      throw new Error('运行期句柄不支持 fork.update，无法叠加会话层配置')
+    }
     let effective = config
     const schema = this.configSchemaOf(managed.entry)
     if (schema) {
       const validation = validateConfig(schema, config)
       if (!validation.ok) {
+        this.overlayFailed.add(name)
         throw new ManagerError('invalid_config', `配置校验失败: ${formatIssues(validation.issues)}`, {
           issues: validation.issues,
         })
@@ -858,6 +882,7 @@ export class GeeWikiManager {
     try {
       await fiber.update(effective)
     } catch (err) {
+      this.overlayFailed.add(name)
       try {
         await fiber.update(previous ?? {})
         console.error(`[manager] 插件 ${name} 会话层配置叠加失败，已回滚为基础层配置`)
@@ -866,6 +891,7 @@ export class GeeWikiManager {
       }
       throw err
     }
+    this.overlayFailed.delete(name)
     managed.config = effective
     console.log(`[manager] 插件 ${name} 已叠加会话层配置（基础层激活 + 会话层覆盖生效）`)
   }
