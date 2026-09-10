@@ -1,0 +1,47 @@
+# ── 依赖与本地缓存（镜像内会重新安装，绝不进入构建上下文）────────────────
+node_modules
+**/node_modules
+.pnpm-store
+.pnpm-cache
+.npm-cache
+.pnpmfile.cjs
+
+# ── 版本控制与编辑器 ───────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+.DS_Store
+.editorconfig
+
+# ── 构建产物与缓存（前端产物由镜像内 vite build 重新生成）────────────────
+dist
+**/dist
+coverage
+.vite
+**/.vite
+**/*.tsbuildinfo
+
+# ── 运行时状态（宿主机数据，不得打进镜像）──────────────────────────────
+data
+**/data
+tmp
+logs
+*.log
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+config/plugins.session.json
+
+# ── 本地环境配置 ──────────────────────────────────────────────────────
+# .npmrc 内含指向宿主机绝对路径的 store-dir/cache-dir，进入镜像会污染容器内 pnpm
+.env
+.env.*
+!.env.example
+.npmrc
+
+# ── 文档（与构建无关，仅减小构建上下文）────────────────────────────────
+docs
+*.md

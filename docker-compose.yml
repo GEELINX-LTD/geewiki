@@ -1,25 +1,41 @@
 # GeeWiki —— Docker Compose 部署编排（Compose V2 规范，不使用已废弃的 version 字段）
 #
-# ⚠️ 未就绪提示：本文件为 Phase 4 部署骨架，镜像构建所需的 Dockerfile 尚未提供，
-#    因此现在**无法**用本文件启动（下方 build 段已注释，仅保留 image 名称占位）。
-#    当前请改用本地开发方式运行：
-#      pnpm install && pnpm dev
-#    （开发形态：前端 http://localhost:5173、后端 http://127.0.0.1:3000；
-#      仅依赖一个 SQLite 文件，无需外部数据库服务。dev 形态由 Vite 提供前端，不读取构建产物）
+# 默认体验（SQLite，开箱即用）：
+#   docker compose up -d --build      → http://localhost:3000
+#   仅启动 geewiki-app；数据持久化在 ./data，无需任何外部数据库服务。
 #
-# 镜像就绪后的默认体验（开箱即用）：docker compose up -d
-#   - 仅启动 geewiki-app，SQLite 数据持久化于 ./data，无需任何外部数据库服务。
-#
-# 生产部署（启用 PostgreSQL 数据库插件）：docker compose --profile production up -d
+# 生产部署（启用 PostgreSQL 数据库插件）：
+#   docker compose --profile production up -d --build
 #   - 同时启动 postgres 服务，应用内将激活 @geewiki/db-pg 互斥插件（该插件尚在规划中）。
 #   - 需先在 .env 中提供 DB_PASSWORD（本项目不提交 .env，避免泄露密钥，见 postgres 服务注释）。
+#
+# ⚠️ 首次运行前的目录权限（绑定挂载的属主必须与容器内用户一致）：
+#   容器内以非 root 的 node 用户运行（默认 uid/gid = 1000）。若 ./data、./config、./plugins
+#   尚不存在或属于其他用户，请先执行：
+#     mkdir -p data config plugins && sudo chown -R 1000:1000 data config plugins
+#   若你的宿主用户 id 不是 1000，可改为对齐自身（无需 sudo chown）：
+#     GEEWIKI_UID=$(id -u) GEEWIKI_GID=$(id -g) docker compose up -d
+#   详见 docs/deployment.md「目录权限」一节。
+#
+# 可用环境变量（均可写入 .env）：
+#   GEEWIKI_HOST_PORT        宿主端口（默认 3000）；容器内端口固定 3000
+#   GEEWIKI_HOST_DATA_DIR    数据目录宿主路径（默认 ./data）
+#   GEEWIKI_HOST_CONFIG_DIR  配置目录宿主路径（默认 ./config）
+#   GEEWIKI_HOST_PLUGINS_DIR 插件目录宿主路径（默认 ./plugins）
+#   GEEWIKI_UID / GEEWIKI_GID 容器运行用户（默认 1000:1000，对应镜像内 node 用户）
 
 services:
   geewiki-app:
-    image: geewiki:latest   # 占位：镜像构建未就绪（Phase 4 提供 Dockerfile），暂勿执行 docker compose up
-    # build: .              # 取消注释前须先提供 Dockerfile（仓库当前无此文件，构建必然失败）
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geewiki:latest
+    # PID 1 交给 tini（负责信号转发与僵尸进程回收）；应用自身收到 SIGTERM 会优雅退出
+    init: true
+    # 非 root 运行：默认与镜像内 node 用户（1000:1000）一致，可用 GEEWIKI_UID/GID 对齐宿主
+    user: "${GEEWIKI_UID:-1000}:${GEEWIKI_GID:-1000}"
     ports:
-      - "3000:3000"
+      - "${GEEWIKI_HOST_PORT:-3000}:3000"
     environment:
       NODE_ENV: production
       # 以下为 packages/server/src/index.ts 实际读取的环境变量
@@ -28,14 +44,15 @@ services:
       GEEWIKI_PORT: 3000
       GEEWIKI_DATA_DIR: /app/data       # SQLite 数据库与 crash.marker 所在目录
       GEEWIKI_CONFIG_DIR: /app/config   # 基础层 / 会话层插件清单目录
-      # 前端静态产物目录：默认值为 packages/web/dist（相对 cwd），依赖工作目录；
-      # 镜像内即便设置了 WORKDIR 也应显式给出，并由镜像构建阶段把前端产物生成到该路径（Phase 4 Dockerfile 负责）
+      # 前端静态产物目录：显式给出，避免依赖 cwd；由镜像构建阶段生成到该路径
       GEEWIKI_WEB_DIST: /app/packages/web/dist
     volumes:
-      - ./data:/app/data        # SQLite 数据库、crash.marker 等运行时数据（持久化）
-      - ./plugins:/app/plugins  # 预留：外部插件挂载点（插件发现/挂载机制尚在规划，见 docs/roadmap.md）
-      - ./config:/app/config    # 基础层 / 会话层插件清单（plugins.base.json / plugins.session.json）
+      - "${GEEWIKI_HOST_DATA_DIR:-./data}:/app/data"          # SQLite 数据库、crash.marker 等运行时数据（持久化）
+      - "${GEEWIKI_HOST_PLUGINS_DIR:-./plugins}:/app/plugins" # 预留：外部插件挂载点（插件发现/挂载机制尚在规划，见 docs/roadmap.md）
+      - "${GEEWIKI_HOST_CONFIG_DIR:-./config}:/app/config"    # 基础层 / 会话层插件清单（plugins.base.json / plugins.session.json）
     restart: unless-stopped
+    # 健康检查沿用镜像内 HEALTHCHECK（GET /api/health，30s 间隔）：
+    #   docker compose ps  可看到 healthy / unhealthy 状态。
     # 自愈逻辑（已由应用实现；见 packages/manager/src/index.ts、packages/server/src/index.ts）：
     #   - 仅在三种情形写入 <data 目录>/crash.marker：未捕获异常 / 未处理 Promise 拒绝 / startServer() 抛错；
     #   - HTTP 监听失败（如端口被占用）不属于上述情形：进程以退出码 1 退出，但不写标记；
@@ -51,7 +68,12 @@ services:
     environment:
       POSTGRES_DB: geewiki
       POSTGRES_USER: geewiki
-      POSTGRES_PASSWORD: ${DB_PASSWORD}   # DB_PASSWORD 由部署者在 .env 中提供（本仓库不提交 .env）
+      # `:-` 兜底：未设置 DB_PASSWORD 时不再让每条 compose 命令都打印
+      # "The DB_PASSWORD variable is not set" 告警（该变量只在启用
+      # --profile production 时才真正被用到）。
+      # 未提供时为空口令，postgres 官方镜像会拒绝以空口令初始化并明确报错退出
+      # （安全失败，不会产生弱口令实例）；启用该 profile 前必须在 .env 中提供强口令。
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-}
     volumes:
       - pgdata:/var/lib/postgresql/data
 
