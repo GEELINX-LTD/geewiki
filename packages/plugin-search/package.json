@@ -1,0 +1,23 @@
+{
+  "name": "@geewiki/search",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 全文检索插件：SQLite FTS5(trigram) 索引 + 短词 LIKE 兜底（REST）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@geewiki/db-sqlite": "workspace:*",
+    "@types/node": "^22.0.0"
+  }
+}

@@ -32,6 +32,8 @@ import {
 } from '@geewiki/core'
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
+import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
+import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
 import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
 import {
   PluginManagerPlugin,
@@ -676,6 +678,22 @@ export function defaultRegistry(
     },
     { ...httpRegistryEntry(webDist, defaults, pluginUiRoots), source: 'builtin' },
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
+    // LLM 契约插件：提供 llm-service（route→provider 注册表 + 终止保证 + 无 key 降级）。
+    // **不声明 requires**：它自身零依赖，没有 provider 时也能装载并给出可迭代的降级流；
+    // **不进 conflictGroup**：它是注册表而非某个厂商的实现，多家 provider 应共存。
+    // 与 @geewiki/echo 同形态：**只登记、不写进默认基础层清单**，即"已注册但未启用"，
+    // 由使用者在管理台按需热启用（需要 LLM 的插件应在自己的 requires 里点名它）。
+    { name: '@geewiki/llm', manifest: llmManifest as GeeWikiManifest, module: LlmPlugin, source: 'builtin' },
+    // 全文检索：索引表由插件自带迁移建立（migrationsDir 交给管理器在激活前执行）。
+    // 注册表数组序不影响激活顺序——管理器按 requires 拓扑排序激活（database-provider /
+    // http-service 必先于本插件），故这里只需登记 + 声明迁移目录。
+    {
+      name: '@geewiki/search',
+      manifest: searchManifest as GeeWikiManifest,
+      module: SearchPlugin,
+      migrationsDir: SEARCH_MIGRATIONS_DIR,
+      source: 'builtin',
+    },
     { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin, source: 'builtin' },
   ]
 }
