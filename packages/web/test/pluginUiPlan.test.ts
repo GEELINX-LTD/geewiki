@@ -11,6 +11,10 @@ import {
   PLUGIN_UI_FILE_SEGMENT,
   PLUGIN_UI_PREFIX,
   PLUGIN_UI_TABLE_PATH,
+  UI_SKIP_HELP,
+  UI_SKIP_LABEL,
+  UI_SKIP_REASONS,
+  classifyUiSkips,
   isPluginUiName,
   isUiSettled,
   parseUiTable,
@@ -205,4 +209,116 @@ test('isUiSettled：已知失败且 rev 未变 → 视为收敛（不重复重�
   assert.equal(isUiSettled({ '@gw/a': WIKI }, new Map(), failed), true)
   // rev 变了 → 失败记录失效，重新尝试
   assert.equal(isUiSettled({ '@gw/a': { ...WIKI, rev: 'newrev' } }, new Map(), failed), false)
+})
+
+/* ------------------------- skipped：解析（从宽） ------------------------- */
+
+/** 构造带 skipped 的响应体 */
+function tableWithSkipped(skipped: unknown, plugins: Record<string, unknown> = {}): unknown {
+  return { ok: true, version: 1, revision: 'rev-skip', plugins, skipped }
+}
+
+test('parseUiTable：解析 skipped 的合法项（name + reason）', () => {
+  const parsed = parseUiTable(
+    tableWithSkipped([
+      { name: '@gw/db', reason: 'no_client' },
+      { name: '@gw/x', reason: 'entry_missing' },
+      { name: '@gw/y', reason: 'inactive' },
+      { name: 'bad name', reason: 'invalid_name' },
+    ]),
+  )
+  assert.deepEqual(parsed?.skipped, [
+    { name: '@gw/db', reason: 'no_client' },
+    { name: '@gw/x', reason: 'entry_missing' },
+    { name: '@gw/y', reason: 'inactive' },
+    { name: 'bad name', reason: 'invalid_name' },
+  ])
+})
+
+test('parseUiTable：缺 skipped 字段 → 空数组（兼容旧后端，不得因此判整表不可信）', () => {
+  const parsed = parseUiTable({ ok: true, version: 1, revision: 'r', plugins: { wiki: { entry: 'client.js', rev: 'x' } } })
+  assert.ok(parsed, '缺 skipped 绝不能导致整表不可信——那会让入口表加载被跳过')
+  assert.deepEqual(parsed.skipped, [])
+})
+
+test('parseUiTable：skipped 不是数组 → 按空处理，且**不影响** plugins 的可信性', () => {
+  for (const bad of ['nope', 42, null, {}]) {
+    const parsed = parseUiTable(tableWithSkipped(bad, { wiki: { entry: 'client.js', rev: 'x' } }))
+    assert.ok(parsed, `skipped=${JSON.stringify(bad)} 不应让整表不可信`)
+    assert.deepEqual(parsed.skipped, [])
+    assert.deepEqual(Object.keys(parsed.entries), ['wiki'], 'plugins 仍应正常解析')
+  }
+})
+
+test('parseUiTable：skipped 单条损坏只丢该条（缺 name / 未知 reason / 非对象）', () => {
+  const parsed = parseUiTable(
+    tableWithSkipped([
+      { name: '@gw/keep', reason: 'inactive' },
+      { reason: 'inactive' }, // 缺 name
+      { name: '', reason: 'inactive' }, // 空 name
+      { name: '@gw/future', reason: 'some_future_reason' }, // 未知 reason（前向兼容：宁可少显示也不误分级）
+      null,
+      'str',
+      { name: '@gw/keep2', reason: 'entry_missing' },
+    ]),
+  )
+  assert.deepEqual(parsed?.skipped, [
+    { name: '@gw/keep', reason: 'inactive' },
+    { name: '@gw/keep2', reason: 'entry_missing' },
+  ])
+})
+
+test('parseUiTable：skipped 独立于整体可信性判定（version/revision/plugins 仍各司其职）', () => {
+  // skipped 合法但 version 不对 → 整表仍不可信
+  assert.equal(parseUiTable({ version: 2, revision: 'r', plugins: {}, skipped: [{ name: 'a', reason: 'inactive' }] }), undefined)
+  // skipped 合法但 revision 缺失 → 整表仍不可信
+  assert.equal(parseUiTable({ version: 1, plugins: {}, skipped: [{ name: 'a', reason: 'inactive' }] }), undefined)
+})
+
+/* ------------------------- skipped：分级 ------------------------- */
+
+test('classifyUiSkips：entry_missing / invalid_name 归"需要注意"，inactive / no_client 归"正常"', () => {
+  const groups = classifyUiSkips([
+    { name: '@gw/a', reason: 'inactive' },
+    { name: '@gw/b', reason: 'entry_missing' },
+    { name: '@gw/c', reason: 'no_client' },
+    { name: '@gw/d', reason: 'invalid_name' },
+  ])
+  assert.deepEqual(groups.attention, [
+    { name: '@gw/b', reason: 'entry_missing' },
+    { name: '@gw/d', reason: 'invalid_name' },
+  ])
+  assert.deepEqual(groups.normal, [
+    { name: '@gw/a', reason: 'inactive' },
+    { name: '@gw/c', reason: 'no_client' },
+  ])
+})
+
+test('classifyUiSkips：两组各自按名排序（渲染确定性），空输入得两个空数组', () => {
+  const groups = classifyUiSkips([
+    { name: 'zeta', reason: 'entry_missing' },
+    { name: 'alpha', reason: 'entry_missing' },
+    { name: 'y', reason: 'inactive' },
+    { name: 'b', reason: 'inactive' },
+  ])
+  assert.deepEqual(groups.attention.map((s) => s.name), ['alpha', 'zeta'])
+  assert.deepEqual(groups.normal.map((s) => s.name), ['b', 'y'])
+  assert.deepEqual(classifyUiSkips([]), { attention: [], normal: [] })
+})
+
+test('classifyUiSkips：不修改入参（纯函数）', () => {
+  const input = [
+    { name: 'z', reason: 'entry_missing' as const },
+    { name: 'a', reason: 'entry_missing' as const },
+  ]
+  const snapshot = JSON.parse(JSON.stringify(input))
+  classifyUiSkips(input)
+  assert.deepEqual(input, snapshot, '不得就地排序入参')
+})
+
+test('UI_SKIP_LABEL / UI_SKIP_HELP：四个 reason 都有中文标签与解释', () => {
+  for (const reason of UI_SKIP_REASONS) {
+    assert.ok(UI_SKIP_LABEL[reason], `${reason} 缺标签`)
+    assert.ok(UI_SKIP_HELP[reason], `${reason} 缺解释`)
+  }
 })

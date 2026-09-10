@@ -182,6 +182,35 @@ h2 + .empty { padding: 8px; }
 .discovery-issues li { margin: 2px 0; font-size: 12px; }
 .discovery-issues .chip { background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 6px; }
 
+/* ---------- 插件界面（入口表 skipped，GET /api/plugins/ui） ----------
+   与上面的"发现期问题"刻意用**不同色系**区分：那一类是"整个插件没加载进来"（黄=警告），
+   这一类是"插件在、但它的前端界面没出现"（红=故障，典型症状是发布漏带 dist/）。 */
+
+.ui-skips-attention { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 8px 12px; }
+.ui-skips-attention h3 { margin: 0 0 4px; font-size: 13px; color: #b91c1c; }
+.ui-skips-attention ul { margin: 4px 0 0; padding-left: 18px; }
+.ui-skips-attention li { margin: 2px 0; font-size: 12px; }
+.ui-skips-attention .chip { background: #fee2e2; color: #991b1b; padding: 1px 6px; border-radius: 6px; margin-left: 6px; }
+
+/* 正常的那一类（未启用 / 本就无前端界面）：折叠 + 弱化，别让噪声淹没真正的故障 */
+.ui-skips-normal { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
+.ui-skips-normal summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.ui-skips-normal ul { margin: 4px 0 0; padding-left: 18px; }
+.ui-skips-normal li { margin: 2px 0; font-size: 12px; }
+
+/* 插件名：等宽 + 浅底，便于在成片中文里一眼认出标识符 */
+.ui-skips-attention .name,
+.ui-skips-normal .name,
+.dependents-block .name { font-family: ui-monospace, Consolas, monospace; background: #f1f5f9; padding: 1px 6px; border-radius: 5px; }
+
+/* ---------- 依赖阻止停用（409 has_dependents）：保护性拦截，不是失败 ---------- */
+
+.dependents-block { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 8px 12px; }
+.dependents-block h3 { margin: 0 0 4px; font-size: 13px; color: #1d4ed8; }
+.dependents-block ul { margin: 4px 0; padding-left: 18px; }
+.dependents-block li { margin: 2px 0; font-size: 12px; }
+.dependents-block p { margin: 2px 0; }
+
 .base-details summary { cursor: pointer; font-size: 13px; color: var(--muted); }
 
 /* ---------- 依赖图 ---------- */

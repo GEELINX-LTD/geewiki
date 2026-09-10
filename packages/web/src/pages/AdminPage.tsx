@@ -1,11 +1,26 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState } from '../api'
 import { SchemaForm } from '../components/SchemaForm'
 import { describeRoot, type FieldDescriptor } from '../lib/configSchema'
-import { syncPluginUi } from '../lib/pluginUi'
+import { syncPluginUi, subscribePluginUiState, pluginUiState } from '../lib/pluginUi'
+import { classifyUiSkips, UI_SKIP_HELP, UI_SKIP_LABEL } from '../lib/pluginUiPlan'
 
 function fmtError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * 取出 `has_dependents`（409）里的依赖方名单。
+ *
+ * 后端抛的是 `ManagerError('has_dependents', …, { dependents })`，`details` 原样透传到前端
+ * `ApiError.details`。**防御性读取**：`details` 是 `unknown`，若形状不符就退回空数组，
+ * 由调用方给"存在依赖方但名单不可用"的兜底文案（而不是显示 `undefined`）。
+ */
+function dependentNamesOf(details: unknown): string[] {
+  if (typeof details !== 'object' || details === null) return []
+  const raw = (details as { dependents?: unknown }).dependents
+  if (!Array.isArray(raw)) return []
+  return raw.filter((n): n is string => typeof n === 'string' && n.length > 0)
 }
 
 /** 把后端 invalid_config 的逐条问题按字段路径归并（供表单就地展示） */
@@ -71,6 +86,14 @@ export function AdminPage(): ReactNode {
     dependents: string[]
     config?: Record<string, unknown>
   } | null>(null)
+  /**
+   * 被依赖方阻止停用的插件（409 `has_dependents`）。用于就地给出专门说明与可操作指引，
+   * 而不是只闪一条泛化错误——用户需要知道"到底是谁挡住了"以及"下一步能做什么"。
+   */
+  const [blockedDisable, setBlockedDisable] = useState<{ name: string; dependents: string[] } | null>(null)
+
+  /** 插件 UI 状态（含入口表 skipped）：由 pluginUi.ts 的订阅式 store 提供 */
+  const uiState = useSyncExternalStore(subscribePluginUiState, pluginUiState, pluginUiState)
 
   const load = useCallback(async () => {
     try {
@@ -79,8 +102,11 @@ export function AdminPage(): ReactNode {
       setSession(s)
       setIssues(p.issues ?? [])
       // 插件 UI 与 fork 生命周期绑定：load() 是四条变更成功路径（act/confirmEnable/doReplace/
-      // saveConfig）的汇聚点，故只挂这一处即可让插槽跟随启停；revision 未变时同步是纯 no-op。
-      void syncPluginUi()
+      // saveConfig）的汇聚点，故只挂这一处即可让插槽跟随启停。
+      // **强制**拉取：整表 revision 只覆盖 plugins（已激活 ∩ 有界面 ∩ 产物存在），**不含 skipped**，
+      // 因此"新装了一个未启用/无界面的插件"不会改变 revision；若走 304 短路，管理台就永远看不到
+      // 这条 skipped 信息。普通轮询仍走 304（省请求），只有这里需要完整表。
+      void syncPluginUi({ force: true })
     } catch (err) {
       setNotice({ kind: 'err', text: `加载失败: ${fmtError(err)}` })
     }
@@ -100,6 +126,35 @@ export function AdminPage(): ReactNode {
         await load()
       } catch (err) {
         setNotice({ kind: 'err', text: fmtError(err) })
+      } finally {
+        setBusy('')
+      }
+    },
+    [load],
+  )
+
+  /**
+   * 停用插件。与其它动作的关键差别：`409 has_dependents` 不是"操作失败"，而是后端在
+   * **保护依赖完整性**（有活动依赖方时卸载会连带打断它们）。因此把它单独识别出来，
+   * 就地给出"谁挡住了 + 下一步能做什么"，其余错误仍走通用提示。
+   */
+  const disablePlugin = useCallback(
+    async (p: PluginInfo): Promise<void> => {
+      setBusy('disable')
+      setNotice(null)
+      setBlockedDisable(null)
+      try {
+        await api.disable(p.name)
+        setNotice({ kind: 'ok', text: `已停用 ${p.name}（会话变更已保存）` })
+        await load()
+      } catch (err) {
+        // 依赖阻止：展示专门的说明块（依赖方名单来自 details.dependents）
+        if (err instanceof ApiError && err.code === 'has_dependents') {
+          setBlockedDisable({ name: p.name, dependents: dependentNamesOf(err.details) })
+          setNotice(null)
+        } else {
+          setNotice({ kind: 'err', text: fmtError(err) })
+        }
       } finally {
         setBusy('')
       }
@@ -297,6 +352,8 @@ export function AdminPage(): ReactNode {
 
   const sessionChanges = session?.session.enabled ?? []
   const canPersist = sessionChanges.length > 0
+  /** 入口表跳过项按严重度分组：`attention` 是本该可见却没出现（或清单有问题），`normal` 是设计使然 */
+  const uiSkips = classifyUiSkips(uiState.skipped)
 
   return (
     <div className="page">
@@ -322,6 +379,80 @@ export function AdminPage(): ReactNode {
               </li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {uiSkips.attention.length > 0 && (
+        <section className="ui-skips-attention">
+          <h3>有 {uiSkips.attention.length} 个插件的界面没能加载</h3>
+          <p className="small">
+            这些插件<strong>已在注册表中</strong>，但它们的<strong>前端界面</strong>没有出现在管理器里——
+            与上面的"发现期问题"不同：那一类是整个插件都没加载进来，这一类是插件在、界面缺。
+          </p>
+          <ul>
+            {uiSkips.attention.map((item) => (
+              <li key={`${item.reason}:${item.name}`}>
+                <code className="name">{item.name}</code>
+                <code className="chip">{UI_SKIP_LABEL[item.reason]}</code>
+                <div className="muted small">{UI_SKIP_HELP[item.reason]}</div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {uiSkips.normal.length > 0 && (
+        <details className="ui-skips-normal">
+          <summary>
+            另外 {uiSkips.normal.length} 个插件没有界面（未启用或本就无前端界面）
+          </summary>
+          <ul>
+            {uiSkips.normal.map((item) => (
+              <li key={`${item.reason}:${item.name}`}>
+                <code className="name">{item.name}</code>
+                <span className="muted small">
+                  {' '}
+                  {UI_SKIP_LABEL[item.reason]}——{UI_SKIP_HELP[item.reason]}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {blockedDisable && (
+        <section className="dependents-block">
+          <h3>无法停用 {blockedDisable.name}：仍有插件在依赖它</h3>
+          {blockedDisable.dependents.length > 0 ? (
+            <p className="small">
+              以下正在运行的插件依赖 <code className="name">{blockedDisable.name}</code>：
+            </p>
+          ) : (
+            <p className="small">
+              该插件仍有正在运行的依赖方（后端未返回名单，可在依赖图中查看指向它的边）。
+            </p>
+          )}
+          {blockedDisable.dependents.length > 0 && (
+            <ul>
+              {blockedDisable.dependents.map((name) => (
+                <li key={name}>
+                  <code className="name">{name}</code>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="small">
+            这是<strong>保护性拦截</strong>：直接卸载会让上述插件的依赖悬空。可先
+            <strong>逐个停用这些依赖方</strong>（在上表对应行点「停用」），再回来停用{' '}
+            <code className="name">{blockedDisable.name}</code>。
+            若它是被同冲突组的其它插件顶替，也可以在目标插件那行点「启用」走
+            <strong>冲突组替换</strong>（会连同依赖方一起安全接管）。
+          </p>
+          <div className="page-actions">
+            <button className="btn" onClick={() => setBlockedDisable(null)} disabled={busy !== ''}>
+              知道了
+            </button>
+          </div>
         </section>
       )}
 
@@ -393,9 +524,7 @@ export function AdminPage(): ReactNode {
                 onOpenConfig={() => openConfig(p)}
                 onEnable={() => confirmEnable(p)}
                 onSaveConfig={() => void saveConfig(p)}
-                onDisable={() =>
-                  void act('disable', () => api.disable(p.name), `已停用 ${p.name}（会话变更已保存）`)
-                }
+                onDisable={() => void disablePlugin(p)}
               />
             ))}
           </tbody>

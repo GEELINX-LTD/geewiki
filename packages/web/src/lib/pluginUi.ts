@@ -6,6 +6,7 @@ import {
   parseUiTable,
   planUiSync,
   pluginUiBase as baseOf,
+  type UiSkipped,
   type UiTableEntry,
 } from './pluginUiPlan'
 
@@ -81,9 +82,88 @@ let lastRevision: string | undefined
  * 边界：若文件内容变了但 rev 恰好不变（等同名同大小同 mtime 的文件被换回），该 rev 不会再被重试，
  * 直到整页刷新（这两个映射都是进程内状态）。这是刻意的取舍——真出问题时刷新一次即可。
  */
+const EMPTY_SKIPPED: readonly UiSkipped[] = Object.freeze([])
+const EMPTY_NAMES: readonly string[] = Object.freeze([])
+
 const failed = new Map<string, string>()
 /** 单飞：重叠的同步请求复用同一个 promise（三个触发点可能同时打过来） */
 let inflight: Promise<void> | null = null
+/** 最近一次成功解析的「未列出 UI 的插件与原因」，供管理台展示（见 `classifyUiSkips`） */
+let lastSkipped: readonly UiSkipped[] = EMPTY_SKIPPED
+
+/** 供 UI 订阅的只读快照（排障入口与管理台用） */
+export interface PluginUiState {
+  /** 最近一次成功解析的整表指纹（未成功过则为 undefined） */
+  revision: string | undefined
+  /** 未列出 UI 的插件与原因（顺序与后端一致：后端已按名排序） */
+  skipped: readonly UiSkipped[]
+  /** 当前已成功挂载界面的插件名（已排序，便于断言） */
+  loaded: readonly string[]
+}
+
+const stateListeners = new Set<() => void>()
+let cachedState: PluginUiState = { revision: undefined, skipped: EMPTY_SKIPPED, loaded: EMPTY_NAMES }
+
+/** 按当前内部状态构造一份快照 */
+function snapshotState(): PluginUiState {
+  return {
+    revision: lastRevision,
+    skipped: lastSkipped,
+    loaded: Object.freeze([...loaded.keys()].sort()),
+  }
+}
+
+/** 两份快照是否等价（逐字段比，数组按序比） */
+function sameState(a: PluginUiState, b: PluginUiState): boolean {
+  if (a.revision !== b.revision) return false
+  if (a.loaded.length !== b.loaded.length) return false
+  for (let i = 0; i < a.loaded.length; i++) if (a.loaded[i] !== b.loaded[i]) return false
+  if (a.skipped.length !== b.skipped.length) return false
+  for (let i = 0; i < a.skipped.length; i++) {
+    const x = a.skipped[i] as UiSkipped
+    const y = b.skipped[i] as UiSkipped
+    if (x.name !== y.name || x.reason !== y.reason) return false
+  }
+  return true
+}
+
+/**
+ * 通知订阅者"插件 UI 状态变了"。
+ *
+ * 两条约束同时成立：
+ * ① `useSyncExternalStore` 要求 `getSnapshot` 在状态**未变**时返回**同一个引用**，否则每次读取
+ *    都算"变了"→ 无限重渲染；
+ * ② 反过来，状态**没实质变化**时也不该通知——15s 轮询每次成功同步都会走到这里，若无脑通知，
+ *    管理台就会每 15 秒白重渲染一次。
+ * 故：先比对，真的变了才换引用 + 通知。
+ */
+function emitState(): void {
+  const next = snapshotState()
+  if (sameState(cachedState, next)) return
+  cachedState = next
+  for (const listener of [...stateListeners]) listener()
+}
+
+/** 订阅插件 UI 状态变更（返回取消订阅函数）。 */
+export function subscribePluginUiState(listener: () => void): () => void {
+  stateListeners.add(listener)
+  return () => {
+    stateListeners.delete(listener)
+  }
+}
+
+/**
+ * 当前插件 UI 状态快照（引用稳定：未变更时返回同一个对象）。
+ * 所有变更点都会经 {@link emitState} 更新缓存，故这里直接读缓存。
+ */
+export function pluginUiState(): PluginUiState {
+  return cachedState
+}
+
+/** 未列出 UI 的插件与原因（排障/测试用）。 */
+export function pluginUiSkipped(): readonly UiSkipped[] {
+  return lastSkipped
+}
 
 /**
  * 当前界面是否已经"收敛"到最近一次看到的入口表（见 `pluginUiPlan.ts` 的 `isUiSettled`）。
@@ -181,6 +261,7 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
   }
   const link = meta.css ? injectCss(name, `${base}/${meta.css}`) : undefined
   loaded.set(name, { plugin: name, rev: meta.rev, disposers, link })
+  emitState()
   console.debug(`[geewiki-plugin-ui] 已加载插件界面：${name}`)
 }
 
@@ -199,6 +280,7 @@ export function unloadPluginUi(name: string): boolean {
   }
   entry.link?.remove()
   loaded.delete(name)
+  emitState()
   return true
 }
 
@@ -213,24 +295,42 @@ export function pluginUiRevision(): string | undefined {
 }
 
 /** 拉一次入口表并让界面与之对齐（幂等、单飞）。三个触发点都调它。 */
-export function syncPluginUi(): Promise<void> {
-  if (inflight) return inflight
-  const run = doSync().finally(() => {
+export interface PluginUiSyncRequest {
+  /**
+   * 强制拉取完整表、**不用** `If-None-Match` 短路。
+   *
+   * 为什么需要它：整表 `revision` 只覆盖 `plugins`（已激活 ∩ 有界面 ∩ 产物存在），
+   * **不含 `skipped`**。所以"新装了一个未启用（或没有前端界面）的插件"这类变化不会改变
+   * `revision`，走 304 短路就永远看不到它。管理台要看这种信息时必须强制一次；
+   * 轮询/可见性触发的常规同步不需要（省掉无谓请求）。
+   */
+  force?: boolean
+}
+
+export function syncPluginUi(options: PluginUiSyncRequest = {}): Promise<void> {
+  if (inflight) {
+    if (options.force !== true) return inflight
+    // 强制同步不能被单飞吞掉：等在途这次结算后再无条件下拉一次完整表。
+    // 此时 inflight 已被 finally 置空，故这次递归不会再次命中本分支。
+    const again = (): Promise<void> => syncPluginUi({ force: true })
+    return inflight.then(again, again)
+  }
+  const run = doSync(options.force === true).finally(() => {
     inflight = null
   })
   inflight = run
   return run
 }
 
-async function doSync(): Promise<void> {
+async function doSync(force: boolean): Promise<void> {
   const sdk = hostSdk()
   if (!sdk) {
     console.warn('[geewiki-plugin-ui] 宿主 SDK 未初始化，跳过插件界面加载')
     return
   }
   const url = new URL(PLUGIN_UI_TABLE_PATH, window.location.origin).href
-  // 只有"已收敛"时才敢用 304 短路（否则可能永久漏加载，见 isSettled 的说明）
-  const useEtag = lastRevision !== undefined && isSettled()
+  // 只有"已收敛"时才敢用 304 短路（否则可能永久漏加载，见 isSettled 的说明）；force 时一律不用
+  const useEtag = !force && lastRevision !== undefined && isSettled()
   let res: Response
   try {
     res = await fetch(url, {
@@ -260,6 +360,10 @@ async function doSync(): Promise<void> {
   }
   lastRevision = table.revision
   desired = table.entries
+  lastSkipped = Object.freeze(table.skipped)
+  // 先广播"跳过项变了"：即使随后没有任何 load/unload（这是常见情形——例如只是新装了一个
+  // 未启用插件），管理台也要能立刻看到新的 skipped。
+  emitState()
   const loadedRevs = new Map([...loaded].map(([name, entry]) => [name, entry.rev]))
   const plan = planUiSync(table.entries, loadedRevs)
   // 先卸后装：产物更新的插件会同时出现在两个数组里（rev 变化），换新代码前必须先回收旧注册
