@@ -604,6 +604,14 @@ export interface ServerOptions {
   configDir?: string
   /** 前端静态产物目录（默认 GEEWIKI_WEB_DIST 或仓库根下 packages/web/dist；相对路径以仓库根为基准） */
   webDist?: string | null
+  /**
+   * 内置插件 UI 资产根（默认 GEEWIKI_PLUGIN_UI_DIST，**缺省回落 `webDist`**；相对路径以仓库根为基准）。
+   *
+   * 与 `webDist` 分开是因为两者职责不同：`webDist` 供 app shell 与 `/assets/*`，
+   * 而插件 UI 资产（`plugins-ui/<插件名>/`）可能有独立来源——dev 下即
+   * `packages/web/public/plugins-ui/**`，无需前端构建。null = 不使用内置根（只看插件自带产物）。
+   */
+  pluginUiDist?: string | null
   /** 外部插件目录（默认 GEEWIKI_PLUGINS_DIR 或仓库根下 plugins/；null = 不启用外部插件发现） */
   pluginsDir?: string | null
   registry?: RegisteredPlugin[]
@@ -712,6 +720,18 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
   } else {
     webDist = resolveProjectPath('packages/web/dist', import.meta.url)
   }
+  // 插件 UI 内置资产根：options > GEEWIKI_PLUGIN_UI_DIST > **缺省回落 webDist**（与拆分前行为一致）。
+  // 拆成独立配置项是为了解除 webDist 的职责过载：dev 曾把 webDist 指向 packages/web/public
+  // 以让插件 UI 免构建可用，但那里没有 index.html → app shell 的 SPA fallback 失败、首页 404。
+  let pluginUiDist: string | null
+  if (options.pluginUiDist !== undefined) {
+    pluginUiDist =
+      options.pluginUiDist === null ? null : resolveProjectPath(options.pluginUiDist, import.meta.url)
+  } else if (process.env.GEEWIKI_PLUGIN_UI_DIST) {
+    pluginUiDist = resolveProjectPath(process.env.GEEWIKI_PLUGIN_UI_DIST, import.meta.url)
+  } else {
+    pluginUiDist = webDist
+  }
   // 外部插件目录：options > GEEWIKI_PLUGINS_DIR > 仓库根下 plugins/；
   // null 表示不做外部插件发现（测试与最小部署可用）
   const pluginsRoot =
@@ -719,6 +739,12 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
       ? null
       : resolveProjectPath(options.pluginsDir ?? process.env.GEEWIKI_PLUGINS_DIR ?? 'plugins', import.meta.url)
   if (pluginsRoot) console.log(`[server] 外部插件目录: ${pluginsRoot}`)
+  // 便于排障：内置插件 UI 根与静态产物根常不同（dev 就是这种形态），分开打印
+  if (pluginUiDist) {
+    console.log(
+      `[server] 插件 UI 内置资产根: ${pluginUiDist}${pluginUiDist === webDist ? '（同静态产物根）' : ''}`,
+    )
+  }
 
   // 注册表来源：显式传入的 registry 优先（issues 为空），否则内置 + 外部插件发现。
   //
@@ -726,7 +752,8 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
   // 而它的闭包又必须在此之前交给 http 条目。因此用可变持有者打破循环——闭包在
   // http 插件首次处理 `/plugins-ui` 请求时求值，那时 builtRef 必定已赋值。
   let builtRef: RegistryBuildResult | null = null
-  const pluginUiRoots = (): Record<string, string> => pluginUiRootsFor(builtRef?.registry ?? [], webDist)
+  const pluginUiRoots = (): Record<string, string> =>
+    pluginUiRootsFor(builtRef?.registry ?? [], pluginUiDist)
   const built: RegistryBuildResult = options.registry
     ? { registry: options.registry, issues: [] }
     : await buildRegistry(webDist, { port, host }, pluginsRoot, pluginUiRoots)
@@ -740,8 +767,9 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
     baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
     sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
     crashMarkerFile,
-    // 入口表的第二候选根（<webDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
+    // 入口表的第二候选根（<pluginUiDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
     webDist,
+    pluginUiDist,
   })
 
   return {

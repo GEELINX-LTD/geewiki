@@ -31,7 +31,7 @@ pnpm dev       # 一条命令同时启动后端（:3000）与前端开发服务�
 >
 > Windows 用户：根 `dev` 脚本使用 POSIX shell 语法（`&`、`$!`、`kill`），请在**两个终端**分别运行 `pnpm dev:server` 与 `pnpm dev:web`。
 
-**开发形态**：浏览器打开 **http://localhost:5173** —— Vite dev server 提供前端（热更新），并把 `/api` **与 `/plugins-ui`** 自动代理到后端 `http://127.0.0.1:3000`（`/plugins-ui` 必须代理：插件 UI 资产可能来自 `plugins/<name>/dist`，位于 Vite `publicDir` 之外）；后端自身也在 3000 提供 REST 接口（可用 `http://127.0.0.1:3000/api/health` 探活）。注意 `pnpm dev` 给后端的 `GEEWIKI_WEB_DIST` 是 `packages/web/public`（dev 形态下前端产物由 Vite 直接提供），而 `pnpm dev:server` / `pnpm start` 仍默认 `packages/web/dist`。
+**开发形态**：浏览器打开 **http://localhost:5173** —— Vite dev server 提供前端（热更新），并把 `/api` **与 `/plugins-ui`** 自动代理到后端 `http://127.0.0.1:3000`（`/plugins-ui` 必须代理：插件 UI 资产可能来自 `plugins/<name>/dist`，位于 Vite `publicDir` 之外）；后端自身也在 3000 提供 REST 接口（可用 `http://127.0.0.1:3000/api/health` 探活）。注意 `pnpm dev` 给后端的是 **`GEEWIKI_PLUGIN_UI_DIST=packages/web/public`**（只改内置**插件 UI 资产根**，让插件 UI 免构建可用；dev 下前端由 Vite 直接提供），`GEEWIKI_WEB_DIST` 仍为默认 `packages/web/dist` —— 后端因此照样能提供 app shell（`http://127.0.0.1:3000/`）。`pnpm dev:server` / `pnpm start` 两项都保持默认。
 
 **生产形态**：先 `pnpm build` 生成前端产物 `packages/web/dist`，再由后端在 **http://127.0.0.1:3000** 直接静态托管该产物 —— 即 `pnpm start`（与 `pnpm dev:server` 是同一条命令：**只起后端、不起 Vite**）。该产物目录已被 `.gitignore` 忽略、**不在版本库中**，因此新克隆的仓库必须先执行 `pnpm build`，否则 3000 端口只有后端 API、没有界面。
 
@@ -39,7 +39,7 @@ pnpm dev       # 一条命令同时启动后端（:3000）与前端开发服务�
 
 | 命令 | 作用 |
 | --- | --- |
-| `pnpm dev` | **一条命令同时启动**后端（:3000，`GEEWIKI_WEB_DIST=packages/web/public`）与前端 Vite 开发服务器（:5173，`/api` 与 `/plugins-ui` 均代理到 :3000） |
+| `pnpm dev` | **一条命令同时启动**后端（:3000，`GEEWIKI_PLUGIN_UI_DIST=packages/web/public`）与前端 Vite 开发服务器（:5173，`/api` 与 `/plugins-ui` 均代理到 :3000） |
 | `pnpm dev:server` | 仅启动后端 → http://127.0.0.1:3000 |
 | `pnpm dev:web` | 仅启动前端开发服务器 → http://localhost:5173（需后端已在 :3000 运行） |
 | `pnpm build` | 构建全仓产物（`@geewiki/web` → `packages/web/dist`） |
@@ -55,9 +55,10 @@ pnpm dev       # 一条命令同时启动后端（:3000）与前端开发服务�
 | `GEEWIKI_HOST` | `0.0.0.0` | 后端监听地址（优先级：`startServer({ host })` 选项 > 本变量 > 默认值）；如需仅本机可访问可设为 `127.0.0.1` |
 | `GEEWIKI_DATA_DIR` | `./data` | SQLite 数据库与运行时数据目录（库文件 `geewiki.db`、崩溃标记 `crash.marker`）；**相对路径以仓库根为基准**，绝对路径原样使用 |
 | `GEEWIKI_CONFIG_DIR` | `./config` | 插件清单目录（`plugins.base.json` / `plugins.session.json`）；相对路径同样以仓库根为基准 |
-| `GEEWIKI_WEB_DIST` | `packages/web/dist` | 前端静态产物目录（未构建时不启用静态服务）；**相对路径一律以仓库根为基准**（与进程工作目录无关，故从任意子目录启动都指向同一份产物），绝对路径原样透传。该目录同时是插件 UI 的**第二候选根** `<本目录>/plugins-ui/<插件名>`（第一候选根是插件自带的 `<插件目录>/dist`）。**注意**：根 `dev` 脚本把它覆盖为 `packages/web/public`（dev 形态），`dev:server` / `start` 保持默认值 |
+| `GEEWIKI_WEB_DIST` | `packages/web/dist` | **前端静态产物根**（app shell 的 `index.html`、`/assets/*`、SPA fallback；未构建时不启用静态服务）；**相对路径一律以仓库根为基准**（与进程工作目录无关，故从任意子目录启动都指向同一份产物），绝对路径原样透传 |
+| `GEEWIKI_PLUGIN_UI_DIST` | 同 `GEEWIKI_WEB_DIST` | **内置插件 UI 资产根**：包含 `plugins-ui/<插件名>/` 的目录，是插件 UI 产物的**第二候选根**（第一候选根是插件自带的 `<插件目录>/dist`）。与 `GEEWIKI_WEB_DIST` **分开配置**——后者供 app shell，本项供插件 UI 资产（dev 下插件 UI 免构建可用，而 app shell 仍走 `packages/web/dist`）。根 `dev` 脚本把它设为 `packages/web/public`；`dev:server` / `start` 保持默认（= `GEEWIKI_WEB_DIST`） |
 
-> 以上相对路径均由 `@geewiki/core` 的 `resolveProjectPath` 以**仓库根**（向上查找 `pnpm-workspace.yaml`）为基准解析，与进程 cwd 无关；启动时 `[@geewiki/http] 静态资源目录: <绝对路径>` 日志可用于核对。
+> 以上相对路径均由 `@geewiki/core` 的 `resolveProjectPath` 以**仓库根**（向上查找 `pnpm-workspace.yaml`）为基准解析，与进程 cwd 无关；启动时 `[@geewiki/http] 静态资源目录: <绝对路径>`（前端产物根）与 `[server] 插件 UI 内置资产根: <绝对路径>` 两条日志可用于核对。
 
 - 零外部依赖默认配置：数据落在 `data/geewiki.db`（WAL + 自动迁移建表）。
 - 界面（hash 路由）：`#/wiki` 知识库（列表/编辑/Markdown/版本历史）· `#/plugins` 插件管理（会话层热启停、schema 自动生成的配置表单——无 schema 插件退回 JSON 编辑、应用并持久化）· `#/graph` 依赖图（React Flow DAG）。

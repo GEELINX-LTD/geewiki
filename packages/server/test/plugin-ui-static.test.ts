@@ -325,3 +325,159 @@ test('静态层：高优先级根消失后必须回退次优先根（根表判�
     await fx.cleanup()
   }
 })
+
+/* ---------- 回归：app shell 产物根 与 插件 UI 资产根 必须是两个配置项 ---------- */
+
+interface SplitRootFixture {
+  port: number
+  appRoot: string
+  uiRoot: string
+  cleanup: () => Promise<void>
+}
+
+/**
+ * 起一个"两个根各司其职"的实例，**走真实 startServer 装配**（不传 registry，让组合根自己
+ * 建注册表并把 pluginUiDist 接进根表闭包）——回归覆盖的正是这条装配链。
+ *
+ * 夹具刻意让两个根**互不包含对方的东西**：
+ * - `appRoot` 只有 `index.html`（app shell），**没有** `plugins-ui/`；
+ * - `uiRoot` 只有 `plugins-ui/<名>/client.js`，**没有** `index.html`。
+ * 因此任一职责被路由到错误的根上，都会立刻暴露成 404（这正是 dev 回归的形态）。
+ *
+ * @param withPluginUiDist false 时**不传** `pluginUiDist`：此时应回落 `webDist`（拆分前的行为），
+ *   故把插件 UI 产物也放进 appRoot。
+ */
+async function startSplitRootFixture(withPluginUiDist: boolean): Promise<SplitRootFixture> {
+  const root = mkdtempSync(join(tmpdir(), 'gw-ui-split-'))
+  const appRoot = join(root, 'app')
+  const uiRoot = join(root, 'ui')
+  const pluginsRoot = join(root, 'plugins')
+  const configDir = join(root, 'config')
+  const pluginName = '@t/ui-ext'
+  const assetRel = join('plugins-ui', '@t', 'ui-ext', 'client.js')
+  mkdirSync(configDir, { recursive: true })
+  // app shell 根：只有 index.html
+  mkdirSync(appRoot, { recursive: true })
+  writeFileSync(join(appRoot, 'index.html'), '<!doctype html><title>APP-SHELL-MARKER</title>\n', 'utf8')
+  // 插件 UI 根：只有插件产物
+  mkdirSync(join(uiRoot, 'plugins-ui', '@t', 'ui-ext'), { recursive: true })
+  writeFileSync(join(uiRoot, assetRel), 'export const register = () => {}\n// CONTENT: ui-root\n', 'utf8')
+  writeFileSync(join(uiRoot, 'plugins-ui', '@t', 'ui-ext', 'client.css'), '.gw-ui-ext { color: green; }\n', 'utf8')
+  // 缺省回落场景：webDist 同时承担两个职责（拆分前形态）
+  if (!withPluginUiDist) {
+    mkdirSync(join(appRoot, 'plugins-ui', '@t', 'ui-ext'), { recursive: true })
+    writeFileSync(join(appRoot, assetRel), 'export const register = () => {}\n// CONTENT: app-root-fallback\n', 'utf8')
+  }
+  // 外部插件：声明 client，但**没有**自带产物根（<dir>/dist），故只能由内置根提供资产
+  const pluginDir = join(pluginsRoot, 'ui-ext')
+  mkdirSync(pluginDir, { recursive: true })
+  writeFileSync(
+    join(pluginDir, 'package.json'),
+    `${JSON.stringify(
+      {
+        name: pluginName,
+        version: '0.1.0',
+        private: true,
+        type: 'module',
+        geewiki: {
+          provides: 'ui-ext-service',
+          requires: ['http-service'],
+          runtime: { supportsHotReload: true, requiresCachePurge: false, drainTimeout: 5 },
+          client: { entry: 'client.js', css: 'client.css' },
+          entry: 'index.js',
+        },
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  )
+  writeFileSync(
+    join(pluginDir, 'index.js'),
+    `const plugin = { name: ${JSON.stringify(pluginName)}, apply: () => () => undefined }\nexport default plugin\n`,
+    'utf8',
+  )
+  writeFileSync(
+    join(configDir, 'plugins.base.json'),
+    `${JSON.stringify({ enabled: [{ name: '@geewiki/http' }, { name: pluginName }] }, null, 2)}\n`,
+    'utf8',
+  )
+  writeFileSync(join(configDir, 'plugins.session.json'), `${JSON.stringify({ enabled: [] }, null, 2)}\n`, 'utf8')
+
+  const port = await freePort()
+  const handle = await startServer({
+    port,
+    host: '127.0.0.1',
+    configDir,
+    webDist: appRoot,
+    pluginsDir: pluginsRoot,
+    ...(withPluginUiDist ? { pluginUiDist: uiRoot } : {}),
+  })
+  await waitForHealth(port)
+  return {
+    port,
+    appRoot,
+    uiRoot,
+    cleanup: async () => {
+      await handle.dispose()
+      rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+
+test('静态层：app shell 根与插件 UI 资产根分离后各司其职（回归：dev 首页 404）', async () => {
+  const fx = await startSplitRootFixture(true)
+  try {
+    // ① app shell 走 webDist：uiRoot 里没有 index.html，若被路由到 uiRoot 必然 404
+    const home = await fetch(`http://127.0.0.1:${fx.port}/`)
+    assert.equal(home.status, 200, '首页必须由 webDist 提供（回归：dev 下曾 404）')
+    assert.match(home.headers.get('content-type') ?? '', /text\/html/)
+    assert.match(await home.text(), /APP-SHELL-MARKER/, '首页正文应来自 webDist 的 index.html')
+
+    // ② 插件 UI 资产走 pluginUiDist：appRoot 里根本没有 plugins-ui/，若被路由到 webDist 必然 404
+    const asset = await fetch(`http://127.0.0.1:${fx.port}/plugins-ui/@t/ui-ext/client.js`)
+    assert.equal(asset.status, 200, '插件 UI 资产必须由 pluginUiDist 提供')
+    assert.match(asset.headers.get('content-type') ?? '', /text\/javascript/)
+    assert.match(await asset.text(), /CONTENT: ui-root/, '资产正文应来自 pluginUiDist 的产物')
+
+    // ③ 入口表把该插件列为就绪（active ∩ 声明 client ∩ 入口存在），且 rev 指向 pluginUiDist 那份
+    const tableRes = await fetch(`http://127.0.0.1:${fx.port}/api/plugins/ui`)
+    assert.equal(tableRes.status, 200)
+    const table = (await tableRes.json()) as { plugins: Record<string, { entry: string; rev: string }> }
+    const listed = table.plugins['@t/ui-ext']
+    assert.ok(listed, '入口表应列出 @t/ui-ext（声明了 client 且由内置根提供资产）')
+    assert.equal(listed?.entry, 'client.js')
+    // rev = 入口与样式的 `mtime-大小` 用 '|' 拼接后取 sha1 前 8 位（本夹具两者都存在）
+    const entryInfo = statSync(join(fx.uiRoot, 'plugins-ui', '@t', 'ui-ext', 'client.js'))
+    const cssInfo = statSync(join(fx.uiRoot, 'plugins-ui', '@t', 'ui-ext', 'client.css'))
+    const expectedRev = createHash('sha1')
+      .update(`${entryInfo.mtimeMs}-${entryInfo.size}|${cssInfo.mtimeMs}-${cssInfo.size}`)
+      .digest('hex')
+      .slice(0, 8)
+    assert.equal(listed?.rev, expectedRev, '入口表的 rev 必须指向 pluginUiDist 那份资产（两真源同源）')
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('静态层：未配置 pluginUiDist 时回落 webDist（拆分不改变既有行为）', async () => {
+  const fx = await startSplitRootFixture(false)
+  try {
+    // 两个职责都由 webDist 承担——与拆分前完全一致
+    const home = await fetch(`http://127.0.0.1:${fx.port}/`)
+    assert.equal(home.status, 200, '未配置 pluginUiDist 时首页仍应由 webDist 提供')
+    assert.match(await home.text(), /APP-SHELL-MARKER/)
+
+    const asset = await fetch(`http://127.0.0.1:${fx.port}/plugins-ui/@t/ui-ext/client.js`)
+    assert.equal(asset.status, 200, '未配置 pluginUiDist 时应回落 webDist 提供插件 UI 资产')
+    assert.match(asset.headers.get('content-type') ?? '', /text\/javascript/)
+    assert.match(await asset.text(), /CONTENT: app-root-fallback/, '回落时资产应来自 webDist')
+
+    const tableRes = await fetch(`http://127.0.0.1:${fx.port}/api/plugins/ui`)
+    assert.equal(tableRes.status, 200)
+    const table = (await tableRes.json()) as { plugins: Record<string, unknown> }
+    assert.ok(table.plugins['@t/ui-ext'], '回落场景下入口表同样应列出该插件')
+  } finally {
+    await fx.cleanup()
+  }
+})

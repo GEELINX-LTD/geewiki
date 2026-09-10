@@ -150,11 +150,24 @@ export interface ManagerConfig {
    */
   discoveryIssues?: DiscoveryIssue[]
   /**
-   * 前端静态产物目录（绝对路径）：用于解析插件 UI 产物的**第二候选根**
-   * `<webDist>/plugins-ui/<插件名>`（第一候选根是外部插件自带的 `<插件目录>/dist`）。
+   * **内置插件 UI 资产的兜底根**（绝对路径）：用于解析插件 UI 产物的**第二候选根**
+   * `<本目录>/plugins-ui/<插件名>`（第一候选根是外部插件自带的 `<插件目录>/dist`）。
    * 仅影响 `GET /api/plugins/ui` 的入口表计算，与静态托管本身无关。null/缺省 = 只看插件自带产物。
+   *
+   * @deprecated 语义已收窄为"内置 UI 根"的兜底缺省值；新代码请用 `pluginUiDist`。
+   *   两者曾共用一个配置项 `webDist`，导致"app shell 产物根"与"插件 UI 资产根"被过载：
+   *   dev 为了让插件 UI 免构建可用而把 webDist 指向 `packages/web/public`，结果 app shell
+   *   的 SPA fallback 找不到 `index.html` → 后端首页 404。
    */
   webDist?: string | null
+  /**
+   * 内置插件 UI 资产根（绝对路径，包含 `plugins-ui/<插件名>/` 的目录）。
+   *
+   * 与 `webDist` 分离是必要的：`webDist` 只指**前端产物根**（app shell 与 `/assets/*`），
+   * 而插件 UI 资产可能有独立来源（dev 下即 `packages/web/public/plugins-ui/**`，无需前端构建）。
+   * **缺省值 = `webDist`**，保证既有行为完全不变。
+   */
+  pluginUiDist?: string | null
 }
 
 export interface PluginSnapshot {
@@ -290,6 +303,8 @@ export class GeeWikiManager {
       crashMarkerFile: config.crashMarkerFile,
       discoveryIssues: config.discoveryIssues ?? [],
       webDist: config.webDist ?? null,
+      // 内置插件 UI 根：缺省回落 webDist（与拆分前行为一致）
+      pluginUiDist: config.pluginUiDist ?? config.webDist ?? null,
     }
   }
 
@@ -313,7 +328,9 @@ export class GeeWikiManager {
     return buildPluginUiTable({
       registry: this.config.registry,
       activeNames: this.activeNames(),
-      webDist: this.config.webDist,
+      // 这里喂给纯函数的是"内置插件 UI 资产根"（= pluginUiDist ?? webDist，已在构造函数解析）。
+      // 纯函数里那个形参仍叫 webDist 是历史命名，语义就是"第二候选根的内置根"。
+      webDist: this.config.pluginUiDist,
       statFile: statFileSync,
     })
   }
