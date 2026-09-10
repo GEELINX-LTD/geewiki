@@ -2,7 +2,8 @@
  * @geewiki/manager —— GeeWiki 插件管理器（核心大脑）
  *
  * 子系统落地（对应 docs/architecture.md 第 5 章）：
- * - 5.1 热插拔引擎：session 激活仅限 supportsHotReload:true 的插件；依赖链热授权检查
+ * - 5.1 热插拔引擎：session 激活仅限 supportsHotReload:true 的插件；依赖链热授权检查；
+ *       卸载前按 manifest.runtime.drainTimeout 优雅排空在途 HTTP 请求，超时才强制卸载
  * - 5.2 依赖图谱：清单驱动装配 + 依赖拓扑排序 + 反向依赖卸载拦截；graph() 供 React Flow
  * - 5.3 会话层沙箱：Base（plugins.base.json）/ Session（plugins.session.json）双层状态；
  *       临时操作仅落 Session；persistSession() 把会话合并进 Base；看门狗熔断时清空会话自愈
@@ -11,7 +12,8 @@
  * - 5.6 看门狗：健康探针轮询；Session 插件 5 秒试用期内探针失败即回滚；
  *       连续失败达阈值（默认 3 次）触发熔断：清空 Session 后以退出码 1 退出（容器重启回 Base）
  * - 5.7 插件配置：REST enable 携带 config（JSON 原文），激活时原样传给插件 apply；
- *       configSchema 驱动的自动表单与配置热更新校验排期 Phase 4（见 roadmap），当前仅透传
+ *       configSchema 驱动的自动表单与配置热更新校验排期 Phase 4（见 roadmap），当前仅透传；
+ *       卸载声明 runtime.requiresCachePurge 的插件后，经事件总线广播 CACHE_PURGE_EVENT
  *
  * 本插件由 @geewiki/server 引导加载（内核组件，不入清单），清单中的插件由本管理器
  * 按依赖拓扑依次激活；REST 路由经 @geewiki/http 的路由服务挂载。
@@ -19,7 +21,15 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
 import type { Context } from 'cordis'
-import { type DatabaseAdapter, type FiberLike, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
+import {
+  CACHE_PURGE_EVENT,
+  closeAfterResponse,
+  normalizeRuntime,
+  type DatabaseAdapter,
+  type FiberLike,
+  type HttpRouterService,
+  type RouteHandlerContext,
+} from '@geewiki/core'
 export type { RegisteredPlugin } from './deps.js'
 import {
   checkHotChain,
@@ -501,21 +511,85 @@ export class GeeWikiManager {
   private async deactivateCore(name: string): Promise<void> {
     const managed = this.plugins.get(name)
     if (!managed?.active) return
+    const error = await this.unloadPlugin(name, managed)
+    if (error) console.error(`[manager] 插件 ${name} 卸载出错:`, error)
+    if (this.lastEnabledName === name) {
+      this.lastEnabledName = null
+      this.lastEnabledAt = null
+    }
+    const idx = this.activationOrder.indexOf(name)
+    if (idx >= 0) this.activationOrder.splice(idx, 1)
+  }
+
+  /**
+   * 卸载统一出口（disable / enable 回滚 / disposeAll 共用）：
+   * 优雅排空（§5.1）→ cordis dispose → 缓存清理钩子（§5.7）。
+   * 卸载异常不在此抛出，而是返回给调用方决定处置（deactivateCore 记日志、disposeAll 聚合上抛）。
+   */
+  private async unloadPlugin(name: string, managed: ManagedPlugin): Promise<Error | null> {
+    await this.drainBeforeUnload(name, managed)
+    let error: Error | null = null
     if (managed.fiber) {
       try {
         await managed.fiber.dispose()
       } catch (err) {
-        console.error(`[manager] 插件 ${name} 卸载出错:`, err)
+        error = err as Error
       }
     }
     managed.fiber = null
     managed.active = false
     managed.layer = null
-    if (this.lastEnabledName === name) {
-      this.lastEnabledName = null
-      this.lastEnabledAt = null
+    await this.purgeCaches(name, managed)
+    return error
+  }
+
+  /**
+   * 卸载前优雅排空（架构 §5.1）：按插件 manifest 的 `runtime.drainTimeout`（秒，缺省 5）
+   * 等待"处理器尚未结算"的在途 HTTP 请求完成；超时则记录告警后强制卸载。
+   * `drainTimeout <= 0` 表示不等待（立即卸载）。
+   *
+   * 语义（与 HttpRouterService.drain 一致）：等待的是全站在途请求，
+   * **不含发起本次卸载的那次管理请求本身**（REST 卸载由处理器内部调用，
+   * 若把自己算进去就会等自己、必然空转满 drainTimeout）。
+   * 按插件（owner）粒度排空属于后续工作。
+   */
+  private async drainBeforeUnload(name: string, managed: ManagedPlugin): Promise<void> {
+    const { drainTimeout } = normalizeRuntime(managed.entry.manifest.geewiki.runtime)
+    if (drainTimeout <= 0) return
+    const router = this.ctx.get('http') as HttpRouterService | undefined
+    if (!router) return
+    // 以 pending() 为准（已排除发起本次卸载的管理请求自身）：为 0 → 零开销快路径，
+    // 也保证"未真正等待就不打印耗时"这一日志语义是确定的（不依赖毫秒计时是否跨过边界）
+    const waiting = router.pending()
+    if (waiting === 0) return
+    const startedAt = Date.now()
+    const drained = await router.drain(drainTimeout * 1000)
+    if (drained) {
+      console.log(`[manager] 插件 ${name} 排空完成：耗时 ${Date.now() - startedAt}ms（等待 ${waiting} 个在途请求）`)
+      return
     }
-    this.activationOrder.splice(this.activationOrder.indexOf(name), 1)
+    console.warn(
+      `[manager] 插件 ${name} 排空超时（${drainTimeout}s，仍有 ${router.pending()} 个在途请求未结算），强制卸载`,
+    )
+  }
+
+  /**
+   * 缓存清理钩子（架构 §5.7）：插件声明 `runtime.requiresCachePurge: true` 时，
+   * 卸载完成后经 cordis 事件总线广播 {@link CACHE_PURGE_EVENT}（参数为插件名），
+   * 由持有派生缓存（索引、渲染结果、资源表等）的插件或宿主监听后自行清理。
+   *
+   * 用 `ctx.parallel`（内部为 Promise.allSettled）而**不是** `ctx.emit`：cordis 的同步
+   * `emit` 逐个调用监听器且无 per-listener 保护，任一监听器抛错会跳过其后的监听器，
+   * 导致后续插件的缓存清理被静默丢失。失败者在此聚合记录，不影响其它插件与卸载结果。
+   */
+  private async purgeCaches(name: string, managed: ManagedPlugin): Promise<void> {
+    const { requiresCachePurge } = normalizeRuntime(managed.entry.manifest.geewiki.runtime)
+    if (!requiresCachePurge) return
+    try {
+      await this.ctx.parallel(CACHE_PURGE_EVENT, name)
+    } catch (err) {
+      console.error(`[manager] 插件 ${name} 缓存清理事件有监听器失败（其余监听器不受影响）:`, err)
+    }
   }
 
   /* ------------------------- 看门狗（5.6） ------------------------- */
@@ -580,22 +654,20 @@ export class GeeWikiManager {
 
   /* --------------------------- 卸载 --------------------------- */
 
-  /** 逆序卸载全部活动插件（管理器 dispose 时调用）；成功后清除崩溃标记（优雅退出） */
+  /**
+   * 逆序卸载全部活动插件（管理器 dispose 时调用）；成功后清除崩溃标记（优雅退出）。
+   * 与 deactivateCore 复用同一卸载出口：逐个优雅排空（§5.1）→ dispose → 缓存清理（§5.7）。
+   */
   async disposeAll(): Promise<void> {
     this.stopWatchdog()
     const errors: string[] = []
     for (const name of [...this.activationOrder].reverse()) {
       const managed = this.plugins.get(name)
-      if (managed?.active && managed.fiber) {
-        try {
-          await managed.fiber.dispose()
-        } catch (err) {
-          errors.push(`${name}: ${(err as Error).message}`)
-        }
-        managed.active = false
-        managed.fiber = null
-      }
+      if (!managed?.active) continue
+      const error = await this.unloadPlugin(name, managed)
+      if (error) errors.push(`${name}: ${error.message}`)
     }
+    this.activationOrder.length = 0
     if (errors.length > 0) throw new Error(`卸载失败: ${errors.join('; ')}`)
     this.lastEnabledName = null
     this.lastEnabledAt = null
@@ -657,6 +729,8 @@ function fail(h: RouteHandlerContext, err: unknown): void {
               err.code === 'migration_failed'
             ? 409
             : 400
+    // 请求体超限：剩余请求体未消费，响应刷出后关闭连接（413 仍走统一出口，计入 stats）
+    if (err.code === 'payload_too_large') closeAfterResponse(h)
     send(h, status, { ok: false, error: err.code, message: err.message, details: err.details })
     return
   }
@@ -703,29 +777,26 @@ function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): voi
   console.log('[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/session')
 }
 
-/** 读取 enable 请求体 JSON（1MB 上限：先回 413 再销毁连接，防内存 DoS） */
+/** 读取 enable 请求体 JSON（1MB 上限）：超限暂停读取剩余请求体并以 payload_too_large 拒绝，
+ *  413 响应由路由层统一出口写出（fail → send，计入 stats/看门狗探针），随后关闭连接。 */
 function readJsonBody(h: RouteHandlerContext, limit = 1_000_000): Promise<Record<string, unknown>> {
   return new Promise((resolveBody, rejectBody) => {
     const chunks: Buffer[] = []
     let size = 0
+    let rejected = false
     h.req.on('data', (c: Buffer) => {
       size += c.length
       if (size > limit) {
+        if (rejected) return // 已拒绝：忽略后续数据块
+        rejected = true
+        h.req.pause()
         rejectBody(new ManagerError('payload_too_large', `请求体过大（上限 ${limit} 字节）`))
-        try {
-          if (!h.res.headersSent && !h.res.writableEnded) {
-            h.res.writeHead(413, { 'content-type': 'application/json; charset=utf-8' })
-            h.res.end(JSON.stringify({ ok: false, error: 'payload_too_large', message: '请求体过大' }))
-          }
-        } catch {
-          /* 客户端已断连则忽略 */
-        }
-        h.req.destroy()
         return
       }
       chunks.push(c)
     })
     h.req.on('end', () => {
+      if (rejected) return
       try {
         const text = Buffer.concat(chunks).toString('utf8')
         resolveBody(text ? (JSON.parse(text) as Record<string, unknown>) : {})
@@ -733,6 +804,8 @@ function readJsonBody(h: RouteHandlerContext, limit = 1_000_000): Promise<Record
         rejectBody(new ManagerError('bad_request', `请求体 JSON 解析失败: ${(err as Error).message}`))
       }
     })
-    h.req.on('error', rejectBody)
+    h.req.on('error', (err) => {
+      if (!rejected) rejectBody(err)
+    })
   })
 }

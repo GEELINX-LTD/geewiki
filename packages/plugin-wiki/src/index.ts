@@ -12,7 +12,7 @@
  *   DELETE /api/pages/:slug   删除页面（含历史）
  */
 import type { Context } from 'cordis'
-import { type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
+import { closeAfterResponse, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
 
 export interface WikiConfig {
   /** 页面详情中返回的最近版本历史条数上限 */
@@ -52,28 +52,40 @@ interface PageRow {
   updated_at: string
 }
 
-/** 读取并解析 JSON 请求体（超限/畸形抛错，由路由层统一 500/400 处理） */
-function readBody(req: RouteHandlerContext['req'], limit = 1_000_000): Promise<unknown> {
+/**
+ * 读取并解析 JSON 请求体（上限 1MB，与 manager 的 readJsonBody 同范式）：
+ * - 超限：暂停读取剩余请求体，以 `payload_too_large` 前缀的错误拒绝；
+ *   响应由调用方经统一出口 `h.json(413, …)` 写出（保证计入 stats()，见看门狗探针）；
+ * - 畸形 JSON：以 `invalid_json` 前缀错误拒绝（→ 400）。
+ */
+function readBody(h: RouteHandlerContext, limit = 1_000_000): Promise<unknown> {
   return new Promise((resolveBody, rejectBody) => {
     let size = 0
+    let rejected = false
     const chunks: Buffer[] = []
-    req.on('data', (chunk: Buffer) => {
+    h.req.on('data', (chunk: Buffer) => {
       size += chunk.length
       if (size > limit) {
-        rejectBody(new Error('request_body_too_large'))
-        req.destroy()
+        if (rejected) return // 已拒绝：忽略后续数据块
+        rejected = true
+        // 不再消费剩余请求体：交由调用方写出 413 后关闭连接（见 PUT 处理器）
+        h.req.pause()
+        rejectBody(new Error(`payload_too_large: 请求体过大（上限 ${limit} 字节）`))
         return
       }
       chunks.push(chunk)
     })
-    req.on('end', () => {
+    h.req.on('end', () => {
+      if (rejected) return
       try {
         resolveBody(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {})
       } catch (err) {
         rejectBody(new Error(`invalid_json: ${(err as Error).message}`))
       }
     })
-    req.on('error', rejectBody)
+    h.req.on('error', (err) => {
+      if (!rejected) rejectBody(err)
+    })
   })
 }
 
@@ -94,7 +106,7 @@ function parseSaveBody(body: unknown): { title: string; content: string } {
   const content = typeof b.content === 'string' ? b.content : ''
   if (!title) throw new Error('invalid_title: 标题不能为空')
   if (title.length > 200) throw new Error('invalid_title: 标题过长（≤200 字符）')
-  if (content.length > 500_000) throw new Error('invalid_content: 正文过长（≤500KB）')
+  if (content.length > 500_000) throw new Error('content_too_large: 正文过长（≤500KB）')
   return { title, content }
 }
 
@@ -190,9 +202,21 @@ export const WikiPlugin = {
         }
         let save: { title: string; content: string }
         try {
-          save = parseSaveBody(await readBody(h.req))
+          save = parseSaveBody(await readBody(h))
         } catch (err) {
-          h.json(400, { ok: false, error: 'invalid_body', message: (err as Error).message })
+          const message = (err as Error).message
+          if (message.startsWith('payload_too_large')) {
+            // 请求体未读完且已暂停：经统一出口写出 413（计入 stats），随后关闭连接
+            closeAfterResponse(h)
+            h.json(413, { ok: false, error: 'payload_too_large', message })
+            return
+          }
+          if (message.startsWith('content_too_large')) {
+            // 正文过长与"请求体过大"是不同错误：按 error 分流的调用方不应混判
+            h.json(413, { ok: false, error: 'content_too_large', message })
+            return
+          }
+          h.json(400, { ok: false, error: 'invalid_body', message })
           return
         }
         const now = new Date().toISOString()

@@ -8,6 +8,8 @@
  * 3. persistSession 跳过激活失败（error/未装配）条目，坏配置不提升进基础层。
  * 4. enable 事务性：冲突预检零副作用；目标加载失败时逆序回滚已启用的依赖。
  * 5. 看门狗决策纯函数 decideWatchdog 的归因/熔断语义。
+ * 6. 卸载统一出口：按 manifest.runtime.drainTimeout 优雅排空（§5.1）；
+ *    requiresCachePurge → 卸载后广播 CACHE_PURGE_EVENT（§5.7）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -15,6 +17,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from 'cordis'
+import { CACHE_PURGE_EVENT, type HttpRouterService } from '@geewiki/core'
 import { GeeWikiManager, ManagerError, writeCrashMarker } from '../src/index.js'
 import { decideWatchdog } from '../src/watchdog.js'
 import type { RegisteredPlugin } from '../src/deps.js'
@@ -54,9 +57,9 @@ function readList(file: string): { name: string; config?: Record<string, unknown
 function makeManager(
   env: Env,
   registry: RegisteredPlugin[],
-  opts: { crashMarkerFile?: boolean } = {},
+  opts: { crashMarkerFile?: boolean; ctx?: Context } = {},
 ): GeeWikiManager {
-  const ctx = new Context()
+  const ctx = opts.ctx ?? new Context()
   return new GeeWikiManager(ctx, {
     registry,
     baseFile: env.baseFile,
@@ -65,10 +68,48 @@ function makeManager(
   })
 }
 
+/**
+ * 路由服务替身（HttpRouterService）：记录 drain 调用与排空顺序，
+ * 便于断言"排空先于 dispose""drainTimeout 秒→毫秒"等契约。
+ */
+function makeRouter(opts: { inflight?: number; drained?: boolean; order?: string[] } = {}): {
+  service: HttpRouterService
+  drains: number[]
+  setInflight(n: number): void
+} {
+  let inflight = opts.inflight ?? 0
+  const drains: number[] = []
+  return {
+    drains,
+    setInflight: (n: number) => {
+      inflight = n
+    },
+    service: {
+      register: () => () => {},
+      stats: () => ({ total: 0, ok: 0, fail: 0, consecutiveFailures: 0, lastMs: 0, avgMs: 0 }),
+      inflight: () => inflight,
+      // 替身不区分"调用方自身请求"：pending 与 inflight 同值（真实实现详见 HttpRouter）
+      pending: () => inflight,
+      drain: (timeoutMs: number) => {
+        drains.push(timeoutMs)
+        opts.order?.push('drain')
+        return Promise.resolve(opts.drained ?? true)
+      },
+    },
+  }
+}
+
 function plugin(
   name: string,
   log: string[],
-  opts: { fail?: boolean; requires?: string[]; conflictGroup?: string; cold?: boolean } = {},
+  opts: {
+    fail?: boolean
+    requires?: string[]
+    conflictGroup?: string
+    cold?: boolean
+    drainTimeout?: number
+    cachePurge?: boolean
+  } = {},
 ): RegisteredPlugin {
   return {
     name,
@@ -78,7 +119,11 @@ function plugin(
       geewiki: {
         requires: opts.requires ?? [],
         conflictGroup: opts.conflictGroup,
-        runtime: { supportsHotReload: opts.cold ? false : true, requiresCachePurge: false, drainTimeout: 5 },
+        runtime: {
+          supportsHotReload: opts.cold ? false : true,
+          requiresCachePurge: opts.cachePurge ?? false,
+          drainTimeout: opts.drainTimeout ?? 5,
+        },
       },
     },
     module: {
@@ -338,6 +383,173 @@ test('enable/disable：会话插件热启停与归因清空（end-to-end）', as
     assert.deepEqual(readList(env.sessionFile).map((e) => e.name), [])
     await m.disposeAll()
     assert.deepEqual(log, ['apply:@t/echo', 'dispose:@t/echo'])
+  } finally {
+    env.cleanup()
+  }
+})
+
+/* ---------------- 6. 卸载排空（§5.1）与缓存清理（§5.7） ---------------- */
+
+test('disable：按 manifest.runtime.drainTimeout 优雅排空（秒→毫秒），排空先于 dispose', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [])
+    writeList(env.sessionFile, [])
+    const order: string[] = []
+    const registry = [plugin('@t/echo', order, { drainTimeout: 2 })]
+    const router = makeRouter({ inflight: 3, order })
+    const ctx = new Context()
+    ctx.provide('http', router.service)
+    const m = makeManager(env, registry, { ctx })
+    await m.boot()
+    await m.enable('@t/echo')
+
+    order.length = 0 // 只观察卸载过程
+    await m.disable('@t/echo')
+    assert.deepEqual(router.drains, [2000], 'drainTimeout 单位为秒，传给 drain 时换算为毫秒')
+    assert.deepEqual(order, ['drain', 'dispose:@t/echo'], '必须先在途请求排空、后卸载插件')
+    assert.equal(snapshotOf(m, '@t/echo').state, 'inactive')
+    await m.disposeAll()
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('disable：无在途请求不排空；drainTimeout<=0 不排空', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [])
+    writeList(env.sessionFile, [])
+    const log: string[] = []
+    const registry = [
+      plugin('@t/idle', log, { drainTimeout: 5 }),
+      plugin('@t/nodrain', log, { drainTimeout: 0 }),
+    ]
+    const router = makeRouter({ inflight: 0 })
+    const ctx = new Context()
+    ctx.provide('http', router.service)
+    const m = makeManager(env, registry, { ctx })
+    await m.boot()
+
+    // (a) 在途请求数为 0 → 不调用 drain（零开销快路径）
+    await m.enable('@t/idle')
+    await m.disable('@t/idle')
+    assert.deepEqual(router.drains, [], 'inflight=0 时不应等待')
+
+    // (b) drainTimeout: 0（显式声明不等待）→ 即便有在途请求也直接卸载
+    router.setInflight(4)
+    await m.enable('@t/nodrain')
+    await m.disable('@t/nodrain')
+    assert.deepEqual(router.drains, [], 'drainTimeout<=0 表示不等待，立即卸载')
+    assert.equal(snapshotOf(m, '@t/nodrain').state, 'inactive')
+    await m.disposeAll()
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('排空超时：记录告警后强制卸载（不阻断卸载流程）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [])
+    writeList(env.sessionFile, [])
+    const order: string[] = []
+    const registry = [plugin('@t/slow', order)] // drainTimeout 缺省 5 秒
+    const router = makeRouter({ inflight: 1, drained: false, order })
+    const ctx = new Context()
+    ctx.provide('http', router.service)
+    const m = makeManager(env, registry, { ctx })
+    await m.boot()
+    await m.enable('@t/slow')
+
+    order.length = 0
+    await m.disable('@t/slow')
+    assert.deepEqual(router.drains, [5000], '缺省 drainTimeout 为 5 秒')
+    assert.deepEqual(order, ['drain', 'dispose:@t/slow'], '排空超时后仍执行卸载')
+    assert.equal(snapshotOf(m, '@t/slow').state, 'inactive', '排空超时不阻断卸载')
+    await m.disposeAll()
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('disposeAll：逆序卸载且各插件使用自己的 drainTimeout（复用同一排空出口）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [{ name: '@t/a' }, { name: '@t/b' }])
+    writeList(env.sessionFile, [])
+    const log: string[] = []
+    const registry = [
+      plugin('@t/a', log, { drainTimeout: 3 }),
+      plugin('@t/b', log, { drainTimeout: 1 }),
+    ]
+    const router = makeRouter({ inflight: 2 })
+    const ctx = new Context()
+    ctx.provide('http', router.service)
+    const m = makeManager(env, registry, { ctx })
+    await m.boot()
+    assert.deepEqual(log, ['apply:@t/a', 'apply:@t/b'], '基础层按拓扑顺序激活')
+
+    await m.disposeAll()
+    assert.deepEqual(router.drains, [1000, 3000], '逆序卸载：@t/b（1s）先于 @t/a（3s），各用自己的 drainTimeout')
+    assert.deepEqual(log.slice(2), ['dispose:@t/b', 'dispose:@t/a'], '逆序 dispose')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('requiresCachePurge：卸载后广播 CACHE_PURGE_EVENT；未声明则不广播', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [{ name: '@t/cache' }, { name: '@t/plain' }])
+    writeList(env.sessionFile, [])
+    const log: string[] = []
+    const registry = [
+      plugin('@t/cache', log, { cachePurge: true }),
+      plugin('@t/plain', log),
+    ]
+    const ctx = new Context()
+    const purged: string[] = []
+    ctx.on(CACHE_PURGE_EVENT, (name: unknown) => {
+      purged.push(String(name))
+    })
+    const router = makeRouter({ inflight: 0 })
+    ctx.provide('http', router.service)
+    const m = makeManager(env, registry, { ctx })
+    await m.boot()
+
+    await m.disposeAll()
+    assert.deepEqual(purged, ['@t/cache'], '仅声明 requiresCachePurge 的插件派发缓存清理事件')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('requiresCachePurge：单个监听器抛错不影响其余监听器（emit 会跳过，parallel 不会）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [{ name: '@t/cache' }])
+    writeList(env.sessionFile, [])
+    const log: string[] = []
+    const ctx = new Context()
+    const called: string[] = []
+    // 第一个监听器抛错：若用同步 emit，第二个监听器会被静默跳过（其插件的缓存永远不清理）
+    ctx.on(CACHE_PURGE_EVENT, () => {
+      called.push('first')
+      throw new Error('cache purge listener boom')
+    })
+    ctx.on(CACHE_PURGE_EVENT, (name: unknown) => {
+      called.push(`second:${String(name)}`)
+    })
+    const router = makeRouter({ inflight: 0 })
+    ctx.provide('http', router.service)
+    const m = makeManager(env, [plugin('@t/cache', log, { cachePurge: true })], { ctx })
+    await m.boot()
+
+    // 卸载本身不得因监听器抛错而失败
+    await m.disposeAll()
+    assert.deepEqual(called, ['first', 'second:@t/cache'], '抛错的监听器不得阻断后续监听器')
+    assert.equal(snapshotOf(m, '@t/cache').state, 'inactive', '缓存清理失败不影响卸载结果')
   } finally {
     env.cleanup()
   }

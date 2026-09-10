@@ -10,15 +10,18 @@
  *    挂载 JSON 路由）+ 健康检查端点 + 请求统计（看门狗数据源）；
  * 4. SIGINT/SIGTERM 优雅退出：逆序卸载全部插件后退出。
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { readFile, stat } from 'node:fs/promises'
-import { isAbsolute, relative, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from 'cordis'
 import {
   DEFAULT_DATA_DIR,
   DEFAULT_PORT,
   HEALTH_PATH,
+  normalizeRuntime,
+  resolveProjectPath,
   type GeeWikiManifest,
   type HttpRouterService,
   type HttpRouterStats,
@@ -30,8 +33,14 @@ import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
 import { PluginManagerPlugin, removeCrashMarker, writeCrashMarker, type RegisteredPlugin } from '@geewiki/manager'
 
-/** 崩溃标记路径：与数据库文件同目录（<GEEWIKI_DATA_DIR 或 ./data>），随 data/ 一起被 gitignore */
-const crashMarkerFile = resolve(process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR, 'crash.marker')
+/**
+ * 崩溃标记路径：与数据库文件同目录（<GEEWIKI_DATA_DIR 或 ./data>），随 data/ 一起被 gitignore。
+ * 相对路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）。
+ */
+const crashMarkerFile = resolveProjectPath(
+  join(process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR, 'crash.marker'),
+  import.meta.url,
+)
 
 /* =========================== HTTP 路由服务 =========================== */
 
@@ -56,11 +65,45 @@ interface RouteEntry {
   handler: RouteHandler
 }
 
+/**
+ * 单次请求的执行状态：经 AsyncLocalStorage 承载（跨 await 传播），
+ * 供 {@link HttpRouter.drain} 识别"发起排空的那次请求"自身并将其排除。
+ */
+interface RequestState {
+  /** 该请求的路由处理器是否仍在途（结算后置 false，重复结算无副作用） */
+  active: boolean
+}
+
+/** 排空等待者：在途数变化时按各自的视角判定（不同等待者的调用来源不同） */
+interface DrainWaiter {
+  /** 该等待者视角下是否已无待等待的请求（已排除它自己发起的那次请求） */
+  check(): boolean
+  /** 结算该等待（drained=true 已排空 / false 超时） */
+  finish(drained: boolean): void
+}
+
+/** 是否为 thenable（原生 Promise 或自定义 then 的对象）：不能用 instanceof Promise 判定 */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  if (typeof value !== 'object' && typeof value !== 'function') return false
+  if (value === null) return false
+  return typeof (value as { then?: unknown }).then === 'function'
+}
+
 class HttpRouter implements HttpRouterService {
   private readonly routes: RouteEntry[] = []
   private readonly counters = { total: 0, ok: 0, fail: 0, consecutiveFailures: 0 }
   private msHistory: number[] = []
   private lastMs = 0
+  /** 进行中的路由处理器数（优雅排空的等待对象；含发起排空的那次管理请求自身） */
+  private inFlight = 0
+  /** 排空等待者：在途数变化时按各自视角判定是否完成 */
+  private readonly drainWaiters = new Set<DrainWaiter>()
+  /**
+   * 请求执行上下文（AsyncLocalStorage）：排空时据此排除"发起排空的那次请求"自身。
+   * 管理面请求（如 REST 卸载插件）本身也计入在途数，若不排除就会等自己——
+   * 结果必然是空转到 drainTimeout 并打印假的超时告警。
+   */
+  private readonly requestScope = new AsyncLocalStorage<RequestState>()
 
   constructor(private readonly healthHandler: RouteHandler) {}
 
@@ -91,6 +134,74 @@ class HttpRouter implements HttpRouterService {
       consecutiveFailures: this.counters.consecutiveFailures,
       lastMs: this.lastMs,
       avgMs: Math.round(avgMs * 10) / 10,
+    }
+  }
+
+  inflight(): number {
+    return this.inFlight
+  }
+
+  /** 除调用方自身请求外的在途数（请求之外调用时等同 inflight()） */
+  pending(): number {
+    return this.pendingExcluding(this.requestScope.getStore())
+  }
+
+  /** 指定请求视角下的待等待数：扣除该请求自身（若它仍在途） */
+  private pendingExcluding(own: RequestState | undefined): number {
+    return this.inFlight - (own?.active ? 1 : 0)
+  }
+
+  /**
+   * 优雅排空（架构 §5.1）：等待"调用时刻已受理"的路由处理器全部结算，
+   * 超时即返回 false，由调用方决定是否强制卸载。
+   *
+   * 语义（务必与实现保持一致）：
+   * - 等待的是**全站**在途请求，**不含发起排空的那次请求本身**——管理面请求
+   *   （如 REST 卸载插件）自身也在在途数里，不自排除就会等自己、必然空转超时；
+   * - 按插件（owner）粒度排空属于后续工作：当前不做请求来源归属，
+   *   一次卸载会等待所有插件的在途请求；
+   * - 排空期间新到的请求照常受理（本方法只等服务，不阻断入站流量）。
+   */
+  drain(timeoutMs: number): Promise<boolean> {
+    // 在调用时刻捕获调用方的请求上下文：等待期间在途数由他人变化，
+    // 若在 check 时重新读取 ALS 会读到"当时正在结算的那个请求"的上下文，判定就会错。
+    const own = this.requestScope.getStore()
+    const pending = (): number => this.pendingExcluding(own)
+    if (pending() <= 0) return Promise.resolve(true)
+    if (!(timeoutMs > 0)) return Promise.resolve(false)
+    return new Promise<boolean>((resolveDrain) => {
+      let settled = false
+      let timer: NodeJS.Timeout | undefined
+      const waiter: DrainWaiter = {
+        check: () => pending() <= 0,
+        finish: (drained: boolean): void => {
+          if (settled) return
+          settled = true
+          if (timer) clearTimeout(timer)
+          this.drainWaiters.delete(waiter)
+          resolveDrain(drained)
+        },
+      }
+      timer = setTimeout(() => waiter.finish(false), timeoutMs)
+      timer.unref()
+      this.drainWaiters.add(waiter)
+    })
+  }
+
+  /** 登记一段在途路由处理（与 exitHandler 配对） */
+  private enterHandler(state: RequestState): void {
+    state.active = true
+    this.inFlight++
+  }
+
+  /** 结束一段在途路由处理；在途数变化后唤醒已排空的等待者 */
+  private exitHandler(state: RequestState): void {
+    if (!state.active) return // 已结算（同步抛错 + then 回调双路径）不重复扣减
+    state.active = false
+    if (this.inFlight > 0) this.inFlight--
+    if (this.drainWaiters.size === 0) return
+    for (const waiter of [...this.drainWaiters]) {
+      if (waiter.check()) waiter.finish(true)
     }
   }
 
@@ -132,12 +243,19 @@ class HttpRouter implements HttpRouterService {
 
     // 内置健康检查（路由表之外常驻，保证看门狗探针永不因插件卸载而缺失）
     if (method === 'GET' && url.pathname === HEALTH_PATH) {
-      try {
-        this.healthHandler({ req, res, url, params: {}, json })
-      } catch (err) {
-        console.error('[http] 健康检查异常:', err)
-        json(500, { ok: false, error: 'health_check_failed' })
-      }
+      const state: RequestState = { active: false }
+      this.enterHandler(state)
+      // 同步处理器：仍置于请求上下文中，保证下游（探针触发的卸载）视角一致
+      this.requestScope.run(state, () => {
+        try {
+          this.healthHandler({ req, res, url, params: {}, json })
+        } catch (err) {
+          console.error('[http] 健康检查异常:', err)
+          json(500, { ok: false, error: 'health_check_failed' })
+        } finally {
+          this.exitHandler(state)
+        }
+      })
       return true
     }
 
@@ -166,18 +284,32 @@ class HttpRouter implements HttpRouterService {
       }
       if (!matched) continue
       const h: RouteHandlerContext = { req, res, url, params, json }
-      try {
-        const result = route.handler(h)
-        if (result instanceof Promise) {
-          result.catch((err) => {
-            console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
-            json(500, { ok: false, error: 'internal', message: (err as Error).message })
-          })
+      // 在途登记：插件卸载前的优雅排空以"处理器是否结算"为准（同步处理器即刻结算）
+      const state: RequestState = { active: false }
+      this.enterHandler(state)
+      // 处理器在请求上下文中执行：管理器于处理器内部调用 drain() 时才能排除自身
+      this.requestScope.run(state, () => {
+        try {
+          const result: unknown = route.handler(h)
+          if (isThenable(result)) {
+            // Promise.resolve 兜住非原生 thenable（自定义 then）：结算时机正确，且 rejection 有人接管
+            void Promise.resolve(result).then(
+              () => this.exitHandler(state),
+              (err: unknown) => {
+                console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
+                json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
+                this.exitHandler(state)
+              },
+            )
+          } else {
+            this.exitHandler(state)
+          }
+        } catch (err) {
+          console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
+          json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
+          this.exitHandler(state)
         }
-      } catch (err) {
-        console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
-        json(500, { ok: false, error: 'internal', message: (err as Error).message })
-      }
+      })
       return true
     }
 
@@ -269,7 +401,12 @@ export interface HttpConfig {
   host?: string
   /** 前端静态产物目录；null = 不启用静态服务 */
   webDist?: string | null
+  /** 关停前等待在途 API 请求结算的上限（秒）；缺省取 httpManifest.runtime.drainTimeout（5） */
+  drainTimeout?: number
 }
+
+/** 本插件声明的排空等待上限（秒，架构 §5.1）：卸载前等待进行中请求完成 */
+const HTTP_DRAIN_TIMEOUT_SECONDS = normalizeRuntime(httpManifest.geewiki.runtime).drainTimeout
 
 /** HTTP 服务插件：提供 http 路由服务（ctx.get('http')），常驻内核插件 */
 export const HttpPlugin = {
@@ -305,13 +442,30 @@ export const HttpPlugin = {
     server.listen(port, host, () => {
       const shown = host === '0.0.0.0' ? '127.0.0.1' : host
       console.log(`[@geewiki/http] 服务已启动: http://${shown}:${port}`)
+      // 打印已解析的静态根（相对路径以仓库根为基准，见 resolveProjectPath）：便于核对 env 是否生效
+      if (config.webDist) console.log(`[@geewiki/http] 静态资源目录: ${config.webDist}`)
     })
 
     const unprovide = ctx.provide('http', router)
     return () =>
       new Promise<void>((resolveClose) => {
         unprovide()
-        server.close(() => resolveClose())
+        // 优雅排空（架构 §5.1）：先等在途 API 请求结算，再关闭监听（超时强制关闭）
+        const drainTimeoutMs = (config.drainTimeout ?? HTTP_DRAIN_TIMEOUT_SECONDS) * 1000
+        void router
+          .drain(drainTimeoutMs)
+          .then((drained) => {
+            if (!drained) {
+              console.warn(
+                `[@geewiki/http] 排空超时（${drainTimeoutMs}ms，仍有 ${router.inflight()} 个请求在途），强制关闭监听`,
+              )
+            }
+            server.close(() => resolveClose())
+          })
+          .catch((err: unknown) => {
+            console.error('[@geewiki/http] 排空异常:', err)
+            server.close(() => resolveClose())
+          })
       })
   },
 }
@@ -319,27 +473,50 @@ export const HttpPlugin = {
 /* ============================ 组合根 ============================= */
 
 export interface ServerOptions {
+  /** 监听端口（优先于 GEEWIKI_PORT 与内置默认 3000；仅默认注册表生效，见 httpRegistryEntry） */
   port?: number
+  /** 监听地址（优先于 GEEWIKI_HOST 与内置默认 0.0.0.0；同上） */
   host?: string
-  /** 插件清单目录（默认取 GEEWIKI_CONFIG_DIR 或 ./config） */
+  /** 插件清单目录（默认取 GEEWIKI_CONFIG_DIR 或仓库根下 config/；相对路径以仓库根为基准） */
   configDir?: string
-  /** 前端静态产物目录（默认 GEEWIKI_WEB_DIST 或仓库根 packages/web/dist） */
+  /** 前端静态产物目录（默认 GEEWIKI_WEB_DIST 或仓库根下 packages/web/dist；相对路径以仓库根为基准） */
   webDist?: string | null
   registry?: RegisteredPlugin[]
 }
 
-/** 绑定静态根后的 http 插件模块（webDist 经注册表注入，避免进入持久化清单） */
-function httpModuleWith(webDist: string | null): { name: string; apply: (ctx: Context, config?: Partial<HttpConfig>) => unknown } {
+/** startServer 传给 http 插件的启动期默认值（清单内未显式配置端口/地址时生效） */
+export interface HttpEntryDefaults {
+  port?: number
+  host?: string
+}
+
+/**
+ * 构造 `@geewiki/http` 的注册表条目：绑定静态根（webDist 经此处注入，避免进入持久化清单），
+ * 并把启动期默认端口/地址带入插件配置。自定义注册表可复用它以获得同样的绑定行为。
+ *
+ * 优先级：清单（持久化）配置里的显式 `port`/`host` > 本处默认值（来自 startServer 的
+ * `options ?? env ?? 内置默认`）> 插件内的环境变量兜底。
+ */
+export function httpRegistryEntry(webDist: string | null, defaults: HttpEntryDefaults = {}): RegisteredPlugin {
   return {
     name: '@geewiki/http',
-    apply(ctx: Context, config: Partial<HttpConfig> = {}) {
-      return HttpPlugin.apply(ctx, { ...config, webDist })
+    manifest: httpManifest,
+    module: {
+      name: '@geewiki/http',
+      apply(ctx: Context, config: Partial<HttpConfig> = {}) {
+        return HttpPlugin.apply(ctx, {
+          ...config,
+          ...(config.port === undefined && defaults.port !== undefined ? { port: defaults.port } : {}),
+          ...(config.host === undefined && defaults.host !== undefined ? { host: defaults.host } : {}),
+          webDist,
+        })
+      },
     },
   }
 }
 
 /** 内置插件注册表（default registry：服务器引导时注册的全部可管插件） */
-export function defaultRegistry(webDist: string | null): RegisteredPlugin[] {
+export function defaultRegistry(webDist: string | null, defaults: HttpEntryDefaults = {}): RegisteredPlugin[] {
   return [
     {
       name: '@geewiki/db-sqlite',
@@ -347,7 +524,7 @@ export function defaultRegistry(webDist: string | null): RegisteredPlugin[] {
       module: SqliteDbPlugin,
       migrationsDir: DB_SQLITE_MIGRATIONS_DIR,
     },
-    { name: '@geewiki/http', manifest: httpManifest, module: httpModuleWith(webDist) },
+    httpRegistryEntry(webDist, defaults),
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin },
     { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin },
   ]
@@ -356,17 +533,26 @@ export function defaultRegistry(webDist: string | null): RegisteredPlugin[] {
 /** 启动应用宿主：引导插件管理器（管理器按双层清单激活全部插件）。返回清理句柄。 */
 export async function startServer(options: ServerOptions = {}): Promise<{ app: Context; dispose: () => Promise<void> }> {
   const app = new Context()
+  // 监听地址来源优先级：options > GEEWIKI_PORT/GEEWIKI_HOST 环境变量 > 内置默认（3000 / 0.0.0.0）
   const port = options.port ?? Number(process.env.GEEWIKI_PORT ?? DEFAULT_PORT)
-  const host = options.host ?? '0.0.0.0'
+  const host = options.host ?? process.env.GEEWIKI_HOST ?? '0.0.0.0'
   const configDir = options.configDir ?? process.env.GEEWIKI_CONFIG_DIR ?? 'config'
-  const webDist = options.webDist !== undefined
-    ? options.webDist
-    : (process.env.GEEWIKI_WEB_DIST ?? resolve('packages/web/dist'))
+  // 静态产物目录：options > GEEWIKI_WEB_DIST > 默认（仓库根 packages/web/dist）；
+  // 相对路径一律以仓库根为基准（绝对路径原样透传），null 表示不启用静态服务
+  let webDist: string | null
+  if (options.webDist !== undefined) {
+    webDist = options.webDist === null ? null : resolveProjectPath(options.webDist, import.meta.url)
+  } else if (process.env.GEEWIKI_WEB_DIST) {
+    webDist = resolveProjectPath(process.env.GEEWIKI_WEB_DIST, import.meta.url)
+  } else {
+    webDist = resolveProjectPath('packages/web/dist', import.meta.url)
+  }
 
   const managerFiber = await app.plugin(PluginManagerPlugin, {
-    registry: options.registry ?? defaultRegistry(webDist),
-    baseFile: resolve(configDir, 'plugins.base.json'),
-    sessionFile: resolve(configDir, 'plugins.session.json'),
+    registry: options.registry ?? defaultRegistry(webDist, { port, host }),
+    // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
+    baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
+    sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
     crashMarkerFile,
   })
 

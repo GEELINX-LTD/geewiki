@@ -7,6 +7,9 @@
 /* 引入 cordis 类型面补充（cordis-env.ts 自包含声明，见该文件头注释）。
    此 import type 仅用于让 cordis 模块进入本 program 的类型解析
    （缺少时 declare module 'cordis' 会报 TS2664 cannot be found）。 */
+import { existsSync } from 'node:fs'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import './cordis-env.js'
 
@@ -131,7 +134,7 @@ export interface DatabaseAdapter {
 /** 默认 HTTP 端口 */
 export const DEFAULT_PORT = 3000
 
-/** 默认数据目录（相对进程工作目录）；SQLite 数据库文件存放于此 */
+/** 默认数据目录（相对路径，以仓库根为基准解析，见 resolveProjectPath）；SQLite 数据库文件存放于此 */
 export const DEFAULT_DATA_DIR = './data'
 
 /** 默认数据库文件名 */
@@ -142,6 +145,58 @@ export const HEALTH_PATH = '/api/health'
 
 /** 迁移登记表名 */
 export const MIGRATION_TABLE = '_migrations'
+
+/**
+ * 缓存清理事件名（架构 §5.7）：插件停用/卸载后，若其 manifest 声明
+ * `runtime.requiresCachePurge: true`，插件管理器经 cordis 事件总线广播本事件
+ * （唯一参数为插件名）；持有派生缓存（索引、渲染结果、前端资源表等）的插件
+ * 或宿主监听该事件后自行清理，避免卸载后残留陈旧数据。
+ */
+export const CACHE_PURGE_EVENT = 'geewiki/cache-purge'
+
+/* ==================== 路径解析（与进程工作目录无关） ==================== */
+
+/** 仓库根识别标记：pnpm workspace 定义文件 */
+const WORKSPACE_MARKER = 'pnpm-workspace.yaml'
+
+/** 向上查找的最大层级（防御性上限，避免异常路径导致长循环） */
+const MAX_ROOT_LOOKUP_DEPTH = 8
+
+/**
+ * 自 `fromUrl`（调用方的 `import.meta.url`）所在目录向上查找仓库根目录。
+ * 识别依据：目录中存在 {@link WORKSPACE_MARKER}。未找到返回 undefined。
+ */
+export function findRepoRoot(fromUrl: string): string | undefined {
+  let dir: string
+  try {
+    dir = dirname(fileURLToPath(fromUrl))
+  } catch {
+    return undefined // 非 file: URL（如被打包器改写）→ 交由调用方回退
+  }
+  for (let depth = 0; depth < MAX_ROOT_LOOKUP_DEPTH; depth++) {
+    if (existsSync(join(dir, WORKSPACE_MARKER))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return undefined
+}
+
+/** 仓库根目录；不可探测时（如包被安装进 node_modules 脱离工作区）回退进程工作目录 */
+export function repoRootOf(fromUrl: string): string {
+  return findRepoRoot(fromUrl) ?? process.cwd()
+}
+
+/**
+ * 解析项目内路径（data/、config/、前端产物等）：
+ * 绝对路径原样返回；相对路径以**仓库根**为基准（无仓库根时相对进程工作目录）。
+ *
+ * 目的：消除进程工作目录（cwd）依赖——`pnpm dev`、`pnpm start`、
+ * `node packages/server/dist/index.js`、从任意子目录启动，都指向同一份数据与配置。
+ */
+export function resolveProjectPath(path: string, fromUrl: string): string {
+  return isAbsolute(path) ? path : resolve(repoRootOf(fromUrl), path)
+}
 
 /* ========================= HTTP 路由服务（插件间共享） ========================= */
 
@@ -164,6 +219,22 @@ export interface RouteHandlerContext {
 
 /** 路由处理器 */
 export type RouteHandler = (h: RouteHandlerContext) => void | Promise<void>
+
+/**
+ * 请求体未读完即已应答时的连接收尾：响应刷出后关闭连接。
+ *
+ * 用于 413（请求体超限）等提前拒绝场景：此时剩余请求体不会被消费，
+ * 若不关闭连接，客户端可能持续推送已被丢弃的数据，或该连接被误当作可复用。
+ * 响应体本身仍应经 `h.json(413, …)` 写出（统一出口 → 计入 stats() 与看门狗探针）。
+ */
+export function closeAfterResponse(h: RouteHandlerContext): void {
+  // 显式声明 Connection: close，使响应头与实际行为（随后关闭连接）一致，
+  // 避免出现"头部宣称 keep-alive、连接却被销毁"的矛盾语义
+  if (!h.res.headersSent) h.res.setHeader('connection', 'close')
+  h.res.once('finish', () => {
+    if (!h.req.readableEnded) h.req.destroy()
+  })
+}
 
 /** 路由服务统计（供看门狗健康监测使用） */
 export interface HttpRouterStats {
@@ -189,4 +260,18 @@ export interface HttpRouterService {
   register(method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH', path: string, handler: RouteHandler): () => void
   /** 请求统计（看门狗探针数据源） */
   stats(): HttpRouterStats
+  /** 进行中的路由请求数（路由处理器尚未结算；交接给静态资源层的请求不计入） */
+  inflight(): number
+  /**
+   * 除"调用方自身请求"外的在途请求数：在请求处理器内部调用时扣除本次请求，
+   * 在请求之外（如进程关停、看门狗）调用时等同 {@link inflight}。
+   * 排空日志/告警以此为准，避免把管理请求自己算成"待等待的请求"。
+   */
+  pending(): number
+  /**
+   * 优雅排空（架构 §5.1）：等待进行中的请求全部结算，最多等待 timeoutMs 毫秒。
+   * 插件卸载前由管理器调用，超时则由调用方强制卸载。
+   * @returns 是否在时限内排空（false = 仍有请求在执行）
+   */
+  drain(timeoutMs: number): Promise<boolean>
 }

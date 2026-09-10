@@ -36,8 +36,10 @@ declare module 'cordis' {
     plugin(plugin: unknown, config?: unknown): FiberLike & PromiseLike<FiberLike>
     /** 注册事件监听，返回解绑函数。 */
     on(name: string, listener: (...args: any[]) => any): () => boolean
-    /** 同步派发事件。 */
+    /** 同步派发事件（无 per-listener 保护：一个监听器抛错会跳过其余监听器）。 */
     emit(name: string, ...args: unknown[]): void
+    /** 并发派发事件：逐个监听器独立结算（allSettled），单个监听器抛错不阻断其余监听器。 */
+    parallel(name: string, ...args: unknown[]): Promise<void>
   }
 
   /** Context 构造器类型补充（真实值来自 cordis 包，类型发布缺失故在此补齐） */

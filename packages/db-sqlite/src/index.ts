@@ -7,7 +7,7 @@
  * 上层业务只面向 DatabaseAdapter 编程，可无缝切换至 PostgreSQL 等其他实现。
  */
 import { mkdirSync, readdirSync, readFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
 import type { Context } from 'cordis'
@@ -15,6 +15,7 @@ import {
   DEFAULT_DATA_DIR,
   DEFAULT_DB_FILENAME,
   MIGRATION_TABLE,
+  resolveProjectPath,
   type DatabaseAdapter,
   type RunResult,
 } from '@geewiki/core'
@@ -22,7 +23,10 @@ import {
 /* ============================== 配置 ============================== */
 
 export interface SqliteDbConfig {
-  /** 数据库文件路径；缺省为 <GEEWIKI_DATA_DIR 或 ./data>/geewiki.db */
+  /**
+   * 数据库文件路径；缺省为 <GEEWIKI_DATA_DIR 或 ./data>/geewiki.db。
+   * 相对路径以仓库根为基准解析（与进程工作目录无关，见 resolveProjectPath）。
+   */
   filename?: string
 }
 
@@ -141,9 +145,11 @@ export const SqliteDbPlugin = {
   name: '@geewiki/db-sqlite',
 
   apply(ctx: Context, config: SqliteDbConfig = {}) {
-    // 数据目录优先取环境变量（与 docker-compose 约定一致），否则取进程工作目录下的 ./data
+    // 数据目录优先取环境变量（与 docker-compose 约定一致），否则取仓库根下的 ./data；
+    // 相对路径一律以仓库根为基准解析（与进程工作目录无关，见 resolveProjectPath），
+    // 因此从任意 cwd 启动（pnpm dev / pnpm start / 子目录内 node）都落到同一份数据库
     const dataDir = process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR
-    const filename = resolve(config.filename ?? join(dataDir, DEFAULT_DB_FILENAME))
+    const filename = resolveProjectPath(config.filename ?? join(dataDir, DEFAULT_DB_FILENAME), import.meta.url)
     const adapter = new SqliteDatabase(filename)
     try {
       adapter.open()
