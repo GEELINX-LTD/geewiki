@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   BookText,
   GitBranch,
@@ -17,11 +17,14 @@ import {
   DropdownMenuLabel,
 } from './ui/DropdownMenu'
 import { focusRing } from './ui/a11y'
+import { CommandPalette } from './components/CommandPalette'
 import { ThemeToggle } from './components/ThemeToggle'
 import { SystemStatusDialog } from './components/SystemStatusDialog'
-import { MAIN_CONTENT_ID, SEARCH_INPUT_ID } from './lib/domIds'
+import { MAIN_CONTENT_ID } from './lib/domIds'
 import { stripHashQuery } from './lib/hashAnchor'
+import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
 import { titleForRoute } from './lib/pageMeta'
+import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice } from './lib/theme'
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AdminPage } from './pages/AdminPage'
@@ -48,17 +51,19 @@ function useRoute(): string {
 }
 
 /**
- * 全局搜索快捷键：`⌘K` / `Ctrl+K` 与 `/`。
+ * 命令面板快捷键：`⌘K` / `Ctrl+K` 与 `/`。
  *
  * 两个**必须处理**的细节（否则会惹恼用户）：
  *  1. **在输入框/文本域里不得劫持按键**——用户正打字时按 `/` 就是在输入斜杠，
  *     绝不能把焦点抢走。判据是 `event.target` 是否为可编辑元素。
+ *     （`⌘K` 不在此限：带修饰键的组合键在任何地方都应可用，这也是业界惯例。）
  *  2. 已按下修饰键时不要重复触发（`⌘K` 命中后不再走 `/` 分支）。
  *
- * 行为：跳转到知识库列表（`#/wiki/list`）并把焦点落到搜索框。
- * 之所以先跳转再聚焦：搜索框只存在于列表页，而快捷键是全局的。
+ * 行为变更（本批）：以前是"跳到列表页再把焦点送进搜索框"，现在**直接打开命令面板**。
+ * 理由是搜索框只能检索**当前列表**，而 ⌘K 的预期是"跳转到任意页面、或执行任意动作"——
+ * 列表页那个输入框仍保留（在列表内部即时过滤），两者职责不同、并列存在。
  */
-function useSearchShortcut(nav: (id: string) => void): void {
+function useCommandPaletteShortcut(onOpen: () => void): void {
   useEffect(() => {
     const isEditable = (el: EventTarget | null): boolean => {
       if (!(el instanceof HTMLElement)) return false
@@ -71,22 +76,21 @@ function useSearchShortcut(nav: (id: string) => void): void {
       )
     }
     const onKeyDown = (e: KeyboardEvent): void => {
-      if (isEditable(e.target)) return
       const isCmdK = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k'
+      if (isCmdK) {
+        e.preventDefault()
+        onOpen()
+        return
+      }
       const isSlash = e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
-      if (!isCmdK && !isSlash) return
+      if (!isSlash) return
+      if (isEditable(e.target)) return
       e.preventDefault()
-      nav('wiki/list')
-      // 等路由渲染出列表页与搜索框后再聚焦（两帧足够；用 rAF 避免与 React 提交赛跑）
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          document.getElementById(SEARCH_INPUT_ID)?.focus()
-        })
-      })
+      onOpen()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [nav])
+  }, [onOpen])
 }
 
 /** 主导航项（产品主入口） */
@@ -113,12 +117,54 @@ export function App(): ReactNode {
   useDocumentTitle(titleForRoute(route === '' ? 'wiki' : route))
 
   /** 统一 hash 跳转：规范化首尾斜杠，避免产生 '#/wiki/'（尾斜杠）或 '#/'（空路由）这类 URL */
-  const nav = (id: string): void => {
+  const nav = useCallback((id: string): void => {
     const clean = id.replace(/^\/+/, '').replace(/\/+$/, '')
     window.location.hash = clean ? `/${clean}` : '/wiki'
-  }
+  }, [])
 
-  useSearchShortcut(nav)
+  /**
+   * 命令面板的开关状态。提升到 App 层是因为**触发点有两个**：
+   * 全局快捷键（⌘K / `/`）与顶栏的搜索按钮——后者原先只是"跳到列表页并聚焦搜索框"。
+   */
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  /**
+   * 打开面板**之前**焦点在哪。用于关闭时归还焦点——本面板是受控对话框、没有
+   * `Dialog.Trigger`，Radix 自己只能退回 body（见 CommandPalette 的 restoreFocusTo 注释）。
+   */
+  const paletteReturnFocus = useRef<HTMLElement | null>(null)
+  const openPalette = useCallback(() => {
+    paletteReturnFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setPaletteOpen(true)
+  }, [])
+  useCommandPaletteShortcut(openPalette)
+
+  /**
+   * 主题 epoch：palette 里的"切换外观"动作**绕过** `useTheme()` 直接读写 localStorage
+   * （`readStoredTheme` / `storeTheme` / `applyTheme`）——因为 `ThemeToggle` 内部自持一份
+   * `useTheme()` 状态，两个实例之间没有同步通道。
+   * 改完 `key` 让 `ThemeToggle` 重新挂载，它就会重新读取当前值、图标不再滞后。
+   * （不去改 `ThemeToggle`/`theme.ts`：前者不在本批授权范围，后者的存储键与
+   *  `index.html` 的内联脚本共用、改动风险外溢。）
+   */
+  const [themeEpoch, setThemeEpoch] = useState(0)
+  const toggleTheme = useCallback(() => {
+    const next: ThemeChoice = resolveTheme(readStoredTheme()) === 'dark' ? 'light' : 'dark'
+    storeTheme(next)
+    applyTheme(next)
+    setThemeEpoch((n) => n + 1)
+  }, [])
+
+  /**
+   * 记录"最近访问"。只在**详情页**记（`visitedSlugFromSub` 用 `parseWikiRoute` 判断，
+   * 保留段与 `/edit` 后缀都不算），这样"最近访问"里不会混进列表页/检索页/编辑页。
+   */
+  const wikiSub = route === 'wiki' ? '' : route.startsWith('wiki/') ? route.slice('wiki/'.length) : null
+  useEffect(() => {
+    if (wikiSub === null) return
+    const slug = visitedSlugFromSub(wikiSub)
+    if (slug !== null) recordRecentPage(slug)
+  }, [wikiSub])
 
   /**
    * 系统状态对话框的开关。提升到这里（而非让 DialogTrigger 包住菜单项）是为了
@@ -232,19 +278,21 @@ export function App(): ReactNode {
         </nav>
 
         <div className="ml-auto flex items-center gap-1">
-          {/* 搜索入口：窄屏也保留（它是产品主功能），并提示快捷键 */}
+          {/* 搜索入口：窄屏也保留（它是产品主功能），并提示快捷键。
+              点击 = 打开命令面板（与 ⌘K 同一入口），而不是"跳到列表页再聚焦搜索框" */}
           <Button
             variant="ghost"
             size="sm"
             icon={<Search className="size-4" />}
-            onClick={() => nav('wiki/list')}
+            onClick={openPalette}
             className="hidden text-header-dim hover:bg-white/10 hover:text-white sm:inline-flex"
-            aria-label="搜索知识库（快捷键 ⌘K 或 /）"
-            title="搜索知识库（⌘K 或 /）"
+            aria-label="打开命令面板（快捷键 ⌘K 或 /）"
+            aria-haspopup="dialog"
+            title="搜索页面或执行命令（⌘K 或 /）"
           >
             搜索
           </Button>
-          <ThemeToggle />
+          <ThemeToggle key={themeEpoch} />
           {/* 窄屏导航降级：把全部目的地收进一个菜单 */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -285,6 +333,15 @@ export function App(): ReactNode {
 
       {/* 系统状态对话框（受控，见上面的 statusOpen 注释） */}
       <SystemStatusDialog open={statusOpen} onOpenChange={setStatusOpen} />
+
+      {/* 命令面板（受控）：⌘K / Ctrl+K / `/` 或点击顶栏「搜索」打开 */}
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        onNavigate={nav}
+        onToggleTheme={toggleTheme}
+        restoreFocusTo={paletteReturnFocus}
+      />
 
       {/*
         主内容区：`id="main"` 是「跳到主内容」的目标；`tabIndex={-1}` 让锚点跳转后
