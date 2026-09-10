@@ -63,6 +63,16 @@ export interface PluginInfo {
   source?: 'builtin' | 'external'
   /** 是否声明了配置 schema（决定管理台渲染表单还是 JSON 编辑框） */
   configurable?: boolean
+  /**
+   * 面向人的名称（manifest 的 `geewiki.displayName`）。
+   *
+   * **可选**：由后端从插件清单读取后透出，旧版本后端不会返回它，
+   * 因此前端一律经 `displayNameOf()` 回退（`displayName ?? 去 scope 的短名`），
+   * 不得假定它存在。
+   */
+  displayName?: string
+  /** 一句话说明（manifest 的 `geewiki.description`）；同样可能缺失 */
+  description?: string
 }
 
 /* --------------------- 插件配置 schema（schemastery） --------------------- */

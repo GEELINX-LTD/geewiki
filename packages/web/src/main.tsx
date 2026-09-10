@@ -8,11 +8,20 @@ import '@xyflow/react/dist/style.css'
 // 层序与新旧共存策略见该文件头部注释。
 import './styles/index.css'
 import { App } from './App'
+import { TooltipProvider } from './ui/Tooltip'
 import { startPluginUiSync } from './lib/pluginUi'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    {/*
+      TooltipProvider 挂在 React 根：Radix 的 Tooltip.Root **要求**祖先里有 Provider，
+      否则直接抛 "Tooltip must be used within TooltipProvider"（实测：管理台整页白屏、
+      控制台只有一条 Uncaught）。放在根上还让同一次悬停路径内的多个 tooltip 共享
+      `delayDuration` 的开关延迟（Radix 的设计语义），而不是各自计时。
+    */}
+    <TooltipProvider delayDuration={300}>
+      <App />
+    </TooltipProvider>
   </StrictMode>,
 )
 

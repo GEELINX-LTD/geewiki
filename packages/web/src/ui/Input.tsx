@@ -9,7 +9,7 @@
  *   但仍保留 outline 以确保高对比度模式下可见；
  * - 触控目标 ≥24px（`h-8` = 32px，达标）。
  */
-import type { InputHTMLAttributes, ReactNode } from 'react'
+import type { InputHTMLAttributes, ReactNode, TextareaHTMLAttributes } from 'react'
 import { cn } from './cn'
 import { focusRing } from './a11y'
 
@@ -40,12 +40,17 @@ export function Input({ className, invalid, ...rest }: InputProps): ReactNode {
 /**
  * Textarea：与 Input 同源的观感（等宽字体留给调用方用 `font-mono` 覆盖，
  * 因为只有代码/配置类输入才需要等宽）。
+ *
+ * 属性类型是 `TextareaHTMLAttributes`（**不是** `InputHTMLAttributes`）：
+ * 后者会把 `onChange` 的 `e.target` 推断成 `HTMLInputElement`，
+ * 于是调用方在文本域上写 `rows`/`onKeyDown` 时事件类型对不上
+ * （本仓库接入管理台时实测报 TS2322）。
  */
 export function Textarea({
   className,
   invalid,
   ...rest
-}: InputHTMLAttributes<HTMLTextAreaElement> & { invalid?: boolean }): ReactNode {
+}: TextareaHTMLAttributes<HTMLTextAreaElement> & { invalid?: boolean }): ReactNode {
   return (
     <textarea
       aria-invalid={invalid || undefined}

@@ -87,104 +87,38 @@ tr.clickable:hover td { background: var(--gw-surface-sunken); }
   border-radius: 6px; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
 }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
-.plugin-name { font-weight: 600; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
-.row-actions { display: flex; gap: 6px; align-items: center; }
 .empty { color: var(--muted); text-align: center; padding: 14px; }
 h2 + .empty { padding: 8px; }
 
 /* ---------- 统计条 ---------- */
 
-.stat-bar { display: flex; gap: 18px; align-items: center; padding: 2px 4px; flex-wrap: wrap; }
-.stat { font-size: 13px; font-weight: 600; }
-.stat.hint { font-weight: 400; color: var(--muted); margin-left: auto; font-size: 12px; }
 
 /* ---------- 配置编辑器 ---------- */
 
-.config-row td { background: var(--gw-surface-sunken); }
-.config-editor { display: flex; flex-direction: column; gap: 8px; }
-.config-editor label { font-size: 12px; color: var(--muted); }
-.config-editor textarea {
-  font-family: ui-monospace, Consolas, monospace; font-size: 13px; width: 100%;
-  border: 1px solid var(--line); border-radius: 8px; padding: 8px; resize: vertical; background: var(--gw-surface);
-}
-.config-actions { display: flex; gap: 8px; }
 
 /* ---------- 会话面板 ---------- */
 
-.session-card { display: flex; flex-direction: column; gap: 8px; }
-.session-head { display: flex; align-items: center; gap: 12px; }
-.session-head h2 { margin: 0; }
-.session-actions { margin-left: auto; }
-.session-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.session-list li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.session-list code { font-family: ui-monospace, Consolas, monospace; background: var(--gw-surface-hover); padding: 2px 8px; border-radius: 6px; }
-.boot-errors { background: var(--gw-danger-bg); border: 1px solid var(--gw-danger-line); border-radius: 8px; padding: 8px 12px; }
-.boot-errors h3 { margin: 0 0 4px; font-size: 13px; color: var(--gw-danger-ink); }
-.boot-errors p { margin: 2px 0; font-size: 12px; }
 
 /* ---------- 外部插件发现期问题（GET /api/plugins 的 issues） ---------- */
 
-.discovery-issues { background: var(--gw-warn-bg); border: 1px solid var(--gw-warn-line); border-radius: 8px; padding: 8px 12px; }
-.discovery-issues h3 { margin: 0 0 4px; font-size: 13px; color: var(--gw-warn-ink); }
-.discovery-issues ul { margin: 0; padding-left: 18px; }
-.discovery-issues li { margin: 2px 0; font-size: 12px; }
-.discovery-issues .chip { background: var(--gw-warn-bg); color: var(--gw-warn-ink); padding: 1px 6px; border-radius: 6px; }
 
 /* ---------- 插件界面（入口表 skipped，GET /api/plugins/ui） ----------
    与上面的"发现期问题"刻意用**不同色系**区分：那一类是"整个插件没加载进来"（黄=警告），
    这一类是"插件在、但它的前端界面没出现"（红=故障，典型症状是发布漏带 dist/）。 */
 
-.ui-skips-attention { background: var(--gw-danger-bg); border: 1px solid var(--gw-danger-line); border-radius: 8px; padding: 8px 12px; }
-.ui-skips-attention h3 { margin: 0 0 4px; font-size: 13px; color: var(--gw-danger-ink); }
-.ui-skips-attention ul { margin: 4px 0 0; padding-left: 18px; }
-.ui-skips-attention li { margin: 2px 0; font-size: 12px; }
-.ui-skips-attention .chip { background: var(--gw-danger-bg); color: var(--gw-danger-ink); padding: 1px 6px; border-radius: 6px; margin-left: 6px; }
 
 /* 正常的那一类（未启用 / 本就无前端界面）：折叠 + 弱化，别让噪声淹没真正的故障 */
-.ui-skips-normal { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
-.ui-skips-normal summary { cursor: pointer; font-size: 12px; color: var(--muted); }
-.ui-skips-normal ul { margin: 4px 0 0; padding-left: 18px; }
-.ui-skips-normal li { margin: 2px 0; font-size: 12px; }
 
 /* 插件名：等宽 + 浅底，便于在成片中文里一眼认出标识符 */
-.ui-skips-attention .name,
-.ui-skips-normal .name,
-.dependents-block .name { font-family: ui-monospace, Consolas, monospace; background: var(--gw-surface-hover); padding: 1px 6px; border-radius: 5px; }
 
 /* ---------- 依赖阻止停用（409 has_dependents）：保护性拦截，不是失败 ---------- */
 
-.dependents-block { background: var(--gw-accent-soft); border: 1px solid var(--gw-accent-soft-line); border-radius: 8px; padding: 8px 12px; }
-.dependents-block h3 { margin: 0 0 4px; font-size: 13px; color: var(--gw-accent-soft-ink); }
-.dependents-block ul { margin: 4px 0; padding-left: 18px; }
-.dependents-block li { margin: 2px 0; font-size: 12px; }
-.dependents-block p { margin: 2px 0; }
 
-.base-details summary { cursor: pointer; font-size: 13px; color: var(--muted); }
 
 /* ---------- 依赖图 ---------- */
 
-.page-graph { gap: 10px; }
-.legend { display: flex; gap: 16px; font-size: 12px; color: var(--gw-ink-soft); align-items: center; padding: 0 4px; flex-wrap: wrap; }
-.legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
-.dot.active { background: var(--ok); box-shadow: 0 0 0 3px rgb(22 163 74 / 15%); }
-.dot.inactive { background: var(--gw-line-strong); }
-.dot.error { background: var(--err); }
 
-.graph-canvas {
-  height: 640px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; position: relative;
-}
-.graph-canvas .empty { margin-top: 200px; }
 
-.flow-node {
-  width: 168px; padding: 10px 12px; background: var(--gw-surface); border: 1.5px solid var(--gw-line-strong);
-  border-radius: 10px; box-shadow: 0 2px 6px rgb(16 24 40 / 10%); font-size: 12px;
-}
-.flow-node.active { border-color: var(--gw-ok-line); background: var(--gw-ok-bg); }
-.flow-node.inactive { opacity: 0.85; border-color: var(--gw-line-strong); }
-.flow-node.error { border-color: var(--gw-danger-line); background: var(--gw-danger-bg); }
-.flow-node-name { font-weight: 700; font-family: ui-monospace, Consolas, monospace; margin-bottom: 6px; word-break: break-all; }
-.flow-node-meta { display: flex; gap: 4px; flex-wrap: wrap; }
 
 /* ---------- Wiki 正文 ---------- */
 
@@ -297,10 +231,6 @@ h2 + .empty { padding: 8px; }
 .schema-errors { margin-top: 2px; }
 
 /* 冲突组替换确认（管理台：启用撞上同组已激活插件时的顶替确认） */
-.replace-prompt { margin: 8px 0; padding: 8px 12px; background: var(--gw-warn-bg); border: 1px solid var(--gw-warn-line); border-radius: 8px; }
-.replace-prompt h3 { margin: 0 0 4px; font-size: 13px; color: var(--gw-warn-ink); }
-.replace-prompt p { margin: 0 0 8px; font-size: 12px; }
-.replace-prompt .chip { background: var(--gw-warn-bg); color: var(--gw-warn-ink); padding: 1px 6px; border-radius: 6px; }
 
 /* ---------- 检索与 AI 问答（宿主原生 UI） ---------- */
 
