@@ -9,10 +9,10 @@ GeeWiki 是面向团队内部的 **AI 原生 Wiki 知识库**。核心哲学为 
 三大设计目标：
 
 - **极致轻量**：系统默认仅依赖一个 SQLite 数据库即可运行（开箱即用），0 外部依赖部署。
-- **高可扩展性**：插件生态按冲突组划分（数据库组、LLM 组、编辑器组……），前端通过**宿主侧 Slot 插槽**动态插拔组件（边界见第 6 章）。
+- **高可扩展性**：插件生态按冲突组划分（数据库组、编辑器组……），而**检索 / 问答 / LLM 契约层三类插件刻意不进任何冲突组**（它们是可自由组合的服务提供方，详见第 9 节）；前端通过**宿主侧 Slot 插槽**动态插拔组件（边界见第 6 章）。
 - **安全可控**：热插拔需显式授权、会话层沙箱自愈、看门狗熔断、迁移控制器拦截，保证系统在持续扩展中保持稳定。
 
-设计参照（见第 9 节）：借鉴 PandaWiki 的 Wiki 功能边界并摒弃其重架构（Redis、多服务拆解）；学习 Cordis 生态中插件间 `ctx` 的隔离与通信模式；参考 VS Code / Obsidian 的插件沙箱与禁用/启用交互范式。
+设计参照（见第 10 节）：借鉴 PandaWiki 的 Wiki 功能边界并摒弃其重架构（Redis、多服务拆解）；学习 Cordis 生态中插件间 `ctx` 的隔离与通信模式；参考 VS Code / Obsidian 的插件沙箱与禁用/启用交互范式。
 
 ## 2. 技术栈选型
 
@@ -45,14 +45,17 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
         │
         │  服务抽象层 (DI)
         ▼
-插件生态（按冲突组划分）：[数据库组: SQLite / PG] [LLM组: OpenAI / Anthropic] [编辑器组: Milkdown / TipTap]
+插件生态（按冲突组划分）：[数据库组: SQLite / PG] [编辑器组: Milkdown / TipTap]
+        ＋
+AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search（FTS5+trigram 检索，默认启用）
+        → @geewiki/ai（检索增强问答，无 key 时降级 retrieval-only）→ @geewiki/llm（契约层：route→provider 注册表，**本阶段尚无厂商 adapter**）
 ```
 
 各层职责（对应上图中原稿的完整描述）：
 
 1. **React 19 前端**：管理界面与 Wiki 界面。宿主侧 Slot 插槽机制——插件 UI bundle 加载后把组件注册进宿主的 `app-header` / `app-footer` 插槽（无后端 `ctx.slot()` 链路，见第 6 章）；以 React Flow 渲染依赖图可视化。前端通过 **REST API（HTTP）**与 Plugin Manager 通信——**当前没有 WebSocket / 推送通道**，界面数据靠请求-响应获取。
 2. **Plugin Manager（核心大脑）**：位于服务抽象层（DI，由 Cordis 提供）之上，包含热加载引擎、依赖图/冲突组管理、会话层沙箱机制、迁移控制器、看门狗探针与配置热管理中心。详见第 5 章。
-3. **插件生态**：全部业务能力以插件形式存在，按冲突组划分，例如数据库组（SQLite / PG）、LLM 组（OpenAI / Anthropic）、编辑器组（Milkdown / TipTap）。
+3. **插件生态**：全部业务能力以插件形式存在。**按冲突组划分**的是真正互斥的同类实现，例如数据库组（SQLite / PG）、编辑器组（Milkdown / TipTap）；而**检索（`@geewiki/search`）、问答（`@geewiki/ai`）、LLM 契约层（`@geewiki/llm`）三类插件刻意不进任何冲突组**——它们提供的是可被多方复用的服务，互斥应留给各厂商 adapter 自己声明（详见第 9 节）。
 
 ## 4. 数据库即互斥插件
 
@@ -161,7 +164,7 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
 - 插件目录为 **`<仓库根>/plugins/<name>/`**（可用 `GEEWIKI_PLUGINS_DIR` 覆盖；`null`/空表示关闭外部发现）。宿主启动时先登记内置注册表，再扫描该目录把外部插件并入同一注册表（`packages/manager/src/discovery.ts`），因此外部插件与内置插件在依赖拓扑、冲突组、会话沙箱、看门狗上**完全同权**。
 - 清单来源二选一：子目录 `package.json` 顶层 `geewiki` 键（优先）或独立的 `geewiki.manifest.json`。入口按 `geewiki.entry` → `index.ts` → `index.js` → `src/index.ts` 顺序探测，加载用 `await import(pathToFileURL(entry).href)` 后取 `mod.default ?? mod`（ESM 不解析目录说明符；含 `#`/`?` 的裸绝对路径会被当作 URL 解析失败，故一律走 `pathToFileURL`）。
 - **失败隔离**：单个插件的清单缺失/入口缺失/路径越界/重名/加载抛错都只记一条 issue 并跳过它，不阻断宿主启动与其余插件。入口与迁移目录**经 `realpathSync` 取真实路径后**必须仍在插件目录内（拒绝 `../` 穿越与 symlink 逃逸；根目录与候选路径都做真实化，因此把整个插件目录做成 symlink 不会误拒全部插件）；symlink 子目录**是目录则纳入发现、否则记一条 issue**（不再静默忽略）。与内置插件或先发现者重名的一律跳过并告警。
-- **发现期问题对外可见**：`GET /api/plugins` 的响应为 `{ plugins, issues }`——`issues` 是 `DiscoveryIssue[]`，元素形状 `{ code, dir, message }`，`code` 为 `missing_manifest` / `invalid_manifest` / `entry_not_found` / `invalid_plugin_path` / `invalid_plugin_dir` / `duplicate_plugin` / `invalid_module` / `load_failed` 八值枚举（`packages/manager/src/discovery.ts`）。因此"目录里躺着但没被加载"的插件**在 API 上可见**（例：插件根目录不可读 → `invalid_plugin_dir`）；前端管理页仍待补"有插件被跳过"的提示位（登记于 `docs/plugin-platform-plan.md` 第 5 节 L-14）。
+- **发现期问题对外可见**：`GET /api/plugins` 的响应为 `{ plugins, issues }`——`issues` 是 `DiscoveryIssue[]`，元素形状 `{ code, dir, message }`，`code` 为 `missing_manifest` / `invalid_manifest` / `entry_not_found` / `invalid_plugin_path` / `invalid_plugin_dir` / `duplicate_plugin` / `invalid_module` / `load_failed` 八值枚举（`packages/manager/src/discovery.ts`）。因此"目录里躺着但没被加载"的插件**在 API 上可见**（例：插件根目录不可读 → `invalid_plugin_dir`）；前端管理页的"有插件被跳过"提示位**已补**（`packages/web/src/pages/AdminPage.tsx:314` 的 `.discovery-issues` 区块渲染 `code` / `dir` / `message`，样式见 `packages/web/src/styles.css:179-183`），该条缺口已闭合（原登记于 `docs/plugin-platform-plan.md` 第 5 节 L-14）。
 - 插件目录**不是** pnpm workspace 包，不需要（也不应）为它做安装步骤；入口里的 TypeScript 由宿主进程的 tsx loader 直接执行，因此外部插件只应使用 Node 内置能力与宿主经 `ctx` 暴露的服务（零依赖示例见 `plugins/hello-geewiki/`）。
 
 ## 6. 前端 UI 插槽机制（React 19）
@@ -197,7 +200,9 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
 
 每个插件根目录包含 `geewiki.manifest.json`（或扩展 `package.json`，将元数据嵌套在顶层 `geewiki` 键下）。
 
-> 现状说明：**外部插件目录发现已落地**（见 5.8）：宿主启动时扫描 `<仓库根>/plugins/<name>/`，按子目录 `package.json` 的 `geewiki` 键或独立 `geewiki.manifest.json` 读取清单并加载；内置插件仍由代码内置注册表静态登记（`packages/server/src/index.ts` 的 `defaultRegistry`，共 **4 个已注册**：`@geewiki/http`、`@geewiki/db-sqlite`、`@geewiki/wiki`、`@geewiki/echo`），两者并入同一注册表。**数量口径注意**：默认基础层清单 `config/plugins.base.json` 只**启用 3 个**（`@geewiki/db-sqlite` / `@geewiki/http` / `@geewiki/wiki`），`@geewiki/echo` 已注册但默认未启用——因此 `GET /api/plugins` 显示 4 条内置，挂载示例外部插件后为 5 条。零依赖示例见 `plugins/hello-geewiki/`。
+> 现状说明：**外部插件目录发现已落地**（见 5.8）：宿主启动时扫描 `<仓库根>/plugins/<name>/`，按子目录 `package.json` 的 `geewiki` 键或独立 `geewiki.manifest.json` 读取清单并加载；内置插件仍由代码内置注册表静态登记（`packages/server/src/index.ts` 的 `defaultRegistry()`，共 **7 个已注册**：`@geewiki/db-sqlite`、`@geewiki/http`、`@geewiki/echo`、`@geewiki/llm`、`@geewiki/search`、`@geewiki/wiki`、`@geewiki/ai`），两者并入同一注册表。**数量口径注意**：默认基础层清单 `config/plugins.base.json` 只**启用 4 个**（`@geewiki/db-sqlite` / `@geewiki/http` / `@geewiki/wiki` / **`@geewiki/search`**），`@geewiki/echo`、`@geewiki/llm`、`@geewiki/ai` 已注册但默认未启用——因此 `GET /api/plugins` 显示 7 条内置，挂载示例外部插件后为 8 条。零依赖示例见 `plugins/hello-geewiki/`。
+>
+> **`provides` 与服务名不是一回事**：`geewiki.provides` 只是**依赖图谱 token**，不会创建 cordis 服务；且它与本插件 `ctx.provide` 的服务名**并不总相同**（`db-sqlite` 声明 `database-provider` 但提供 `'db'`；`http` 声明 `http-service` 但提供 `'http'`）。**完整映射表见第 9.2 节——写消费方代码前必读。**
 
 完整示例：
 
@@ -227,7 +232,7 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
 | `name` | 顶层 | 是 | — | 插件名称（npm 风格，如 `@geewiki/ai-assistant`），依赖图与冲突组以它作为标识 |
 | `version` | 顶层 | 是 | — | 插件版本号（语义化版本） |
 | `geewiki` | 顶层 | 是 | — | 插件元数据命名空间（扩展 package.json 时必填） |
-| `geewiki.provides` | `geewiki` | 是 | — | 该插件对外提供的服务/能力标识（如 `ai-service`），供其他插件 `requires` 引用 |
+| `geewiki.provides` | `geewiki` | 是 | — | 该插件对外提供的服务/能力标识（如 `ai-service`），供其他插件 `requires` 引用。**⚠️ 这是依赖图谱 token，不会创建 cordis 服务**，且**与 `ctx.provide` 的服务名并不总相同**（`db-sqlite` 声明 `database-provider` 但提供 `'db'`、`http` 声明 `http-service` 但提供 `'http'`；search / wiki / llm / ai 四者同名）——完整映射表见 **9.2 节**，消费方必须按真实服务名 `ctx.get` |
 | `geewiki.requires` | `geewiki` | 是 | — | 依赖的插件/服务标识列表（示例依赖 `@geewiki/core`）；加载时自动递归加载未激活的依赖项 |
 | `geewiki.conflictGroup` | `geewiki` | 否（可选） | — | 广义冲突组名：同组内全局仅允许激活一个（如 `llm-provider`、`database-provider`） |
 | `geewiki.migrations` | `geewiki` | 否（可选目录） | — | 迁移脚本目录（SQL/JS，相对插件目录），插件激活前由迁移控制器执行（见 5.5）；外部插件的该目录必须位于插件目录内（拒绝路径穿越） |
@@ -249,7 +254,150 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
 - **密钥管理**：仓库不提交 `.env` 文件；`DB_PASSWORD` 由部署者在部署环境的 `.env` 中提供。
 - **默认开箱即用**：不启用任何 profile 时仅运行 geewiki-app，SQLite 持久化于 `./data`，无需额外数据库容器。
 
-## 9. 参考与对比
+## 9. 检索与 AI 能力层（本阶段新增）
+
+本阶段落地的是"AI 原生知识库"的**检索地基 + 问答骨架**：把"检索"与"生成"彻底解耦，让**没有 API key 时整条链路依然完整可用**。三个插件均在 `packages/server/src/index.ts` 的 `defaultRegistry()` 静态登记，且**都不进任何冲突组**。
+
+### 9.1 三个插件
+
+| 插件 | 包路径 | `provides` | `requires`（服务 token） | 默认部署 | 对外端点 |
+| --- | --- | --- | --- | --- | --- |
+| `@geewiki/search` | `packages/plugin-search/` | `search-service` | `['database-provider', 'http-service']` | **启用**（`config/plugins.base.json` 第 4 条） | `GET /api/search?q=&limit=&mode=` |
+| `@geewiki/llm` | `packages/plugin-llm/` | `llm-service` | `[]`（零依赖，无 provider 也能装载） | 已注册未启用 | 无（纯服务契约层） |
+| `@geewiki/ai` | `packages/plugin-ai/` | `ai-service` | `['http-service', 'database-provider', 'search-service', 'llm-service']` | 已注册未启用 | `POST` / `GET /api/ai/ask`、`GET /api/ai/capabilities` |
+
+三者都声明 `runtime.supportsHotReload: true`、`requiresCachePurge: false`、`drainTimeout: 5`，均无进程内状态（索引在库里、路由注册表在内存但可安全重建），故可安全热插拔。`@geewiki/search` 另带 `migrations: './migrations'`（`SEARCH_MIGRATIONS_DIR`），由**管理器的迁移控制器在激活前执行**（见 5.5），不依赖 `db-sqlite` 自己的迁移。
+
+### 9.2 服务名映射表（**消费方必读**）
+
+> ⚠️ **manifest 的 `provides` token 与本插件 `ctx.provide` 的服务名并不总相同。** 两者是**两套命名空间**：`requires` 里写的是 **`provides` token**（由管理器的 `resolveDependency` 解析依赖边），而 `ctx.get(...)` 取的是**真实 cordis 服务名**。混用**不会报错**，只会让 `ctx.get` 拿到 `undefined`，表现为"功能静默不可用"——这是本仓最难定位的一类症状。
+
+| `provides` token（写进 `requires` 用） | 真实服务名（`ctx.get` 用） | 提供者插件 | 定义处 | 同名？ |
+| --- | --- | --- | --- | --- |
+| `database-provider` | **`db`** | `@geewiki/db-sqlite` | `packages/db-sqlite/src/index.ts:160`（`ctx.provide('db', adapter)`） | ❌ **不同名** |
+| `http-service` | **`http`** | `@geewiki/http` | `packages/server/src/index.ts:575`（`ctx.provide('http', router)`） | ❌ **不同名** |
+| `wiki-service` | `wiki-service` | `@geewiki/wiki` | `packages/plugin-wiki/src/index.ts:443` | ✅ |
+| `search-service` | `search-service` | `@geewiki/search` | `packages/plugin-search/src/index.ts:383` | ✅ |
+| `llm-service` | `llm-service` | `@geewiki/llm` | `packages/plugin-llm/src/index.ts:117` | ✅ |
+| `ai-service` | `ai-service` | `@geewiki/ai` | `packages/plugin-ai/src/index.ts:552` | ✅ |
+| （未声明 `provides`） | `manager` | `@geewiki/manager` | `packages/manager/src/index.ts:1393` | — |
+| （**已撤销** `echo-service`） | **无服务** | `@geewiki/echo` | — | — |
+
+**本阶段的"服务提供一致性"三次修复**（同一类缺陷的三种表现，均已收敛）：
+
+1. **`@geewiki/wiki` 只声明不提供**：manifest 写着 `provides: 'wiki-service'`，却从未 `ctx.provide` ⇒ 任何 `requires: ['wiki-service']` 的消费方依赖被解析为"已满足"，而 `ctx.get('wiki-service')` 恒为 `undefined`。**已补**真实 `ctx.provide('wiki-service', svc)`（`packages/plugin-wiki/src/index.ts:443`）。
+2. **`@geewiki/echo` 谎报 token**：声明 `provides: 'echo-service'` 但从未提供，且**全仓无任何消费方**。**已撤掉**该字段（`packages/plugin-echo/src/index.ts:33`），而不是为它硬造一个无人使用的服务契约。
+3. **新增三个插件一律"声明 token + 显式 provide + 同名"**：`search` / `llm` / `ai` 三者的 `provides` token 与服务名**严格同名**，并在源码注释里写明"两者名字必须一致，否则消费方 `ctx.get` 拿到 `undefined`"。
+
+> 判断规则（写新插件时照此执行）：`provides` 是**依赖图谱 token**，它**不会创建任何 cordis 服务**；要对外提供能力，必须显式 `ctx.provide(<服务名>, svc)` 并在 dispose 时注销，同时导出服务契约类型供消费方使用。
+
+### 9.3 `@geewiki/search`：FTS5 + `trigram` 的中文检索事实
+
+**索引形态**（`packages/plugin-search/migrations/0001_search.sql`）：FTS5 **external content** 虚表 `pages_fts(title, content, content='pages', content_rowid='id', tokenize='trigram')`，配三条触发器（`pages_fts_ai` / `pages_fts_ad` / `pages_fts_au`）与末尾的 `rebuild` 回填；迁移脚本**不写 `BEGIN`/`COMMIT`**（`db.migrate()` 已把每个迁移文件包在单个事务里，脚本内再开事务会嵌套报错）。
+
+> ⚠️ **本仓最容易被误传的一点**：中文检索能不能用，**完全取决于 `tokenize` 参数**。以下四条均已在 `better-sqlite3@13.0.3` 上复验（2026-09-10，HEAD `585dbac`）：
+
+| # | 事实 | 实测证据 |
+| --- | --- | --- |
+| ① | `better-sqlite3` 的**预编译包已含 FTS5**，**无需 node-gyp** | `db.pragma('compile_options')` 含 **`ENABLE_FTS5`**（59 项之一）；`select sqlite_version()` = **3.53.4**；`CREATE VIRTUAL TABLE … USING fts5(x, tokenize='trigram')` 直接成功 |
+| ② | FTS5 默认的 **`unicode61` 分词器把连续 CJK 当成一个 token** ⇒ **中文等于搜不到** | 同一段中文正文下，`MATCH '"知识库"'` → **0 命中**、`'"全文检索"'` → **0 命中**、`'"插件化知识库"'` → 0 命中；只有整段完全相同（如 `'"GeeWiki"'`）才命中 |
+| ③ | 因此**必须显式 `tokenize='trigram'`** | 同一正文下 `MATCH '"知识库"'` → **1 命中**、`'"全文检索"'` → 1 命中、`'"gee"'` → 1 命中（大小写不敏感的子串匹配） |
+| ④ | **trigram 的硬缺口**：查询串 **<3 字符**时 `MATCH` 恒为空 | `MATCH '"检索"'`（中文 2 字）→ **0 命中**、`'"库"'`（1 字）→ 0 命中；`'"知识"'` → 0 命中。该缺口由插件层 **LIKE 兜底**（`mode: 'like'`）覆盖 |
+
+**两条检索路径**（响应里的 `mode` 回传实际走的那条，用于观测与测试）：
+
+- `fts`：查询串（trim 后）**≥3 字符**（`MIN_TRIGRAM_LENGTH = 3`）→ `pages_fts MATCH ?`，按 BM25 相关度排序。查询串经 `toFtsPhrase()` **整体加双引号**（内部双引号翻倍）——这是**查询语法注入防护**：用户输入绝不按 FTS5 语法解释，否则 `*`、`NEAR(`、`a OR b`、裸 `"` 会抛 `fts5: syntax error` 或改变语义。
+- `like`：**<3 字符** → LIKE 兜底，且**直接扫 `pages` 真源表而非索引**。这是刻意的：短查询本就用不上 trigram 索引（切不出完整 3 字符片段），且这样在**索引漂移**（迁移未跑全、触发器被删）时短查询仍给出正确结果。`%` / `_` / `\` 经 `escapeLike()` 转义并配 `ESCAPE '\'`。
+
+**索引体积**：trigram 索引与正文**同量级**。本轮自测（5000 行、正文合计 6.23 MB）→ 建索引后库文件增长 **7.07 MB**（≈ **1.14×** 正文）；`migrations/0001_search.sql` 内记录的仓库实测为 6.6 MB 语料 +7.9 MB。
+
+**端点契约** `GET /api/search?q=&limit=&mode=` → `{ ok, query, mode: 'fts'|'like', queryMode: 'phrase'|'terms', total, hits: [{ slug, title, snippet, score, updated_at }] }`：
+
+- **请求参数是 `q` / `limit` / `mode`**；`limit` 须为 **1..100** 的整数（配置项 `limit` 默认 20）；`mode` 缺省 `'phrase'`。
+- **响应里有两个方向不同的字段，不要混**：**`mode`** 回传**实际走的那条路径**（`'fts'` / `'like'`，观测与测试用）；**`queryMode`** 回传**本次请求的查询语义**（`'phrase'` / `'terms'`）。
+- 参数错误 → **400**：空查询（含只有空白）`invalid_query`；非法 `limit` `invalid_limit`；**非法 `mode`（非 `phrase` / `terms`）`invalid_mode`**——不做静默降级，因为把 `term` / `keywords` 这类拼错当 `phrase` 会表现为"问了却没结果"。
+- **`total` 是全量命中数，不受 `limit` 限制**，且用 **`COUNT(DISTINCT p.id)`** 统计：`terms` 模式下 OR 会让同一行被多个词元各自命中，`COUNT(*)` 会把该行按命中次数重复计入，而契约里 `total` 与 `hits` 是同一套"行"语义。
+- `snippet` 是**服务端已 HTML 转义的 HTML**（只含 `<mark>`）：正文先按原始下标切片、三段分别转义、再拼进 `<mark>`，故正文里的 `<script>` 不可能逃逸成真标签。**消费方不得二次转义**（会显示成字面 `&lt;mark&gt;`），也不得当纯文本插入页面。自实现高亮而非用 FTS5 的 `snippet()`——trigram 下后者上限约 64 token（≈ 中文 64 字），太短且会把片段切得很碎。
+- `score` 是 FTS 路**取负后的 BM25**（越大越相关）；**这不是归一化**——值域无界、量级随语料规模与查询词变化，故**只在同一次查询的结果内部可比**；LIKE 路恒为 `0`，两种 `mode` 的 `score` 也不可比。
+
+**查询语义 `queryMode`（`phrase` 缺省 / `terms`）**——这一维与"走 FTS 还是 LIKE"正交：
+
+- `phrase`（缺省，**搜索框语义**）：整串经 `toFtsPhrase()` 加引号当一个**字面短语**。
+- `terms`（**问句检索 / RAG 语义**）：把查询切成**词元**后以 **OR** 连接。切分规则由 trigram 的硬约束决定（<3 字符的词元在 `MATCH` 下恒为空）：**CJK 连续片段**取长度 3 的**滑窗 3-gram**（「检索增强怎么做」→ 检索增/索增强/…）；**ASCII/数字片段**按空白与常见标点切词，只保留长度 ≥3 者。**每个词元仍各自 `toFtsPhrase()` 后拼 OR**——切词与转义分开，"注入防护只有一处实现"。`terms` 切不出词元时（<3 字符、纯标点）**回退 LIKE**（不构造空 `MATCH`，它抛 `fts5: syntax error`）。`terms` 下 BM25 天然让"命中词元更多"的行排前（OR 的相关度是各词元得分之和）；`snippet` 的锚点也改为**逐个词元试**（问句本身不在正文里，用整句定位会让每条命中都高亮为空）。
+- **⚠️ 已知缺陷与修复状态（如实记录，以最终提交为准）**：`phrase` 作为缺省使 `@geewiki/ai` 的问答**按整串短语检索**，而自然语言问句几乎不可能逐字连续出现在正文里 ⇒ **恒为 0 命中**，问答的检索地基实际不可用。**修复**即上面的 `terms` 模式，并让 `@geewiki/ai` 一律走 `terms`（`packages/plugin-ai/src/index.ts` 的 `search.search(query, { limit, mode: 'terms' })`）。**截至本文取数时刻，该修复在工作树中已实现但尚未提交**：HEAD `585dbac` 的已提交版本仍是 `search(query, { limit })` 且端点不读 `mode` 参数。**本文不对"问答召回是否正常"下任何断言。**
+
+**服务契约** `SearchService`（`ctx.get('search-service')`）：`search(q, opts?: { limit?: number; mode?: SearchMode }): SearchResult`（`SearchMode = 'phrase' | 'terms'`，缺省 `'phrase'`）与 `contents(slugs: readonly string[]): ReadonlyMap<string, string>`。`search()` 与端点走**同一份实现**（端点只做 HTTP 层），故两者在同 `q` 同 `limit` 下结果逐字段一致；`limit` 非法时服务层抛 `RangeError`（对应端点的 400）。`contents()` 供 RAG 拼上下文，**只包含真实存在的 slug**（查不到的键不出现，消费方据此区分"页面不存在"与"正文为空串"）；占位符按 `slugs.length` 动态生成、值一律参数绑定（绝不把 slug 文本拼进 SQL）。插件卸载后调用**显式报错**，绝不返回空结果——"卸载后静默返回 0 命中"会被误读成"库里没有匹配内容"。
+
+### 9.4 `@geewiki/llm`：契约 + 降级 + 密钥安全（**本阶段不含任何厂商 adapter**）
+
+本阶段有意**不实现任何厂商 adapter**：产品价值"没有 API key 时整条链路依然完整可用"这条契约不需要 adapter 就能验证，而"流式 SSE + 宿主排空"是更难的一层，混批会让两类缺陷互相掩盖。因此**当前实际不存在任何可用 provider**——只注册了一个恒不可用的兜底路由 `null`（`NULL_PROVIDER`：`available: () => false`，被点名时产出单个 `error{MISSING_CREDENTIAL}`）。
+
+**契约要点**（`packages/plugin-llm/src/types.ts`）：
+
+- **统一错误码枚举**（跨 provider 可判别，不依赖各厂商的错误文本）：`NO_ADAPTER` / `MISSING_CREDENTIAL` / `INVALID_CREDENTIAL` / `AUTH` / `RATE_LIMIT` / `CONTEXT_WINDOW_EXCEEDED` / `TIMEOUT` / `NETWORK` / `PROVIDER_ERROR` / `ABORTED`。
+- **调用方按 `type`/`code` 分支，绝不按 `message` 文本分支**——message 是给人看的，可能被脱敏、也可能被上游改写。
+- **`error` chunk 在结构上就没有 `message` 字段**：上游报错文本里可能夹带密钥（URL query、鉴权头回显），从结构上让它无处可去，比"记得脱敏"更可靠。
+- **终止保证**：`stream()` **保证终止 chunk（`done` / `error`）恰出现一次且在末位**，且**绝不抛异常** ⇒ 消费方可以无判空 `for await`。五条路径都被钉死：provider 抛错 → `error`；signal 已/中途 abort → `error{ABORTED}`；终止之后仍产 chunk → 丢弃并关闭上游；未产终止就结束 → `error{PROVIDER_ERROR}`；无可用 provider → `error{NO_ADAPTER}`。
+- **服务本身绝不重试**：重试涉及退避、配额与幂等语义，属独立层的职责；偷偷重试会让上层无法判断"这次失败到底花了多少配额"。
+- 重复注册同一 `route` **必须抛错**（不得静默覆盖）；`available()` 抛错视为不可用（不拖垮整个服务）。
+
+**密钥安全**（结构性而非纪律性）：
+
+- 配置里只存**环境变量名**（`apiKeyEnv`，如 `DEEPSEEK_API_KEY`）而非密钥值——结构上杜绝密钥进入**会落盘入库**的 `config/plugins.base.json`。
+- `detectSuspiciousCredential()`：识别"把密钥值本身填进该字段"，命中则让**插件激活失败**（throw 而非 `process.exit(1)`——后者会把一个可恢复的配置问题升级成整站不可用）。**保守优先**：全大写 SNAKE 命名（`DEEPSEEK_API_KEY`）一律放行，因为把变量名误判成密钥会让插件无法激活，而漏判只是少脱敏一处日志。
+- `redact()`：日志/错误文本脱敏，与检测**共用同一组正则源**（`SECRET_PATTERN_SOURCES`，单一事实来源），并遮蔽 `authorization` / `proxy-authorization` / `x-api-key` / `api-key` 等头名后面的值（保留原有引号，避免把 JSON 日志改成非法 JSON）。
+- `status.message` 经 `redact` 后输出；**`text-delta`（模型输出）刻意不脱敏**——脱敏会篡改模型输出内容。
+
+### 9.5 `@geewiki/ai`：检索增强问答的**检索-only 形态**
+
+**核心产品承诺：没有 API key 时也完整可用。** 因此检索与生成彻底解耦：**检索永远执行、`sources` 永远返回**，只有"回答"这一步会因缺模型而降级为零成本的**抽取式摘要**。有没有 key，**响应结构完全相同**（`AskResponse`），差别只在 `mode` / `degraded` / `answer` 三个字段上——前端不必为降级写一套平行的错误分支。
+
+**状态码语义**（`packages/plugin-ai/src/types.ts` 的注释即契约）：`200` = 正常（**含降级、含检索无结果**）、`400` = 调用方输入问题、`500` = 我们自己的代码炸了。**绝不用 4xx/5xx 表达"没有配置模型"**。
+
+| 端点 | 入参 | 成功 | 错误 |
+| --- | --- | --- | --- |
+| `POST /api/ai/ask` | body `{ q, limit?, extractive? }`（未知字段/非对象 body → `invalid_body`） | `200` + `AskResponse` | `400 empty_query`（`q` 缺失/空白）、`400 too_long`（`q.length > 500`）、`400 invalid_limit`、`400 invalid_extractive`、`400 invalid_json`、`413 payload_too_large`（body 上限 1 MB） |
+| `GET /api/ai/ask` | query `q`、`limit`、`extractive` | 同上 | 同上 |
+| `GET /api/ai/capabilities` | — | `200` + `CapabilitiesResponse`（`available` / `degraded` / `providers` / `message`） | — |
+
+`MAX_QUERY_LENGTH = 500`（`packages/plugin-ai/src/index.ts:98`）。`capabilities()` 让前端据此决定是否显示"未配置模型"提示，`message` 已脱敏。
+
+**响应字段与降级**：`mode` **诚实反映实际发生了什么**——`retrieval-only`（没有可用 provider，只返回检索结果 + 抽取式摘要；**本阶段恒为此值**）/ `rag`（模型确实生成了回答）/ `rag-partial`（生成中途失败但有部分文本，`partial: true`）。`degraded: { reason, code, message }` 中 `reason` 是**跨 provider 可判别的枚举**（`no_provider` / `missing_credential` / `invalid_credential` / `rate_limit` / `timeout` / `context_window_exceeded` / `network` / `provider_error`，加上本插件自身的 `search_unavailable` / `empty_query`），**前端据此选文案，不要按 `message` 分支**。
+
+**上下文截断策略**（`packages/plugin-ai/src/select.ts:44` 的 `selectSources()`，纯函数）：
+
+- 按 `score` 降序排序（LIKE 路 `score` 全为 0，靠 `Array.prototype.sort` 的稳定性保持检索服务给的 `updated_at DESC` 顺序）。
+- 逐条：先用 `perSourceChars` 截断正文，再判断 `usedChars + text.length <= totalContextChars`，且已入选条数 `< maxSourcesInContext`。
+- ⚠️ **放不下就整条丢弃，绝不做尾部裁切**：半句话会诱导模型顺着编下去，而"少一条来源"只是信息量略低。
+- 答案必须精确回传到响应的 `sources[].used` 与 `sources[].n` 上——否则前端会展示一批"看起来被引用了、实际没进 prompt"的来源。被丢弃者 `used: false` 且 `n: null`；**`n` 只对 `used: true` 者从 1 起连续编号**（故类型是 `number | null`），与 prompt 里的 `[n]` 严格一致。
+- 页面在"检索命中"与"取正文"之间被删除（竞态）时该条无法进上下文；注意区分"页面不存在"（`undefined`）与"页面正文为空串"——后者仍可只靠标题入上下文。
+- 抽取式摘要用**未截断**的原文定位命中词（命中点可能落在 `perSourceChars` 之外）。
+- **检索一律走 `mode: 'terms'`**：`search.search(query, { limit, mode: 'terms' })`（工作树状态，见 §9.3 的修复状态说明）。本插件的入口是**自然语言问句**，按整串短语检索会恒为 0 命中；词元切分复用 `@geewiki/search` 的单一实现（`buildTermQuery`），本插件**不重复实现分词**。
+- 正文一律经 `search-service.contents()` 取，**不直连 wiki 的 `pages` 表**——否则 wiki 的表结构会变成跨包隐式契约。
+
+**唯一接线点**：`generate()`（`packages/plugin-ai/src/index.ts:261`）是本阶段**唯一有意未接线**的函数——没有厂商 adapter 时 `availableProviders()` 为空，它必然走降级分支。将来 adapter 批次只需在这一个函数里补齐"按需中断/超时、token 计量口径、SSE 增量外发"三件事，其余代码无需改动；prompt 拼装已拆成纯函数（`prompt.ts` 的 `buildContext` / `buildMessages` / `SYSTEM_PROMPT`）并有单测。
+
+**服务契约** `AiService`（`ctx.get('ai-service')`）：`ask(q, opts?)` 与 `capabilities()`，两者都是**端点正在使用的那份实现**（端点只做 HTTP 层），故 REST 与服务的输出逐字段一致。服务层的语义边界与端点有别：空查询/超长**不在服务层拦**（那是 HTTP 语义），直接的空白查询会照常走完检索并返回 200 + 空结果；`opts.limit` 非法时抛错；**卸载后再调用显式抛错**，绝不返回空结果（口径同 `search-service`）。
+
+### 9.6 前端接入（**宿主原生 UI，不改 Slot 机制**）
+
+检索与问答界面是**宿主原生 UI**，走 hash 子路由 `#/wiki/search/<q>` 与 `#/wiki/ask/<q>`（可分享、刷新不丢）。**Slot 机制一行未改**——`packages/web/src/lib/slots.tsx` 在本阶段零改动，"宿主不向插件传数据"的冻结裁决保持。
+
+- **插件未启用时静默降级**：入口探测用两路——`GET /api/plugins`（恒可用）判插件是否 `active`，这是权威判据、**不产生 404**；`GET /api/ai/capabilities`（按契约要求调用）拿"模型是否就绪"的说明，插件未启用时它会 404，前端**静默降级**（只 `console.debug`，**绝不产生 console error**）。插件未启用时搜索框 disabled + 给出提示。
+- **降级提示条是信息性的**，不是错误样式：`no_provider` / `missing_credential` → `level: 'info'`，文案"未配置模型密钥，以下为检索结果与摘要"（`packages/web/src/lib/searchPlan.ts:77-86`）；未知 `reason` 回退到通用文案并带上 `message`，**绝不 throw**（降级提示本身不该成为新的故障点）。
+
+### 9.7 本层已知边界（不做，且都有理由）
+
+| 边界 | 状态 | 理由 / 后续方案 |
+| --- | --- | --- |
+| **无任何厂商 LLM adapter** | 现状 | `llm-service` 无可用 provider，问答**恒走 `retrieval-only`**；`rag` / `rag-partial` 两条路径目前**仅有"假 provider"的单测覆盖**，无真实模型链路验证 |
+| **流式（SSE）未做** | **有意不做** | 长连接在途期间会被**永久计入在途计数**，会让卸载/关停时的优雅排空（`drain`）空转满 `drainTimeout` 并打印**假的排空超时告警**。因此 SSE 出口**必须与排空语义一起设计**；方案已定：流式响应登记为"不阻塞排空" + 硬超时 / idle 超时 + `res.on('close')` 即取消上游。本阶段检索与问答均为一次成型返回 |
+| **向量 / 语义检索未做** | 有意后置 | 离线 + 零重依赖前提下不现实（本地 ONNX 需预烤模型与 ORT WASM 运行时）；只留接口位。当前检索是**纯字面**匹配，故同义改写、跨语言、模糊表述都搜不到 |
+| **`search` / `ask` 是保留 slug** | 现状 | 二者成为 wiki 下的**保留首段 slug**，不能再创建同名页面（判据见 `packages/web/src/pages/WikiPage.tsx:37` 的 `allowedSecond`） |
+| **密钥** | 边界 | 配置里只存**环境变量名**，**环境变量本身**由运维在外部设置；`GET /api/plugins/:name/config` 对**普通配置字段**仍**明文返回**（见 5.7），而 `apiKeyEnv` 只是变量名故不构成泄漏 |
+| **`redact` 是启发式** | 现状 | 未覆盖的密钥形态不会被脱敏；`text-delta`（模型输出）**刻意不脱敏** |
+
+## 10. 参考与对比
 
 - **PandaWiki**：借鉴其 Wiki 功能边界，摒弃重架构（Redis、多服务拆解）。
 - **Cordis 生态**：学习插件间 `ctx` 的隔离与通信模式。

@@ -8,7 +8,7 @@
 
 ## 1. 背景与目标
 
-GeeWiki 已具备"清单驱动装配 + 依赖图/冲突组 + 会话沙箱 + 迁移控制器 + 看门狗"的插件管理器（`packages/manager`），但插件的**可配置、可外部扩展、可贡献界面**这三条链路尚未打通。插件化平台需要补齐 6 项能力：
+GeeWiki 已具备"清单驱动装配 + 依赖图/冲突组 + 会话沙箱 + 迁移控制器 + 看门狗"的插件管理器（`packages/manager`），但插件的**可配置、可外部扩展、可贡献界面**这三条链路尚未打通。插件化平台需要补齐 6 项能力（另有本阶段新增的第 ⑦ 项"检索与问答"，见下表末行与**批次 G**）：
 
 > **落地状态（本轮回填，按代码核对）**：①②**已落地**，③**宿主侧已完整落地**（含后端下发入口表与生命周期自动同步；仅剩后端 `ctx.slot()` 与更多扩展点未做），④ 的一半已落地、另一半仍是设计定稿，⑤ 已落地，⑥ 明确延期。逐条见下表与第 4 节各批次。
 
@@ -20,6 +20,7 @@ GeeWiki 已具备"清单驱动装配 + 依赖图/冲突组 + 会话沙箱 + 迁�
 | ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 三项**均已落地**：排空见 L-1（粒度是**全站**在途请求，非 owner 级）；冲突组替换 = `POST /api/plugins/:name/replace` + 管理台顶替确认框（G-1，提交 `42db76a`；前置校验与前端交互后经 `2227adf` / `b21534a` 收紧，见 G-1 的三类拒绝）；`enable` 回滚改为全递归共用集合（G-2，提交 `69cfeb2`） |
 | ⑤ | 容器化：`docker compose up` 可用 | **已落地并实测**（`Dockerfile` / `docker-compose.yml` / `docs/deployment.md`；G1–G4 的逐条状态见第 5 节 L-10） |
 | ⑥ | PostgreSQL 适配（评估） | 未落地，`DatabaseAdapter` 目前为同步接口；**已裁决延期**（依据与前置条件见第 5 节 L-9） |
+| ⑦ | 检索与问答（AI 原生能力首批，**本阶段新增**） | **检索地基已落地并默认启用**（`@geewiki/search`：FTS5 + `trigram` + 短词 LIKE 兜底）；**LLM 契约层已落地**（`@geewiki/llm`，**有意不含厂商 adapter** ⇒ 无可用 provider）；**问答检索-only 已落地**（`@geewiki/ai`，**没有 API key 也完整可用**）；前端为**宿主原生 UI**（子路由 `#/wiki/search/<q>`、`#/wiki/ask/<q>`，**Slot 机制零改动**）。**未做**：厂商 adapter（L-15）、流式 SSE（L-16，有意）、向量/语义检索（L-17，有意后置）。交付与核对记录见**批次 G**，实证见 **§2.4** |
 
 目标：在不引入子进程沙箱、不引入重前端构建链路的前提下，让第三方插件能以"放进目录即被发现、填表即被配置、注册即出现在管理台"的方式接入。
 
@@ -198,6 +199,71 @@ schemastery 暴露的 `[Symbol.for('standard-schema')]` 接口返回 `{value}` �
 **L-5 插件导出形态沿用 cordis 约定。**
 
 `mod.default ?? mod` 得到 `{name, apply(ctx, config)}`；`probe3-load.mjs` §F 实测动态 import 得到的模块可直接 `ctx.plugin(plugin, config)` 并正常 `dispose()`。
+
+### 2.4 SQLite FTS5 与中文分词（本阶段实证）
+
+> 编号约定：本节 `T-n` = **分词器 / FTS5 的实证事实**（Tokenizer）；第 5 节的 `L-n` = 已知限制，§2.3 的 `L-n` = Loader 事实，三者编号独立，交叉引用时以节号为准。
+
+**取证环境**：`better-sqlite3@13.0.3`（`packages/db-sqlite/package.json` 声明 `^13.0.3`，`pnpm-lock.yaml` 解析为 `13.0.3`），Node `v22.23.2`，取值时刻 `2026-09-10T23:2x +08:00`、HEAD `585dbac`。探针为一次性 `node -e` 脚本（未入库，见下方复现命令）。
+
+**T-1 FTS5 由 `better-sqlite3` 的预编译包直接提供，无需 node-gyp。**
+
+`db.pragma('compile_options')` 返回 **59** 项，其中含 **`ENABLE_FTS5`**；`select sqlite_version()` = **3.53.4**；`CREATE VIRTUAL TABLE … USING fts5(x, tokenize='trigram')` 直接建表成功。**这是"离线 + 零重依赖"成立的前提**——若 FTS5 缺失，就得让用户装编译工具链重新构建原生模块。
+
+**T-2 FTS5 默认的 `unicode61` 分词器把连续 CJK 当成一个 token ⇒ 中文等于搜不到。**
+
+同一段正文（`GeeWiki 是一个插件化知识库系统，支持全文检索与问答。`）下，`MATCH` 加引号短语查询的结果：
+
+| 查询串 | 长度 | `unicode61` 命中 | 原因 |
+| --- | --- | --- | --- |
+| `"知识库"` | 3 | **0** | 整段 CJK 被切成一个 token，子串不匹配 |
+| `"知识"` | 2 | **0** | 同上 |
+| `"插件化知识库"` | 6 | **0** | 同上 |
+| `"全文检索"` | 4 | **0** | 同上 |
+| `"GeeWiki"` | 7 | **1** | 与 token **整体**相同才命中 |
+
+因此**中文检索能否使用完全取决于 `tokenize` 参数**，默认值下"中文等于搜不到"——这是本仓最容易被误传的一点。
+
+**T-3 解药是显式 `tokenize='trigram'`（切 3 字符片段）。**
+
+同一正文、同一批查询改用 `trigram`：
+
+| 查询串 | 长度 | `trigram` 命中 |
+| --- | --- | --- |
+| `"知识库"` | 3 | **1** |
+| `"插件化知识库"` | 6 | **1** |
+| `"全文检索"` | 4 | **1** |
+| `"gee"` | 3 | **1**（大小写不敏感的子串匹配） |
+
+**T-4 trigram 的硬缺口：查询串短于 3 字符时 `MATCH` 恒为空。**
+
+| 查询串 | 长度 | `trigram` 命中 |
+| --- | --- | --- |
+| `"知识"` | 2 | **0** |
+| `"检索"` | 2 | **0** |
+| `"库"` | 1 | **0** |
+
+索引切的是 **3 字符**片段，短于 3 字符的查询（中文 2 字词如「检索」、英文 2 字母）**在 `MATCH` 下恒为空**。⇒ **必须由插件层用 LIKE 兜底**（`@geewiki/search` 的 `mode: 'like'` 路径），且该路径**直接扫 `pages` 真源表而非 `pages_fts`**：短查询本就用不上 trigram 索引（实测 5000 行语料下裸表 3.0 ms vs 经 `pages_fts` 4.0 ms），且在**索引漂移**（迁移未跑全、触发器被删）时短查询仍能给出正确结果——"兜底"就该兜在真正的真源上。
+
+**T-5 索引体积与正文同量级。**
+
+5000 行语料实测（正文合计 **6.23 MB**）：建 `pages_fts`（external content + trigram + `rebuild`）后库文件从 **19.58 MB** 增至 **26.65 MB**，**增量 7.07 MB ≈ 1.14× 正文**。`packages/plugin-search/migrations/0001_search.sql` 内记录的仓库实测为 6.6 MB 语料 +7.9 MB（≈1.2×）；外部资料给出的量级是 1.7× 原文。**结论**：按"与正文同量级"（约 1.1–1.7×）做容量规划，不要按"索引很小"预期。
+
+**T-6 external content + 三条触发器是同步的全部机制，且迁移不写事务。**
+
+`pages_fts(title, content, content='pages', content_rowid='id', tokenize='trigram')` —— 索引**不复制正文**（省一份正文存储），靠 `pages_fts_ai` / `pages_fts_ad` / `pages_fts_au` 三条触发器与 `pages` 表同步（更新是"先 delete 旧值再 insert 新值"两步，缺一不可，否则旧词残留）；末尾 `INSERT INTO pages_fts(pages_fts) VALUES ('rebuild')` 回填存量行。**不写 `BEGIN`/`COMMIT`**：`db.migrate()` 已把每个迁移文件包在单个事务里执行，脚本内再开事务会嵌套报错。全部语句幂等（`IF NOT EXISTS` / `rebuild` 可重放），可安全重跑。
+
+**复现命令**（在仓库根执行，`<bsqlite>` = `node_modules/.pnpm/better-sqlite3@13.0.3/node_modules/better-sqlite3` 的 realpath）：
+
+```bash
+node -e "const D=require('<bsqlite>');const db=new D(':memory:');
+console.log(db.pragma('compile_options').map(r=>r.compile_options).includes('ENABLE_FTS5'));
+console.log(db.prepare('select sqlite_version() v').get().v);
+for (const tok of ['unicode61','trigram']) { db.exec(\"CREATE VIRTUAL TABLE t_\"
++tok+\" USING fts5(x, tokenize='\"+tok+\"')\"); db.prepare('INSERT INTO t_'+tok+' VALUES(?)')
+.run('GeeWiki 是一个插件化知识库系统，支持全文检索与问答。');
+for (const q of ['知识库','检索','gee']) console.log(tok, q, db.prepare('SELECT count(*) c FROM t_'+tok+' WHERE t_'+tok+' MATCH ?').get('\"'+q+'\"').c); }"
+```
 
 ## 3. 已拍板的技术决策
 
@@ -559,6 +625,42 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 
 **验证方式（补充）**：镜像重建后实跑三组场景——①不挂 `./config` 卷（验证默认基础层清单生效、`HEALTHCHECK` 不再永久 unhealthy）；②挂空 `./plugins`（验证 0 插件是**显式可见**的而非静默）；③`docker run -w /tmp` 覆盖工作目录（验证 G1 固化后插件发现根不漂移）。
 
+### 批次 G：检索与问答（AI 原生能力首批）
+
+**范围**：`@geewiki/search`（全文检索）、`@geewiki/llm`（LLM 服务契约层）、`@geewiki/ai`（检索增强问答的检索-only 形态）三个插件 + wiki 内宿主原生的检索/问答界面 + 一轮"服务提供一致性"平台修复。对应提交 `e6ddfbd`（search + llm）、`dc5885e`（前端）、`585dbac`（ai + 一致性修复 + 默认启用检索）。
+
+**交付口径**（逐项已核对源码）：
+
+| 项 | 结论 |
+| --- | --- |
+| 索引与迁移 | `packages/plugin-search/migrations/0001_search.sql`：FTS5 **external content** 虚表 `pages_fts` + 三条同步触发器 + `rebuild` 回填；由**管理器的迁移控制器**在激活前执行（`defaultRegistry()` 里 `migrationsDir: SEARCH_MIGRATIONS_DIR`），**不依赖 db-sqlite 自己的迁移**。触发器同步与"迁移内不写事务"的理由见 **§2.4 T-6** |
+| 检索路径 | `MIN_TRIGRAM_LENGTH = 3`（`packages/plugin-search/src/index.ts:134`）：trim 后 ≥3 字符走 `pages_fts MATCH ?`（`mode: 'fts'`，按 BM25 排序）；**<3 字符走 LIKE 兜底**（`mode: 'like'`，**直接扫 `pages`**）。`MATCH` 的查询串经 `toFtsPhrase()` **整体加双引号**（内部引号翻倍）作**查询语法注入防护**——用户输入绝不按 FTS5 语法解释 |
+| 查询语义 `queryMode`（`phrase` / `terms`，**工作树新增**） | 缺省 `'phrase'`＝**整串字面短语**（搜索框语义，向后兼容）；`'terms'`＝把查询切成**词元**后以 ` OR ` 连接（**问句检索 / RAG 语义**）。切分：**CJK 连续片段取长度 3 的滑窗 3-gram**、**ASCII/数字片段按空白与常见标点切词且只保留长度 ≥3** 者（trigram 的 <3 字符硬约束所致）、去重且保序；**每个词元仍各自 `toFtsPhrase()` 后拼 OR**——切词与转义分开，注入防护仍只有一处实现。`terms` 切不出词元时（<3 字符、纯标点）**回退 LIKE**（不构造空 `MATCH`，它抛 `fts5: syntax error`）。`terms` 下 BM25 天然让"命中词元更多"的行排前；`snippet` 锚点改为**逐个词元试** |
+| `mode` 的方向（**两个含义，勿混**） | **`mode` 现在有两个不同含义，分处响应与请求两侧**：① **响应字段 `mode`** = **实际走的那条路径**（`'fts'` / `'like'`，观测与测试用），HEAD `585dbac` 起即存在；② **请求参数 `mode`**（`'phrase'` / `'terms'`）= **本次请求的查询语义**，**工作树新增**；同时**响应新增 `queryMode`** 回传该请求语义。⇒ **文档必须分别命名两侧**，不能笼统写"`mode` 是响应字段，不是请求参数"（那是 HEAD `585dbac` 的旧行为，工作树已不成立） |
+| 端点语义 | **请求参数**：`q` / `limit` / `mode`。空查询 → **400 `invalid_query`**；非法 `limit` → **400 `invalid_limit`**（须为 1..100 的整数）；**非法 `mode`（非 `phrase` / `terms`）→ 400 `invalid_mode`**（**不静默降级**——把 `term` / `keywords` 这类拼错当 `phrase` 会表现为"问了却没结果"）。**`total` 是全量命中数，不受 `limit` 限制**，且工作树改为 **`COUNT(DISTINCT p.id)`**（`terms` 下 OR 会让同一行被多个词元命中，`COUNT(*)` 会按命中次数重复计入）；`snippet` 是**服务端已 HTML 转义的 HTML**（只含 `<mark>`，前端不得二次转义）；`score` 是**取负后的 BM25**（越大越相关，**非归一化**、值域无界，**仅同次查询内可比**，LIKE 路恒 0） |
+| 检索召回缺陷与修复（**并行批次，进行中**） | **机制**：`toFtsPhrase()` 把**整串**当一个 FTS5 字面短语 ⇒ 自然语言问句（「检索增强怎么做」）要求正文连续出现该整串，**恒为 0 命中**，`@geewiki/ai` 的检索地基因此不可用。**修复（工作树）**：新增 `buildTermQuery(q): string[]` 与新 `SearchMode = 'phrase' \| 'terms'`，让 `@geewiki/ai` 改为 `search.search(query, { limit, mode: 'terms' })`。**状态**：**工作树已实现、尚未提交**；HEAD `585dbac` 的已提交版本仍是整串短语。**本文不对"问答召回是否正常"下任何断言**，以最终提交为准 |
+| 单一实现 | `GET /api/search` 与 `search-service.search()` 走**同一份实现**（端点只做 HTTP 层），故同 `q` 同 `limit` 下逐字段一致；`search-service.contents(slugs)` 供 RAG 取正文（只含真实存在的 slug）。卸载后调用**显式抛错**而非返回空结果 |
+| LLM 契约层 | `provides: 'llm-service'`、**不进任何 conflictGroup**、**有意不含任何厂商 adapter** ⇒ **当前无可用 provider**（只注册恒不可用的兜底路由 `null`）。契约核心：稳定错误码枚举（10 值）、调用方**按 code 分支不按 message**、`error` chunk **结构上无 message 字段**、**终止 chunk 恰一次且在末位**、**服务绝不重试**、重复 route 注册抛错 |
+| 密钥安全 | 配置只存**环境变量名**（`apiKeyEnv`）⇒ 结构上杜绝密钥进入**会落盘入库**的 `config/plugins.base.json`；`detectSuspiciousCredential()` 命中则让**激活失败**（throw，而非 `process.exit(1)`）；`redact()` 与检测**共用同一组正则源**；**`text-delta` 刻意不脱敏**（脱敏会篡改模型输出） |
+| 问答产品承诺 | **没有 API key 时也完整可用**：`200` 一律正常（含"未配置密钥"与"检索无结果"），**绝不用 4xx/5xx 表达"没有 key"**；降级为 `mode: 'retrieval-only'` + `degraded{reason,code,message}` + **完整 `sources`** + 零成本抽取式摘要；`400 empty_query` / `400 too_long`（`MAX_QUERY_LENGTH = 500`，`packages/plugin-ai/src/index.ts:98`） |
+| 上下文截断 | `selectSources()`（`packages/plugin-ai/src/select.ts:44`）：`perSourceChars` 截断后逐条试放，不超 `totalContextChars` / `maxSourcesInContext`；**放不下就整条丢弃，绝不做尾部裁切**（半句话会诱导模型顺着编）；被丢弃者 `used: false` 且 `n: null`；`sources[].n` **只对 `used: true` 者从 1 起连续编号**（故类型是 `number | null`）。正文经 `search-service.contents()` 取，**不直连 `pages` 表** |
+| 唯一接线点 | `generate()`（`packages/plugin-ai/src/index.ts:261`）是本阶段**唯一有意未接线**的函数（无 adapter ⇒ 必走降级）；接 adapter 时只需替换它，prompt 拼装已拆成纯函数（`prompt.ts` 的 `buildContext` / `buildMessages` / `SYSTEM_PROMPT`）并有单测 |
+| 前端 | **宿主原生 UI**，走 hash 子路由 `#/wiki/search/<q>` 与 `#/wiki/ask/<q>`；**Slot 机制一行未改**（`packages/web/src/lib/slots.tsx` 零改动，"宿主不向插件传数据"的冻结裁决保持）。入口探测两路：`GET /api/plugins`（权威、**不产生 404**）+ `GET /api/ai/capabilities`（插件未启用时 404，**静默降级只 `console.debug`，绝不产生 console error**）。降级提示条是**信息性**的（`no_provider` / `missing_credential` → `level: 'info'`，`packages/web/src/lib/searchPlan.ts:77-86`） |
+
+**本批的平台级修复（三件事，均与"服务提供一致性"或读数可靠性有关）**：
+
+1. **服务提供一致性的三次修复**（同一类缺陷的三种表现，详见 `docs/architecture.md` §9.2 的映射表与修复记录）：
+   - `@geewiki/wiki` **只声明不提供**——manifest 写了 `provides: 'wiki-service'` 却从未 `ctx.provide` ⇒ 依赖边被解析为"已满足"而 `ctx.get('wiki-service')` 恒为 `undefined`。**已补**真实 `ctx.provide('wiki-service', svc)`（`packages/plugin-wiki/src/index.ts:443`）。
+   - `@geewiki/echo` **谎报 token**——声明 `provides: 'echo-service'` 但从未提供，且**全仓无消费方**（已 grep 核实）。**已撤掉**该字段（`packages/plugin-echo/src/index.ts:33`），而不是硬造一个无人使用的服务契约。
+   - 新增三者**一律"声明 token + 显式 `ctx.provide` + 两者同名"**：`search` / `llm` / `ai`（`packages/plugin-search/src/index.ts:383`、`packages/plugin-llm/src/index.ts:117`、`packages/plugin-ai/src/index.ts:552`），源码注释里明文写"名字必须一致，否则消费方 `ctx.get` 拿到 `undefined`"。
+   - **派生的文档契约**：`provides` token 与真实服务名**是两套命名空间**（`db-sqlite` 声明 `database-provider` 但提供 `'db'`；`http` 声明 `http-service` 但提供 `'http'`）——**消费方必须知道这层映射**，完整映射表见 `docs/architecture.md` **§9.2**。
+2. **根 `package.json` 的 `test` 脚本加 `--no-bail`**。此前 `pnpm -r` 在**首个失败包处即中止**、后续包根本不执行 ⇒ 过去的"全量绿"读数可能是**部分**读数（一个红色包会把它后面所有包藏起来）。这是**读数可靠性**的修复，不是功能修复。
+3. **默认启用检索的决策**：`config/plugins.base.json` 加入 `@geewiki/search`（第 4 条启用项）。**理由**：检索是**纯只读增强**、不需要任何凭据、不引入外部服务，属"开箱即用"能力的自然延伸；而 `@geewiki/ai` 与 `@geewiki/llm` **仍是已注册未启用**（与 `@geewiki/echo` 同形态），因为问答是否启用涉及运维对模型接入的取舍。启用后 `GET /api/plugins` 显示 **7** 条内置（注册 7 条 − 未启用 3 条 = 启用 4 条），挂载外部示例后为 **8** 条。
+
+**验证方式**：见第 6 节"当前质量基线"（本批实跑口径）与第 9 节的事实核对记录。**本批新增的实证结论集中在 §2.4（FTS5 / 中文分词），新增的已知限制见 L-15…L-20。**
+
+**未验证 / 待并行批次复核**：① `rag` / `rag-partial` 两条路径**仅有"假 provider"的单测覆盖**（无真实模型链路），"能接上真实模型"这件事**尚未被证明**（见 L-15）；② 检索召回行为的缺陷修复由**并行批次**在 `packages/plugin-search/**` 与 `packages/plugin-ai/**` 上进行（机制与修复形态见上表"检索召回缺陷与修复"行）：**截至本文取数时刻该修复在工作树已实现但尚未提交**，其**正确性未经本文档作者端到端验证**（无真实问答链路复跑），本文**不对"问答召回是否正常"下任何断言**；③ 因此这两个包的**用例数不稳定**（读数 A 25 / 23 → 读数 B 32 / 25，见第 6.1 节），**该批次提交后须重跑并复核**。
+
 ## 5. 已知限制与待办
 
 **L-1 排空语义是全站在途请求，不是 owner 级。**
@@ -630,15 +732,93 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 **L-13 schemastery `bitset` 暂保留降级为 JSON 编辑（裁决）。**
 未满足 S-13 对 `bitset` 的期望控件（"`Object.keys(bits)` 作多选项，提交值为**选中位按位或的 `number`**"）。当前结论：**暂保留降级**——配置表单对该类型回落到 JSON 文本编辑，不在批次 C 内实现多选控件。理由：`bitset` 在当前两个内置插件（`packages/plugin-wiki` / `packages/plugin-echo`）的 `configSchema` 中**均未使用**，为一个无消费方的类型投入控件实现与测试不划算；载荷侧的信息（`bits` 名字→数字字面量映射）已在 S-13 记录，未来实现时无需重新勘察。**影响面**：仅表现为该类型的配置项需要手工写数字，不产生错误数据（服务端仍按 schemastery 校验）。
 
-**L-14 发现期 issue 的可观测性：接口侧已闭合，前端提示位待补（缺口收窄）。**
+**L-14 发现期 issue 的可观测性：接口侧与前端提示位**均已闭合**（缺口已闭合）。**
 外部插件目录扫描会把失败/跳过记为 issue（`DiscoveryResult.issues`，见批次 B 的修正签名），日志里能看到（例：`[manager:discovery] 跳过插件目录 …（invalid_manifest）: … EACCES: permission denied`）。**本条曾被记为真实可观测性缺口**：在修复批之前，`GET /api/plugins` 只返回已注册条目（4 条内置），既不返回 issues、也不返回"有 N 个被跳过"的计数 → **API 与 UI 上完全看不出"有插件被跳过"**，即 L-11 / L-10-G2 修好之后残留的那半个问题：**不再崩溃，但也不可见**。**该半截已在修复批中闭合**（下条字段形状已按源码核对），本文保留此条作为"接口可见性"的契约锚点与前端待办的登记处。
 
 - **裁决与现状**：曾记为**已知限制**并列入修复批——`GET /api/plugins` 带上机器可读的 `issues`。**现状：已落地并已核对源码**（见下条字段形状）。
 - **字段形状（已回填，以源码为准；行号已按当前 HEAD 更正）**：`GET /api/plugins` → `ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() })`——**实现在 `packages/manager/src/index.ts:1417`**（旧稿写的 `packages/server/src/index.ts:1008` **是错的**：该文件当前只有 803 行，且 `/api/plugins` 路由由 manager 的 `registerRoutes()` 注册，server 只负责把路由服务挂上）；`issues` 元素类型为 `DiscoveryIssue`，即 `{ code, dir, message }` 三字段（`packages/manager/src/discovery.ts:28-40`）：`dir` 是**出问题的插件目录绝对路径**，`message` 是人类可读说明，`code` 为八值枚举 —— `'missing_manifest' | 'invalid_manifest' | 'entry_not_found' | 'invalid_plugin_path' | 'invalid_plugin_dir' | 'duplicate_plugin' | 'invalid_module' | 'load_failed'`。**没有 name 字段**（失败目录未必解析得出插件名）。管理器的 `discoveryIssues(): DiscoveryIssue[]` 在 `packages/manager/src/index.ts:368-370`（旧稿写的 `:310-311` 已错位，那里现在是 `uiTable()` 相关代码），数据源是 `config.discoveryIssues`（`packages/manager/src/index.ts:151` 声明、`:291` 由构造参数默认 `[]`）。该字段同时是"插件根目录不可读"的出口：`scanPluginDirs` 的 `readdirSync` 失败记 `code: 'invalid_plugin_dir'`、`message: 插件根目录不可读，已跳过全部外部插件: …`（`packages/manager/src/discovery.ts:184-190`）——与 L-10 的 G2 收敛为同一条路径。
-- **兼容性提示**：`GET /api/plugins` 的响应体新增字段属**向后兼容**（前端当前不读该字段），但**前端"插件管理"页应增加"有插件被跳过"的提示位**，否则缺口只是从后端挪到前端。
+- **兼容性提示与前端提示位（已落地，本轮核对更正）**：`GET /api/plugins` 的响应体新增字段属**向后兼容**。当时登记为"**前端"插件管理"页应增加"有插件被跳过"的提示位**，否则缺口只是从后端挪到前端"——**该提示位实际已在代码里**，项登记有误：`packages/web/src/pages/AdminPage.tsx:314` 的 `.discovery-issues` 区块渲染 `issues`，标题为"外部插件发现期有 N 条问题（这些插件未加载）"，逐条展示 `code`（`<code className="chip">`）/ `dir`（`.muted.small`）/ `message`（`.err-text.small`），样式见 `packages/web/src/styles.css:179-183`；`docs/roadmap.md` 的 Phase 4 条目 `[ ] 发现期 issues 的前端提示位` 已同步改为 `[x]` 并回填落点。**结论：L-14 已完全闭合**，本条目保留作为接口可见性的契约锚点。
 - **另有一个新的可观测性出口（本批新增，与 L-14 互补）**：插件 **UI 入口表**的 `GET /api/plugins/ui` 响应带 `skipped: [{ name, reason }]`，`reason ∈ 'inactive' | 'no_client' | 'entry_missing' | 'invalid_name'`——这是"**插件在目录里、也注册成功了，但界面没起来**"的唯一机器可读出口（典型情形：声明了 `client` 却忘了跑 `build:fixtures` → `entry_missing`）。它与 `GET /api/plugins` 的 `issues` **职责不同**：后者是**发现/加载期**的失败（目录、清单、入口模块），前者是**UI 产物就绪性**。前端当前同样不展示它（`skipped` 只向后端调用方暴露）。
 
+**L-15 无任何厂商 LLM adapter（本阶段有意不做）。**
+`@geewiki/llm` 只交付了**契约层**（route→provider 注册表 + 终止保证 + 无 key 降级 + 密钥安全），**不含 OpenAI / Anthropic 等任何真实 provider**，且只注册了一个恒不可用的兜底路由 `null`（`NULL_PROVIDER`）⇒ **`availableProviders()` 恒为空，问答恒走 `retrieval-only`**。
+**后果（必须如实理解）**：`@geewiki/ai` 的 `rag` 与 `rag-partial` 两条路径**目前仅有"假 provider"的单测覆盖**（测试里注入一个假的 `LlmProvider` 驱动终止保证与部分文本分支），**无任何真实模型链路验证**——"能接上真实模型"这件事**尚未被证明**。
+**接线位置是唯一的**：`packages/plugin-ai/src/index.ts:261` 的 `generate()`。将来 adapter 批次需在此补齐"按需中断/超时、token 计量口径、SSE 增量外发"三件事（见 L-16）。
+**不做的理由**：产品价值"没有 API key 时整条链路依然完整可用"这条契约**不需要 adapter 就能验证**；而"流式 SSE + 宿主排空"是更难的一层，混批会让两类缺陷互相掩盖。
+
+**L-16 流式（SSE）未做，且这是有意的——它与排空（drain）语义耦合。**
+当前 `@geewiki/search` 与 `@geewiki/ai` 的所有端点都是**一次成型返回**，没有任何 SSE / chunked 流式出口。
+**不做的理由是技术性的，不是排期问题**：`@geewiki/http` 的 `inflight()` 以"处理器尚未结算"为在途判据，而**一条长连接会在其存活期间被永久计入在途计数**。于是卸载/关停时的 `drain(drainTimeout × 1000)` 会**空转满 `drainTimeout`**、并打印**假的排空超时告警**（告警说"还有 N 个在途请求未结算"，而那 N 个正是设计上就该长期存在的流）。这条与 **L-1**（排空粒度是全站）叠加后症状更难分辨。
+**因此 SSE 出口必须与排空语义一起设计**，方案已定：① 流式响应**登记为"不阻塞排空"**（不进入 `inflight()` 的结算等待集合）；② 配**硬超时 / idle 超时**兜住真正卡死的流；③ `res.on('close')` 即**取消上游**（`AbortSignal` 传到 provider，契约侧已有 `opts.signal` 与 `ABORTED` 错误码支撑）。
+**推论**：`LlmService.stream()` 的**异步迭代式契约本身已经是为流式准备的**（终止 chunk 恰一次且在末位），缺的只是 HTTP 出口那一层——这也是本阶段就能把契约层独立交付的原因。
+
+**L-17 向量 / 语义检索未做（有意后置），检索是纯字面匹配。**
+当前检索链路为 **FTS5 trigram 子串匹配 + <3 字符的 LIKE 兜底**（见 §2.4），**没有任何 embedding、向量库或语义召回**。
+**不做的理由是环境约束**：本项目的立身之本是"离线 + 零重依赖 + 开箱即用"（默认只依赖一个 SQLite 文件）。本地跑 embedding 需要**预烤模型权重 + ONNX Runtime WASM 运行时**，两者都会把"`pnpm install` 即可运行"变成"先下载几百 MB 模型"；调用远端 embedding API 则与"没有 API key 也完整可用"的产品承诺直接冲突。
+**后果（如实登记）**：**同义改写、跨语言、模糊表述一律搜不到**（搜「怎么备份数据」不会命中「数据备份指南」）。当前只留接口位（`search-service` 是唯一检索入口，将来换实现不影响消费方）。
+
+**L-18 `snippet` 是已转义的 HTML、`score` 只在同次查询内可比——两条都是跨包契约，消费方必须遵守。**
+- `snippet` 由 `@geewiki/search` 的 `buildSnippet()` **服务端转义**（正文先按原始下标切片、三段分别 HTML 转义、再拼进 `<mark>`），**只含 `<mark>` 一种标签**。⇒ 前端**不得二次转义**（会显示成字面 `&lt;mark&gt;`），也**不得**当纯文本插入页面（那样高亮会消失）。该设计的价值是：正文里的 `<script>` **不可能逃逸成真标签**。
+- `score` 是 FTS 路**取负后的 BM25**（越大越相关）。**这不是归一化**——值域无界、量级随语料规模与查询词变化，故**只在同一次查询的结果内部可比**；LIKE 路恒为 `0`，**两种 `mode` 的 `score` 也不可比**。消费方不得跨查询、跨 `mode` 比大小，也不得把它当"百分比相关度"展示。
+- 附：**自实现高亮而非用 FTS5 的 `snippet()`**——trigram 下后者的上限约 64 token（≈ 中文 64 字），太短且会把片段切得很碎（`packages/plugin-search/src/index.ts:170-178`）。
+
+**L-19 `search` / `ask` 是 wiki 下的保留首段 slug。**
+`#/wiki/search/<q>` 与 `#/wiki/ask/<q>` 占用 `search` / `ask` 两个**首段 slug**，判据在 `packages/web/src/pages/WikiPage.tsx:37` 的 `allowedSecond`（`seg[1] === 'edit' || first === 'search' || first === 'ask'`）。⇒ 用户**不能再创建名为 `search` 或 `ask` 的页面**（也不能建 `search/edit` 这类路径）；服务端 slug 校验**不会**拦截它们，冲突只在前端路由层显现。这是**主动付出的代价**：换取的是"可分享、刷新不丢"的 hash 子路由，而无需引入前端路由库或改动 Slot 机制。
+
+**L-20 密钥的剩余边界：环境变量由运维设置；`redact` 是启发式且刻意不脱敏模型输出。**
+- 配置里只存**环境变量名**（`apiKeyEnv`），**环境变量本身由运维在外部设置**——本系统不负责密钥的注入、轮转与保管。
+- `GET /api/plugins/:name/config` 对**普通配置字段**仍**明文返回**（该边界此前已记录，见 L-14 同批的 ③ 与 `docs/architecture.md` §5.7）；`apiKeyEnv` 只是变量名，故**不构成泄漏**——但若有人无视 `detectSuspiciousCredential` 的拦截把密钥值硬写进**其它**普通字段，它会明文出现在该端点响应里。
+- `redact()` 是**启发式**（`packages/plugin-llm/src/redact.ts` 的三条正则源 + 头名遮蔽）：**未覆盖的密钥形态不会被脱敏**。设计取向是"**宁可漏判不可误伤**"——把 `DEEPSEEK_API_KEY` 这类变量名误判成密钥会让插件**无法激活**（配置明明是对的），而漏判只是少脱敏一处日志，故全大写 SNAKE 命名一律放行。
+- **`text-delta`（模型输出）刻意不脱敏**：脱敏会**篡改模型输出内容**。若模型自己复述了密钥，它会被原样透传——这是有意的取舍，不是遗漏。
+
 ## 6. 当前质量基线
+
+### 6.1 当前口径（检索与问答批次落地后实跑）
+
+**本小节给两个实测读数**，差别**只**来自一个并行批次的未提交改动，两个都是真读数：
+
+- **读数 A（已提交状态）**：**取值时刻 `2026-09-10T23:24 +08:00`**（测试 `23:24:15`、类型检查 `23:24:46`），**HEAD `585dbac`**，工作树干净。
+- **读数 B（工作树，含并行批次改动）**：**取值时刻 `2026-09-10T23:35 +08:00`**（测试 `23:35:15`、类型检查 `23:35:29`），**HEAD 仍是 `585dbac`**，但工作树含并行批次对 `packages/plugin-search/**` 与 `packages/plugin-ai/**` 的**未提交**改动。
+
+**命令**（两次相同）：`pnpm -r --no-bail --if-present run test` 与 `pnpm -r --if-present run typecheck`。
+
+**读数 A（HEAD `585dbac`，工作树干净）——242/242，7 个包**
+
+| 包 | 用例数 | 通过 | 失败 | 逐文件明细 |
+| --- | --- | --- | --- | --- |
+| `packages/manager` | **91** | 91 | 0 | `config` 36 + `deps` 10 + `discovery` 13 + `manager` 14 + `plugin-ui` 15 + `repo-paths` 3 |
+| `packages/web` | **38** | 38 | 0 | `pluginUiPlan` 19 + `searchPlan` **19** |
+| `packages/plugin-llm` | **33** | 33 | 0 | `service` 24 + `redact` 9 |
+| `packages/plugin-search` | **25** | 25 | 0 | `search` 25 |
+| `packages/server` | **24** | 24 | 0 | `router` 11 + `plugin-ui-static` 10 + `registry` 3 |
+| `packages/plugin-ai` | **23** | 23 | 0 | `ai` 23 |
+| `packages/plugin-wiki` | **8** | 8 | 0 | `service` 8 |
+| **合计（7 个包）** | **242** | **242** | **0** | — |
+
+**读数 B（工作树含并行批次改动）——251/251**
+
+**只有两个包变化，其余五包与读数 A 逐包相同**：
+
+| 包 | 读数 A | 读数 B | 差值 |
+| --- | --- | --- | --- |
+| `packages/plugin-search` | 25 | **32** | **+7** |
+| `packages/plugin-ai` | 23 | **25** | **+2** |
+| 其余五包（manager / web / plugin-llm / server / plugin-wiki） | 91 / 38 / 33 / 24 / 8 | 91 / 38 / 33 / 24 / 8 | 0 |
+| **合计** | **242** | **251** | **+9** |
+
+`pnpm typecheck`（两次读数一致）：**`Scope: 10 of 11 workspace projects`，全部 `Done`，0 个 `error TS`**。第 11 个 workspace 项目是 `plugins/hello-geewiki`，**没有 `typecheck` 脚本**，被 `--if-present` 跳过。没有 `test` 脚本的包：`packages/core`、`packages/db-sqlite`、`packages/plugin-echo`、`plugins/hello-geewiki`。
+
+> ⚠️ **读数 B 里的 `plugin-search` / `plugin-ai` 两行是"待并行批次落地后复核"的不稳定读数。** 该批次正在这两个包上修复一个**检索召回缺陷**（整串短语 vs 词元 OR，机制与修复形态见第 9 节的对应行与 `docs/architecture.md` §9.3），会继续改变行为与用例数。**该批次提交后必须重跑并复核这两行**；其余五包已稳定。**本文不对"问答召回是否正常"下任何断言。**
+
+**相对读数 A 之前的 134/134 口径的三处结构性变化，勿混用**：
+
+1. **测试覆盖的包从 3 个扩到 7 个**——本轮起 `packages/plugin-search`、`packages/plugin-llm`、`packages/plugin-ai`、`packages/plugin-wiki` 四个包**拥有单测**（此前只 web / manager / server 三包）。新增的 108 例 = manager 91 + server 24 之外的 `web` +19、`plugin-llm` +33、`plugin-search` +25、`plugin-ai` +23、`plugin-wiki` +8。
+2. **根 `package.json` 的 `test` 脚本新加 `--no-bail`**——此前 `pnpm -r` 会在**首个失败包处中止**、后续包根本不执行，故更早的"全量绿"读数可能是**部分**读数。**这条对历史数字的解释力有影响**：过去某个包变红时，排在它后面的包不会被跑到，读数会"看起来更绿"。
+3. **口径可复核性**：逐文件计数用 `node --import tsx --test <file>` 单独跑取 `# pass`；也可静态复核 `git show HEAD:<file> | grep -cE "^test\("`。
+
+> ⚠️ **待并行批次复核（同前）**：读数 A 的 `plugin-search` 25 / `plugin-ai` 23 与读数 B 的 32 / 25 **都是并行批次中途的状态**——该批次正在这两个包上修复检索召回缺陷（见上表下注与第 9 节对应行），**修复结论尚未确定**，本文**不对"问答召回是否正常"下任何断言**。该批次提交后须**重跑并复核这两行**。
+
+### 6.2 历史端到端验收基线
 
 本节记录一次完整端到端验收结果，作为后续批次回归的比较基准。**验收时点**：治理批修复的未提交工作树，该修复随后落为提交 `ed826b5`（`fix(manager): consume drainTimeout on unload, unify 413 path, decouple cwd and add router tests`），即该提交的代码状态即本节口径。**手段**：headless Chrome（CDP）驱动运行中的应用，全部交互为**真实 DOM 事件**（原生 `click` 与 `input` 事件，非直接调用接口）；脚本与产物在 `data/spike/e2e/`（`cdp.mjs` / `wiki-ui.mjs` / `phase2.mjs` / `phase3.mjs` / `phase4.mjs` 及抓取的 DOM 快照，`data/` 已被 gitignore）。
 
@@ -653,7 +833,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 | console 洁净度 | 无任何错误 / 未捕获异常，无失败请求，无 4xx / 5xx；无 React 告警（无 key 缺失、无受控组件告警） |
 | 清理 | 测试页面已删除，`GET /api/pages` 复原为空，`config/plugins.base.json` md5 未变 |
 
-**测试口径（本轮回填，已实跑）**：上述 UI 基线是**提交 `ed826b5` 的代码状态**；插件平台批次 A–D 落地后测试集合已扩张，且**当前全绿**——以 `pnpm test`（`pnpm -r --if-present run test`，实际跑到 `packages/web` / `packages/manager` / `packages/server` 三个包，各自的 `test` 脚本都是 `node --import tsx --test test/*.test.ts`）实跑为准。**本段已按 HEAD `88e0c58` 重跑取值**（逐文件命令 `node --import tsx --test <file>`；`pnpm typecheck` 的 `error TS` 计数为 **0**）：
+**测试口径（本轮回填，已实跑）**：**⚠️ 本小节整节（含下表 134/134）已被 §6.1 的 242/242 取代，保留以便追溯。** 上述 UI 基线是**提交 `ed826b5` 的代码状态**；插件平台批次 A–D 落地后测试集合已扩张，且**当时全绿**——以 `pnpm test`（`pnpm -r --if-present run test`，**当时**实际跑到 `packages/web` / `packages/manager` / `packages/server` 三个包，各自的 `test` 脚本都是 `node --import tsx --test test/*.test.ts`）实跑为准。**本段按 HEAD `88e0c58` 取值**（下表同）：
 
 | 包 | 用例数 | 通过 | 失败 |
 | --- | --- | --- | --- |
@@ -678,7 +858,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 - `packages/manager/test/config.test.ts`『REST：GET/PUT /api/plugins/:name/config 的状态码与响应形状』——旧断言 `assert.equal(got.body['layer'], null, '未激活 → 无层')`（`:305`）与最终裁决冲突：`layer` 现为**持久化层**（从未持久化时落 `'base'`，类型 `Layer` 非空），"未激活"改由 `activeLayer: null` 表达。**已改写**：文件头注释第 8 条明确"`layer`（持久化层）与 `activeLayer`（激活层）两个维度"，并新增用例『`configOf`：layer = 持久化层、`activeLayer` = 激活层（基础层激活 / 会话层激活 / 未激活三态）』（`:445`）。
 - 另外新增了会话层叠加用例（『boot 叠加：基础层 + 会话层并存时，会话层配置作为覆盖层生效』）与外部插件发现用例（`discovery.test.ts` 13 例，含『`parsePluginManifest`：`package.json` 的 `geewiki` 键优先』`discovery.test.ts:54`、『`resolvePluginEntry`：显式 entry 优先，其后 `index.ts` → `index.js` → `src/index.ts`』）。
 
-因此 `README.md` / `docs/roadmap.md` 中出现的 35/35 是**历史时点口径**，当前口径为 **134/134**（见上表；相对 132/132 的 +2 例来自提交 `88e0c58` 的 `plugin-ui-static` 回归用例）。**旧文残句（供检索）：15/15、35/35、72/72、81/81、87/87、132/132**（前四条为历史口径，132/132 已被 134/134 取代）。
+因此 `README.md` / `docs/roadmap.md` 中出现的 35/35 是**历史时点口径**；134/134 亦已作废，**当前口径为 §6.1 的 242/242**（当时 134/134 相对 132/132 的 +2 例来自提交 `88e0c58` 的 `plugin-ui-static` 回归用例）。**旧文残句（供检索）：15/15、35/35、72/72、81/81、87/87、132/132、134/134**（**全部为历史口径**，134/134 已被 242/242 取代）。
 
 **遗留项**：见第 5 节 **L-7**（React Flow 授权提示）与 **L-8**（详情页「← 返回列表」走 `history.back()`）。
 
@@ -689,7 +869,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 每一批交付必须同时满足：
 
 1. `pnpm typecheck` **0 错**；
-2. `pnpm test` **全绿**，且包含该批新增用例。**当前（本轮实跑）全绿：134/134** —— `packages/web` **19**（`pluginUiPlan` 19）+ `packages/manager` **91**（`deps` 10 + `manager` 14 + `config` 36 + `discovery` 13 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/server` **24**（`registry` 3 + `router` 11 + `plugin-ui-static` 10），逐文件口径见第 6 节；`pnpm typecheck` 7 个包 **0** 个 `error TS`。**历史时点**：132/132（server 22，提交 `88e0c58` 前，**已过时**）；87/87（manager 73 + server 14，web 与 `plugin-ui*` 尚未计入，**已过时**）；81/81（manager 67 + server 14）；基线提交 `ed826b5` 为 **35/35**（manager 24 + server 11）；其后修复批一度出现 manager **39 例 / 37 过 / 2 失败**（两条旧断言尚未随新契约更新：`layer` 语义反转、无 schema 插件改为接受原始 JSON），**现已全部改写完成**；
+2. `pnpm test` **全绿**，且包含该批新增用例。**当前有两个实测读数（差别只来自一个并行批次的未提交改动，见第 6.1 节）**：**读数 A（已提交状态 HEAD `585dbac`，`2026-09-10T23:24 +08:00`）242/242**；**读数 B（工作树含并行批次改动，`2026-09-10T23:35 +08:00`）251/251**（仅 `plugin-search` 25→**32**、`plugin-ai` 23→**25**，其余五包不变）。覆盖 **7 个包** —— `packages/manager` **91**（`config` 36 + `deps` 10 + `discovery` 13 + `manager` 14 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/web` **38**（`pluginUiPlan` 19 + `searchPlan` 19）+ `packages/plugin-llm` **33**（`service` 24 + `redact` 9）+ `packages/plugin-search` **25 / 32**（`search`）+ `packages/server` **24**（`router` 11 + `plugin-ui-static` 10 + `registry` 3）+ `packages/plugin-ai` **23 / 25**（`ai`）+ `packages/plugin-wiki` **8**（`service` 8），逐文件口径见第 6.1 节；`pnpm typecheck` **10 个包 0** 个 `error TS`（`Scope: 10 of 11 workspace projects`；`plugins/hello-geewiki` 无该脚本）。**`plugin-search` / `plugin-ai` 两行属"待并行批次落地后复核"的不稳定读数。** **命令是 `pnpm -r --no-bail --if-present run test`——`--no-bail` 为本阶段新加**，此前 `pnpm -r` 会在**首个失败包处中止**、后续包根本不执行，故更早的"全量绿"读数可能是**部分**读数。**历史时点**：134/134（3 个包，**已过时**）；132/132（server 22，提交 `88e0c58` 前，**已过时**）；87/87（manager 73 + server 14，web 与 `plugin-ui*` 尚未计入，**已过时**）；81/81（manager 67 + server 14）；基线提交 `ed826b5` 为 **35/35**（manager 24 + server 11）；其后修复批一度出现 manager **39 例 / 37 过 / 2 失败**（两条旧断言尚未随新契约更新：`layer` 语义反转、无 schema 插件改为接受原始 JSON），**现已全部改写完成**；
 3. **隔离端口**的端到端冒烟（不得占用开发用的 3000 / 5173）；
 4. 涉及 UI 的批次必须有**浏览器端到端验收**（真实渲染，而非接口断言）；
 5. **每批先经独立 Reviewer 审查，再提交**；
@@ -785,4 +965,16 @@ S-7…S-17 的载荷规格另可用 `data/spike/probe4-payload-spec.mjs` / `prob
 | 事实核对记录中若干旧行号已失效（**本批更正**） | L-14 与 §9 多处引用 `packages/server/src/index.ts:1008`（`GET /api/plugins` 返回 issues）、`packages/manager/src/index.ts:310-311`（`discoveryIssues()`）、`packages/web/src/lib/pluginUi.ts:262-267`（调试入口）、`:27-30`（三项 TODO）、`:193`（unload 注释） | **逐条复核结果**：① `GET /api/plugins` 的 `ok(h, { plugins, issues })` 实际在 **`packages/manager/src/index.ts:1417`**（`packages/server/src/index.ts` 全文仅 **803** 行，旧引的 `:1008` 不可能存在；该路由由 manager 的 `registerRoutes()` 注册）；② `discoveryIssues()` 在 **`packages/manager/src/index.ts:368-370`**，数据源声明在 `:151`、构造默认值在 `:291`（旧引的 `:310-311` / `:250` 已错位）；③ `DiscoveryIssue` 在 **`packages/manager/src/discovery.ts:28-40`**（旧引 `:28-41`），根目录不可读的 issue 在 **`:184-190`**（旧引 `:180-190`）；④ `pluginUi.ts:262-267` 已不存在（现 `:216-223` `syncPluginUi`、`:292-310` `startPluginUiSync`），`:27-30` 的三项 TODO 已被"已知边界（决策，不是待办）"段落（`:36-41`）替换，`:193` 的 unload 注释现为 `:187` 附近 | 已就地更正 L-14 的字段形状条目、L-9③ 的两个消费点行号（`packages/manager/src/index.ts:667-671` → `:1076-1080`、`packages/server/src/index.ts:427` → `:544`）、§9 的"Slot 的生命周期绑定"行，以及各处以"已按源码核对/当前位置"自居却已错位的 `configSchema`（`:72` → `:95`）与 `migrations`（`:56` → `:72`）、配置端点（`:1126`/`:1135` → `:1458`/`:1467`）引用。**本文档其余历史行号未逐条重跑**（如 L-2 引的 `packages/manager/src/index.ts:655`/`:660`、L-10-G2 引的 `:461`、批次 C 的 `packages/web/src/api.ts:180-182` 等——其中 `activatedByThisCall` 标识符在当前源码中**已零命中**，与该缺陷已修复一致），引用时请以当前源码为准 |
 | 源码注释与实现不符（**本批发现，留给后续代码批**） | `packages/server/src/index.ts` 的 `/plugins-ui` 静态分支注释写"与既有非 hashed 资产策略一致：交给前端的 `?v=<rev>` 自行击穿缓存" | **该注释已过时**：实际下发的响应头是 `cache-control: no-cache`，而前端**已彻底不使用** `?v=`（见上方证伪行）。注释是历史残留 | **本次只同步文档**（禁止改源码/配置）；已在 `docs/plugin-platform-plan.md` 与 `docs/architecture.md` 写明真实行为（`no-cache`，`rev` 不进 URL），并把该注释登记为**待代码批清理项** |
 | 配置项职责拆分：`GEEWIKI_PLUGIN_UI_DIST`（**本批新增，提交 `88e0c58`**） | 此前 `webDist` **一个配置项同时承担两个职责**：① 前端产物根（app shell 与 `/assets/*`）；② **内置插件 UI 资产**的兜底根 `<root>/plugins-ui/<插件名>/` | **dev 首页 404 回归已复现并修复**：上一批为让插件 UI 免构建可用，把根 `package.json` 的 `dev` 脚本设为 `GEEWIKI_WEB_DIST=packages/web/public`——而 `packages/web/public/` 只有 `host-sdk/` 与 `plugins-ui/`、**没有 `index.html`**（核实命令 `ls packages/web/public/`），静态层与 SPA fallback 都取不到 app shell → `curl :3000/` 返回 **404**（改动前为 200）。**修法 = 拆出独立的「内置插件 UI 资产根」**：环境变量 `GEEWIKI_PLUGIN_UI_DIST` + `ServerOptions.pluginUiDist`（类型与注释 `packages/server/src/index.ts:607-614`，读取逻辑 `:723-734`），**缺省回落 `webDist`**（prod 与既有行为完全不变）；**两个 `null` 语义不同**（类型注释原文）：`pluginUiDist: null` = "不使用内置根（只看插件自带产物）"，`webDist: null` = "不启用静态服务"。`packages/manager/src/index.ts:307` 把 `pluginUiDist: config.pluginUiDist ?? config.webDist ?? null` 落入管理器配置，`:333` 的 `uiTable()` 把 `this.config.pluginUiDist` 喂给 `buildPluginUiTable`；`ManagerConfig.webDist`（`:152-162`）加 `@deprecated` 并写明过载史。根 `dev` 脚本改为 `GEEWIKI_PLUGIN_UI_DIST=packages/web/public`（`dev:server` / `start` 不动）。启动日志现在**同时打印两个根**，二者相同时附注"（同静态产物根）"——`packages/server/src/index.ts:743-746`：`` `[server] 插件 UI 内置资产根: ${pluginUiDist}${pluginUiDist === webDist ? '（同静态产物根）' : ''}` ``（与既有的 `[@geewiki/http] 静态资源目录: <绝对路径>` 成对，见 `:569`）。**红-绿证据要点**：变异"把交给 `buildRegistry` 的 `webDist` 换成 `pluginUiDist`"（精确复现 dev 回归形态）→ 首页断言**红**；关变异 → **绿**。**遗留（改名未做，如实记录）**：`packages/manager/src/plugin-ui.ts` 里 `buildPluginUiTable` / `pluginUiRootsFor` / `resolvePluginUiHit` 的形参**仍叫 `webDist`**（`:163` / `:207` / `:242` / `:265`），语义已是"第二候选根的内置根"；另 `packages/web/vite.config.ts:21` 的注释曾写"dev 下后端以 `GEEWIKI_WEB_DIST=packages/web/public` 启动"（**已过时**，现为 `GEEWIKI_PLUGIN_UI_DIST`）——**该项已由提交 `716ec92` 修正，遗留只剩上面那一项（形参改名未做）** | 第 4 节批次 D 的资产根段落追加该拆分；`docs/architecture.md` §6"静态资源的托管"段补"内置根由 `GEEWIKI_PLUGIN_UI_DIST` 指定、缺省 = `webDist`"与两个 `null` 的差异；`docs/deployment.md` 变量表新增该变量并说明**镜像内刻意不设**（缺省即 `GEEWIKI_WEB_DIST` `/app/packages/web/dist`，行为不变）；`README.md` 环境变量表补该变量、`GEEWIKI_WEB_DIST` 描述收窄为"仅前端产物根" |
-| 测试计数（**七次实跑，当前口径**） | 上一行的 132/132（web 19 + manager 91 + server 22） | 全绿 **134/134** = `packages/web` **19**（`pluginUiPlan` 19）+ `packages/manager` **91**（`deps` 10 + `manager` 14 + `config` 36 + `discovery` 13 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/server` **24**（`registry` 3 + `router` 11 + `plugin-ui-static` **10**）。相对 132/132 新增 **2** 例，全部来自提交 `88e0c58` 的 `packages/server/test/plugin-ui-static.test.ts`：①『静态层：app shell 根与插件 UI 资产根分离后各司其职（回归：dev 首页 404）』②『静态层：未配置 pluginUiDist 时回落 webDist（拆分不改变既有行为）』。**命令**：`pnpm test`（`pnpm -r --if-present run test`，逐包汇总行 `packages/web test: # tests 19 / # pass 19 / # fail 0`、`packages/manager test: # tests 91 / # pass 91 / # fail 0`、`packages/server test: # tests 24 / # pass 24 / # fail 0`）+ 逐文件 `node --import tsx --test <file>`（1 + 6 + 3 = **10 个测试文件**）+ `pnpm typecheck`（`Scope: 7 of 8 workspace projects`，全 `Done`，`error TS` 计数 **0**），代码状态 `88e0c58`、工作树干净。**逐文件明细（本轮实跑）**：`pluginUiPlan` 19 / `deps` 10 / `manager` 14 / `config` 36 / `discovery` 13 / `plugin-ui` 15 / `repo-paths` 3 / `plugin-ui-static` 10 / `registry` 3 / `router` 11，各自 `fail 0` | 同步第 6 节表与逐文件口径、第 7 节 item 2、`README.md`（`pnpm test` 行 + 实现状态段）、`docs/roadmap.md` 的"当前口径"段。上一行（六次实跑 132/132）**标注为已过时但保留**，其明细仍可追溯 |
+| 测试计数（**七次实跑，已过时**） | 上一行的 132/132（web 19 + manager 91 + server 22） | 全绿 **134/134** = `packages/web` **19**（`pluginUiPlan` 19）+ `packages/manager` **91**（`deps` 10 + `manager` 14 + `config` 36 + `discovery` 13 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/server` **24**（`registry` 3 + `router` 11 + `plugin-ui-static` **10**）。相对 132/132 新增 **2** 例，全部来自提交 `88e0c58` 的 `packages/server/test/plugin-ui-static.test.ts`：①『静态层：app shell 根与插件 UI 资产根分离后各司其职（回归：dev 首页 404）』②『静态层：未配置 pluginUiDist 时回落 webDist（拆分不改变既有行为）』。**命令**：`pnpm test`（`pnpm -r --if-present run test`，逐包汇总行 `packages/web test: # tests 19 / # pass 19 / # fail 0`、`packages/manager test: # tests 91 / # pass 91 / # fail 0`、`packages/server test: # tests 24 / # pass 24 / # fail 0`）+ 逐文件 `node --import tsx --test <file>`（1 + 6 + 3 = **10 个测试文件**）+ `pnpm typecheck`（`Scope: 7 of 8 workspace projects`，全 `Done`，`error TS` 计数 **0**），代码状态 `88e0c58`、工作树干净。**逐文件明细（本轮实跑）**：`pluginUiPlan` 19 / `deps` 10 / `manager` 14 / `config` 36 / `discovery` 13 / `plugin-ui` 15 / `repo-paths` 3 / `plugin-ui-static` 10 / `registry` 3 / `router` 11，各自 `fail 0` | 同步第 6 节表与逐文件口径、第 7 节 item 2、`README.md`（`pnpm test` 行 + 实现状态段）、`docs/roadmap.md` 的"当前口径"段。上一行（六次实跑 132/132）**标注为已过时但保留**，其明细仍可追溯 |
+| 测试计数（**八次实跑，已过时**） | 上一行的 134/134（web 19 + manager 91 + server 24，三包） | 全绿 **242/242，覆盖 7 个包**：`packages/manager` **91** + `packages/web` **38**（`pluginUiPlan` 19 + `searchPlan` **19**）+ `packages/plugin-llm` **33**（`service` 24 + `redact` 9）+ `packages/plugin-search` **25**（`search` 25）+ `packages/server` **24** + `packages/plugin-ai` **23**（`ai` 23）+ `packages/plugin-wiki` **8**（`service` 8）。相对 134/134 新增 **108** 例，且**测试覆盖的包从 3 个扩到 7 个**（`plugin-search` / `plugin-llm` / `plugin-ai` / `plugin-wiki` 四个包**本轮起拥有单测**）。**命令**：`pnpm -r --no-bail --if-present run test`（**`--no-bail` 为本阶段新加**）+ `pnpm -r --if-present run typecheck`（`Scope: 10 of 11 workspace projects`，0 个 `error TS`；`plugins/hello-geewiki` 无该脚本）；取值时刻 **`2026-09-10T23:24 +08:00`**、HEAD **`585dbac`**、工作树干净；逐文件计数用 `node --import tsx --test <file>` 取 `# pass` | 写入 §6.1（新增"当前口径"小节，原 134/134 小节降为 §6.2"历史端到端验收基线"并标注被取代）、§7 item 2、批次 G、`README.md`（`pnpm test` / `pnpm typecheck` 两行 + 实现状态）、`docs/roadmap.md`（Phase 2 尾注）。**同时纠正两条口径性事实**：① 旧文"实际跑到 web / manager / server 三个包"**已作废**；② `pnpm -r` 在**首个失败包处中止**——这是 `--no-bail` 存在的原因，也意味着**更早的"全量绿"读数可能是部分读数**。**待并行批次复核**：此刻有并行批次在 `plugin-search` / `plugin-ai` 上修检索召回缺陷，落地后须重跑并复核这两行（25 / 23） |
+| 检索端点是否有 `mode` **请求**参数 | 阶段说明写"端点 `GET /api/search?q=&limit=`（另有 `mode` 参数，见并行批次的最终状态）" | **两个状态，都不是"文档说错"，而是并行批次在两次取数之间落了改动**：① **HEAD `585dbac` 的已提交版本：没有 `mode` 请求参数**——处理器只读 `q` 与 `limit`（`packages/plugin-search/src/index.ts:349-372`），`mode` 是**响应字段**（回传实际走了 `'fts'` 还是 `'like'`）。② **工作树（并行批次未提交改动）：`mode` 已成为请求参数**——新增 `SearchMode = 'phrase' \| 'terms'`，端点读 `h.url.searchParams.get('mode')`，缺省 `'phrase'`，**非法值 400 `invalid_mode`**（不静默降级）；响应在既有 `mode` 之外**新增 `queryMode`** 字段 | **如实按两个状态写**：`docs/architecture.md` §9.3 与 `README.md` 均按**工作树**状态记录（`q` / `limit` / `mode` 三个请求参数 + `mode` / `queryMode` 两个响应字段 + 400 `invalid_mode`），并**显式标注"该修复在工作树已实现但尚未提交，HEAD `585dbac` 仍是旧行为"**。**教训**：`mode` 一词在本仓有**两个不同含义**（响应里的实际路径 vs 请求里的查询语义），文档必须分别命名，这也是新增 `queryMode` 字段的价值 |
+| 检索召回缺陷：整串短语 vs 词元 OR（**并行批次的修复进行中**） | 阶段说明写"已知：整串按 FTS5 短语匹配，自然语言问句需按词元检索（修复进行中/已修）"，并明确要求"**先不要**写'问答召回正常'之类的断言" | **机制已核实**：`toFtsPhrase()` 把**整串**当一个 FTS5 字面短语（搜索框语义）⇒ 自然语言问句（「检索增强怎么做」）要求正文里连续出现该整串，**恒为 0 命中**，`@geewiki/ai` 的检索地基因此不可用。**修复形态（工作树）**：新增 `buildTermQuery(q): string[]`——CJK 连续片段取**长度 3 的滑窗 3-gram**、ASCII/数字片段按空白与常见标点切词且**只保留长度 ≥3** 者（trigram 的 <3 字符硬约束所致）、去重且保序；词元各自 `toFtsPhrase()` 后以 ` OR ` 连接（**切词与转义分开，注入防护仍只有一处**）；`terms` 切不出词元时**回退 LIKE**（不构造空 `MATCH`）；`total` 相应改为 **`COUNT(DISTINCT p.id)`**（OR 会让同一行被多个词元命中，`COUNT(*)` 会重复计入）；`snippet` 锚点改为**逐个词元试**；`@geewiki/ai` 改为 `search.search(query, { limit, mode: 'terms' })` | **按两个状态如实写**，且**不对召回是否正常下断言**：`docs/architecture.md` §9.3 记机制 + 修复方案 + "工作树已实现、尚未提交"；`README.md` 检索条目新增"⚠️ 已知（修复进行中）"段；`docs/roadmap.md` Phase 3 与批次 G 记同一口径。**未验证项**：修复**未经本文档作者端到端验证**（无真实问答链路复跑），其正确性由并行批次负责；相关用例数**不稳定**（见"八次/九次实跑"两行） |
+| 测试计数（**九次实跑，当前口径＝工作树**） | 上一行（八次）的 242/242（`plugin-search` 25 + `plugin-ai` 23） | 全绿 **251/251** = `packages/plugin-search` **32**（+7）+ `packages/plugin-ai` **25**（+2），其余五包与八次口径**逐包相同**（manager 91 / web 38 / plugin-llm 33 / server 24 / plugin-wiki 8）。**命令**：`pnpm -r --no-bail --if-present run test`；取值时刻 **`2026-09-10T23:35:15+08:00`**；**代码状态 = 工作树（含并行批次对 `packages/plugin-search/**` 与 `packages/plugin-ai/**` 的未提交改动；HEAD 仍是 `585dbac`）**。`pnpm typecheck`（同理复跑）：`Scope: 10 of 11 workspace projects`、**0** 个 `error TS`，取值 `2026-09-10T23:35:29+08:00` | **两个读数都写进文档并标明差别来源**：`README.md` 的 `pnpm test` 行给"读数 A（HEAD `585dbac`，242/242）/ 读数 B（工作树，251/251）"，`docs/roadmap.md` 与 §6.1 / §7 item 2 同口径。**`plugin-search` / `plugin-ai` 两行属"待并行批次落地后复核"的不稳定读数**，其余五包已稳定。**该批次落地并提交后须重跑并复核这两行** |
+| `better-sqlite3` 是否自带 FTS5 | 阶段说明写"预编译包已含 FTS5（`compile_options` 有 `ENABLE_FTS5`、SQLite 3.53.4），**无需 node-gyp**" | **实测确认**：`better-sqlite3@13.0.3` 的 `db.pragma('compile_options')` 含 **`ENABLE_FTS5`**（59 项之一），`select sqlite_version()` = **3.53.4**，`CREATE VIRTUAL TABLE … USING fts5(x, tokenize='trigram')` 直接成功 | **采纳**，写入 **§2.4 T-1**（并给出复现命令）。这是"离线 + 零重依赖"成立的前提 |
+| FTS5 的 `unicode61` 与中文 | 阶段说明写"默认 `unicode61` 分词器把**连续 CJK 当成一个 token** ⇒ 中文等于搜不到（实测 `MATCH '知识库'` 0 命中）" | **实测确认**：同一段中文正文下 `MATCH '"知识库"'` / `'"知识"'` / `'"全文检索"'` / `'"插件化知识库"'` 全部 **0 命中**；只有整段与 token 相同时命中（`'"GeeWiki"'` → 1）。改用 `trigram` 后 `'"知识库"'` / `'"全文检索"'` / `'"gee"'` 均 **1 命中** | **采纳**，写入 **§2.4 T-2 / T-3**。这是"本仓最容易被误传的一点"，故在 `docs/architecture.md` §9.3 也以表格形式重述 |
+| trigram 的 <3 字符硬缺口 | 阶段说明写"查询串 **<3 字符**时 `MATCH` 失效（中文 2 字词如「检索」是空结果）⇒ 插件层用 **LIKE 兜底**（走 `pages` 真源表而非索引，故索引缺失时短查询仍正确）" | **实测确认**：`trigram` 下 `MATCH '"知识"'` / `'"检索"'` / `'"库"'` 全部 **0 命中**（索引切的是 3 字符片段）。源码侧 `MIN_TRIGRAM_LENGTH = 3`（`packages/plugin-search/src/index.ts:134`）、`const useFts = q.length >= MIN_TRIGRAM_LENGTH`（`:255`），LIKE 路的 SQL 直接 `FROM pages`（`:296-301`）而非 `pages_fts`——与说明一致 | **采纳**，写入 **§2.4 T-4**；`docs/architecture.md` §9.3 记两条路径的 SQL 落点 |
+| trigram 索引体积 | 阶段说明写"与正文**同量级**（实测 5000 行/6.6MB 语料增约 7.9MB；外部资料给的量级是 1.7× 原文）" | **本轮自测（5000 行、正文合计 6.23 MB）**：建索引后库文件 19.58 MB → 26.65 MB，**增量 7.07 MB ≈ 1.14× 正文**。仓库内记录的实测为 6.6 MB 语料 +7.9 MB（≈1.2×，见 `packages/plugin-search/migrations/0001_search.sql`）。三条数字**互不矛盾**，量级一致 | **采纳并按区间写**"约 1.1–1.7× 正文"（写入 **§2.4 T-5**），同时**给出本轮自测的三个原始数字**（19.58 / 26.65 / 7.07 MB）与其语料口径，避免把区间读成单点 |
+| 服务名映射（`provides` token ≠ `ctx.provide` 名） | 阶段说明要求"核实一条**重要的映射事实**：manifest 的 `provides` token 与本插件 `ctx.provide` 的服务名并不总相同" | **核实成立**：`packages/db-sqlite/src/index.ts:174` 声明 `provides: 'database-provider'`，`:160` 却是 `ctx.provide('db', adapter)`；`packages/server/src/index.ts:66` 声明 `provides: 'http-service'`，`:575` 却是 `ctx.provide('http', router)`；而 **search / wiki / llm / ai 四者同名**（`packages/plugin-search/src/index.ts:64` ↔ `:383`、`packages/plugin-wiki/src/index.ts:108` ↔ `:443`、`packages/plugin-llm/src/index.ts:77` ↔ `:117`、`packages/plugin-ai/src/index.ts:107` ↔ `:552`）。`@geewiki/echo` 的 `provides: 'echo-service'` **已撤销**（`packages/plugin-echo/src/index.ts:33`，从未 provide 且全仓无消费方） | **采纳**：新增 **`docs/architecture.md` §9.2 服务名映射表**（`provides` token → 真实服务名 → 提供者插件 → 定义处行号 → 是否同名），并在 §7 的 `geewiki.provides` 字段说明处加警告与指针；`README.md` 的无障碍说明不涉及该细节，故只在架构文档登记 |
+| 默认部署是否含检索 | 阶段说明写"`config/plugins.base.json` 现在**包含 `@geewiki/search`**；`@geewiki/ai` 与 `@geewiki/llm` 仍是**已注册未启用**" | **核实成立**：`config/plugins.base.json` 的 `enabled` 恰为 4 条（`@geewiki/db-sqlite` / `@geewiki/http` / `@geewiki/wiki` / `@geewiki/search`）；`packages/server/src/index.ts:667-707` 的 `defaultRegistry()` 恰为 **7** 条（另含 `echo` / `llm` / `ai` 三条已注册未启用） | **采纳**并**更新全部数量口径**：清单启用 **4** 条 / 已注册 **7** 条 / `GET /api/plugins` 显示 **7** 条内置 / 挂载外部示例后 **8** 条（旧口径 3 / 4 / 4 / 5 **已作废**）。落点：`README.md` 实现状态段与仓库结构注、`docs/architecture.md` §7 现状说明 + §9.1 表 |
+| 发现期 issues 的前端提示位 | 阶段说明指出"roadmap 的 `[ ] 发现期 issues 的前端提示位` **已过时**——该横幅**已在代码里**，见 `packages/web/src/pages/AdminPage.tsx` 的 `.discovery-issues`" | **核实成立**：`packages/web/src/pages/AdminPage.tsx:314` `<section className="discovery-issues">`，条件 `issues.length > 0`，标题"外部插件发现期有 N 条问题（这些插件未加载）"，逐条渲染 `issue.code` / `issue.dir` / `issue.message`；样式 `packages/web/src/styles.css:179-183` | **采纳**：`docs/roadmap.md` 的 Phase 4 该条改为 **`[x]` 并回填落点**（标注"此前登记为未做，实际已在代码里"）；第 5 节 **L-14 标题与"兼容性提示"条目同步更正为已闭合**；`docs/architecture.md` §5.8 末句"前端管理页仍待补…提示位"改为已补 |
+| `--no-bail` 的读数含义 | 阶段说明写"根 `package.json` 的 `test` 脚本加了 **`--no-bail`**（此前 `pnpm -r` 会在**首个失败包处中止**，后续包根本不执行 ⇒ 全量绿读数可能是**部分**读数）" | **核实成立**：根 `package.json` 的 `scripts.test` 现为 `pnpm -r --no-bail --if-present run test`。**含义**：旧行为下**一个红色包会把它后面所有包藏起来**，因此更早的"全量绿"数字**在解释力上有限**（不只是"数字旧了"） | **采纳**：写入批次 G 的平台修复第 2 条、§6.1 的结构性变化第 2 条、§7 item 2。**注意**：这是**读数可靠性**修复，不是功能修复 |
