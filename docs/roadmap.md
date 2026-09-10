@@ -8,7 +8,7 @@
 | Phase 1 | 插件管理器 | 依赖图/双层状态/迁移控制器/看门狗/REST | ✅ 完成（e97ce6b） |
 | Phase 2 | 前端可视化 + Wiki MVP | React 19 管理台 + React Flow + Wiki CRUD/版本 | ✅ 完成（本次提交） |
 | Phase 3 | AI 原生能力 | Slots 插槽、LLM/RAG、编辑器组插件 | ⏳ 候选 |
-| Phase 4 | 稳定性加固 | PG 适配、配置热更新表单、docker 镜像构建 | ⏳ 候选 |
+| Phase 4 | 稳定性加固 | PG 适配、配置热更新表单（容器镜像与 Compose 部署已提前完成，见 [deployment.md](deployment.md)） | ⏳ 候选 |
 
 ## Phase 0：基础骨架 ✅
 
@@ -45,6 +45,8 @@
 
 **验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 15/15（`packages/manager/test/deps.test.ts` 8 例 + `manager.test.ts` 7 例）、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
 
+> 后续治理批次（同一实现期）在 `manager.test.ts` 增补崩溃自愈、persist 跳过失败条目、enable 事务性、看门狗决策、卸载排空与缓存清理等用例，并新增 `repo-paths.test.ts`（3 例，路径解析与进程工作目录解耦）与 `packages/server/test/router.test.ts`（11 例，覆盖 HTTP 路由排空/413/端口选项）；当前累计单测 **35/35**（deps 8 + manager 13 + repo-paths 3 + server 11）。
+
 ## Phase 3（候选）：AI 原生能力
 
 - [ ] Slots 插槽机制：`ctx.slot(name, component)` 注册 + 前端 `header-slots` / `editor-toolbar-slots` / `admin-page-slots` 扩展点
@@ -57,8 +59,8 @@
 
 - [ ] @geewiki/db-pg：PostgreSQL 适配插件（conflictGroup database-provider 与 sqlite 互斥切换）
 - [ ] 配置热更新：`POST /api/plugins/:name/config`（fiber.update 热重跑 apply）+ configSchema 自动生成 React 表单
-- [ ] 卸载排空倒计时 UI（drainTimeout 展示）
+- [ ] 卸载排空倒计时 UI（drainTimeout 展示）——**后端已就绪**：管理器在统一卸载出口按 `runtime.drainTimeout` 排空在途请求（见 architecture §5.1），仅缺前端展示
 - [ ] 冲突组替换交互（加载同组新插件时提示替换）
 - [ ] 依赖阻止卸载弹窗提示（当前 409 文案展示）
-- [ ] docker-compose 应用镜像多阶段构建（web build → server），容器自愈联动实测
+- [x] docker-compose 应用镜像多阶段构建（web build → server），容器自愈联动实测 —— **已完成**：`Dockerfile`（多阶段、非 root 运行、`HEALTHCHECK` 判 `ok && db.present`）+ `docker compose up -d --build` 已实测（构建、持久化、插件启停持久化、SIGTERM 优雅退出、数据目录不可写时如实变 `unhealthy`）；详见 [deployment.md](deployment.md)
 - [ ] 端到端故障演练：注入崩溃/慢查询验证熔断与数据无损

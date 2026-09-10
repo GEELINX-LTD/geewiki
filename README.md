@@ -8,8 +8,8 @@
 
 **当前实现状态**
 
-- **已完成（Phase 0-2）**：pnpm monorepo 共 7 个包；`pnpm dev` 一条命令同时启动后端 http://127.0.0.1:3000 与前端开发服务器 http://localhost:5173（生产形态 `pnpm build` 后用 `pnpm start`，由后端静态托管前端产物）；4 个内置插件（`@geewiki/http`、`@geewiki/db-sqlite`、`@geewiki/wiki`、`@geewiki/echo`）由代码内注册表静态登记；Web 管理台含 `#/wiki`、`#/plugins`、`#/graph` 三个路由；单元测试 15/15 通过，`pnpm typecheck` 7 个包 0 错误。
-- **尚未实现**：Phase 3 的 Slot 插槽、LLM/RAG 与 configSchema 表单；Phase 4 的 PostgreSQL 适配与容器镜像构建。详见 [docs/roadmap.md](docs/roadmap.md)。
+- **已完成（Phase 0-2）**：pnpm monorepo 共 7 个包；`pnpm dev` 一条命令同时启动后端 http://127.0.0.1:3000 与前端开发服务器 http://localhost:5173（生产形态 `pnpm build` 后用 `pnpm start`，由后端静态托管前端产物）；4 个内置插件（`@geewiki/http`、`@geewiki/db-sqlite`、`@geewiki/wiki`、`@geewiki/echo`）由代码内注册表静态登记；Web 管理台含 `#/wiki`、`#/plugins`、`#/graph` 三个路由；单元测试 35/35 通过，`pnpm typecheck` 7 个包 0 错误。卸载统一出口已消费 `runtime.drainTimeout`（优雅排空在途 HTTP 请求，超时强制卸载）并在 `requiresCachePurge` 时广播缓存清理事件。
+- **尚未实现**：Phase 3 的 Slot 插槽、LLM/RAG 与 configSchema 表单；Phase 4 的 PostgreSQL 适配。**容器镜像与 Compose 编排已可用**（多阶段 `Dockerfile` + `docker compose up -d --build`，见 [docs/deployment.md](docs/deployment.md)）。详见 [docs/roadmap.md](docs/roadmap.md)。
 
 ## 快速开始
 
@@ -21,6 +21,8 @@ pnpm dev       # 一条命令同时启动后端（:3000）与前端开发服务�
 ```
 
 > ⚠️ **必须在仓库根目录执行 `pnpm dev`**：该脚本同时拉起后端与前端。若在 `packages/web` 目录下执行，只会启动 Vite 前端而不启动后端（`packages/web/package.json` 的 `dev` 仅运行 `vite`），前端会因 `/api` 代理不到后端而请求失败。
+>
+> 补充：应用内部的**路径解析已与进程工作目录解耦**——`data/`、`config/`、`packages/web/dist` 等相对路径一律以**仓库根**为基准（`@geewiki/core` 的 `resolveProjectPath`，依据 `pnpm-workspace.yaml` 定位仓库根），因此后端从任意目录启动都指向同一份数据与配置。
 >
 > Windows 用户：根 `dev` 脚本使用 POSIX shell 语法（`&`、`$!`、`kill`），请在**两个终端**分别运行 `pnpm dev:server` 与 `pnpm dev:web`。
 
@@ -38,40 +40,50 @@ pnpm dev       # 一条命令同时启动后端（:3000）与前端开发服务�
 | `pnpm build` | 构建全仓产物（`@geewiki/web` → `packages/web/dist`） |
 | `pnpm start` | 与 `pnpm dev:server` 同一条命令：**仅启动后端**（不起 Vite）；生产形态下由后端静态托管 `packages/web/dist` → http://127.0.0.1:3000（需先 `pnpm build`） |
 | `pnpm typecheck` | 全仓类型检查（`pnpm -r --if-present run typecheck`，7 个包） |
-| `pnpm test` | 运行单元测试（`packages/manager/test`，当前 15/15 通过） |
+| `pnpm test` | 运行单元测试（`packages/manager/test` 与 `packages/server/test`，当前 35/35 通过） |
 
 环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `GEEWIKI_PORT` | `3000` | 后端监听端口。注意：前端 dev server 的 `/api` 代理目标在 `packages/web/vite.config.ts:9` 中硬编码为 `http://127.0.0.1:3000`，**改动本变量需同步修改该代理配置**，否则开发形态下前后端断链 |
-| `GEEWIKI_DATA_DIR` | `./data` | SQLite 数据库与运行时数据目录（库文件 `geewiki.db`） |
-| `GEEWIKI_CONFIG_DIR` | `./config` | 插件清单目录（`plugins.base.json` / `plugins.session.json`） |
-| `GEEWIKI_WEB_DIST` | `packages/web/dist` | 前端静态产物目录（未构建时不启用静态服务） |
+| `GEEWIKI_PORT` | `3000` | 后端监听端口（优先级：`startServer({ port })` 选项 > 本变量 > 默认值）。注意：前端 dev server 的 `/api` 代理目标在 `packages/web/vite.config.ts:9` 中硬编码为 `http://127.0.0.1:3000`，**改动本变量需同步修改该代理配置**，否则开发形态下前后端断链 |
+| `GEEWIKI_HOST` | `0.0.0.0` | 后端监听地址（优先级：`startServer({ host })` 选项 > 本变量 > 默认值）；如需仅本机可访问可设为 `127.0.0.1` |
+| `GEEWIKI_DATA_DIR` | `./data` | SQLite 数据库与运行时数据目录（库文件 `geewiki.db`、崩溃标记 `crash.marker`）；**相对路径以仓库根为基准**，绝对路径原样使用 |
+| `GEEWIKI_CONFIG_DIR` | `./config` | 插件清单目录（`plugins.base.json` / `plugins.session.json`）；相对路径同样以仓库根为基准 |
+| `GEEWIKI_WEB_DIST` | `packages/web/dist` | 前端静态产物目录（未构建时不启用静态服务）；**相对路径一律以仓库根为基准**（与进程工作目录无关，故从任意子目录启动都指向同一份产物），绝对路径原样透传 |
+
+> 以上相对路径均由 `@geewiki/core` 的 `resolveProjectPath` 以**仓库根**（向上查找 `pnpm-workspace.yaml`）为基准解析，与进程 cwd 无关；启动时 `[@geewiki/http] 静态资源目录: <绝对路径>` 日志可用于核对。
 
 - 零外部依赖默认配置：数据落在 `data/geewiki.db`（WAL + 自动迁移建表）。
 - 界面（hash 路由）：`#/wiki` 知识库（列表/编辑/Markdown/版本历史）· `#/plugins` 插件管理（会话层热启停、JSON 配置、应用并持久化）· `#/graph` 依赖图（React Flow DAG）。
 - 插件热操作示例：在「插件管理」启用 `@geewiki/echo` 即时挂载 `GET /api/echo`，停用即摘除；「应用并持久化」把会话变更合并进 `config/plugins.base.json`。
 - REST 面：`/api/health`（健康/库表/迁移）· `/api/plugins*` · `/api/pages*`。
-- **Docker 部署**：根目录 `docker-compose.yml` 是 Phase 4 的部署骨架 —— Dockerfile 与镜像构建尚未提供，因此 `docker compose up -d` 目前不能直接成功（镜像构建属 Phase 4）。当前请用 `pnpm dev` 本地运行，Compose 文件仅作部署形态参考。
+- **Docker 部署**：仓库自带多阶段 `Dockerfile` 与 `docker-compose.yml`，容器内以非 root（`node`）运行、数据落在宿主机 `./data`（SQLite）：
+  ```bash
+  mkdir -p data config plugins && chown -R 1000:1000 data config plugins
+  docker compose up -d --build        # → http://localhost:3000
+  ```
+  镜像已提供并实测（含健康检查、持久化与 SIGTERM 优雅退出）；完整的目录权限、备份、排障与验证清单见 [docs/deployment.md](docs/deployment.md)。本地开发仍推荐 `pnpm dev`。
 
 ## 特性亮点
 
 - **开箱即用**：默认仅依赖一个 SQLite 数据库（better-sqlite3）即可运行，实现 0 外部依赖部署。
 - **数据库即互斥插件**：系统通过标准 `DatabaseAdapter` 接口抽象数据库层（见 `packages/core`），SQLite ↔ PostgreSQL 以互斥插件（conflictGroup）方式切换，业务代码零改动；PostgreSQL 适配包 `@geewiki/db-pg` 属 Phase 4 规划，尚未实现。
-- **插件管理器（核心大脑）**：依赖拓扑/环检测、会话层沙箱热启停（显式热授权 + 试用期看门狗 + 熔断）、广义冲突组互斥、迁移控制器、持久化清单合并。配置热更新与前端 Slot 插槽机制列 Phase 3（见 roadmap）。
+- **插件管理器（核心大脑）**：依赖拓扑/环检测、会话层沙箱热启停（显式热授权 + 试用期看门狗 + 熔断）、广义冲突组互斥、迁移控制器、持久化清单合并。卸载走统一出口（`disable` / 启停回滚 / `disposeAll`）：先按 `runtime.drainTimeout` **优雅排空**在途 HTTP 请求（超时告警并强制卸载），卸载后对声明 `requiresCachePurge` 的插件广播**缓存清理事件**。配置热更新与前端 Slot 插槽机制列 Phase 3（见 roadmap）。
 - **管理面可视化**：React 19 管理台 —— 插件状态/层/热能力一览、会话层热操作、依赖图（React Flow DAG）、Wiki 页面编辑与版本历史。
 
 ## 技术栈
 
 | 层次 | 选型 | 说明 |
 | --- | --- | --- |
-| 后端内核 | [Cordis](https://github.com/cordiverse/cordis) | 依赖注入、事件总线与插件生命周期管理 |
+| 后端内核 | [Cordis](https://github.com/cordiverse/cordis) `cordis@^4.0.0-rc.10` | 依赖注入、事件总线与插件生命周期管理。当前实际安装 `4.0.0-rc.10`（npm `latest` 标签即指向该 RC；3.x 稳定线止于 `3.18.1`，本项目未采用） |
 | 开发语言 | TypeScript（Node.js 环境） | — |
 | 前端框架 | React 19+ | use Hook、Suspense 流式渲染及 Compiler 优化，实现前端组件的动态插拔 |
 | 默认数据库 | better-sqlite3 | 零外部依赖，开箱即用 |
 | 生产数据库 | PostgreSQL（pg 驱动） | 适配规划中（Phase 4），当前尚未提供适配包 |
-| 容器编排 | Docker Compose（Profiles 模式） | 部署骨架已就位；镜像构建属 Phase 4，默认不启动 Postgres 服务 |
+| 容器编排 | Docker Compose（Profiles 模式） | 多阶段 `Dockerfile` + `docker compose up -d --build` 已可用（非 root 运行、SQLite 持久化到 `./data`）；`--profile production` 预留 Postgres 服务，默认不启动，详见 [docs/deployment.md](docs/deployment.md) |
+
+**内核版本事实（cordis，2026-09 核实）**：仓库 6 个包（core / db-sqlite / manager / server / plugin-wiki / plugin-echo）统一声明 `"cordis": "^4.0.0-rc.10"`，`pnpm-lock.yaml` 解析并安装 `cordis@4.0.0-rc.10`。npm `dist-tags` 为 `latest = 4.0.0-rc.10`、`next = 4.0.0-beta.5`（即 `pnpm add cordis` 装到的就是该 RC），3.x 序列的最后一个版本是 `3.18.1`。该包本身未声明 `engines` 字段，本项目在 Node 22.23.2 上实测通过（typecheck + 测试 + 运行）。`^4.0.0-rc.10` 按 semver 语义覆盖 `4.0.0` 正式版及其后 4.x，正式版发布后 `pnpm update cordis` 即可升级。另需注意 4.x 的类型发布缺口：`lib/index.d.ts` 的 `export *` 链使 `Context` 的 `provide/get/plugin` 等方法在外部消费时不被解析，本仓库由 `packages/core/src/cordis-env.ts` 的自包含模块增强补齐（详见该文件头注释）。
 
 ## 架构总览
 
@@ -105,8 +117,11 @@ geewiki/
 ├── data/             # SQLite 数据库与运行时数据（已在 .gitignore 中排除）
 ├── docs/
 │   ├── architecture.md    # 系统设计文档
+│   ├── deployment.md      # Docker 部署指南（镜像构成、目录权限、备份、排障、验证清单）
 │   └── roadmap.md         # 开发路线图（Phase 0 – Phase 4）
-├── docker-compose.yml
+├── Dockerfile             # 多阶段生产镜像（builder + runtime，非 root 运行）
+├── .dockerignore
+├── docker-compose.yml     # Compose 编排（默认 SQLite；--profile production 预留 Postgres）
 ├── LICENSE
 └── README.md
 ```
@@ -118,6 +133,7 @@ geewiki/
 | 文档 | 内容 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 系统设计：设计哲学、技术栈选型、分层架构、数据库即互斥插件、插件管理器六大子系统、前端 Slot 插槽、Manifest 规范、部署模型 |
+| [docs/deployment.md](docs/deployment.md) | Docker 部署：快速开始、镜像构成、目录权限、环境变量、数据备份、生命周期自愈、PostgreSQL profile、升级、排障与验证清单 |
 | [docs/roadmap.md](docs/roadmap.md) | 开发路线图：Phase 0 – Phase 4 的目标、任务清单与验收口径 |
 
 ## 许可证
