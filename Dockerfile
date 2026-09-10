@@ -89,11 +89,16 @@ RUN TSX_VERSION="$(node -p "require('/src/node_modules/tsx/package.json').versio
 # ─────────────────────────────────────────────────────────────────────────────
 FROM node:22-bookworm-slim AS runtime
 
+# 运行期默认值。注意 GEEWIKI_PLUGINS_DIR 必须是**绝对路径**：部署树里没有
+# pnpm-workspace.yaml，resolveProjectPath() 找不到仓库根时会回退到 process.cwd()，
+# 于是任何覆盖 WORKDIR 的启动方式（docker run -w、自定义 entrypoint）都会让插件发现
+# 静默指向别处——不报错、0 个插件。固定为 /app/plugins 后与 compose 的挂载点一致。
 ENV NODE_ENV=production \
     HOME=/home/node \
     GEEWIKI_PORT=3000 \
     GEEWIKI_DATA_DIR=/app/data \
     GEEWIKI_CONFIG_DIR=/app/config \
+    GEEWIKI_PLUGINS_DIR=/app/plugins \
     GEEWIKI_WEB_DIST=/app/packages/web/dist \
     PATH=/opt/tsx/node_modules/.bin:$PATH
 
@@ -107,6 +112,14 @@ COPY --from=builder /src/packages/web/dist /app/packages/web/dist
 
 # 运行期 tsx（含 esbuild 平台二进制）
 COPY --from=builder /opt/tsx /opt/tsx
+
+# 默认插件清单：把仓库的 config/ 打进镜像。构建上下文里只有 plugins.base.json
+# （plugins.session.json 已被 .dockerignore 排除），这正是我们要的默认基础层清单。
+# 缺了它，未挂载 ./config 的容器会读到「空清单」→ 没有任何插件被激活 → HTTP 不监听，
+# 进程随即以退出码 0 结束，并被 restart 策略反复拉起，形成静默重启循环、对外完全不服务
+# （已实测：日志仅剩「http 路由服务不可用：REST API 未挂载」，端口无监听）。
+# 放在下面的权限归一化之前，以便一并 chown/chmod。
+COPY --from=builder /src/config /app/config
 
 # 权限归一化：
 #   * pnpm deploy 生成的部署树里，少量文件权限为 600（root:root），非 root 运行时会被
@@ -135,4 +148,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 # 服务端注册了 SIGTERM/SIGINT 优雅退出（卸载插件、关闭 DB）；
 # PID 1 的僵尸进程回收由 compose 的 init: true 负责。
-CMD ["tsx", "src/index.ts"]
+# 入口写绝对路径：与上面 GEEWIKI_* 的绝对化同理，避免任何 -w / 自定义 WORKDIR
+# 让容器连入口都解析不到（相对 "src/index.ts" 会按 cwd 解析而失败）。
+CMD ["tsx", "/app/src/index.ts"]

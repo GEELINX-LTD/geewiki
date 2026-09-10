@@ -39,16 +39,20 @@ services:
     environment:
       NODE_ENV: production
       # 以下为 packages/server/src/index.ts 实际读取的环境变量
-      # （GEEWIKI_PORT / GEEWIKI_DATA_DIR / GEEWIKI_CONFIG_DIR / GEEWIKI_WEB_DIST），取值与下方挂载点一致；
-      # 插件清单文件名固定为 <config 目录>/plugins.base.json 与 plugins.session.json，无独立环境变量。
+      # （GEEWIKI_PORT / GEEWIKI_DATA_DIR / GEEWIKI_CONFIG_DIR / GEEWIKI_PLUGINS_DIR / GEEWIKI_WEB_DIST），
+      # 取值与下方挂载点一致；插件清单文件名固定为 <config 目录>/plugins.base.json 与
+      # plugins.session.json，无独立环境变量。
       GEEWIKI_PORT: 3000
-      GEEWIKI_DATA_DIR: /app/data       # SQLite 数据库与 crash.marker 所在目录
-      GEEWIKI_CONFIG_DIR: /app/config   # 基础层 / 会话层插件清单目录
+      GEEWIKI_DATA_DIR: /app/data            # SQLite 数据库与 crash.marker 所在目录
+      GEEWIKI_CONFIG_DIR: /app/config        # 基础层 / 会话层插件清单目录
+      # 外部插件发现根：必须是绝对路径（相对路径在部署树里会回退到 process.cwd()，
+      # 见 Dockerfile 中该变量的注释）。与下方 ./plugins 挂载的目标路径保持一致。
+      GEEWIKI_PLUGINS_DIR: /app/plugins
       # 前端静态产物目录：显式给出，避免依赖 cwd；由镜像构建阶段生成到该路径
       GEEWIKI_WEB_DIST: /app/packages/web/dist
     volumes:
       - "${GEEWIKI_HOST_DATA_DIR:-./data}:/app/data"          # SQLite 数据库、crash.marker 等运行时数据（持久化）
-      - "${GEEWIKI_HOST_PLUGINS_DIR:-./plugins}:/app/plugins" # 预留：外部插件挂载点（插件发现/挂载机制尚在规划，见 docs/roadmap.md）
+      - "${GEEWIKI_HOST_PLUGINS_DIR:-./plugins}:/app/plugins" # 外部插件发现根：每个子目录一个插件（清单见 package.json 的 geewiki 键或 geewiki.manifest.json）；插件不从镜像内打包，只来自此挂载
       - "${GEEWIKI_HOST_CONFIG_DIR:-./config}:/app/config"    # 基础层 / 会话层插件清单（plugins.base.json / plugins.session.json）
     restart: unless-stopped
     # 健康检查沿用镜像内 HEALTHCHECK（GET /api/health，30s 间隔）：
