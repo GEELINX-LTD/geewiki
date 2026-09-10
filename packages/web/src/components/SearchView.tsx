@@ -7,9 +7,9 @@
  * - 空/超长查询本地先拦一次并给明确提示，同时仍容忍后端 400；
  * - 检索插件未启用时端点 404 → 不报 error，只在结果区给出"未启用"提示。
  */
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ApiError, api, type SearchResponse } from '../api'
-import { checkQuery, snippetToHtml } from '../lib/searchPlan'
+import { checkQuery, scoreBadges, snippetToHtml } from '../lib/searchPlan'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -68,6 +68,11 @@ export function SearchView(props: {
     onSearch(checked.value)
   }
 
+  // 相关度徽标：后端给的是绝对量级不定的 BM25（实测 1e-6 量级，直接 toFixed(2) 恒为 0.00），
+  // 故只呈现**本次查询内的相对值**；纯逻辑在 lib/searchPlan.ts 的 scoreBadges 里并有单测。
+  // 输入框打字会触发重渲染，故这里 memo 一次，避免每次都重算。
+  const badges = useMemo(() => scoreBadges(data?.hits ?? []), [data])
+
   return (
     <div className="page">
       <div className="page-head">
@@ -104,6 +109,7 @@ export function SearchView(props: {
             查询「{data.query}」· 命中 {data.total} 条 · 路径 {data.mode}
             {data.mode === 'like' ? '（短查询兜底）' : ''}
             {data.total > data.hits.length ? ` · 仅显示前 ${data.hits.length} 条` : ''}
+            {data.mode === 'fts' ? ' · 相关度为本次查询内的相对值' : ''}
           </div>
 
           {data.hits.length === 0 ? (
@@ -111,24 +117,28 @@ export function SearchView(props: {
           ) : (
             <section className="card">
               <ul className="search-hit-list">
-                {data.hits.map((hit) => (
-                  <li key={hit.slug} className="search-hit">
-                    <div className="search-hit-head">
-                      <button className="search-hit-title" onClick={() => onOpen(hit.slug)} title={`打开 ${hit.slug}`}>
-                        {hit.title}
-                      </button>
-                      <code className="chip">{hit.slug}</code>
-                      <span className="muted small">{fmtTime(hit.updated_at)}</span>
-                      {hit.score !== 0 && (
-                        <span className="badge badge-base" title="取负后的 BM25，仅同一次查询内可比">
-                          {hit.score.toFixed(2)}
-                        </span>
-                      )}
-                    </div>
-                    {/* 服务端已转义 + 只含 <mark>：按 HTML 注入以显示高亮 */}
-                    <p className="search-snippet" dangerouslySetInnerHTML={{ __html: snippetToHtml(hit.snippet) }} />
-                  </li>
-                ))}
+                {data.hits.map((hit, i) => {
+                  const badge = badges[i]
+                  return (
+                    <li key={hit.slug} className="search-hit">
+                      <div className="search-hit-head">
+                        <button className="search-hit-title" onClick={() => onOpen(hit.slug)} title={`打开 ${hit.slug}`}>
+                          {hit.title}
+                        </button>
+                        <code className="chip">{hit.slug}</code>
+                        <span className="muted small">{fmtTime(hit.updated_at)}</span>
+                        {badge && (
+                          // 只呈现相对值（后端 score 是绝对量级不定的 BM25，见 lib/searchPlan.ts）
+                          <span className={`badge ${badge.top ? 'badge-base' : 'badge-cold'}`} title={badge.title}>
+                            {badge.label}
+                          </span>
+                        )}
+                      </div>
+                      {/* 服务端已转义 + 只含 <mark>：按 HTML 注入以显示高亮 */}
+                      <p className="search-snippet" dangerouslySetInnerHTML={{ __html: snippetToHtml(hit.snippet) }} />
+                    </li>
+                  )
+                })}
               </ul>
             </section>
           )}

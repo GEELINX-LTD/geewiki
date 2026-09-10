@@ -7,7 +7,11 @@
  *    下面的 {@link snippetToHtml} 是唯一出口，并**顺带做一次白名单消毒**：
  *    只允许 `<mark>`，其余标签一律转义——即使服务端将来改了契约（或某条数据被污染），
  *    也不会把任意 HTML 注入宿主页面。
- * 2. **降级文案**——按 `degraded.reason`（稳定枚举）分叉，**绝不按 `message` 文本分支**。
+ * 2. **相关度呈现**——后端给的是**取负后的 BM25**（越大越相关），但它**不是归一化分数**：
+ *    值域无界、量级随语料规模与查询词变化。实测本仓库语料下只有 `1e-6 ~ 2e-6` 量级，
+ *    直接 `toFixed(2)` 会**恒为 `0.00`**（等于没有信息量、还误导用户"分数都为零"）。
+ *    因此只呈现**同一次查询内的相对值**（见 {@link scoreBadges}），绝不呈现绝对值。
+ * 3. **降级文案**——按 `degraded.reason`（稳定枚举）分叉，**绝不按 `message` 文本分支**。
  */
 import type { Degraded, DegradedReason } from '../api'
 
@@ -53,6 +57,87 @@ function escapeHtml(text: string): string {
 /** 片段里是否真的带高亮（用于测试与排障，不参与渲染决策） */
 export function hasHighlight(snippet: string): boolean {
   return ALLOWED_MARK.test(snippet)
+}
+
+/* ------------------------- 相关度呈现 ------------------------- */
+
+/** 需要相关度徽标的命中（与 `api.ts` 的 `SearchHit` 结构兼容，便于直接传入） */
+export interface ScoredHit {
+  score: number
+}
+
+/** 一条命中的相关度徽标（纯数据，调用方直接渲染） */
+export interface ScoreBadge {
+  /** 展示文本：`100%` / `60%` / `<1%` / `0%` / `关键词匹配` */
+  label: string
+  /** 悬停说明：已含"相对值、非绝对相关度、仅同次查询内可比"的限定 */
+  title: string
+  /** 是否为本次最高分（可能并列）——调用方可用于加亮 */
+  top: boolean
+  /** 该结果只是关键词匹配（`like` 兜底路径），后端不产生相关度分 */
+  keywordOnly: boolean
+}
+
+/** 每次呈现都必须带上的限定语：后端给的是绝对量级不定的 BM25，只有相对关系有意义 */
+const RELATIVE_HINT = '相对值，非绝对相关度；仅同一次查询内可比'
+
+/** `like` 兜底路径（命中全部零分）的统一徽标：明确说明"没有分数"而不是显示 `0%` */
+const KEYWORD_ONLY_LABEL = '关键词匹配'
+
+/**
+ * 把后端返回的 `score` 数组转成**可渲染的相对相关度徽标**（与入参等长、同序）。
+ *
+ * 语义（**只呈现相对值**）：
+ * - 以本次结果的**最高分**为基准：最高分 → `100%`，其余 → 相对最高分的百分比（取整）；
+ *   并列最高分时**都为 `100%`**（它们确实同等相关）。
+ * - 非最高分**永不超过 `99%`**（避免出现两个 `100%` 造成歧义）。
+ * - 正分但不足最高分的 `0.5%` → `<1%`（不显示 `0%`，否则与"真的没有分"混淆）。
+ * - **本次没有任何正分**（`like` 兜底路径的典型情形，实测 `score` 恒为 0）→ 全部标
+ *   `关键词匹配`，**绝不显示 `0%`**（那会被读成"相关度为零"）。
+ * - 非有限值（`NaN`/`±Infinity`）与负值都按"没有相关度分"处理 → `0%`。
+ *
+ * **永不产生** `NaN`、`Infinity`、负百分比，也不会除零（基准 ≤ 0 时走上面的零分分支）。
+ */
+export function scoreBadges(hits: readonly ScoredHit[]): ScoreBadge[] {
+  if (hits.length === 0) return []
+
+  let max = Number.NEGATIVE_INFINITY
+  for (const hit of hits) {
+    if (Number.isFinite(hit.score) && hit.score > max) max = hit.score
+  }
+
+  // 无任何正分（like 兜底 / 全 0 / 全非有限值）：无法给出相对值
+  if (!Number.isFinite(max) || max <= 0) {
+    return hits.map(() => ({
+      label: KEYWORD_ONLY_LABEL,
+      // 这里**不提"相对值"**：本次根本没有分数，说相对值会误导（它是"没有分"而非"分很低"）
+      title: '短查询兜底的关键词匹配（LIKE），后端不产生相关度分，故不显示百分比',
+      top: false,
+      keywordOnly: true,
+    }))
+  }
+
+  return hits.map((hit) => {
+    const score = hit.score
+    if (!Number.isFinite(score) || score <= 0) {
+      // 本次确实有正分，而这一条没有 → 它没有相关度信号（不是"最低分"）
+      return { label: '0%', title: `本次未给出相关度分（${RELATIVE_HINT}）`, top: false, keywordOnly: false }
+    }
+    if (score >= max) {
+      return { label: '100%', title: `本次最高分（${RELATIVE_HINT}）`, top: true, keywordOnly: false }
+    }
+    const pct = Math.round((score / max) * 100)
+    if (pct <= 0) {
+      return { label: '<1%', title: `不足本次最高分的 1%（${RELATIVE_HINT}）`, top: false, keywordOnly: false }
+    }
+    const capped = Math.min(99, pct)
+    return {
+      label: `${capped}%`,
+      title: `约为本次最高分的 ${capped}%（${RELATIVE_HINT}）`,
+      top: false,
+      keywordOnly: false,
+    }
+  })
 }
 
 /** 前端预检查询串：空/超长在本地就拦下并给出明确文案（同时仍容忍后端 400） */

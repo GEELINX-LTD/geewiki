@@ -15,6 +15,7 @@ import {
   checkQuery,
   degradedNotice,
   hasHighlight,
+  scoreBadges,
   snippetToHtml,
 } from '../src/lib/searchPlan'
 
@@ -144,4 +145,123 @@ test('answerRenderer：markdown 走 markdown 渲染，其余按纯文本', () =>
   assert.equal(answerRenderer('markdown'), 'markdown')
   assert.equal(answerRenderer('plain'), 'plain')
   assert.equal(answerRenderer(undefined), 'plain')
+})
+
+/* ------------------------- scoreBadges ------------------------- */
+
+/** 断言一条徽标既没有 NaN/Infinity，也不是负百分比（本批要消灭的呈现故障） */
+function assertSaneLabel(label: string): void {
+  assert.ok(!/NaN|Infinity/.test(label), `不得出现 NaN/Infinity：${label}`)
+  assert.ok(!label.startsWith('-'), `不得出现负百分比：${label}`)
+}
+
+test('scoreBadges：真实量级的 BM25（1e-6）**不再显示成 0.00**——最高分为 100%、其余按比例', () => {
+  // 取自隔离实例的实测值：三段不同相关度的真实分数
+  const badges = scoreBadges([
+    { score: 1.906253824501285e-6 },
+    { score: 1.3604087514738635e-6 },
+    { score: 1.1517302573203196e-6 },
+  ])
+  assert.equal(badges[0]?.label, '100%', '最高分应显示 100%')
+  assert.equal(badges[0]?.top, true)
+  assert.equal(badges[1]?.label, '71%', '1.3604/1.9063 ≈ 71%')
+  assert.equal(badges[2]?.label, '60%', '1.1517/1.9063 ≈ 60%')
+  for (const b of badges) {
+    assertSaneLabel(b.label)
+    assert.ok(!/^0(\.0+)?%$/.test(b.label), `非零分数不得显示为 0%：${b.label}`)
+    assert.match(b.title, /相对值|相对/, '说明必须点明是相对值')
+    assert.match(b.title, /仅同一次查询内可比/)
+  }
+})
+
+test('scoreBadges：并列最高分都为 100%（同等相关），且已不同于旧的"全 0.00"', () => {
+  const badges = scoreBadges([{ score: 1.375e-6 }, { score: 1.375e-6 }, { score: 1.375e-6 }])
+  assert.deepEqual(
+    badges.map((b) => b.label),
+    ['100%', '100%', '100%'],
+  )
+  assert.ok(badges.every((b) => b.top))
+})
+
+test('scoreBadges：非最高分永不超过 99%（不出现两个 100% 造成歧义）', () => {
+  // 0.999 会被 round 成 100，必须被压到 99
+  const badges = scoreBadges([{ score: 1 }, { score: 0.999 }])
+  assert.equal(badges[0]?.label, '100%')
+  assert.equal(badges[1]?.label, '99%')
+  assert.equal(badges[1]?.top, false)
+})
+
+test('scoreBadges：**like 兜底路径（全 0 分）**→ 标注"关键词匹配"，绝不显示 0%/NaN', () => {
+  // 实测 2 字中文查询走 LIKE，score 恒为 0
+  const badges = scoreBadges([{ score: 0 }, { score: 0 }])
+  assert.deepEqual(
+    badges.map((b) => b.label),
+    ['关键词匹配', '关键词匹配'],
+  )
+  assert.ok(badges.every((b) => b.keywordOnly))
+  for (const b of badges) {
+    assertSaneLabel(b.label)
+    assert.match(b.title, /关键词匹配/)
+    assert.ok(!b.label.includes('%'), '零分路径不得显示任何百分比')
+    assert.ok(!/相对值/.test(b.title), '本次没有分数，标题不得声称是"相对值"（会被读成"分很低"）')
+  }
+})
+
+test('scoreBadges：本次有正分时，某条为 0 分 → 显示 0%（确实没有相关度信号）', () => {
+  const badges = scoreBadges([{ score: 1e-5 }, { score: 0 }])
+  assert.equal(badges[0]?.label, '100%')
+  assert.equal(badges[1]?.label, '0%')
+  assert.equal(badges[1]?.keywordOnly, false)
+})
+
+test('scoreBadges：极小但非零的相对值显示 <1%（不谎报为 0%）', () => {
+  const badges = scoreBadges([{ score: 1 }, { score: 1e-9 }])
+  assert.equal(badges[1]?.label, '<1%')
+  assertSaneLabel(badges[1]?.label ?? '')
+})
+
+test('scoreBadges：边界——空数组不产生任何徽标（不除零）', () => {
+  assert.deepEqual(scoreBadges([]), [])
+})
+
+test('scoreBadges：边界——单条结果为 100% 且 top', () => {
+  const badges = scoreBadges([{ score: 3.2e-7 }])
+  assert.equal(badges.length, 1)
+  assert.equal(badges[0]?.label, '100%')
+  assert.equal(badges[0]?.top, true)
+})
+
+test('scoreBadges：边界——负值/NaN/Infinity 都按"没有相关度分"处理，不污染其它行', () => {
+  const badges = scoreBadges([
+    { score: -5 },
+    { score: Number.NaN },
+    { score: Number.POSITIVE_INFINITY },
+    { score: Number.NEGATIVE_INFINITY },
+  ])
+  // 全部非正分/非有限值 → 无法给出相对值 → 关键词匹配分支
+  for (const b of badges) {
+    assertSaneLabel(b.label)
+    assert.ok(!b.label.includes('%'), `无有效正分时不得显示百分比：${b.label}`)
+  }
+  // 混合：有正分时，异常值行按 0% 处理
+  const mixed = scoreBadges([{ score: 2e-6 }, { score: -1 }, { score: Number.NaN }])
+  assert.equal(mixed[0]?.label, '100%')
+  assert.equal(mixed[1]?.label, '0%')
+  assert.equal(mixed[2]?.label, '0%')
+  for (const b of mixed) assertSaneLabel(b.label)
+})
+
+test('scoreBadges：极大值不产生 Infinity（比值恒在 0~1 之间）', () => {
+  const badges = scoreBadges([{ score: Number.MAX_VALUE }, { score: Number.MAX_VALUE / 2 }])
+  assert.equal(badges[0]?.label, '100%')
+  assert.equal(badges[1]?.label, '50%')
+  for (const b of badges) assertSaneLabel(b.label)
+})
+
+test('scoreBadges：返回数组与入参**等长同序**（调用方可按 index 直接取）', () => {
+  const hits = [{ score: 3e-6 }, { score: 0 }, { score: 1e-6 }, { score: 2e-6 }]
+  const badges = scoreBadges(hits)
+  assert.equal(badges.length, hits.length)
+  assert.equal(badges[0]?.label, '100%')
+  assert.equal(badges[3]?.label, '67%', '2/3 ≈ 67%')
 })
