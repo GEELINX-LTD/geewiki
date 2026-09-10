@@ -2,7 +2,7 @@
 
 > 本文档面向项目维护者与后续接手者，回答两个问题：**下一步按什么顺序做什么**，以及**底层内核行为已经被实验证实成什么样**。
 >
-> 文档中的"实证"结论来自 `data/spike/` 下的探针脚本（`probe1-fork-update.mjs` / `probe1b-hooks.mjs` / `probe1c-hook-next.mjs` / `probe2-schemastery.mjs` / `probe2b-payload.mjs` / `probe3-load.mjs` / `addendum.mjs`）。**`data/` 被 `.gitignore` 排除，该目录随时可能被清理**，因此结论在此固化；`data/spike/` 内另装有 `schemastery@3.18.0` 与 `cordis@4.0.0-rc.10`（工作区尚未声明 schemastery 依赖）作为独立验证环境。复现方式见第 8 节。
+> 文档中的"实证"结论来自 `data/spike/` 下的探针脚本（`probe1-fork-update.mjs` / `probe1b-hooks.mjs` / `probe1c-hook-next.mjs` / `probe2-schemastery.mjs` / `probe2b-payload.mjs` / `probe3-load.mjs` / `addendum.mjs`）。**`data/` 被 `.gitignore` 排除，该目录随时可能被清理**，因此结论在此固化；`data/spike/` 内另装有 `schemastery@3.18.0` 与 `cordis@4.0.0-rc.10` 作为独立验证环境（**注**：`schemastery@3.18.0` 后来已在工作区正式声明——`packages/core` / `packages/manager` / `packages/plugin-wiki` / `packages/plugin-echo` 的 `package.json` 均为 `"schemastery": "3.18.0"`，见第 9 节；`data/spike/` 内的那份是初版核对时的独立安装）。复现方式见第 8 节。
 >
 > 现状与设计蓝图见 [architecture.md](./architecture.md)，阶段划分见 [roadmap.md](./roadmap.md)（本文批次 B–F 对应 roadmap 的 Phase 3 / Phase 4 候选清单），容器化细节见 [deployment.md](./deployment.md)。本文编号自成体系，不延续 architecture.md 的章节号。
 
@@ -17,7 +17,7 @@ GeeWiki 已具备"清单驱动装配 + 依赖图/冲突组 + 会话沙箱 + 迁�
 | ① | 插件配置系统：manifest `configSchema` → 前端表单 + 持久化 + 热更新 | **已落地**：`configSchema` 采用 schemastery 3.18.0（`packages/core/src/index.ts:72` 的类型 + 两个内置插件均为 `Schema.object({...})`）；服务端校验 + 白名单裁剪 + 原子落盘 + 已激活插件 `fork.update()` 热更新（失败双向回滚）；管理台按 schema 自动生成表单，无 schema 插件退回 JSON 原文通道（不校验、不裁剪） |
 | ② | 外部插件加载：`./plugins` 目录 + 清单发现 | **已落地**：`packages/manager/src/discovery.ts` 的 `loadExternalPlugins()` 发现并加载，`packages/server/src/index.ts` 的 `buildRegistry()` 把外部插件**并入同一注册表**；内置插件仍由 `defaultRegistry()` 代码内置登记（4 个：`@geewiki/db-sqlite` / `@geewiki/http` / `@geewiki/echo` / `@geewiki/wiki`）；发现期问题经 `GET /api/plugins` 的 `issues` 字段可观测（L-14） |
 | ③ | 前端 Slot 插槽：插件向 Web 管理台贡献 UI | **部分落地（仅宿主侧）**：`window.__GEEWIKI_HOST__` 宿主 SDK + `packages/web/src/lib/slots.tsx` 的 `registerSlot` / `SlotOutlet`（含 ErrorBoundary）+ `/plugins-ui/<name>/client.js` 动态加载；插槽名白名单**仅 `app-header` / `app-footer`**。**未落地**：后端 `ctx.slot()` 注册链路、`editor-toolbar-slots` / `admin-page-slots`、Suspense 懒加载、fork 生命周期绑定（详见 `docs/architecture.md` §6） |
-| ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 三项**均已落地**：排空见 L-1（粒度是**全站**在途请求，非 owner 级）；冲突组替换 = `POST /api/plugins/:name/replace` + 管理台顶替确认框（G-1，提交 `42db76a`）；`enable` 回滚改为全递归共用集合（G-2，提交 `69cfeb2`） |
+| ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 三项**均已落地**：排空见 L-1（粒度是**全站**在途请求，非 owner 级）；冲突组替换 = `POST /api/plugins/:name/replace` + 管理台顶替确认框（G-1，提交 `42db76a`；前置校验与前端交互后经 `2227adf` / `b21534a` 收紧，见 G-1 的三类拒绝）；`enable` 回滚改为全递归共用集合（G-2，提交 `69cfeb2`） |
 | ⑤ | 容器化：`docker compose up` 可用 | **已落地并实测**（`Dockerfile` / `docker-compose.yml` / `docs/deployment.md`；G1–G4 的逐条状态见第 5 节 L-10） |
 | ⑥ | PostgreSQL 适配（评估） | 未落地，`DatabaseAdapter` 目前为同步接口；**已裁决延期**（依据与前置条件见第 5 节 L-9） |
 
@@ -352,36 +352,48 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 
 以下两项属批次 B 的治理面：**设计已定稿，代码未落地**。它们被写进本批次是为了让实现批"照文档对齐代码"，不需要重新决策。
 
-**G-1 `conflictGroup` 替换交互：`POST /api/plugins/:name/replace`（已落地，提交 `42db76a`）**
+**G-1 `conflictGroup` 替换交互：`POST /api/plugins/:name/replace`（已落地：提交 `42db76a`；前置校验与前端交互另经 `2227adf` / `b21534a` 收紧）**
 
 请求体：`{ config?: Record<string, unknown> }`（可选，作为目标插件替换激活时的配置）。
 
 | 状态码 | 码值 | 含义 |
 | --- | --- | --- |
-| 200 | — | `{ok, plugin: PluginSnapshot, replaced: {name, config}, restarted: string[]}`——`replaced` 是被替换（停用）的旧插件，`restarted` 是被级联重启的依赖方列表 |
-| 409 | `base_layer` | 旧插件不在 session 层（基础层插件不允许被替换下线） |
+| 200 | — | `{ok, plugin: PluginSnapshot, replaced: {name, config} \| null, restarted: string[]}`——`replaced` 是被替换（停用）的旧插件，**`replaced: null` 表示未发生替换**（目标已激活的幂等路径，或"无同组冲突"的降级路径），`restarted` 是被级联重启并接回的依赖方列表 |
+| 409 | `base_layer` | 基础层（冷操作）拒绝：① 旧插件（被顶替者）真实激活层非 session → 不带 `details`；② 卸载集合内任一成员真实激活层非 session → **带 `details.plugins`**（基础层成员名单） |
+| 409 | `provider_mismatch` | **新增错误码**：`requires` 的依赖边原本指向被顶替者，而目标无法承接（按名与 `provides` 都不命中） |
 | 409 | `hot_reload_not_supported` | 目标插件不支持热重载 |
 | 409 | `hot_dependency_not_supported` | 热链上存在不支持热重载的依赖方 |
 | 400 | `load_failed` | 目标插件加载失败 |
 | 400 | `migration_failed` | 目标插件迁移失败 |
 | 500 | `replace_rollback_failed` | **新增错误码**：回滚（恢复旧插件与依赖方）也失败，需人工介入 |
 
-⚠️ `replace_rollback_failed` 需要被 `fail()` 认识。**注意本仓库并没有显式的"错误码 → HTTP 状态映射表"**：`packages/manager/src/index.ts` 的 `fail()` 是 if/else 条件链（`not_found`→404、`payload_too_large`→413、一组冲突类码→409、其余 400）。已落地版本在该条件链里新增 `replace_rollback_failed → 500` 分支。
+**`replaced.config` 口径**：取自 `persistedConfigOf(旧插件名)`——即**已落盘的生效配置**（会话条目写了 `config` 就用它；**会话条目存在但没写 `config` 时不构成有效覆盖，回落基础层值**，见 `packages/manager/src/index.ts` 的 `persistedConfigOf()`），**不是**"会话条目里的原始 config 字段"。
+
+⚠️ `replace_rollback_failed` 需要被 `fail()` 认识。**注意本仓库并没有显式的"错误码 → HTTP 状态映射表"**：`packages/manager/src/index.ts` 的 `fail()` 是 **if/else（三元嵌套）条件链**——`not_found`→404、`payload_too_large`→413、`replace_rollback_failed`→500、一组冲突类码（`conflict_group` / `hot_reload_not_supported` / `hot_dependency_not_supported` / **`provider_mismatch`** / `has_dependents` / `base_layer` / `hot_update_failed` / `migration_failed`）→409、其余 400。已落地版本在该条件链里新增 `replace_rollback_failed → 500` 与 `provider_mismatch → 409` 两个分支。**若在别处读到"错误码→HTTP 映射表"的措辞，按本行以条件链为准。**
 
 **流程**：
 
 1. 目标插件**已激活** → 幂等返回（不重复替换）；
 2. **无冲突方**（该 `conflictGroup` 内没有其它已激活插件）→ **降级走 `enable`**，不必走替换路径；
-3. 否则前置校验三项：目标插件支持热重载、热链可用、**旧插件确实在 session 层**（在 base 层则 409 `base_layer`）；
+3. 否则进入**前置校验**（全部在产生任何副作用之前，故拒绝路径零残留）：热能力校验 = 目标插件支持热重载 + 热链可用；随后**三类拒绝**——
+   - ① **旧插件的真实激活层**必须是 session：判据是 `this.plugins.get(conflict)?.layer`（**真实激活层**），**不是 `layerOf()`**。两者语义不同：`layerOf()` 判的是"会话清单里有没有该条目"（它的语义是"配置的**写入**目标层"，别处依赖它）；而"同一插件同时出现在基础层与会话层清单"是本仓库明确支持的**叠加态**（会话层是叠加在基础层之上的覆盖层），此时插件实际以 **base 层**激活，`layerOf()` 会误报 session → 冷插件被热替换、旧插件仍留在基础层清单里、重启后每次启动都撞冲突组互斥。`disable()` 用的也是真实激活层，两处必须一致。非 session → 409 `base_layer`（不带 `details`）；
+   - ② **整个卸载集合**（旧插件 ∪ 其活跃传递依赖方）中任一成员的真实激活层不是 session → 409 `base_layer`，**带 `details.plugins`**。含义：位于基础层的**活跃依赖方不可被热卸载**——卸载走 `deactivateCore`（它会**绕过** `disable()` 的 base_layer 守卫直接热卸载），而把依赖方接回时走 `enable()` 落的是**会话层**条目，于是基础层插件的持久化层会被静默改写成 session（此后对它的 `PUT /config` 会写进会话清单）。**拒绝优于"把它热卸载并在会话层重新落盘"**；
+   - ③ **提供者覆盖**：新增纯函数 `findUncoveredRequires(registry, replaced, target, names)`（`packages/manager/src/deps.ts`）做校验，`names = [旧插件, ...待接回的依赖方]`——即**目标自身也在校验范围内**。判定：对某插件每个 `requires` token `t`，若 `resolveDependency(registry, t)?.name === replaced`（这条边当前指向被顶替者），则要求目标 `target` 能承接该 token —— 按插件名命中（`target === t`）或按服务标识命中（`target` 的 `provides === t`）；都不满足即违规 → 409 `provider_mismatch`，`details` = `{plugin, token, target, targetProvides, violations}`（`violations` 是全部违规项 `{plugin, token}[]`）。
+   - ③′ **目标自洽**（独立一处校验）：目标自身 `requires` 中经 `resolveDependency` 解析后指向被顶替者的 token 也一律拒绝 → 409 `provider_mismatch`，`details` = `{plugin: 目标名, tokens, target, conflict}`。此处**不给"目标恰好 `provides` 同名 token"的豁免**：按名的边仍指向旧插件，目标激活后该依赖恒不满足。
+   - **刻意取舍（宁可拒绝也不假报成功）**：依赖方**按具体插件名**依赖被顶替者时必然违规——按名的边无法由新插件承接，正解是依赖方改为依赖**服务标识**（`provides` token，本仓库推荐用法）。该取舍的对外影响就是**这一类替换会被 409 拒绝**，而不是返回 200 却留下无人提供的服务（见 `packages/manager/src/deps.ts` 的 `findUncoveredRequires` 头注释与 `packages/manager/src/index.ts` 的 `replace()` 注释）；
 4. 取旧插件的**依赖方传递闭包**——已新增 `packages/manager/src/deps.ts` 的 `collectDependentsClosure(registry, names)`（BFS + visited，环安全，遍历整个注册表取安全超集，调用方与当前活跃集合取交集）：现有 `collectDependents` 只查**直接**反向边，替换场景必须拿到**传递**闭包（否则孙依赖会被留在半激活状态）；
 5. 与旧插件合并成待停用集合，按拓扑序**逆序卸载**（依赖方先卸、旧插件后卸）；
 6. 激活目标插件（`enableWithDeps` 传入 `skipDeps = {旧插件}`——目标与旧插件往往 `provides` 同一服务，旧插件卸载后若仍被解析为依赖会被重新拉起，进而撞上冲突组互斥）；
 7. 按正向拓扑序把依赖方接回新提供者，并记入 `restarted`；失败 → **先防御性卸载目标**（避免半激活污染），再恢复旧插件与依赖方；恢复也失败 → 500 `replace_rollback_failed`；
-8. **成功时只写一次 session 清单**；失败则零落盘——**天然原子**（不在中途分多次落盘）。
+8. **不是"全程仅一次落盘"**：卸载集合一次 `removeManyFromSession`、目标激活一次、每个接回的依赖方各一次，共 **1 + 1 + N** 次写会话清单（`replace()` 头注释原文："整个过程会多次写会话清单（卸载集合一次 + 目标 + 每个接回的依赖方）"）。每次都是 `writeList()` 的 **tmp + rename 原子替换**，因此任意时刻的清单文件都是自洽的；"失败不留痕"靠"调用前快照 + 回滚成功时写回"保证，而非靠"零落盘"。（**旧版此处写"成功时只写一次 session 清单、失败则零落盘——天然原子"，与实现相反，已按源码改正。**）
 
-> ⚠️ **实现偏离（如实记录）**：落地版本在失败回滚路径上**做不到"零落盘"**——卸载集合先用一次 `removeManyFromSession` 落盘，随后激活目标与逐个接回依赖方都会各自原子落盘。因此回滚不是"零写"而是"**把会话清单还原成调用前的字节**"：`replace()` 在动手前用 `JSON.parse(JSON.stringify(this.session))` 快照会话清单，回滚全部成功时把该快照原样写回，使条目**顺序与格式**都与调用前逐字节一致（逐条 `enable` 恢复只会按拓扑序追加，与原启用顺序未必相同——已由用例「回滚按调用前的条目顺序逐字节复原会话清单」钉住，并做过红-绿验证）。回滚未全部成功时抛 500 `replace_rollback_failed`，此时清单可能处于中间态，需人工介入。
+> ⚠️ **实现偏离（如实记录，措辞已按源码校准）**：落地版本在失败回滚路径上**做不到"零落盘"**——卸载集合先用一次 `removeManyFromSession` 落盘，随后激活目标与逐个接回依赖方都会各自原子落盘。因此回滚不是"零写"而是"**按调用前的条目顺序与原内容复原会话清单**"：`replace()` 在动手前用 `JSON.parse(JSON.stringify(this.session))` 快照会话清单（`packages/manager/src/index.ts`），回滚全部成功时把这个快照对象整体写回（`this.session = sessionBackup; writeList(...)`）。逐条 `enable` 恢复只会把条目按拓扑序追加回去，与原顺序（用户启用顺序）不一定一致，所以快照写回保证的是**条目顺序与内容**；**但文件格式会规范化**——`writeList()` 恒以 `${JSON.stringify(list, null, 2)}\n` 落盘，若清单文件此前是**人工编辑过的非规范格式**（自定义缩进、字段顺序颠倒、无末尾换行），写回后字节与原文件**不再相同**（语义相同、条目顺序相同）。**因此本文旧措辞"逐字节复原 / 逐字节一致"已降级为"按调用前的条目顺序与原内容复原；文件格式会规范化为 `JSON.stringify(…, null, 2)` + 末尾换行"**（审查已用人工编辑的非规范清单复现该反例）。用例『replace：回滚按调用前的条目顺序逐字节复原会话清单（依赖方启用顺序与拓扑序相反时也成立）』（`packages/manager/test/config.test.ts:989`）钉住的是**该用例自己构造的规范格式文件**的前后字节相等（`:1023-1027` 的 `assert.equal(readFileSync(...), sessionBefore)`），不覆盖非规范输入——用例名沿用旧措辞，实际保证以上述准确措辞为准。
+>
+> 回滚未全部成功时抛 500 `replace_rollback_failed`。**该路径的真实语义（按源码核实）**：回滚循环已按正向激活序逐条尝试 `enable`，且失败项才进 `failures`；走到 500 时**整个卸载集合的会话条目都已从清单消失**——`removeManyFromSession(unloadSet)` 已把旧插件与依赖方整体摘除、目标的条目也已被 `removeFromSession(name)` 摘除，恢复失败的条目没有被重新写回。因此**内存中的 `this.session` 与磁盘上的清单文件始终一致、无分歧**（每次 `addToSession` 都是"改内存 + 立即 `writeList`"），与本文其他位置的"清单可能处于中间态、状态不确定"旧措辞不同：实际是"**已知的确定态：这几条插件不在清单里了**，message 里写明当前真实状态，需人工介入"。**无单测覆盖**：`replace_rollback_failed` 在 `packages/*/test/` 中**零命中**（`grep -rn "replace_rollback_failed" packages/*/test/` 无输出），该分支**仅代码路径 + 人工推演**——构造"回滚本身也失败"需要更细的注入点（例如让恢复期的 `enable` 稳定抛错），本轮未做，**登记为未验证项**。
 
-**裁决**：采用"**级联停用并自动重启依赖方**"而非"有依赖方即拒绝"。理由：拒绝会让用户**永远无法完成同组替换**（同组互斥且真实依赖普遍存在）；而静默断供不可选。**代价已接受**：最坏情况出现 `N × drainTimeout` 的短暂中断（N = 被级联停用的插件数，`drainTimeout` 默认 5 秒）。**前端确认文案必须预告该中断**（让用户在点确认前知道会短暂不可用）。
+**裁决**：采用"**级联停用并自动重启依赖方**"而非"有依赖方即拒绝"。理由：拒绝会让用户**永远无法完成同组替换**（同组互斥且真实依赖普遍存在）；而静默断供不可选。**代价已接受**：最坏情况出现 `N × drainTimeout` 的短暂中断（N = 被级联停用的插件数，`drainTimeout` 默认 5 秒）。**前端确认文案必须预告该中断**（让用户在点确认前知道会短暂不可用）——已在 `packages/web/src/pages/AdminPage.tsx:335` 落地。
+>
+> **后续收紧（`2227adf` / `b21534a`，与上面裁决不冲突）**：本裁决否掉的是"**只要有依赖方就拒绝**"；`2227adf` 新增的是**在依赖方可被安全接管时才允许替换**的前置校验，二者互补而非替代。具体三类拒绝见上文流程第 3 步：① 旧插件真实激活层非 session → 409 `base_layer`；② 卸载集合内任一成员真实激活层非 session → 409 `base_layer`（`details.plugins`）；③ 依赖边指向被顶替者而目标无法承接 → 409 `provider_mismatch`。**依赖方按具体插件名依赖被顶替者属于第 ③ 类，会被 409 拒绝**——这是刻意取舍：按名的边无法由新插件承接，返回 200 会留下无人提供的服务；正解是依赖方改为依赖服务标识（`provides` token）。`b21534a` 则补齐了前端三处如实呈现（短暂中断预告、依赖方按活跃过滤、无替换时的降级文案分叉）。
 
 **G-2 `enable` 回滚作用域缺陷：已确认缺陷 + 已按定稿修法修复（提交 `69cfeb2`）**
 
@@ -628,22 +640,24 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 
 | 包 | 用例数 | 通过 | 失败 |
 | --- | --- | --- | --- |
-| `packages/manager` | **67**（5 个测试文件：`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3） | 67 | 0 |
+| `packages/manager` | **73**（5 个测试文件：`deps` 10 + `manager` 14 + `config` 33 + `discovery` 13 + `repo-paths` 3） | 73 | 0 |
 | `packages/server` | **14**（`registry` 3 + `router` 11） | 14 | 0 |
-| **合计** | **81** | **81** | **0** |
+| **合计** | **87** | **87** | **0** |
 
 逐文件口径：
 
-- `packages/manager/test/`：`deps.test.ts` 9 例、`manager.test.ts` 14 例、`config.test.ts` 28 例、`discovery.test.ts` 13 例、`repo-paths.test.ts` 3 例 —— 合计 **67**。
+- `packages/manager/test/`：`deps.test.ts` 10 例、`manager.test.ts` 14 例、`config.test.ts` 33 例、`discovery.test.ts` 13 例、`repo-paths.test.ts` 3 例 —— 合计 **73**。
 - `packages/server/test/`：`registry.test.ts` 3 例（`buildRegistry` 内置 4 + 外部合并 / `pluginsRoot` 为 `null` / 目录不可用）、`router.test.ts` 11 例（drain 空闲、在途、超时、多等待者、回归自计数；inflight 结算；404 与静态交接不计在途；REST 卸载两类；wiki 413 计入 stats；`ServerOptions.port` / `host`）—— 合计 **14**。
 
-**已过时口径（保留以便追溯，勿再引用）**：本版之前此处记录的是"manager **39** 例 / **37** 过 / **2** 失败、server **11/11**"。那两个失败用例是**尚未随新契约更新的旧断言**，不是新代码缺陷，现均已改写：
+> **注意（并行批次，务必先读）**：上表数字是**提交 `b21534a` 状态**的实跑口径（manager 5 个测试文件 73 例 + server 2 个测试文件 14 例，逐文件命令 `node --import tsx --test <file>`，实跑时刻见第 9 节"五次实跑"行）。**若工作树中存在未提交的并行批次**（例如新增 `packages/manager/test/plugin-ui.test.ts`，或在既有 `config.test.ts` 里追加 `GET /api/plugins/ui` 等用例），`pnpm test` 会一并收集这些用例，数字与失败数都会随之变化——**那是并行批次的中间状态，不属于本节口径**。核对本节数字时请只跑上表的 7 个文件，或先确认工作树无其他未提交改动；也可用 `git show HEAD:<file> | grep -cE "^test\("` 静态核对已提交状态的用例数（管理台/测试文件的并行增补会让工作树数字高于上表）。
+
+**已过时口径（保留以便追溯，勿再引用）**：本版之前此处记录的是"manager **67** 例 / server **14** 例、合计 **81/81**"（81 = `deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3 + `registry` 3 + `router` 11）；再之前是"manager **39** 例 / **37** 过 / **2** 失败、server **11/11**"。那两个失败用例是**尚未随新契约更新的旧断言**，不是新代码缺陷，现均已改写：
 
 - `packages/manager/test/config.test.ts`『updateConfig：未声明 schema → config_not_supported』——旧契约要求无 schema 插件改配置返回 400 `config_not_supported`；新裁决反转为"接受并保存原始 JSON"（见批次 C 与 `docs/architecture.md` §5.7）。**已改写**为新契约用例『updateConfig：未声明 schema → 按 JSON 原文透传（不校验、不裁剪），已激活同样热更新』（`packages/manager/test/config.test.ts:220`）。
 - `packages/manager/test/config.test.ts`『REST：GET/PUT /api/plugins/:name/config 的状态码与响应形状』——旧断言 `assert.equal(got.body['layer'], null, '未激活 → 无层')`（`:305`）与最终裁决冲突：`layer` 现为**持久化层**（从未持久化时落 `'base'`，类型 `Layer` 非空），"未激活"改由 `activeLayer: null` 表达。**已改写**：文件头注释第 8 条明确"`layer`（持久化层）与 `activeLayer`（激活层）两个维度"，并新增用例『`configOf`：layer = 持久化层、`activeLayer` = 激活层（基础层激活 / 会话层激活 / 未激活三态）』（`:445`）。
 - 另外新增了会话层叠加用例（『boot 叠加：基础层 + 会话层并存时，会话层配置作为覆盖层生效』）与外部插件发现用例（`discovery.test.ts` 13 例，含『`parsePluginManifest`：`package.json` 的 `geewiki` 键优先』`discovery.test.ts:54`、『`resolvePluginEntry`：显式 entry 优先，其后 `index.ts` → `index.js` → `src/index.ts`』）。
 
-因此 `README.md` / `docs/roadmap.md` 中出现的 35/35 是**历史时点口径**，当前口径为 **81/81**（见第五行核对表；本节其余历史口径仅作追溯）。**旧文残句（供检索）：72/72**（两处均已同步更新）。
+因此 `README.md` / `docs/roadmap.md` 中出现的 35/35 是**历史时点口径**，当前口径为 **87/87**（见第五行核对表；本节其余历史口径仅作追溯）。**旧文残句（供检索）：72/72、81/81**（均已同步更新）。
 
 **遗留项**：见第 5 节 **L-7**（React Flow 授权提示）与 **L-8**（详情页「← 返回列表」走 `history.back()`）。
 
@@ -654,7 +668,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 每一批交付必须同时满足：
 
 1. `pnpm typecheck` **0 错**；
-2. `pnpm test` **全绿**，且包含该批新增用例。**当前（本轮实跑）全绿：81/81** —— `packages/manager` **67**（`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11），逐文件口径见第 6 节。**历史时点**：基线提交 `ed826b5` 为 **35/35**（manager 24 + server 11）；其后修复批一度出现 manager **39 例 / 37 过 / 2 失败**（两条旧断言尚未随新契约更新：`layer` 语义反转、无 schema 插件改为接受原始 JSON），**现已全部改写完成**；
+2. `pnpm test` **全绿**，且包含该批新增用例。**当前（本轮实跑）全绿：87/87** —— `packages/manager` **73**（`deps` 10 + `manager` 14 + `config` 33 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11），逐文件口径见第 6 节。**历史时点**：81/81（manager 67 + server 14，见核对表"四次实跑"行）；基线提交 `ed826b5` 为 **35/35**（manager 24 + server 11）；其后修复批一度出现 manager **39 例 / 37 过 / 2 失败**（两条旧断言尚未随新契约更新：`layer` 语义反转、无 schema 插件改为接受原始 JSON），**现已全部改写完成**；
 3. **隔离端口**的端到端冒烟（不得占用开发用的 3000 / 5173）；
 4. 涉及 UI 的批次必须有**浏览器端到端验收**（真实渲染，而非接口断言）；
 5. **每批先经独立 Reviewer 审查，再提交**；
@@ -688,16 +702,17 @@ S-7…S-17 的载荷规格另可用 `data/spike/probe4-payload-spec.mjs` / `prob
 | `simplify` 是实例方法 | "`schema.simplify(value)`，不是 `Schema.simplify`" | 实跑确认静态调用抛 `TypeError: Schema.simplify is not a function` | 采纳（S-5） |
 | `schemastery` 依赖 | 选型 `schemastery@3.18.0` | 初版核对时工作区 `packages/*` **尚未声明**该依赖，只在 `data/spike/` 独立环境中安装；**当前已正式声明**：`packages/core/package.json` / `packages/manager/package.json` / `packages/plugin-wiki/package.json` / `packages/plugin-echo/package.json` 均为 `"schemastery": "3.18.0"` | 第 2.2 节开头的"工作区尚未声明"已按现状修正；批次 C 的加依赖待办**已闭合** |
 | `drainTimeout` 消费 | 能力 ④ 列出"`drainTimeout` 消费"待补 | **已落地**：`packages/manager/src/index.ts` 的统一卸载出口按 `runtime.drainTimeout` 排空 | 第 1 节状态改为"已落地"，与 roadmap Phase 4 的说明一致 |
-| `conflictGroup` 替换交互 | 能力 ④ 列出待补 | **已落地**（提交 `42db76a`）：`POST /api/plugins/:name/replace` + `collectDependentsClosure` + 管理台顶替确认框；隔离实例实测 200 替换 / 409 `conflict_group` 探测 / 409 `base_layer`（旧插件在基础层），浏览器 CDP 实测确认框与成功提示 | 更新为已实现（G-1） |
+| `conflictGroup` 替换交互 | 能力 ④ 列出待补 | **已落地**（提交 `42db76a`，后经 `2227adf` 补强前置校验、`b21534a` 补强前端交互）：`POST /api/plugins/:name/replace` + `collectDependentsClosure` + 管理台顶替确认框；隔离实例实测 200 替换 / 409 `conflict_group` 探测 / 409 `base_layer`（旧插件在基础层），浏览器 CDP 实测确认框与成功提示。**前置校验已收紧为三类拒绝**（均在零副作用阶段）：① 旧插件**真实激活层**（`managed.layer`，**非** `layerOf()`）非 session → 409 `base_layer`；② 卸载集合（旧插件 ∪ 活跃传递依赖方）内任一成员真实激活层非 session → 409 `base_layer` + `details.plugins`（`packages/manager/src/index.ts` 的 `const baseLayerMembers = unloadSet.filter((n) => this.plugins.get(n)?.layer !== 'session')`）；③ `requires` 的边经 `resolveDependency` 解析后指向被顶替者、而目标无法承接（目标插件名与 `provides` 均不命中）→ 409 **`provider_mismatch`**（纯函数 `packages/manager/src/deps.ts` 的 `findUncoveredRequires(registry, replaced, target, names)`，`details = {plugin, token, target, targetProvides, violations}`），**目标自身依赖被顶替者同样被拒**（`index.ts` 的 `const selfRequiresConflict = (m.requires ?? []).filter((t) => resolveDependency(this.config.registry, t)?.name === conflict)`，`details = {plugin, tokens, target, conflict}`，不给"目标恰好 provides 同名 token"的豁免） | 更新为已实现（G-1），并把"依赖方会被卸载并接回新提供者"的旧表述改三类拒绝口径；**对外影响已写明**：依赖方按**具体插件名**依赖被顶替者时该替换被 409 拒绝，正解是改为依赖服务标识（`provides`）；`fail()` 无显式映射表、`provider_mismatch` 在条件链里归 409 |
 | 前端 Slot 单例共享 | 初版 D-4 写"宿主用 import map 暴露 react 单例" | **勘察证伪**：`react@19.2.8` 无任何 ESM 产物（`exports` 只有 `react-server`/`default`）、宿主产物已内联 react（`packages/web/dist/assets/index-DyngNpzw.js`）、dev 的 `?v=<hash>` 会造成实例分裂 | **改写**：D-4 保留其余结论并指向新增 **D-8**（宿主 `window.__GEEWIKI_HOST__` SDK + 薄 shim） |
 | `configSchema` 承载方式 | 批次 C 直接按 schemastery 载荷渲染 | 初版核对时仓库现状是 **JSON Schema 风格字面量**：`packages/core/src/index.ts:49` 为 `Record<string, unknown>`，`packages/plugin-wiki/src/index.ts:37` / `packages/plugin-echo/src/index.ts:30` 用 `title` 键（schemastery 无此键） | 当时判定为**契约迁移开放项**（推荐方案甲）；**现已按方案甲落地**——`packages/core/src/index.ts:30`（`ConfigSchema = ReturnType<typeof Schema.any<any>>`）与 `:72`，`packages/plugin-wiki/src/index.ts:27-33`、`packages/plugin-echo/src/index.ts:22-26` 全部改为 `Schema.object({...})` |
 | schemastery 载荷规格 | "`refs` 是数组 / 节点带 `uid` / 有 `Schema.fromJSON`" | 实测均为**否**：`refs` 是对象、节点无 `uid` 字段、反序列化只有构造函数入口（`src/index.ts:178-208`）；且反序列化会 `new Function` 执行 `callback`（`:197-202`） | 写入 **S-7 / S-8**，并把"前端不得 hydrate"列为安全红线 |
 | uid 作为缓存键 | "同一 schema 重复序列化 uid 会变" | 需区分两种情形：**同一实例**重复 stringify 字节相同（`probe5.out` §B `uid=14/14 equal=true`）；**重新构造**同一 schema 才变（§A `uid1=4 uid2=9`） | 写入 **S-14**，表述按两种情况区分，跨请求用内容 hash / 插件版本号 |
 | UI 资源 URL 前缀 | 初版批次 D 写 `/plugins/<name>/...` | 现有静态托管的 root 锁死 `webDist`（`packages/server/src/index.ts` 的 `serveStatic()` 与 `HttpPlugin` 的 `webDist` 配置项），需独立挂载点 | 统一为 **`/plugins-ui/<name>/client.{js,css}`**，dev 由 `packages/web/vite.config.ts` proxy 转发 3000 |
-| 测试计数（一次实跑，**历史**） | 各文档写"单测 23/23" | 实跑 `pnpm -r --if-present run test`：**manager 24 + server 11 = 35/35**（`deps 8 + manager 13 + repo-paths 3`；`packages/server/test/router.test.ts` 11） | 当时已同步修正 `README.md`、`docs/roadmap.md`、本文第 7 节。**该 35/35 现降级为历史基线口径**，当前口径见下方"测试计数（三次实跑）"行 |
-| 测试计数（二次实跑，**已过时**） | 上一行记录的 35/35（manager 24 + server 11） | 那一轮实跑曾变为 `packages/manager` **39 例 / 37 过 / 2 失败**（39 = deps 8 + manager 13 + repo-paths 3 + `config.test.ts` 8 + `discovery.test.ts` 7）、`packages/server` **11/11**；失败两条均为尚未随新契约更新的旧断言 | 该口径**已作废**：两条旧断言已改写（见第 6 节），当前为核对表最后一行的 81/81 |
-| 测试计数（**三次实跑，已过时**） | 上一行的"39 / 37 / 2" | **全绿 72/72**：`packages/manager` **58**（**5 个测试文件**：`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11）。**命令注意**：`pnpm -r` 在任一包失败即中止、不会跑到后面的包，故两包数字分别用 `pnpm --filter @geewiki/manager run test` 与 `pnpm --filter @geewiki/server run test` 取 | 写入第 6 节实跑表与第 7 节 item 2，并同步更新 `README.md`（`pnpm test` 行 + 当前实现状态）与 `docs/roadmap.md`（Phase 2 尾注 + Phase 3/4 状态）。**顺带纠正两处旧数**：① manager 是 **5 个测试文件**而非 4 个；② 旧口径给出的"deps 8 + manager 13 + repo-paths 3 + config 8 + discovery 7"里 config/discovery 两文件当时尚未增补完，现为 **config 21 + discovery 13** |
-| 测试计数（**四次实跑，当前口径**） | 上一行的 72/72（manager 58） | 全绿 **81/81**：`packages/manager` **67**（`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**；新增 9 例 = W2 泄漏回归 1 + 替换相关 8（`collectDependentsClosure` 1 + `replace` 7） | 已同步第 6 节表、第 7 节 item 2、`README.md` 与 `docs/roadmap.md` |
+| 测试计数（一次实跑，**已过时**） | 各文档写"单测 23/23" | 实跑 `pnpm -r --if-present run test`：**manager 24 + server 11 = 35/35**（`deps 8 + manager 13 + repo-paths 3`；`packages/server/test/router.test.ts` 11） | 当时已同步修正 `README.md`、`docs/roadmap.md`、本文第 7 节。**该 35/35 为历史基线口径，已过时**，当前口径见下方"测试计数（五次实跑）"行 |
+| 测试计数（二次实跑，**已过时**） | 上一行记录的 35/35（manager 24 + server 11） | 那一轮实跑曾变为 `packages/manager` **39 例 / 37 过 / 2 失败**（39 = deps 8 + manager 13 + repo-paths 3 + `config.test.ts` 8 + `discovery.test.ts` 7）、`packages/server` **11/11**；失败两条均为尚未随新契约更新的旧断言 | 该口径**已作废**：两条旧断言已改写（见第 6 节），当前为核对表"五次实跑"行的 87/87 |
+| 测试计数（**三次实跑，已过时**） | 上一行的"39 / 37 / 2" | **全绿 72/72**：`packages/manager` **58**（**5 个测试文件**：`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11）。**命令注意**：`pnpm -r` 在任一包失败即中止、不会跑到后面的包，故两包数字分别用 `pnpm --filter @geewiki/manager run test` 与 `pnpm --filter @geewiki/server run test` 取 | 写入第 6 节实跑表与第 7 节 item 2，并同步更新 `README.md`（`pnpm test` 行 + 当前实现状态）与 `docs/roadmap.md`（Phase 2 尾注 + Phase 3/4 状态）。**顺带纠正两处旧数**：① manager 是 **5 个测试文件**而非 4 个；② 旧口径给出的"deps 8 + manager 13 + repo-paths 3 + config 8 + discovery 7"里 config/discovery 两文件当时尚未增补完，现为 **config 21 + discovery 13**。**该 72/72 已过时** |
+| 测试计数（**四次实跑，已过时**） | 上一行的 72/72（manager 58） | 全绿 **81/81**：`packages/manager` **67**（`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**；新增 9 例 = W2 泄漏回归 1 + 替换相关 8（`collectDependentsClosure` 1 + `replace` 7） | 当时已同步第 6 节表、第 7 节 item 2、`README.md` 与 `docs/roadmap.md`。**该 81/81 已被下一行取代（已过时）** |
+| 测试计数（**五次实跑，当前口径**） | 上一行的 81/81（manager 67） | 全绿 **87/87**：`packages/manager` **73**（`deps` **10** + `manager` 14 + `config` **33** + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11）；相对 81/81 新增 **6** 例 = `deps` +1、`config` +5（`2227adf` 补强前置校验：`base_layer` 判据改真实激活层、卸载集合基础层成员拒绝、`provider_mismatch` 提供者覆盖 + 目标自洽，`b21534a` 为前端交互）。**命令**：`pnpm typecheck`（7 个包 0 错）+ 逐文件 `node --import tsx --test <file>`（manager 5 个测试文件 + server 2 个），取值时刻 2026-09-10T17:17 +08:00、代码状态 `b21534a` | 同步第 6 节表、第 7 节 item 2、`README.md` 与 `docs/roadmap.md`。**口径排除项（如实记录）**：取值时刻工作树内另有**未提交的并行批次**（实现"插件 UI 入口表由后端下发"，与本轮文档同步无关）——新增 `packages/manager/src/plugin-ui.ts` 与 `packages/manager/test/plugin-ui.test.ts`，并在既有 `packages/manager/test/config.test.ts` 里追加 3 例 `GET /api/plugins/ui` 用例。该批次的用例（含其失败用例）**一律未计入本节 87/87**；87/87 只由上表 7 个测试文件的**已提交版本**（`git show HEAD:<file>`，即 `b21534a`）构成，可用 `git show HEAD:packages/manager/test/config.test.ts \| grep -cE "^test\("` 静态复现（=33）。**若需在工作树上复核，请待并行批次落地后重跑，或只跑已提交版本的 7 个文件。** |
 | `meta.role: 'password'` | 曾按"已实现"记录，上一版又反转为"未实现" | **实际已实现**（上一版写反了）：`packages/web/src/lib/configSchema.ts:132` 对 `role === 'password'` 置 `secret: true`，`packages/web/src/components/SchemaForm.tsx:131-132` 据此渲染 `type={field.secret ? 'password' : 'text'}` + `autoComplete={field.secret ? 'new-password' : undefined}`；只有非 `textarea`、非 `password` 的 `role` 才退化为文本框并附 `role=…` 注记（`configSchema.ts:133`）。**边界**：脱敏只作用于表单输入框的呈现，`GET /api/plugins/:name/config` 返回的 `config` 仍是**明文原值**。`hidden` 则**确已支持**（`:106` → `kind: 'hidden'`，`packages/web/src/components/SchemaForm.tsx:210-212` 的 `case 'hidden': return null`，**连说明行都没有**） | 已把 `docs/architecture.md` §5.7 与 `README.md` 的已知限制改为"输入框脱敏已实现 + API 返回明文"口径；并纠正上一版把 `hidden` 写成 `kind: 'static'` 的错误（`kind: 'static'` 实为 `const` 节点的只读展示分支，`configSchema.ts:136`） |
 | UI 基线验收 | "4 路由可达、停用 3ms、console 无错误" | 对照 `data/spike/e2e/` 的 CDP 脚本与 DOM 快照确认：`/`、`#/wiki`、`#/plugins`、`#/graph` 四路由与 `#/graph` 的 **4 节点 + 3 边**（`react-flow__edge-path` 计数 3）均可复核 | 写入第 6 节"当前质量基线"；3 ms 标注为客户端观测口径 |
 | React Flow 授权提示 | 未提及 | `packages/web/src/pages/GraphPage.tsx:145` 的 `proOptions={{ hideAttribution: true }}` 会触发上游许可证提示 | 写入 **L-7**（非缺陷，按许可证决定处理） |
@@ -731,3 +746,6 @@ S-7…S-17 的载荷规格另可用 `data/spike/probe4-payload-spec.mjs` / `prob
 | 插件 UI bundle 的构建位置 | 批次 D 涉及文件表写 `plugins/<name>/client/vite.config.ts` → 产物 `plugins/<name>/dist/client.js` | **实际在** `packages/web/fixtures/vite.config.ts`（`build.lib`：`entry` / `formats: ['es']` / `fileName: 'client'` / **显式 `cssFileName: 'client'`**），源码在 `packages/web/fixtures/src/`，产物落 `packages/web/public/plugins-ui/`；生成命令 `pnpm --filter @geewiki/web run build:fixtures`（**不在 `pnpm build` 内**，且产物目录被 `.gitignore` 排除） | 批次 D 涉及文件表已按实现改写；另注明 `plugins/hello-geewiki/` 是**后端零依赖插件示例（无 UI）**，与前端 fixture 是两回事 |
 | 插槽名清单 | 批次 D 关键契约写"插槽名（如 `admin-page-slots` / `header-slots`）"，roadmap Phase 3 写 `header-slots` / `editor-toolbar-slots` / `admin-page-slots` | **实际白名单只有两个**：`packages/web/src/lib/slots.tsx:12` 的 `export type SlotName = 'app-header' \| 'app-footer'`（`SLOT_NAMES` 在 `:15`；未在名单内的名字在 `:62` 打印 `[geewiki-slot] 未知插槽名 "…"，已忽略（可用：app-header, app-footer）`）。且**没有**后端 `ctx.slot(name, component)` 注册链路 | 批次 D 关键契约与 `docs/roadmap.md` Phase 3 均已按实现改写；`ctx.slot()` 与另两个扩展点保留为未落地候选 |
 | Slot 的生命周期绑定 | 批次 D 涉及文件表写加载器"生命周期绑定 fork" | **未绑定**：刷新入口是 `packages/web/src/lib/pluginUi.ts:262-267` 的 `window.__GEEWIKI_PLUGIN_UI__ = { refresh, unload, loaded, base }`，由调用方（`packages/web/src/main.tsx`）显式触发；`unloadPluginUi` 只做"注销插槽注册 + 移除 CSS"（`:193` 注释：ESM 模块本身无法从模块图中卸载） | 写入批次 D 风险段与 `docs/architecture.md` §6 的"已知边界"；源码 TODO（`:27-30`）已登记"入口表后端下发 / fork 事件自动刷新 / 版本与完整性校验"三项 |
+| 替换回滚的"逐字节复原" | G-1 与 `README.md` / `docs/architecture.md` §5.4 写"把会话清单还原成调用前的**字节**"/"逐字节一致" | **措辞过强，已降级**：`replace()` 确实在动手前快照会话清单对象（`packages/manager/src/index.ts` 的 `const sessionBackup = JSON.parse(JSON.stringify(this.session)) as PluginListFile`），回滚全部成功时整体写回（同文件 `this.session = sessionBackup; writeList(this.config.sessionFile, this.session)`），因此**条目顺序与内容**与调用前一致；但 `writeList()` 恒以 `` `${JSON.stringify(list, null, 2)}\n` `` 落盘，**文件格式会被规范化**——若清单此前是人工编辑过的非规范格式（自定义缩进 / 字段顺序颠倒 / 无末尾换行），写回后**字节与原文件不再相同**（语义与条目顺序相同）。用例『replace：回滚按调用前的条目顺序逐字节复原会话清单（依赖方启用顺序与拓扑序相反时也成立）』钉住的是**该用例自构造的规范格式文件**的前后字节相等（`packages/manager/test/config.test.ts` 内 `assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '回滚后会话清单必须逐字节复原（含条目顺序），不能只保证语义等价')`），不覆盖非规范输入 | 已把 G-1"实现偏离"段、`README.md` 替换条目、`docs/architecture.md` §5.4 全部改为"按调用前的条目顺序与原内容复原；文件格式会规范化为 `JSON.stringify(…, null, 2)` + 末尾换行"；**未验证项**：审查所用的非规范清单反例未在本轮留档复跑，结论依据为 `writeList()` 的实现形式 |
+| 500 `replace_rollback_failed` 的状态语义与覆盖 | 旧文写"此时清单可能处于中间态 / 状态不确定，需人工介入"（`docs/architecture.md` §5.4 旧版同） | **按源码核实为确定态**：走到该分支前，`removeManyFromSession(unloadSet)`（`packages/manager/src/index.ts` 的 `replace()` 内）已把旧插件与依赖方整体摘除、`this.removeFromSession(name)`（同函数回滚段）已摘除目标条目，恢复失败的条目不会再写回；故**整个卸载集合的会话条目都已从清单消失**，且每次 `addToSession` 都是"改内存 + 立即 `writeList`"，**内存与磁盘始终一致、无分歧**。**无单测覆盖**：`grep -rn "replace_rollback_failed" packages/*/test/` **零命中**（该码仅出现在 `packages/manager/src/index.ts` 的 `replace()` 头注释、抛出点与 `fail()` 条件链三处） | 已把 G-1"实现偏离"段与 `docs/architecture.md` §5.4 改为"整个卸载集合的会话条目都已消失、内存与磁盘一致、需人工介入"，并**如实标注"仅代码路径 + 人工推演，无单测覆盖"**（构造"回滚本身也失败"需更细的注入点，登记为未验证项） |
+| 替换失败语义"天然原子" | G-1 流程第 8 步旧版写"**成功时只写一次 session 清单**；失败则零落盘——**天然原子**" | **与实现相反**：`replace()` 头注释（`packages/manager/src/index.ts`）原文即"整个过程会多次写会话清单（卸载集合一次 + 目标 + 每个接回的依赖方），每次都是 tmp+rename 原子替换，因此任意时刻的清单文件都是自洽的；**不追求'全程仅一次落盘'**"。实际写盘次数 = 1（`removeManyFromSession`）+ 1（目标）+ N（接回的依赖方） | 第 8 步已按源码重写为"共 1 + 1 + N 次写会话清单，每次原子替换，任意时刻清单自洽；'失败不留痕'靠快照写回而非'零落盘'" |

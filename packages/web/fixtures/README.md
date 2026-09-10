@@ -17,8 +17,7 @@ pnpm --filter @geewiki/web build:fixtures
 - `packages/web/public/plugins-ui/@geewiki/wiki/client.{js,css}`
 - `packages/web/public/plugins-ui/@geewiki-plugin/hello/client.{js,css}`
 
-这两份产物是**生成物但随仓库提交**：好处是全新克隆后只跑 `pnpm build` 就能看到插槽效果，
-不必先补一次夹具构建。修改夹具源码后重新执行 `build:fixtures` 即可覆盖。
+这两份产物是**生成物，且不随仓库提交**：`.gitignore` 的 `packages/web/public/plugins-ui/` 一行排除了整个目录（`git check-ignore -v packages/web/public/plugins-ui/x.js` → `.gitignore:15`；`git ls-files packages/web/public/` 只列出 `host-sdk/react.js` 与 `host-sdk/jsx-runtime.js`，无任何 `plugins-ui/` 文件）。因此全新克隆后需先执行上面的 `build:fixtures`，管理台上才会有示例插件 UI；缺失时宿主不会报错，只是没有插件 UI 可加载。修改夹具源码后重新执行 `build:fixtures` 即可覆盖。
 
 `vite build` 会把 `public/` 原样拷进 `dist/`，所以 prod 模式（后端 3000 端口托管 dist）同样生效。
 
