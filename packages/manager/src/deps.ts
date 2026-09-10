@@ -118,6 +118,39 @@ export function collectDependentsClosure(
 }
 
 /**
+ * 冲突组替换的"提供者覆盖"校验（纯函数）：找出 `names` 中**原本依赖被顶替者 `replaced`、
+ * 但目标 `target` 无法承接该依赖边**的条目。
+ *
+ * 判定：对某个插件的每个 `requires` token `t`，若 `resolveDependency(registry, t)?.name === replaced`
+ * （即这条边当前指向被顶替者），则要求目标能承接该 token —— 按插件名命中（`target === t`）
+ * 或按服务标识命中（目标的 `provides === t`）；都不满足即违规。
+ *
+ * **刻意取舍（宁可拒绝，也不假报成功）**：依赖方**按具体插件名**依赖被顶替者时必然违规——
+ * 按名的边无法由新插件承接，正解是依赖方改为依赖服务标识（provides token，本仓库推荐用法）。
+ * 否则替换会返回 200，而依赖方依赖的服务已无人提供。
+ */
+export function findUncoveredRequires(
+  registry: readonly RegisteredPlugin[],
+  replaced: string,
+  target: string,
+  names: readonly string[],
+): { plugin: string; token: string }[] {
+  const targetEntry = registry.find((p) => p.name === target)
+  const out: { plugin: string; token: string }[] = []
+  for (const name of names) {
+    const entry = registry.find((p) => p.name === name)
+    if (!entry) continue
+    for (const token of entry.manifest.geewiki.requires ?? []) {
+      if (resolveDependency(registry, token)?.name !== replaced) continue // 这条边不指向被顶替者
+      if (target === token) continue // 目标按插件名承接
+      if (targetEntry?.manifest.geewiki.provides === token) continue // 目标按服务标识承接
+      out.push({ plugin: name, token })
+    }
+  }
+  return out
+}
+
+/**
  * 热授权链检查：会话层激活（热加载）插件 X 时，X 及其"需要随热加载的
  * 未激活依赖"都必须 supportsHotReload: true。
  * @param registry 注册表

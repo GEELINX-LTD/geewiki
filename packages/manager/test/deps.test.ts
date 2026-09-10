@@ -10,6 +10,7 @@ import {
   collectDependentsClosure,
   directDependencies,
   findConflict,
+  findUncoveredRequires,
   resolveDependency,
   topologicalOrder,
   type RegisteredPlugin,
@@ -124,4 +125,46 @@ test('checkHotChain：热加载链上未激活冷依赖被拦截；已激活冷�
   assert.deepEqual(warm, [])
   // 冷插件自身禁热
   assert.equal(checkHotChain(registry, new Set(), '@gw/http').length, 1)
+})
+
+test('findUncoveredRequires：指向被顶替者的依赖边必须能被目标承接（按 provides 可承接，按名不可）', () => {
+  // 注意：共享夹具里 @gw/wiki 是**按插件名** require '@gw/db'（不是按 provides），
+  // 所以即便目标 provides 同名服务，这条按名的边也无法被承接 —— 这正是本函数的严格语义。
+  assert.deepEqual(findUncoveredRequires(registry, '@gw/db', '@gw/pg', ['@gw/wiki']), [
+    { plugin: '@gw/wiki', token: '@gw/db' },
+  ])
+  // 与本次替换无关的边（@gw/editor-hot 按名依赖 @gw/wiki，不指向被顶替者）→ 不算违规
+  assert.deepEqual(findUncoveredRequires(registry, '@gw/db', '@gw/http', ['@gw/editor-hot']), [])
+  // 被顶替者自身没有 requires → 无违规
+  assert.deepEqual(findUncoveredRequires(registry, '@gw/db', '@gw/pg', ['@gw/db']), [])
+  // 空集合
+  assert.deepEqual(findUncoveredRequires(registry, '@gw/db', '@gw/pg', []), [])
+
+  // 局部夹具：依赖方分别按 provides token / 按插件名依赖被顶替者
+  const byProvides: RegisteredPlugin[] = [
+    plugin('@t/old', { geewiki: { provides: 'db-provider' } }),
+    plugin('@t/new', { geewiki: { provides: 'db-provider' } }),
+    plugin('@t/app', { geewiki: { requires: ['db-provider'] } }),
+  ]
+  // 目标提供同一 token → 可承接，放行
+  assert.deepEqual(findUncoveredRequires(byProvides, '@t/old', '@t/new', ['@t/app']), [])
+  // 目标不提供该 token → 违规
+  assert.deepEqual(findUncoveredRequires(byProvides, '@t/old', '@gw/http', ['@t/app']), [
+    { plugin: '@t/app', token: 'db-provider' },
+  ])
+  // 目标与被顶替者同名（实际不会发生：同组互斥且新旧不同名，但分支语义要正确）：
+  // 目标 provides 同一 token → 可承接 → 放行
+  assert.deepEqual(findUncoveredRequires(byProvides, '@t/old', '@t/old', ['@t/app']), [])
+
+  const byName: RegisteredPlugin[] = [
+    plugin('@t/old2', { geewiki: { provides: 'db-provider' } }),
+    plugin('@t/new2', { geewiki: { provides: 'db-provider' } }),
+    plugin('@t/app2', { geewiki: { requires: ['@t/old2'] } }),
+  ]
+  // 按**具体插件名**依赖：即使目标 provides 同名 token 也承接不了这条按名的边 → 违规
+  assert.deepEqual(findUncoveredRequires(byName, '@t/old2', '@t/new2', ['@t/app2']), [
+    { plugin: '@t/app2', token: '@t/old2' },
+  ])
+  // 若目标的名字恰好等于该 token（按名承接），则放行
+  assert.deepEqual(findUncoveredRequires(byName, '@t/old2', '@t/old2', ['@t/app2']), [])
 })

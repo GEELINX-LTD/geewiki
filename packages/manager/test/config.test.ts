@@ -798,8 +798,10 @@ test('replace：同冲突组替换成功——旧插件卸载、目标激活、�
     const registry = [
       cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
       cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
-      // 依赖方按插件名依赖旧插件（替换后必须接回，且不得把旧插件当依赖拉回来）
-      cfgPlugin('@t/app', log, { requires: ['@t/old-db'] }),
+      // 依赖方按**服务标识**依赖旧插件（provides token，本仓库推荐用法）：替换后必须接回新提供者，
+      // 且不得把旧插件当依赖拉回来。按**插件名**依赖被顶替者的边无法由新插件承接，会被
+      // provider_mismatch 拒绝（见 S1 用例）。
+      cfgPlugin('@t/app', log, { requires: ['db-provider'] }),
     ]
     const manager = makeManager(env, registry)
     await manager.boot()
@@ -808,6 +810,7 @@ test('replace：同冲突组替换成功——旧插件卸载、目标激活、�
     await manager.enable('@t/app')
     assert.equal(manager.snapshot().find((p) => p.name === '@t/app')?.state, 'active')
 
+    // S1(c) 正路径：依赖方按服务标识 require，旧插件与目标 provides 同一 token → 放行
     const result = await manager.replace('@t/new-db', { message: 'new' })
     assert.equal(result.replaced?.name, '@t/old-db', '应报告被顶替的插件')
     assert.deepEqual(result.replaced?.config, { message: 'old', count: 1 }, '应回报旧插件原配置')
@@ -900,7 +903,7 @@ test('replace：旧插件位于基础层 → base_layer（冷操作，不可热�
   }
 })
 
-test('replace：目标激活失败 → 旧插件与依赖方被恢复，会话清单逐字节复原', async () => {
+test('replace：目标激活失败 → 旧插件与依赖方被恢复，会话清单语义等价复原（顺序由另一条用例负责）', async () => {
   const env = makeEnv()
   try {
     const log: string[] = []
@@ -911,14 +914,14 @@ test('replace：目标激活失败 → 旧插件与依赖方被恢复，会话�
         provides: 'db-provider',
         failActivate: true,
       }),
-      cfgPlugin('@t/app', log, { requires: ['@t/old-db'] }),
+      cfgPlugin('@t/app', log, { requires: ['db-provider'] }),
     ]
     const manager = makeManager(env, registry)
     await manager.boot()
 
     await manager.enable('@t/old-db', { message: 'old' })
     await manager.enable('@t/app')
-    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+    const parseSessionSnapshot = readList(env.sessionFile)
 
     await assert.rejects(
       () => manager.replace('@t/new-db', { message: 'new' }),
@@ -931,9 +934,18 @@ test('replace：目标激活失败 → 旧插件与依赖方被恢复，会话�
     assert.equal(states.get('@t/app'), 'active', '依赖方应被恢复')
     // 失败目标留 error 态（本仓库既有语义：激活失败的插件不以 active 留存，而是记 error），关键是不得 active
     assert.equal(states.get('@t/new-db'), 'error', '失败目标必须已卸载（留 error 态，不得 active）')
-    // 会话清单逐字节复原（旧插件配置原样写回）
-    assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '回滚后会话清单应与调用前逐字节一致')
-    assert.deepEqual(readList(env.sessionFile).map((e) => e.name).sort(), ['@t/app', '@t/old-db'])
+    // 本用例只有**一个**依赖方，其恢复序恰好等于启用序，因此"逐字节"在这里是空转的
+    // （实测：注释掉 replace() 里的 sessionBackup 还原两行，本用例照样通过）。
+    // 故此处只断言**语义等价**（条目集合与各自 config 一致，按名排序后比较），"条目顺序也
+    // 逐字节复原"由专门构造了"启用顺序与拓扑序相反"的用例负责钉住。
+    const byName = (list: { name: string; config?: Record<string, unknown> }[]) =>
+      [...list].sort((a, b) => a.name.localeCompare(b.name))
+    assert.deepEqual(
+      byName(readList(env.sessionFile)),
+      byName(parseSessionSnapshot),
+      '回滚后会话清单应与调用前语义等价（条目集合与各条 config 一致；顺序由另一条用例负责）',
+    )
+    assert.equal(readList(env.sessionFile).length, 2, '不得多出或缺少条目')
   } finally {
     env.cleanup()
   }
@@ -986,8 +998,8 @@ test('replace：回滚按调用前的条目顺序逐字节复原会话清单（�
         failActivate: true,
       }),
       // 两个互相独立的依赖方：故意按与拓扑序（按名排序）相反的顺序启用，钉住"顺序也要复原"
-      cfgPlugin('@t/zeta', log, { requires: ['@t/old-db'] }),
-      cfgPlugin('@t/alpha', log, { requires: ['@t/old-db'] }),
+      cfgPlugin('@t/zeta', log, { requires: ['db-provider'] }),
+      cfgPlugin('@t/alpha', log, { requires: ['db-provider'] }),
     ]
     const manager = makeManager(env, registry)
     await manager.boot()
@@ -1002,7 +1014,12 @@ test('replace：回滚按调用前的条目顺序逐字节复原会话清单（�
     )
     const sessionBefore = readFileSync(env.sessionFile, 'utf8')
 
-    await assert.rejects(() => manager.replace('@t/new-db'), (err: unknown) => err instanceof ManagerError)
+    await assert.rejects(
+      () => manager.replace('@t/new-db'),
+      (err: unknown) =>
+        err instanceof ManagerError && err.code === 'load_failed',
+      '必须是目标加载失败（load_failed）触发的回滚；若改成 provider_mismatch 等前置校验拒绝，本用例就不再覆盖回滚路径',
+    )
     assert.equal(
       readFileSync(env.sessionFile, 'utf8'),
       sessionBefore,
@@ -1012,6 +1029,218 @@ test('replace：回滚按调用前的条目顺序逐字节复原会话清单（�
     assert.equal(states.get('@t/old-db'), 'active')
     assert.equal(states.get('@t/zeta'), 'active')
     assert.equal(states.get('@t/alpha'), 'active')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：旧插件同名条目同时在两层（实际以 base 层激活）→ base_layer 拒绝热替换', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+    ]
+    const manager = makeManager(env, registry)
+    // 叠加态：同名插件同时写在基础层与会话层清单里（本仓库明确支持，见 boot 叠加用例）。
+    // boot 时基础层优先 → 该插件实际以 **base 层**激活，会话条目只是一层配置覆盖。
+    writeFileSync(env.baseFile, `${JSON.stringify({ enabled: [{ name: '@t/old-db' }] }, null, 2)}\n`, 'utf8')
+    writeFileSync(
+      env.sessionFile,
+      `${JSON.stringify({ enabled: [{ name: '@t/old-db', config: { message: 'session-overlay', count: 1 } }] }, null, 2)}\n`,
+      'utf8',
+    )
+    await manager.boot()
+
+    // 前置：确认这确实是"激活层 = base、但会话层有条目"的叠加态
+    assert.equal(
+      manager.snapshot().find((p) => p.name === '@t/old-db')?.layer,
+      'base',
+      '前置：叠加态下旧插件的激活层必须是 base',
+    )
+    assert.equal(manager.configOf('@t/old-db').layer, 'session', '前置：会话条目构成有效覆盖，故配置层报 session')
+    const baseBefore = readFileSync(env.baseFile, 'utf8')
+    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+
+    await assert.rejects(
+      () => manager.replace('@t/new-db'),
+      (err: unknown) => err instanceof ManagerError && err.code === 'base_layer',
+      '实际以基础层激活的插件不得被热替换（否则旧插件仍在基础层清单里，重启后每次启动都撞冲突组互斥）',
+    )
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/old-db')?.state, 'active', '旧插件应仍在跑')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/new-db')?.state, 'inactive', '目标不得被激活')
+    assert.equal(readFileSync(env.baseFile, 'utf8'), baseBefore, '失败路径不得改动基础层清单')
+    assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '失败路径不得改动会话清单')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：活跃依赖方位于基础层 → base_layer（不得把基础层插件的持久化层改写成会话层）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      // 依赖方在**基础层**清单里（冷插件），但它依赖旧插件
+      cfgPlugin('@t/base-app', log, { requires: ['db-provider'] }),
+    ]
+    const manager = makeManager(env, registry)
+    writeFileSync(env.baseFile, `${JSON.stringify({ enabled: [{ name: '@t/base-app' }] }, null, 2)}\n`, 'utf8')
+    await manager.boot()
+    // 旧插件在会话层启用（它不在基础层清单里）
+    await manager.enable('@t/old-db', { message: 'old' })
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/base-app')?.layer, 'base', '前置：依赖方激活层是 base')
+
+    const baseBefore = readFileSync(env.baseFile, 'utf8')
+    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+
+    await assert.rejects(
+      () => manager.replace('@t/new-db'),
+      (err: unknown) => {
+        assert.ok(err instanceof ManagerError, '应为 ManagerError')
+        assert.equal(err.code, 'base_layer')
+        assert.deepEqual((err.details as { plugins?: string[] })?.plugins, ['@t/base-app'], '应指明集合内的基础层成员')
+        return true
+      },
+      '活跃依赖方位于基础层时不得热替换',
+    )
+    // 核心：基础层插件的持久化层不得被静默改写成会话层
+    assert.equal(readFileSync(env.baseFile, 'utf8'), baseBefore, '基础层清单不得改动')
+    assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '会话清单不得改动')
+    assert.equal(
+      readList(env.sessionFile).some((e) => e.name === '@t/base-app'),
+      false,
+      '基础层插件不得被写进会话清单（否则其持久化层被改写）',
+    )
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/base-app')?.layer, 'base', '依赖方仍应属基础层')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/new-db')?.state, 'inactive', '目标不得被激活')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：依赖方按插件名依赖被顶替者 → provider_mismatch 拒绝（不假报成功）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      // 按**具体插件名**依赖旧插件：这条边无法由新插件承接
+      cfgPlugin('@t/app', log, { requires: ['@t/old-db'] }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+    await manager.enable('@t/old-db', { message: 'old' })
+    await manager.enable('@t/app')
+
+    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+    await assert.rejects(
+      () => manager.replace('@t/new-db'),
+      (err: unknown) => {
+        assert.ok(err instanceof ManagerError)
+        assert.equal(err.code, 'provider_mismatch')
+        assert.deepEqual(
+          (err.details as { plugin?: string; token?: string })?.plugin,
+          '@t/app',
+          '应指明违规的依赖方',
+        )
+        assert.equal((err.details as { token?: string })?.token, '@t/old-db', '应指明无法承接的 token')
+        return true
+      },
+      '按插件名的依赖边无法由目标承接，必须拒绝而非返回 200',
+    )
+    assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '拒绝路径不得有副作用')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/new-db')?.state, 'inactive', '目标不得被激活')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/app')?.state, 'active', '依赖方应仍在跑')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：目标自身依赖它要顶替的插件 → provider_mismatch（不自洽）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      // 目标 requires 指向旧插件
+      cfgPlugin('@t/new-db', log, {
+        conflictGroup: 'database-provider',
+        provides: 'db-provider',
+        requires: ['@t/old-db'],
+      }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+    await manager.enable('@t/old-db', { message: 'old' })
+    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+
+    await assert.rejects(
+      () => manager.replace('@t/new-db'),
+      (err: unknown) => {
+        assert.ok(err instanceof ManagerError)
+        assert.equal(err.code, 'provider_mismatch')
+        assert.deepEqual(
+          (err.details as { tokens?: string[] })?.tokens,
+          ['@t/old-db'],
+          '应指明目标自依赖的 token',
+        )
+        return true
+      },
+      '目标依赖它要顶替掉的插件：替换不自洽，必须拒绝',
+    )
+    assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '拒绝路径不得有副作用')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/new-db')?.state, 'inactive')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('REST：replace 的 409 分支（base_layer / provider_mismatch）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/app', log, { requires: ['@t/old-db'] }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+    const { service, invoke } = makeRouter()
+    registerRoutes(service, manager)
+    await manager.enable('@t/old-db', { message: 'old' })
+    await manager.enable('@t/app')
+
+    const mismatch = await invoke('POST', '/api/plugins/:name/replace', { name: '@t/new-db' }, {})
+    assert.equal(mismatch.status, 409, JSON.stringify(mismatch.body))
+    assert.equal(mismatch.body['error'], 'provider_mismatch')
+
+    // 基础层分支：把旧插件下沉到基础层清单（叠加态：会话条目仍在，使其激活层为 base）
+    const other = makeManager(env, [
+      cfgPlugin('@t/base-old', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/base-new', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+    ])
+    writeFileSync(
+      env.baseFile,
+      `${JSON.stringify({ enabled: [{ name: '@t/base-old' }] }, null, 2)}\n`,
+      'utf8',
+    )
+    writeFileSync(
+      env.sessionFile,
+      `${JSON.stringify({ enabled: [{ name: '@t/base-old', config: { message: 'ov', count: 1 } }] }, null, 2)}\n`,
+      'utf8',
+    )
+    await other.boot()
+    const { service: service2, invoke: invoke2 } = makeRouter()
+    registerRoutes(service2, other)
+    const baseLayer = await invoke2('POST', '/api/plugins/:name/replace', { name: '@t/base-new' }, {})
+    assert.equal(baseLayer.status, 409, JSON.stringify(baseLayer.body))
+    assert.equal(baseLayer.body['error'], 'base_layer')
   } finally {
     env.cleanup()
   }

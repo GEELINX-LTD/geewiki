@@ -59,6 +59,8 @@ import {
   collectDependentsClosure,
   directDependencies,
   findConflict,
+  findUncoveredRequires,
+  resolveDependency,
   topologicalOrder,
   type RegisteredPlugin,
 } from './deps.js'
@@ -751,8 +753,19 @@ export class GeeWikiManager {
    * 顺序即语义：
    *  1. 目标已激活 → 幂等返回当前快照（不顶替任何插件，`replaced` 为 null）。
    *  2. 无同组冲突 → 退化为普通会话层启用（`replaced` 为 null、`restarted` 为空）。
-   *  3. 有冲突 → 前置校验（目标 supportsHotReload、热依赖链、旧插件必须位于**会话层**：
-   *     基础层属冷操作，热替换无从谈起）——全部在做任何副作用之前完成。
+   *  3. 有冲突 → 前置校验（全部在做任何副作用之前）：
+   *     - 目标 `runtime.supportsHotReload`；
+   *     - 热依赖链可用（`checkHotChain`）；
+   *     - **旧插件的真实激活层**必须是 session（`managed.layer`，不是 `layerOf()`）——
+   *       同名条目同时在两层的叠加态下它以 base 层激活，属冷操作，热替换无从谈起；
+   *     - **整个卸载集合的成员**（旧插件 + 活跃的传递依赖方）真实激活层都必须是 session：
+   *       卸载走 `deactivateCore` 会绕过 `disable()` 的守卫，而接回依赖方时 `enable()` 落的是
+   *       会话层条目，会把基础层插件的持久化层静默改写；
+   *     - **提供者覆盖**：被顶替者自身与每个待接回的依赖方，凡"原本指向被顶替者的依赖边"
+   *       都必须能被目标承接（按插件名或按 `provides`）。依赖方**按具体插件名**依赖被顶替者时
+   *       会被拒绝（`provider_mismatch`）——按名的边无法由新插件承接，正解是依赖方改为依赖服务
+   *       标识；目标是"宁可 409，也不返回 200 却留下无人提供的服务"。目标自身依赖它要顶替掉的
+   *       插件同样被拒（不自洽）。
    *  4. 卸载集合 = 旧插件 ∪ 其（传递）依赖方中当前活跃者，按拓扑序**逆序**逐个卸载
    *     （依赖方先卸、被依赖者后卸），再激活目标；随后按正向拓扑序把依赖方接回
    *     （`skipDeps` 阻止旧插件被当依赖重新拉起）。成功返回的 `restarted` 即接回的依赖方。
@@ -797,7 +810,13 @@ export class GeeWikiManager {
         { path: violations },
       )
     }
-    if (this.layerOf(conflict) !== 'session') {
+    // B1：判据必须是**真实激活层**（managed.layer），不能用 layerOf()——后者判的是"有没有
+    // 会话条目"（它的语义是"配置写入目标层"，别处依赖它）。同名插件同时出现在基础层与会话层
+    // 清单是本仓库明确支持的叠加态（会话层是叠加在基础层之上的覆盖层），此时它实际以 base 层
+    // 激活，而 layerOf() 会误报 session → 冷插件被热替换，且旧插件仍留在基础层清单里，
+    // 重启后每次启动都会撞冲突组互斥。disable() 用的就是真实激活层，两处必须一致。
+    const conflictManaged = this.plugins.get(conflict)
+    if (conflictManaged?.layer !== 'session') {
       throw new ManagerError(
         'base_layer',
         `${conflict} 属于基础层（冷操作），无法热替换：请编辑基础层清单 ${basename(this.config.baseFile)} 后重启进程`,
@@ -807,6 +826,46 @@ export class GeeWikiManager {
     const active = this.activeNames()
     const restarted = collectDependentsClosure(this.config.registry, [conflict]).filter((n) => active.has(n))
     const unloadSet = [conflict, ...restarted]
+    // S2：卸载集合里不允许出现基础层成员。卸载走 deactivateCore，它**绕过** disable() 的
+    // base_layer 守卫直接热卸载；而把依赖方接回时走 enable() 落的是**会话层**条目，于是基础层
+    // 插件的持久化层会被静默改写成 session（此后对它的 PUT /config 会写进会话清单）。
+    const baseLayerMembers = unloadSet.filter((n) => this.plugins.get(n)?.layer !== 'session')
+    if (baseLayerMembers.length > 0) {
+      throw new ManagerError(
+        'base_layer',
+        `无法热替换 ${conflict}：${baseLayerMembers.join('、')} 属于基础层（冷插件），其活跃依赖方不可热卸载；请编辑基础层清单 ${basename(this.config.baseFile)} 后重启进程`,
+        { plugins: baseLayerMembers },
+      )
+    }
+    // S1：提供者覆盖校验。被顶替者自身与每个将要接回的依赖方，凡"原本指向被顶替者的依赖边"
+    // 都必须能被目标承接；否则替换会返回 200，而服务已无人提供（依赖方依赖落空）。
+    const uncovered = findUncoveredRequires(this.config.registry, conflict, name, [conflict, ...restarted])
+    const firstUncovered = uncovered[0]
+    if (firstUncovered) {
+      throw new ManagerError(
+        'provider_mismatch',
+        `${firstUncovered.plugin} 依赖 ${firstUncovered.token}（原本由 ${conflict} 提供），但目标 ${name} 无法承接该依赖：请让依赖方改为依赖服务标识（provides token）`,
+        {
+          plugin: firstUncovered.plugin,
+          token: firstUncovered.token,
+          target: name,
+          targetProvides: m.provides ?? null,
+          violations: uncovered,
+        },
+      )
+    }
+    // S1（目标自洽）：目标自身依赖它要顶替掉的插件 → 拒绝。此处**不给"目标恰好 provides
+    // 同名 token"的豁免：按名的边仍指向旧插件，目标激活后该依赖恒不满足。
+    const selfRequiresConflict = (m.requires ?? []).filter(
+      (t) => resolveDependency(this.config.registry, t)?.name === conflict,
+    )
+    if (selfRequiresConflict.length > 0) {
+      throw new ManagerError(
+        'provider_mismatch',
+        `目标 ${name} 自身依赖 ${selfRequiresConflict.join('、')}（即它要顶替掉的 ${conflict}），不自洽`,
+        { plugin: name, tokens: selfRequiresConflict, target: name, conflict },
+      )
+    }
     const restoreOrder = this.safeTopological(unloadSet)
     const unloadOrder = [...restoreOrder].reverse()
     // 卸载前捕获各插件已落盘的配置：会话条目即将被移除，恢复时要原样写回
@@ -1296,6 +1355,7 @@ function fail(h: RouteHandlerContext, err: unknown): void {
             : err.code === 'conflict_group' ||
               err.code === 'hot_reload_not_supported' ||
               err.code === 'hot_dependency_not_supported' ||
+              err.code === 'provider_mismatch' || // 依赖边无法由目标承接：客户端可改依赖为 provides 后重试
               err.code === 'has_dependents' ||
               err.code === 'base_layer' ||
               err.code === 'hot_update_failed' ||
