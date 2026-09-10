@@ -7,7 +7,7 @@
 
 | 构建 | 输出位置 | 演示的链路 |
 | --- | --- | --- |
-| 第一次（`FIXTURE_OUT=@geewiki/wiki`，默认） | `packages/web/public/plugins-ui/@geewiki/wiki/` | **宿主侧约定根**：dev 由后端以 `public` 为 webDist 提供、prod 由 `vite build` 拷进 `dist/` |
+| 第一次（`FIXTURE_OUT=@geewiki/wiki`，默认） | `packages/web/public/plugins-ui/@geewiki/wiki/` | **宿主侧约定根**：dev 由后端以 `public` 为**内置插件 UI 资产根**（`GEEWIKI_PLUGIN_UI_DIST`）提供、prod 由 `vite build` 拷进 `dist/`（内置根缺省回落 `GEEWIKI_WEB_DIST`） |
 | 第二次（`FIXTURE_OUT=@geewiki-plugin/hello` + `FIXTURE_OUT_DIR=../../../plugins/hello-geewiki/dist`） | `plugins/hello-geewiki/dist/` | **插件自带产物根**：外部插件把自己的 UI 产物放在插件目录里（Docker 下 `plugins/` 是 bind mount，这是"安装即生效、无需重建 web 包"的路径） |
 
 ## 构建
@@ -83,7 +83,7 @@ node scripts/acceptance/plugin-ui-cdp.mjs http://127.0.0.1:3000 9451 \
   --missing-asset=$PWD/plugins/hello-geewiki/dist/client.js
 
 # dev（必须单独跑一遍：Vite 的 ?import 改写只在 dev 出现）。用隔离端口，别占用开发用的 3000/5173：
-GEEWIKI_PORT=3313 GEEWIKI_WEB_DIST=$PWD/packages/web/public GEEWIKI_PLUGINS_DIR=$PWD/plugins \
+GEEWIKI_PORT=3313 GEEWIKI_PLUGIN_UI_DIST=$PWD/packages/web/public GEEWIKI_PLUGINS_DIR=$PWD/plugins \
   pnpm start &
 GEEWIKI_DEV_PORT=5273 GEEWIKI_DEV_API=http://127.0.0.1:3313 pnpm --filter @geewiki/web exec vite &
 node scripts/acceptance/plugin-ui-cdp.mjs http://127.0.0.1:5273 9452 \
