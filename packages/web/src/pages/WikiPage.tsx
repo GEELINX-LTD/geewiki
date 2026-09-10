@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { parseWikiRoute } from '../lib/wikiRoute'
+import { invalidatePages, usePages } from '../lib/pagesStore'
+import { Sidebar, SidebarDrawer } from '../components/Sidebar'
 import {
   ChevronLeft,
   ChevronRight,
@@ -19,7 +22,7 @@ import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { SearchView } from '../components/SearchView'
 import { TableOfContents } from '../components/TableOfContents'
-import { SEARCH_INPUT_ID } from '../lib/domIds'
+import { FILTER_HINT_ID, FILTER_INPUT_ID, SEARCH_INPUT_ID } from '../lib/domIds'
 import {
   decideDraftRestore,
   draftKey,
@@ -74,14 +77,6 @@ const PREVIEW_DEBOUNCE_MS = 200
 const DRAFT_DEBOUNCE_MS = 900
 
 /** hash 段里的查询串解码（用户可能在地址栏手输，容错返回原文） */
-function decodeSegment(raw: string): string {
-  try {
-    return decodeURIComponent(raw)
-  } catch {
-    return raw
-  }
-}
-
 /**
  * Wiki 页：sub 为 hash 中 'wiki/' 之后的子路径。
  * 保留段：'' | 'list'（列表）、'new'（新建）、'search/<q>'（检索）、'ask[/<q>]'（问答）、
@@ -90,44 +85,120 @@ function decodeSegment(raw: string): string {
  */
 export function WikiPage(props: { sub: string; onNavigate: (path: string) => void }): ReactNode {
   const { sub, onNavigate } = props
-  const seg = sub.split('/').filter(Boolean)
-  const first = seg[0] ?? ''
-  // 允许作为第二段的保留字（其余深层路径视为未知 → 回列表）
-  const allowedSecond = seg[1] === 'edit' || first === 'search' || first === 'ask'
-  const unknownDeep = seg.length >= 2 && !allowedSecond
-  // 未知深层路径 → 导航副作用收敛到 useEffect（不在 render 期改 location）
-  useEffect(() => {
-    if (unknownDeep) onNavigate('')
-  }, [unknownDeep, onNavigate])
-  if (unknownDeep) return null
+  // 路由解析抽到 lib/wikiRoute.ts（纯函数 + 单测）：它修掉了"分层 slug 打不开"
+  // 这个只在真实浏览器里才暴露的缺陷（未编码路径被当成未知深层跳回列表、
+  // 编码路径被双重编码成 404）。
+  const route = parseWikiRoute(sub)
+  const activeSlug =
+    route.kind === 'detail' ? route.slug : route.kind === 'edit' ? route.slug : null
+  const pages = usePages()
 
-  if (seg.length === 0 || first === 'list') {
-    return <WikiList onOpen={(slug) => onNavigate(slug)} onNew={() => onNavigate('new')} onSearch={(q) => onNavigate(`search/${encodeURIComponent(q)}`)} onAsk={(q) => onNavigate(q === '' ? 'ask' : `ask/${encodeURIComponent(q)}`)} />
-  }
-  if (first === 'search') {
-    const q = decodeSegment(seg[1] ?? '')
-    return <SearchView key={q} query={q} onOpen={(slug) => onNavigate(slug)} onSearch={(next) => onNavigate(`search/${encodeURIComponent(next)}`)} />
-  }
-  if (first === 'ask') {
-    const q = decodeSegment(seg[1] ?? '')
+  if (route.kind === 'list') {
     return (
-      <div className="page">
-        <div className="page-head">
-          <h1>问答</h1>
-          <div className="page-actions">
-            <button className="btn" onClick={() => onNavigate('')}>← 返回列表</button>
-          </div>
-        </div>
-        <AskPanel key={q} initialQuery={q} onOpenPage={(slug) => onNavigate(slug)} />
-      </div>
+      <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+        <WikiList
+          onOpen={(slug) => onNavigate(slug)}
+          onNew={() => onNavigate('new')}
+          onSearch={(q) => onNavigate(`search/${encodeURIComponent(q)}`)}
+          onAsk={(q) => onNavigate(q === '' ? 'ask' : `ask/${encodeURIComponent(q)}`)}
+        />
+      </WikiShell>
     )
   }
-  if (first === 'new') return <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
-  // 到这里 seg.length ≥ 1 且首段非保留字：非空 slug
-  const slug = first
-  if (seg.length === 1) return <WikiDetail key={slug} slug={slug} onEdit={() => onNavigate(`${slug}/edit`)} onDeleted={() => onNavigate('')} onNavigate={onNavigate} />
-  if (seg[1] === 'edit') return <WikiEdit key={slug} slug={slug} onDone={() => onNavigate(slug)} onCancel={() => onNavigate(slug)} />
-  return null
+  if (route.kind === 'search') {
+    return (
+      <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+        <SearchView
+          key={route.q}
+          query={route.q}
+          onOpen={(slug) => onNavigate(slug)}
+          onSearch={(next) => onNavigate(`search/${encodeURIComponent(next)}`)}
+        />
+      </WikiShell>
+    )
+  }
+  if (route.kind === 'ask') {
+    return (
+      <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+        <div className="page">
+          <div className="page-head">
+            <h1>问答</h1>
+            <div className="page-actions">
+              <Button onClick={() => onNavigate('')}>返回列表</Button>
+            </div>
+          </div>
+          <AskPanel key={route.q} initialQuery={route.q} onOpenPage={(slug) => onNavigate(slug)} />
+        </div>
+      </WikiShell>
+    )
+  }
+  if (route.kind === 'new') {
+    return (
+      <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+        <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
+      </WikiShell>
+    )
+  }
+  if (route.kind === 'detail') {
+    return (
+      <WikiShell activeSlug={activeSlug} pages={pages} onNavigate={onNavigate}>
+        <WikiDetail
+          key={route.slug}
+          slug={route.slug}
+          onEdit={() => onNavigate(`${route.slug}/edit`)}
+          onDeleted={() => onNavigate('')}
+          onNavigate={onNavigate}
+        />
+      </WikiShell>
+    )
+  }
+  return (
+    <WikiShell activeSlug={activeSlug} pages={pages} onNavigate={onNavigate}>
+      <WikiEdit
+        key={route.slug}
+        slug={route.slug}
+        onDone={() => onNavigate(route.slug)}
+        onCancel={() => onNavigate(route.slug)}
+      />
+    </WikiShell>
+  )
+}
+
+/**
+ * 知识库的双栏外壳：左侧导航树 + 右侧内容。
+ *
+ * 信息架构依据（研究员引 NN/g）：**面包屑不能替代本地导航**，所以先有侧边栏；
+ * 详情页原有的"← 返回列表"只解决了"回退"，没有解决"逛"。
+ *
+ * 响应式：桌面常驻、窄屏收起为抽屉（由 `SidebarDrawer` 承担，复用 Radix Dialog
+ * 以获得焦点陷阱 / Escape / aria-modal）。
+ */
+function WikiShell(props: {
+  activeSlug: string | null
+  pages: ReturnType<typeof usePages>
+  onNavigate: (path: string) => void
+  children: ReactNode
+}): ReactNode {
+  const { activeSlug, pages, onNavigate, children } = props
+  const navProps = {
+    pages: pages.pages,
+    error: pages.error,
+    activeSlug,
+    onOpen: (slug: string) => onNavigate(slug),
+    onNavigate,
+  }
+  return (
+    <div className="flex items-start gap-[var(--spacing-gutter)]">
+      <Sidebar {...navProps} />
+      <div className="min-w-0 flex-1">
+        {/* 窄屏的目录入口与"全部页面"并列在内容顶部，避免挤占标题行 */}
+        <div className="mb-2 lg:hidden">
+          <SidebarDrawer {...navProps} />
+        </div>
+        {children}
+      </div>
+    </div>
+  )
 }
 
 /* ============================ 列表 ============================ */
@@ -139,9 +210,18 @@ function WikiList(props: {
   onAsk: (q: string) => void
 }): ReactNode {
   const { onOpen, onNew, onSearch, onAsk } = props
-  const [pages, setPages] = useState<PageSummary[] | null>(null)
-  const [err, setErr] = useState('')
+  // 列表数据来自共享 store（与侧边栏、详情页的上一篇/下一篇同源）
+  const pagesState = usePages()
+  const pages = pagesState.pages
+  const err = pagesState.error ?? ''
   const [q, setQ] = useState('')
+  /**
+   * **即时过滤**（纯客户端）——与上方"检索"是两件事，刻意分开：
+   * - 这里的 `filter` 只筛当前已加载的列表（输入即生效、零请求），解决"页多了找不到"；
+   * - 上方的"搜索"走服务端全文检索（`@geewiki/search`，支持中文分词与相关度排序）。
+   * 合成一个控件会逼用户猜"我这次敲的是哪种"——所以并列存在，各自有标签。
+   */
+  const [filter, setFilter] = useState('')
   const [queryNotice, setQueryNotice] = useState('')
   /**
    * 检索/问答插件**可能未启用**（默认部署下 `@geewiki/search` 与 `@geewiki/ai` 都不在基础层
@@ -157,13 +237,8 @@ function WikiList(props: {
   const [modelReady, setModelReady] = useState<boolean | null>(null)
 
   const load = (): void => {
-    setErr('')
-    api
-      .pages()
-      .then((r) => setPages(r.pages))
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+    pagesState.reload()
   }
-  useEffect(load, [])
 
   useEffect(() => {
     api
@@ -199,6 +274,20 @@ function WikiList(props: {
         setModelReady(null)
       })
   }, [aiReady])
+
+  /**
+   * 即时过滤结果。匹配**标题或标识**（标识常是英文、标题是中文，两者都查才实用），
+   * 大小写不敏感（`toLowerCase` 而非 locale 相关比较：这两个字段是标识性文本，
+   * 用户不会期望"İ/i"这类语言特例在这里起作用）。
+   */
+  const filtered = useMemo(() => {
+    const list = pages ?? []
+    const needle = filter.trim().toLowerCase()
+    if (needle === '') return list
+    return list.filter(
+      (p) => p.title.toLowerCase().includes(needle) || p.slug.toLowerCase().includes(needle),
+    )
+  }, [pages, filter])
 
   const submitSearch = (): void => {
     // 与检索视图共用同一套校验（空串 / 超长），这样超长查询在**原地**就给出提示、不必先跳转
@@ -289,6 +378,35 @@ function WikiList(props: {
         )}
       </div>
 
+      {/* 即时过滤：只筛已加载的列表，零请求（与上方服务端检索是两件事） */}
+      {pages !== null && pages.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <label htmlFor={FILTER_INPUT_ID} className="sr-only">
+            在当前列表中过滤
+          </label>
+          <Input
+            id={FILTER_INPUT_ID}
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="在当前列表中过滤标题或标识…"
+            className="max-w-sm"
+            aria-describedby={filter !== '' ? FILTER_HINT_ID : undefined}
+          />
+          {filter !== '' && (
+            <span id={FILTER_HINT_ID} className="text-xs text-muted" role="status">
+              {filtered.length} / {pages.length} 条匹配
+              <button
+                type="button"
+                onClick={() => setFilter('')}
+                className="gw-focus-ring ml-2 rounded-sm text-accent hover:underline"
+              >
+                清除
+              </button>
+            </span>
+          )}
+        </div>
+      )}
+
       <Card>
         <CardHeader
           title="全部页面"
@@ -345,7 +463,7 @@ function WikiList(props: {
                 </tr>
               </thead>
               <tbody>
-                {pages.map((p) => (
+                {filtered.map((p) => (
                   /*
                     行的可访问性语义选择：**标题单元格内放真正的 <a>**，而不是
                     给 <tr> 加 tabIndex + role="link"。
@@ -426,8 +544,15 @@ function WikiDetail(props: {
   const [page, setPage] = useState<PageDetail | null>(null)
   const [err, setErr] = useState('')
   const [notice, setNotice] = useState('')
-  /** 列表（用于"上一篇/下一篇"）：与列表页同一份数据、同一顺序 */
-  const [siblings, setSiblings] = useState<PageSummary[] | null>(null)
+  /*
+   * 同级页面列表（用于"上一篇/下一篇"）：来自**共享 store**，不再是本组件自己的请求。
+   *
+   * 改动前这里是独立的 `api.pages()` + 独立 state，于是"每打开一页就重拉一次整张表"，
+   * 而侧边栏也要同一份数据 ⇒ 同一份列表被反复取。现在一次取、多订阅，并在写操作后显式失效。
+   * 失败不阻塞阅读：`pages.pages` 为 null 时等价于"没有上下篇"。
+   */
+  const pagesState = usePages()
+  const siblings = pagesState.pages
   // versionContent: id=快照主键（API 定位用）；label=per-page 版本号（展示/恢复提示用）
   const [versionContent, setVersionContent] = useState<{
     id: number
@@ -451,22 +576,11 @@ function WikiDetail(props: {
 
   useEffect(load, [load])
 
-  // 同级页面列表：只为"上一篇/下一篇"。失败不阻塞阅读（静默），因此单独一个请求、单独 catch。
-  useEffect(() => {
-    let alive = true
-    api
-      .pages()
-      .then((r) => {
-        if (alive) setSiblings(r.pages)
-      })
-      .catch((e: unknown) => {
-        console.debug('[geewiki-wiki] 页面列表不可用，跳过上一篇/下一篇：', e instanceof Error ? e.message : e)
-        if (alive) setSiblings(null)
-      })
-    return () => {
-      alive = false
-    }
-  }, [slug])
+  /*
+   * 这里原来有一段"为上一篇/下一篇单独拉一次全表"的 useEffect。
+   * 已删除：那份数据现在由 `usePages()` 的共享 store 提供（侧边栏也用同一份），
+   * 于是打开一页不再额外产生一次 `GET /api/pages`。
+   */
 
   /*
    * 正文渲染：先剥掉与页面标题重复的首个一级标题（既有行为），再一次性得到
@@ -499,7 +613,11 @@ function WikiDetail(props: {
     if (!window.confirm(`确定删除页面「${page?.title ?? slug}」？版本历史将一并清除。`)) return
     api
       .deletePage(slug)
-      .then(() => onDeleted())
+      .then(() => {
+        // 列表/侧边栏必须立刻反映删除（否则会出现"点得到但打不开"的幽灵条目）
+        void invalidatePages()
+        onDeleted()
+      })
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
   }
 
@@ -522,6 +640,7 @@ function WikiDetail(props: {
         setNotice(`已恢复 v${versionContent.label} 内容（当前 v${r.version}）`)
         setVersionContent(null)
         load()
+        void invalidatePages() // 版本变了 ⇒ 列表里的"版本"列与排序都要更新
       })
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
       .finally(() => setRestoring(false))
@@ -553,9 +672,12 @@ function WikiDetail(props: {
     )
   }
 
-  // 上一篇/下一篇：沿用列表页顺序（后端 `ORDER BY updated_at DESC`）。
-  // **如实说明**：该排序没有次级排序键，若两页 `updated_at` 完全相同，
-  // 它们之间的先后由 SQLite 决定（不保证稳定）——极端情况下"下一篇"可能不是唯一的。
+  // 上一篇/下一篇：沿用列表页顺序（后端 `ORDER BY p.updated_at DESC, p.id DESC`）。
+  //
+  // 该排序**是稳定的**：后端加了次级键 `p.id DESC`，且它的注释明确写了"这不是装饰，
+  // 是正确性要求"——因为 `updated_at` 是秒级 ISO 字符串，同一秒内保存的多页若无次级键，
+  // 顺序在不同查询计划下会反转（后端有实测记录）。因此这里可以放心假设顺序唯一。
+  // （本注释上一版写的是"先后由 SQLite 决定、不保证稳定"，那是后端加次级键之前的旧口径。）
   const list = siblings ?? []
   const idx = list.findIndex((p) => p.slug === slug)
   const prev = idx > 0 ? list[idx - 1] : undefined
@@ -964,6 +1086,8 @@ function WikiEdit(props: {
         // 保存成功 ⇒ 草稿使命结束（连同新建页的哨兵键一起清）
         removeDraft(slug)
         if (isNew) removeDraft('')
+        // 列表/侧边栏立刻反映新页面（新建）或新标题（改名）——否则要手动刷新才看得到
+        void invalidatePages()
         onDone(isNew ? r.slug : slug)
       } catch (e) {
         setErr(e instanceof Error ? e.message : String(e))

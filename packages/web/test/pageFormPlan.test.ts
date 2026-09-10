@@ -1,18 +1,18 @@
 /**
  * 页面表单校验与脏值判定单测（node:test + tsx）。
  *
- * 与后端 `SLUG_RE` 的一致性由本文件钉住：前端若比后端**宽**，用户会白填一遍再被 400 拒；
- * 若比后端**严**，则会出现"后端明明接受、前端不让存"。两者的字符集必须逐字一致。
+ * **slug 规则不在这里测**——它已迁到 `lib/slugRules.ts`，并由 `test/slugRules.test.ts`
+ * 的**对齐守卫**真的 import 后端模块逐条比对。本文件只测"表单层"的行为
+ * （字段级错误、trim、非新建态不校验、脏值判定）。
+ *
+ * 历史教训（本文件上一版）：这里曾断言 `SLUG_RE.test('a/b') === false`，并注释
+ * "与后端逐字一致"。后端支持路径式 slug 之后，该断言把**错误行为**钉成了正确，
+ * 于是"用户填 `guide/intro` 被前端拒掉"这件事在全绿测试下无人发现。
+ * 规则类断言从此只放在有守卫的地方。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import {
-  SLUG_RE,
-  charCount,
-  hasErrors,
-  isDirty,
-  validatePageForm,
-} from '../src/lib/pageFormPlan'
+import { charCount, hasErrors, isDirty, validatePageForm } from '../src/lib/pageFormPlan'
 
 /* ------------------------- 字段级校验 ------------------------- */
 
@@ -42,16 +42,23 @@ test('validatePageForm：合法输入无错误', () => {
   assert.deepEqual(validatePageForm({ isNew: true, slugInput: 'getting-started', title: '快速开始' }), {})
 })
 
-test('SLUG_RE：与后端同口径的边界（首字符必须是字母数字；总长 ≤80）', () => {
-  assert.equal(SLUG_RE.test('a'), true)
-  assert.equal(SLUG_RE.test('9'), true)
-  assert.equal(SLUG_RE.test('a.b_c-d'), true)
-  assert.equal(SLUG_RE.test('.a'), false) // 以点开头
-  assert.equal(SLUG_RE.test('-a'), false)
-  assert.equal(SLUG_RE.test('a b'), false)
-  assert.equal(SLUG_RE.test('a/b'), false)
-  assert.equal(SLUG_RE.test(`a${'b'.repeat(79)}`), true) // 80 字符
-  assert.equal(SLUG_RE.test(`a${'b'.repeat(80)}`), false) // 81 字符
+test('validatePageForm：**分层标识被接受**（回归：上一版前端会拒掉 guide/intro）', () => {
+  assert.deepEqual(validatePageForm({ isNew: true, slugInput: 'guide/intro', title: '指南' }), {})
+  assert.deepEqual(validatePageForm({ isNew: true, slugInput: 'a/b/c', title: '深层' }), {})
+})
+
+test('validatePageForm：错误提示**分类**（而不是一句通用话）', () => {
+  const deep = validatePageForm({ isNew: true, slugInput: 'a/'.repeat(8) + 'x', title: 't' })
+  assert.match(deep.slug as string, /层级过深/)
+
+  const reserved = validatePageForm({ isNew: true, slugInput: 'search/x', title: 't' })
+  assert.match(reserved.slug as string, /保留字/)
+
+  const second = validatePageForm({ isNew: true, slugInput: 'guide/edit', title: 't' })
+  assert.match(second.slug as string, /编辑路由/)
+
+  const empty = validatePageForm({ isNew: true, slugInput: 'a//b', title: 't' })
+  assert.match(empty.slug as string, /空段/)
 })
 
 test('validatePageForm：标识首尾空白由调用方 trim 后判定（全空白视为非法）', () => {

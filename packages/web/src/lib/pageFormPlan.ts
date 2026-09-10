@@ -8,11 +8,19 @@
  * - 可以在保存前就把所有问题一次列全，而不是"改一个再报下一个"；
  * - 边界（超长 slug、以点开头、空白标题、非新建页不该校验 slug）都能用单测钉住。
  */
+import { explainInvalidSlug, isValidSlug } from './slugRules'
 
-/** 页面标识（URL 路径段）允许的形态——**与后端 `SLUG_RE` 逐字一致**（单一事实来源在后端，此处是它的镜像） */
-export const SLUG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
+/**
+ * 页面标识规则**不在本文件**：见 `lib/slugRules.ts`（后端规则的镜像 + 对齐守卫）。
+ *
+ * 历史教训（本文件上一版）：这里曾自己写一个整串正则，并注释"与后端 `SLUG_RE` 逐字一致"。
+ * 后端改成"逐段校验 + 支持 / 分层"之后前端没跟 ⇒ 用户在表单里填 `guide/intro` 会被前端
+ * 直接拒掉（层级页面只能经 API 创建），而当时 161 个前端测试**全是绿的**——因为旧断言
+ * 恰好把 `a/b` 钉成了非法。现在规则集中在 `slugRules.ts`，并由 `test/slugRules.test.ts`
+ * 真的 import 后端模块做**行为比对**：再漂移就会红。
+ */
+export { SLUG_HELP, SLUG_HINT } from './slugRules'
 
-export const SLUG_HINT = '页面标识需以字母或数字开头，仅含 a-z 0-9 . _ -，≤80 字符'
 export const TITLE_REQUIRED_HINT = '标题不能为空'
 
 export interface PageFormInput {
@@ -30,12 +38,18 @@ export interface PageFormErrors {
 /**
  * 逐字段校验。返回空对象表示通过。
  *
- * 细节：`title` 用 `trim()` 后判空——全是空格的标题在列表里是"看不见的行"，
- * 与空标题一样不可接受（后端也会拒，但前端先拦住能少一次往返）。
+ * 细节：
+ * - 用 `explainInvalidSlug` 给出**针对性**原因（"层级过深" / "第二段不能是 edit" …），
+ *   而不是一句把五条规则挤在一起的通用提示——用户得自己对照才知道错在哪。
+ * - `title` 用 `trim()` 后判空——全是空格的标题在列表里是"看不见的行"，
+ *   与空标题一样不可接受（后端也会拒，但前端先拦住能少一次往返）。
  */
 export function validatePageForm(input: PageFormInput): PageFormErrors {
   const errors: PageFormErrors = {}
-  if (input.isNew && !SLUG_RE.test(input.slugInput.trim())) errors.slug = SLUG_HINT
+  if (input.isNew) {
+    const slug = input.slugInput.trim()
+    if (!isValidSlug(slug)) errors.slug = explainInvalidSlug(slug)
+  }
   if (input.title.trim() === '') errors.title = TITLE_REQUIRED_HINT
   return errors
 }

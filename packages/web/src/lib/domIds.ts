@@ -12,3 +12,8 @@ export const SEARCH_INPUT_ID = 'wiki-search-input'
 
 /** 主内容区的 id：「跳到主内容」链接的目标（也是 `main` 元素的 id） */
 export const MAIN_CONTENT_ID = 'main'
+
+/** 列表页"在当前列表中过滤"输入框的 id（与 label 的 htmlFor 配对） */
+export const FILTER_INPUT_ID = 'gw-page-filter'
+/** 过滤结果计数的 id（供 aria-describedby 关联） */
+export const FILTER_HINT_ID = 'gw-page-filter-hint'
