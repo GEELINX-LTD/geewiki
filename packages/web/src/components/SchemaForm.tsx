@@ -7,6 +7,7 @@
  * 字段组 / 列表（可增删）/ JSON 编辑框（复杂或未知类型的兜底）。
  */
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { X } from 'lucide-react'
 import { getByPath, setByPath, type FieldDescriptor } from '../lib/configSchema'
 
 export interface SchemaFormProps {
@@ -71,7 +72,10 @@ function Field(props: {
       <div className="schema-errors">
         {messages.map((m, i) => (
           <p key={i} className="err-text small">
-            ✕ {m}
+            {/* 最后一个 emoji 图标换掉：emoji 在不同平台字形/基线不一致，且无法继承
+                currentColor（错误色靠 CSS 变量随主题变）。用 lucide 图标与之对齐。 */}
+            <X className="mr-1 inline size-3.5 align-[-2px]" aria-hidden="true" />
+            {m}
           </p>
         ))}
       </div>

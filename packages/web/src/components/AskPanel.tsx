@@ -20,6 +20,9 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ApiError, api, type AskResponse, type AskSource } from '../api'
 import { mdToHtml } from '../lib/sanitize'
 import { answerRenderer, checkQuery, degradedNotice, snippetToHtml } from '../lib/searchPlan'
+import { streamErrorText } from '../lib/errorText'
+import { Button, EmptyState, ErrorState } from '../ui'
+import { SearchX } from 'lucide-react'
 import {
   applyAiStreamEvent,
   applyLocalFailure,
@@ -228,10 +231,23 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
 
           {/* 答案区：流式期间纯文本 + 光标；`done` 后按 answerFormat 正式渲染 */}
           {state.error ? (
-            <div className="ask-answer ask-answer-error">
-              <strong>回答生成失败</strong>
-              <span className="muted small"> （{state.error.code}）{state.error.message}</span>
-              {sources.length > 0 && <div className="muted small">检索到的来源仍列在下方。</div>}
+            /*
+              修掉一处"开发味"：原实现把 `{state.error.code}` 直接印给用户（RATE_LIMIT /
+              TIMEOUT / PROVIDER_ERROR 这类**内部错误码**），普通用户读不懂，且不该知道。
+              现在按 code 映射成人话 + 给出该做什么；code 本身只在 title 里留作排障线索。
+              同时补上「重试」（此前的错误态是死路，用户只能手工重打一遍问题）。
+            */
+            <div className="ask-answer ask-answer-error" role="alert" title={state.error.code}>
+              <ErrorState
+                className="border-0 bg-transparent px-0 py-2"
+                title={streamErrorText(state.error.code).title}
+                hint={
+                  sources.length > 0
+                    ? `${streamErrorText(state.error.code).hint}（已检索到的来源仍列在下方）`
+                    : streamErrorText(state.error.code).hint
+                }
+                onRetry={() => submit(input)}
+              />
             </div>
           ) : hasAnswer ? (
             answer.authoritative && answerRenderer(answer.format) === 'markdown' ? (
@@ -250,7 +266,18 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
             </div>
           ) : (
             state.phase === 'done' &&
-            sources.length === 0 && <p className="empty">未找到相关内容 —— 换个说法或先写入相关页面</p>
+            sources.length === 0 && (
+              <EmptyState
+                icon={<SearchX className="size-8" />}
+                title="没有找到能回答这个问题的资料"
+                hint="换个说法，或先把相关主题写进知识库——问答只在已有页面里找依据，不会凭空作答。"
+                action={
+                  <Button variant="secondary" size="sm" onClick={() => onOpenPage('')}>
+                    去知识库看看
+                  </Button>
+                }
+              />
+            )
           )}
 
           {sources.length > 0 && (

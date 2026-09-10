@@ -16,15 +16,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import {
-  BREADCRUMB_ROOT_HREF,
-  BREADCRUMB_ROOT_LABEL,
-  BREADCRUMB_SEP,
-  breadcrumbTokens,
-  buildBreadcrumb,
-  hasSeparatorBefore,
-  intermediateCrumbCount,
-} from '../src/lib/navTree'
+import { BREADCRUMB_ROOT_HREF, BREADCRUMB_ROOT_LABEL, BREADCRUMB_SEP, breadcrumbTokens, buildBreadcrumb, buildNavTree, hasSeparatorBefore, intermediateCrumbCount, navLabelOf } from '../src/lib/navTree'
 
 /** 朴素 href 构造器：单测不 import 组件模块，只注入等价实现 */
 const hrefOf = (slug: string): string => `#/wiki/${encodeURIComponent(slug)}`
@@ -261,4 +253,46 @@ test('源码守卫：Breadcrumb 组件里画分隔符的地方只有一处', () 
 
   // 根项不得再硬编码分隔符：根项现在由 buildBreadcrumb 产出，组件里不应出现写死的知识库链接
   assert.doesNotMatch(body, /href="#\/wiki\/list"/, '根项应由 buildBreadcrumb 产出，组件里不得硬编码')
+})
+
+/* ---------------- 分组标签（侧栏与面包屑共用同一规则） ---------------- */
+
+test('navLabelOf：有页面用标题（kind=title），无页面退回路径段（kind=segment）', () => {
+  assert.deepEqual(navLabelOf('guides', { title: '指南' }), { text: '指南', kind: 'title' })
+  // 纯分组：没有同名页面 ⇒ 只能显示段名，且**明确标记为 segment**，
+  // 界面据此用等宽字体渲染成"标识符"，不冒充页面标题（见 navLabelOf 注释）
+  assert.deepEqual(navLabelOf('guides', null), { text: 'guides', kind: 'segment' })
+  assert.deepEqual(navLabelOf('guides', undefined), { text: 'guides', kind: 'segment' })
+  // 标题为空白的页面等同于没有标题（否则会渲染出一片空白标签）
+  assert.deepEqual(navLabelOf('guides', { title: '   ' }), { text: 'guides', kind: 'segment' })
+})
+
+test('面包屑的纯分组项 labelKind=segment，有页面项 labelKind=title', () => {
+  const pages = new Map([
+    ['guides', { title: '指南' }],
+    ['guides/authoring', { title: '撰写指南' }],
+  ])
+  const withPage = buildBreadcrumb('guides/authoring', '撰写指南', pages, (s) => `#/wiki/${s}`)
+  assert.deepEqual(withPage.map((c) => c.labelKind), ['title', 'title', 'title'])
+
+  // 只有深层页、没有中间层页面：中间项必须是 segment（界面渲染为标识符）
+  const noMid = buildBreadcrumb('a/b/c', '深层页', new Map([['a/b/c', { title: '深层页' }]]), (s) => `#/wiki/${s}`)
+  assert.deepEqual(noMid.map((c) => c.labelKind), ['title', 'segment', 'segment', 'title'])
+  assert.deepEqual(noMid.map((c) => c.label), ['知识库', 'a', 'b', '深层页'])
+})
+
+test('侧栏与面包屑对同一纯分组给出**相同文本**（这是抽公共函数的理由）', () => {
+  const pages = [{ slug: 'guides/authoring', title: '撰写指南', updated_at: 'x', version: 1 }]
+  const tree = buildNavTree(pages)
+  const groupNode = tree.find((n) => n.segment === 'guides')
+  assert.ok(groupNode, '应聚合出 guides 分组')
+  assert.equal(groupNode.page, null, 'guides 自身不是页面')
+  const sidebarLabel = navLabelOf(groupNode.segment, groupNode.page)
+
+  const crumbs = buildBreadcrumb('guides/authoring', '撰写指南', new Map([['guides/authoring', { title: '撰写指南' }]]), (s) => `#/wiki/${s}`)
+  const crumbLabel = crumbs.find((c) => c.path === 'guides')
+  assert.ok(crumbLabel)
+  assert.equal(sidebarLabel.text, crumbLabel.label, '同一分组在侧栏与面包屑必须同名')
+  assert.equal(crumbLabel.labelKind, 'segment', '且都必须被标记为"标识符"而非标题')
+  assert.equal(crumbLabel.href, null, '纯分组不可导航（不造"看似能到"的假链接）')
 })

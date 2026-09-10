@@ -15,7 +15,9 @@ import {
 } from '@xyflow/react'
 import { AlertTriangle, Info, RefreshCw, Workflow } from 'lucide-react'
 import { api, type GraphData, type GraphNodeInfo } from '../api'
-import { Badge, Button, Dialog, DialogClose, DialogContent, Skeleton } from '../ui'
+import { Badge, Button, Dialog, DialogClose, DialogContent, ErrorState, LoadingState, Skeleton } from '../ui'
+import { describeError } from '../lib/errorText'
+import { useSlowHint } from '../lib/useSlowHint'
 import {
   LAYER_HUMAN,
   LAYER_TECH,
@@ -246,7 +248,13 @@ export function GraphPage(): ReactNode {
    */
   const [displayNames, setDisplayNames] = useState<ReadonlyMap<string, string>>(new Map())
   const [err, setErr] = useState('')
+  /**
+   * 原始错误值：`err` 是给人看的字符串，但**分类**（连不上服务 / 服务出错）需要 status 或
+   * 是否 TypeError，那些信息在字符串里已丢失，故单独留一份供 `describeError` 使用。
+   */
+  const [errValue, setErrValue] = useState<unknown>(null)
   const [loading, setLoading] = useState(true)
+  const slowGraph = useSlowHint(loading && graph === null)
   const [detail, setDetail] = useState<string | null>(null)
 
   const load = useCallback((): void => {
@@ -255,7 +263,10 @@ export function GraphPage(): ReactNode {
     api
       .graph()
       .then((r) => setGraph(r.graph))
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        setErrValue(e)
+        setErr(e instanceof Error ? e.message : String(e))
+      })
       .finally(() => setLoading(false))
   }, [])
   useEffect(load, [load])
@@ -337,19 +348,24 @@ export function GraphPage(): ReactNode {
       <div className="h-[min(70vh,44rem)] overflow-hidden rounded-lg border border-line bg-sunken">
         {loading && graph === null && (
           <div className="grid h-full place-items-center p-6">
-            <Skeleton className="h-full w-full rounded-md" />
+            <LoadingState className="w-full" slow={slowGraph}>
+              <Skeleton className="h-[min(60vh,36rem)] w-full rounded-md" />
+            </LoadingState>
           </div>
         )}
         {!loading && err !== '' && (
-          <div className="grid h-full place-items-center p-6 text-center">
-            <div className="flex flex-col items-center gap-2">
-              <AlertTriangle className="size-6 text-warn" aria-hidden="true" />
-              <p className="m-0 text-sm font-medium text-ink">依赖图加载失败</p>
-              <p className="m-0 max-w-[46ch] text-xs text-muted">{err}</p>
-              <Button size="sm" onClick={load}>
-                重试
-              </Button>
-            </div>
+          <div className="grid h-full place-items-center p-6">
+            {/*
+              用统一的 ErrorState（而不是就地再拼一个）：错误态的文案分级、重试入口、
+              role="alert" 播报三件事只应该有一处实现，否则各页面的错误体验会漂移。
+            */}
+            <ErrorState
+              className="w-full max-w-[52ch] border-solid"
+              title={describeError(errValue).title}
+              hint={describeError(errValue).hint}
+              onRetry={describeError(errValue).retryable ? load : undefined}
+              retrying={loading}
+            />
           </div>
         )}
         {!loading && err === '' && graph !== null && graph.nodes.length === 0 && (

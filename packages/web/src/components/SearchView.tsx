@@ -10,6 +10,9 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ApiError, api, type SearchResponse } from '../api'
 import { checkQuery, scoreBadges, snippetToHtml } from '../lib/searchPlan'
+import { SearchX } from 'lucide-react'
+import { describeError } from '../lib/errorText'
+import { Button, EmptyState, ErrorState } from '../ui'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -25,7 +28,12 @@ export function SearchView(props: {
   const [input, setInput] = useState(query)
   const [data, setData] = useState<SearchResponse | null>(null)
   const [err, setErr] = useState('')
+  /** 真失败的原始错误（404「未启用」不算）；非 null 时渲染可重试的错误态 */
+  const [errValue, setErrValue] = useState<unknown>(null)
   const [busy, setBusy] = useState(false)
+  /** 重试信号：查询串本身没变，靠它让下面的 effect 重新跑一次（比手动调函数更可靠，
+   *  因为校验、清错、busy 全在那条路径上） */
+  const [retryNonce, setRetryNonce] = useState(0)
 
   useEffect(() => {
     setInput(query)
@@ -36,12 +44,16 @@ export function SearchView(props: {
       return
     }
     setErr('')
+    setErrValue(null)
     setBusy(true)
     api
       .search(checked.value)
       .then((r) => setData(r))
       .catch((e: unknown) => {
         setData(null)
+        // 404 是"插件没启用"，属于**环境未就绪**而不是"请求失败"：它不可重试，
+        // 也不该用错误态吓人，故只记 err 文本、不记 errValue。
+        setErrValue(e instanceof ApiError && e.status === 404 ? null : e)
         if (e instanceof ApiError) {
           setErr(
             e.status === 404
@@ -57,7 +69,7 @@ export function SearchView(props: {
         }
       })
       .finally(() => setBusy(false))
-  }, [query])
+  }, [query, retryNonce])
 
   const submit = (): void => {
     const checked = checkQuery(input)
@@ -101,7 +113,16 @@ export function SearchView(props: {
         </button>
       </form>
 
-      {err && <p className="notice err">{err}</p>}
+      {errValue !== null ? (
+        <ErrorState
+          title={describeError(errValue).title}
+          hint={describeError(errValue).hint}
+          onRetry={describeError(errValue).retryable ? () => setRetryNonce((n) => n + 1) : undefined}
+          retrying={busy}
+        />
+      ) : (
+        err !== '' && <p className="notice">{err}</p>
+      )}
 
       {data && (
         <>
@@ -113,7 +134,18 @@ export function SearchView(props: {
           </div>
 
           {data.hits.length === 0 ? (
-            <div className="empty">未找到相关内容 —— 换个关键词，或先写入相关页面</div>
+            <EmptyState
+              icon={<SearchX className="size-8" />}
+              title={`没有找到与「${data.query}」相关的内容`}
+              hint="换个关键词试试，或者先把这个主题写进知识库。"
+              action={
+                onSearch !== undefined ? (
+                  <Button variant="secondary" size="sm" onClick={() => onSearch('')}>
+                    返回全部页面
+                  </Button>
+                ) : undefined
+              }
+            />
           ) : (
             <section className="card">
               <ul className="search-hit-list">

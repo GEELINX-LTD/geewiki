@@ -26,7 +26,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ChevronDown, ChevronRight, FileText, PanelLeft, X } from 'lucide-react'
-import { ancestorPaths, buildNavTree, containsSlug, countPages, type NavNode } from '../lib/navTree'
+import { ancestorPaths, buildNavTree, containsSlug, countPages, navLabelOf, type NavNode } from '../lib/navTree'
 import type { PageSummary } from '../api'
 import { cn } from '../ui/cn'
 import { Button } from '../ui/Button'
@@ -66,6 +66,8 @@ function NodeRow(props: {
   const isActive = activeSlug !== null && node.page !== null && node.page.slug === activeSlug
   // 当前页在该子树内 ⇒ 祖先链上加一点暗示（但不做整行高亮，避免与"当前页"混淆）
   const inPath = activeSlug !== null && hasChildren && containsSlug(node, activeSlug)
+  // 标签种类：有页面 ⇒ 页面标题；无页面（纯分组）⇒ 退回路径段并按"标识符"渲染
+  const groupLabel = navLabelOf(node.segment, node.page)
 
   return (
     <li>
@@ -83,7 +85,7 @@ function NodeRow(props: {
             type="button"
             onClick={() => onToggle(node.path)}
             aria-expanded={isOpen}
-            aria-label={`${isOpen ? '折叠' : '展开'}「${node.segment}」`}
+            aria-label={`${isOpen ? '折叠' : '展开'}「${navLabelOf(node.segment, node.page).text}」`}
             // 触控目标 ≥24×24（WCAG 2.5.8 AA）：14px 图标 + p-1.5 两侧 = 26px
             className="gw-focus-ring rounded-md p-1.5 text-muted hover:bg-hover hover:text-ink"
           >
@@ -107,14 +109,20 @@ function NodeRow(props: {
             {node.page.title}
           </a>
         ) : (
-          // 纯分组：名字本身不可导航（没有页面可打开），但仍需可聚焦以支持键盘展开
+          // 纯分组：名字本身不可导航（没有页面可打开），但仍需可聚焦以支持键盘展开。
+          // 标签走 navLabelOf —— 无页面时只能退回 slug 段，故**明确渲染为"标识符"**
+          // （等宽 + 弱化 + title 说明），而不是让它看起来像页面标题。
           <button
             type="button"
             onClick={() => onToggle(node.path)}
             aria-expanded={isOpen}
-            className="gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-left text-[13px] font-medium text-ink-soft"
+            title={`分组「${groupLabel.text}」——尚无同名页面，名称取自路径`}
+            className={cn(
+              'gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-left text-[13px] font-medium text-ink-soft',
+              groupLabel.kind === 'segment' && 'font-mono text-xs',
+            )}
           >
-            {node.segment}
+            {groupLabel.text}
           </button>
         )}
       </div>

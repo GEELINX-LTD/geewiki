@@ -21,11 +21,18 @@ import { api, type PageSummary } from '../api'
 export interface PagesState {
   pages: PageSummary[] | null
   error: string | null
+  /**
+   * 原始错误值（未经加工的 thrown 值）。`error` 是给人看的字符串，而**分类**（连不上服务/
+   * 不存在/服务出错）需要看 `status` 或是否 `TypeError`，那些信息在字符串里已经丢了——
+   * 故额外保留原始值供 `lib/errorText.ts` 的 `describeError()` 使用。
+   * 可选字段，向后兼容（既有消费者只读 `error`）。
+   */
+  errorValue?: unknown
   /** 首次加载中（`pages === null && error === null`）*/
   loading: boolean
 }
 
-const EMPTY: PagesState = { pages: null, error: null, loading: true }
+const EMPTY: PagesState = { pages: null, error: null, errorValue: null, loading: true }
 
 let state: PagesState = EMPTY
 let inflight: Promise<void> | null = null
@@ -53,19 +60,19 @@ export function loadPages(options: { force?: boolean } = {}): Promise<void> {
 
   if (state.pages === null) {
     // 首次加载显示 loading；已有数据时的静默刷新不闪骨架屏
-    setState({ pages: null, error: null, loading: true })
+    setState({ pages: null, error: null, errorValue: null, loading: true })
   }
 
   inflight = api
     .pages()
     .then((r) => {
-      setState({ pages: r.pages, error: null, loading: false })
+      setState({ pages: r.pages, error: null, errorValue: null, loading: false })
     })
     .catch((e: unknown) => {
       const msg = e instanceof Error ? e.message : String(e)
       console.debug('[geewiki-pages] 页面列表加载失败：', msg)
       // 失败时**不保留旧数据也不写缓存**：让 UI 能显示错误并允许重试
-      setState({ pages: null, error: msg, loading: false })
+      setState({ pages: null, error: msg, errorValue: e, loading: false })
     })
     .finally(() => {
       inflight = null

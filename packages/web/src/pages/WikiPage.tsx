@@ -2,20 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { parseWikiRoute } from '../lib/wikiRoute'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
-import {
-  ChevronLeft,
-  ChevronRight,
-  FileText,
-  History,
-  MessageSquareText,
-  Pencil,
-  Plus,
-  RefreshCw,
-  RotateCcw,
-  Save,
-  Search,
-  Trash2,
-} from 'lucide-react'
+import { ChevronLeft, ChevronRight, FileText, History, MessageSquareText, Pencil, Plus, RefreshCw, RotateCcw, Save, Search, SearchX, Trash2 } from 'lucide-react'
 import { api, type PageDetail, type PageSummary } from '../api'
 import { AskPanel } from '../components/AskPanel'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
@@ -50,6 +37,8 @@ import {
   intermediateCrumbCount,
   neighborsOf,
 } from '../lib/navTree'
+import { describeError } from '../lib/errorText'
+import { useSlowHint } from '../lib/useSlowHint'
 import { checkQuery } from '../lib/searchPlan'
 import { useActiveHeading } from '../lib/useActiveHeading'
 import { useDocumentTitle } from '../lib/useDocumentTitle'
@@ -65,7 +54,9 @@ import {
   DialogClose,
   DialogContent,
   EmptyState,
+  ErrorState,
   Input,
+  LoadingState,
   Skeleton,
   SkeletonTable,
   Spinner,
@@ -246,6 +237,7 @@ function WikiList(props: {
   const load = (): void => {
     pagesState.reload()
   }
+  const slowList = useSlowHint(pages === null && pagesState.error === null)
 
   useEffect(() => {
     api
@@ -436,8 +428,22 @@ function WikiList(props: {
           这是 WCAG 2.1.1（键盘）在"可滚动区域"上的具体要求，VitePress 等实现亦如此。
           `aria-label` 给这个可聚焦区域一个名字（否则屏幕阅读器只念"表格"）。
         */}
-        {pages === null ? (
-          <SkeletonTable rows={4} cols={4} />
+        {/*
+          三态的顺序即优先级：**先看错误**（请求没成功 ⇒ 我们不知道有没有数据），
+          再看加载，最后才判断"确实为空"。若把空态放在错误之前，请求失败会被误报成
+          "还没有页面"——用户会以为数据没了。
+        */}
+        {pagesState.error !== null ? (
+          <ErrorState
+            title={describeError(pagesState.errorValue).title}
+            hint={describeError(pagesState.errorValue).hint}
+            onRetry={describeError(pagesState.errorValue).retryable ? load : undefined}
+            retrying={pagesState.loading}
+          />
+        ) : pages === null ? (
+          <LoadingState slow={slowList}>
+            <SkeletonTable rows={4} cols={4} />
+          </LoadingState>
         ) : pages.length === 0 ? (
           <EmptyState
             icon={<FileText className="size-8" />}
@@ -446,6 +452,22 @@ function WikiList(props: {
             action={
               <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={onNew}>
                 新建页面
+              </Button>
+            }
+          />
+        ) : filtered.length === 0 ? (
+          /*
+            "过滤后无匹配"与"一个页面都没有"是**两种不同的空**，文案必须不同：
+            前者要用"清除筛选"（数据其实在），后者要引导"新建"（数据确实没有）。
+            混用会让用户以为自己的数据不见了。
+          */
+          <EmptyState
+            icon={<SearchX className="size-8" />}
+            title={`没有匹配「${filter.trim()}」的页面`}
+            hint={`共 ${pages.length} 个页面，但标题与标识都不含这个关键词。换个词，或清除筛选看全部。`}
+            action={
+              <Button variant="secondary" onClick={() => setFilter('')}>
+                清除筛选
               </Button>
             }
           />
@@ -597,8 +619,13 @@ function Breadcrumb({
                 {c.label}
               </a>
             ) : (
-              // 纯分组：不可导航，但仍要能"看见层级"
-              <span className="shrink-0 text-muted" title={`${c.path}（分组，没有对应页面）`}>
+              // 纯分组：不可导航，但仍要能"看见层级"。
+              // 标签种类为 'segment' 时说明它**没有**同名页面，只能退回路径段——
+              // 故用等宽字体明示"这是标识符"，与侧栏保持同一套呈现规则（同一个 navLabelOf）。
+              <span
+                className={cn('shrink-0 text-muted', c.labelKind === 'segment' && 'font-mono text-xs')}
+                title={`${c.path}（分组，没有对应页面）`}
+              >
                 {c.label}
               </span>
             )}

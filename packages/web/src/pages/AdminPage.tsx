@@ -13,6 +13,8 @@ import {
 import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState } from '../api'
 import { SchemaForm } from '../components/SchemaForm'
 import { describeRoot, type FieldDescriptor } from '../lib/configSchema'
+import { describeError } from '../lib/errorText'
+import { useSlowHint } from '../lib/useSlowHint'
 import { syncPluginUi, subscribePluginUiState, pluginUiState } from '../lib/pluginUi'
 import { classifyUiSkips, UI_SKIP_HELP, UI_SKIP_LABEL } from '../lib/pluginUiPlan'
 import {
@@ -36,6 +38,8 @@ import {
   DialogClose,
   DialogContent,
   EmptyState,
+  ErrorState,
+  LoadingState,
   SkeletonTable,
   Textarea,
   Tooltip,
@@ -123,6 +127,8 @@ function Chip({ children }: { children: ReactNode }): ReactNode {
 
 export function AdminPage(): ReactNode {
   const [plugins, setPlugins] = useState<PluginInfo[] | null>(null)
+  /** 首屏加载的原始错误：非 null 时整块显示可重试的错误态（区别于"确实没有插件"的空态） */
+  const [loadError, setLoadError] = useState<unknown>(null)
   const [session, setSession] = useState<SessionState | null>(null)
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   /** 全页性忙碌（刷新/持久化）：只有这类操作才该禁用全表 */
@@ -161,6 +167,7 @@ export function AdminPage(): ReactNode {
   const load = useCallback(async () => {
     try {
       const [p, s] = await Promise.all([api.plugins(), api.session()])
+      setLoadError(null)
       setPlugins(p.plugins)
       setSession(s)
       setIssues(p.issues ?? [])
@@ -171,6 +178,8 @@ export function AdminPage(): ReactNode {
       // 这条 skipped 信息。普通轮询仍走 304（省请求），只有这里需要完整表。
       void syncPluginUi({ force: true })
     } catch (err) {
+      // 首屏失败要能"整块重试"，不能只留一条会消失的 notice：故额外记 loadError
+      setLoadError(err)
       setNotice({ kind: 'err', text: `加载失败: ${fmtError(err)}` })
     }
   }, [])
@@ -178,6 +187,14 @@ export function AdminPage(): ReactNode {
   useEffect(() => {
     void load()
   }, [load])
+  /** 错误态里"重试"的进行中标记（只服务于那个按钮的 loading 样式） */
+  const [retrying, setRetrying] = useState(false)
+  const slowAdmin = useSlowHint(plugins === null && loadError === null)
+  const retryLoad = useCallback((): void => {
+    setRetrying(true)
+    void load().finally(() => setRetrying(false))
+  }, [load])
+
 
   const act = useCallback(
     async (label: string, fn: () => Promise<unknown>, successMsg: string) => {
@@ -587,8 +604,22 @@ export function AdminPage(): ReactNode {
               : undefined
           }
         />
-        {plugins === null ? (
-          <SkeletonTable rows={5} cols={4} />
+        {loadError !== null ? (
+          /*
+            三态优先级：**先错误**（请求没成功 ⇒ 不知道有没有插件），再加载，最后才判"确实为空"。
+            顺序反了会把"加载失败"误报成"没有已注册的插件"——而插件其实都在，只是没读到。
+          */
+          <ErrorState
+            className="m-4"
+            title={describeError(loadError).title}
+            hint={describeError(loadError).hint}
+            onRetry={describeError(loadError).retryable ? retryLoad : undefined}
+            retrying={retrying}
+          />
+        ) : plugins === null ? (
+          <LoadingState slow={slowAdmin}>
+            <SkeletonTable rows={5} cols={4} />
+          </LoadingState>
         ) : plugins.length === 0 ? (
           <EmptyState
             icon={<Package className="size-6" />}
