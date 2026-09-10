@@ -632,8 +632,49 @@ export class GeeWikiManager {
     }
   }
 
-  /** 会话层热启用（enable）：校验热授权/依赖链/冲突/迁移后激活并写入 Session 清单 */
+  /**
+   * 会话层热启用（enable）：校验热授权/依赖链/冲突/迁移后激活并写入 Session 清单。
+   *
+   * **单一回滚点**：本方法是所有递归深度的唯一回滚处，递归主体见 enableInner。
+   * 回滚集合（activated）由 enableInner 各帧**共用**——历史缺陷（W2）：回滚集合曾是
+   * 每递归帧各自的局部数组，且由父帧替子帧记账，导致目标插件激活失败时**深度 ≥2 的
+   * 孙依赖**无人回滚，残留在 Session 清单文件里（落盘为已启用但进程内并不活跃）。
+   * 该缺陷在内置注册表（依赖深度最大 1）下不可达，但 buildRegistry 会把外部插件与
+   * 内置插件并入同一注册表，深度 ≥2 的链路可由外部插件构造，故必须修。
+   */
   async enable(name: string, config?: Record<string, unknown>): Promise<PluginSnapshot> {
+    const activated: string[] = []
+    try {
+      return await this.enableInner(name, config, activated)
+    } catch (err) {
+      // 按**逆激活序**回滚本次调用新增激活的全部插件（含任意递归深度）：
+      // 先卸依赖方再卸被依赖者，逐个移出会话清单，不留半激活残留
+      for (const n of [...activated].reverse()) {
+        try {
+          await this.deactivateCore(n)
+        } catch (rollbackErr) {
+          console.error(`[manager] 启用 ${name} 失败后的回滚卸载 ${n} 出错:`, rollbackErr)
+        }
+        this.removeFromSession(n)
+      }
+      throw err
+    }
+  }
+
+  /**
+   * enable 的递归主体：校验 → 递归激活未激活的直接依赖 → 激活并落盘自身。
+   *
+   * 所有递归帧共用同一个 activated 数组并**自登记**（激活成功的那一帧自己 push），
+   * 而不是由父帧替子帧记账——这是 W2 的修法要点。
+   *
+   * 注：cordis 的 inject 语义使得依赖方在依赖被更新时会连带重启（dispose + 重新 apply），
+   * 这是预期行为，不是回滚。
+   */
+  private async enableInner(
+    name: string,
+    config: Record<string, unknown> | undefined,
+    activated: string[],
+  ): Promise<PluginSnapshot> {
     const entry = this.registryOf(name)
     const m = entry.manifest.geewiki
 
@@ -668,30 +709,19 @@ export class GeeWikiManager {
         { path: violations },
       )
     }
-    // 事务性启用：先递归启用未激活依赖（同样走会话层热路径），任一环节失败
-    // 则逆序回滚本次新增激活的插件并移出会话清单，不留半激活残留
+    // 事务性启用：先递归启用未激活依赖（同样走会话层热路径）。
+    // 任一环节失败时的回滚由 enable 的**单一回滚点**统一负责（共用 activated 数组），
+    // 本帧不再自行回滚——避免深度 ≥2 时孙依赖无人记账（W2）。
     // 未显式传配置时回退到清单里已持久化的配置（PUT /config 的成果应当生效）
     const effectiveConfig = config && Object.keys(config).length > 0 ? config : (this.persistedConfigOf(name) ?? {})
-    const activatedByThisCall: string[] = []
-    try {
-      for (const dep of directDependencies(this.config.registry, name)) {
-        if (!this.plugins.get(dep)?.active) {
-          await this.enable(dep)
-          activatedByThisCall.push(dep)
-        }
+    for (const dep of directDependencies(this.config.registry, name)) {
+      if (!this.plugins.get(dep)?.active) {
+        await this.enableInner(dep, undefined, activated)
       }
-      await this.activateCore(name, effectiveConfig, 'session')
-    } catch (err) {
-      for (const n of [...activatedByThisCall].reverse()) {
-        try {
-          await this.deactivateCore(n)
-        } catch (rollbackErr) {
-          console.error(`[manager] 启用 ${name} 失败后的回滚卸载 ${n} 出错:`, rollbackErr)
-        }
-        this.removeFromSession(n)
-      }
-      throw err
     }
+    await this.activateCore(name, effectiveConfig, 'session')
+    // 自登记：激活成功的那一帧自己记账（目标自身激活失败时不登记）
+    activated.push(name)
     this.lastEnabledName = name
     this.lastEnabledAt = Date.now()
     // 落盘用"生效配置"（activateCore 已按 schema 填默认值/裁剪未知字段）

@@ -302,6 +302,47 @@ test('enable：目标加载失败 → 逆序回滚本次启用的依赖（无半
   }
 })
 
+test('enable：递归深度 ≥2 时回滚集合必须覆盖孙依赖（会话清单零残留）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.baseFile, [])
+    writeList(env.sessionFile, [])
+    const log: string[] = []
+    // A ← B ← C：C 是目标（加载失败），B 是它的依赖，A 是 B 的依赖（孙依赖）
+    const registry = [
+      plugin('@t/grand', log),
+      plugin('@t/mid', log, { requires: ['@t/grand'] }),
+      plugin('@t/top', log, { requires: ['@t/mid'], fail: true }),
+    ]
+    const m = makeManager(env, registry)
+    await m.boot()
+
+    await assert.rejects(
+      () => m.enable('@t/top'),
+      (err: unknown) => err instanceof ManagerError && err.code === 'load_failed',
+      '目标插件加载失败应抛 load_failed',
+    )
+    assert.deepEqual(
+      readList(env.sessionFile),
+      [],
+      '会话清单文件不得残留任何条目（含递归深度 2 的孙依赖）',
+    )
+    assert.deepEqual(m.sessionState().session.enabled, [], '内存会话清单同样零残留')
+    for (const n of ['@t/grand', '@t/mid']) {
+      assert.equal(snapshotOf(m, n).state, 'inactive', `${n} 应被回滚卸载`)
+    }
+    assert.equal(snapshotOf(m, '@t/top').state, 'error', '目标自身留 error 态')
+    assert.deepEqual(
+      log,
+      ['apply:@t/grand', 'apply:@t/mid', 'dispose:@t/mid', 'dispose:@t/grand'],
+      '孙依赖先激活，回滚按逆激活序逐个 dispose',
+    )
+    await m.disposeAll()
+  } finally {
+    env.cleanup()
+  }
+})
+
 /* --------------------------- 5. 看门狗决策函数 --------------------------- */
 
 test('decideWatchdog：试用期回滚绑定最近会话插件，仅会话层存在时熔断', () => {
