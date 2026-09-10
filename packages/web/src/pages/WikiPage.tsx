@@ -43,7 +43,13 @@ import {
   type PageFormErrors,
 } from '../lib/pageFormPlan'
 import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
-import { ancestorPaths, buildNavTree, neighborsOf } from '../lib/navTree'
+import {
+  buildBreadcrumb,
+  buildNavTree,
+  hasSeparatorBefore,
+  intermediateCrumbCount,
+  neighborsOf,
+} from '../lib/navTree'
 import { checkQuery } from '../lib/searchPlan'
 import { useActiveHeading } from '../lib/useActiveHeading'
 import { useDocumentTitle } from '../lib/useDocumentTitle'
@@ -537,72 +543,56 @@ function Breadcrumb({
   pages: readonly PageSummary[] | null
 }): ReactNode {
   const bySlug = useMemo(() => new Map((pages ?? []).map((p) => [p.slug, p])), [pages])
-  const paths = useMemo(() => ancestorPaths(slug), [slug])
 
   /*
-   * 每一段的显示名：**有页面就用页面标题**（人读），否则退回该段自己的路径片段。
-   * 退回片段（而不是整个 slug）是为了"能对上 URL"——分组没有标题可用，显示 `guides` 最诚实。
+   * 面包屑的全部项（含根项与当前页）由 `buildBreadcrumb` 产出——**唯一来源**。
+   * 这里不再自己拼「知识库」根项、也不再在根项尾部画分隔符：那曾经与"每项开头的分隔符"
+   * 叠加成 `知识库 › › 指南`。详见 `navTree.ts` 的 `BreadcrumbItem` 注释。
    */
-  const crumbs = useMemo(() => {
-    const built = paths.map((path, i) => {
-      const page = bySlug.get(path)
-      const seg = path.split('/').pop() ?? path
-      return { path, label: page?.title ?? seg, hasPage: page !== undefined, isLast: i === paths.length - 1 }
-    })
-    // 新建页（slug 为空）没有层级可拆：只保留"当前页"这一段，否则末段会整个消失
-    if (built.length === 0) return [{ path: '', label: title, hasPage: false, isLast: true }]
-    return built
-  }, [paths, bySlug, title])
+  const crumbs = useMemo(() => buildBreadcrumb(slug, title, bySlug, wikiHref), [slug, title, bySlug])
+  const intermediate = intermediateCrumbCount(crumbs)
 
   return (
     <nav aria-label="面包屑" className="min-w-0 text-[13px]">
       <ol className="m-0 flex list-none flex-wrap items-center gap-x-1.5 gap-y-1 p-0">
-        <li className="flex min-w-0 items-center gap-1.5">
-          {/*
-            只用 `href`，**不叠 onClick**：应用监听 `hashchange` 完成导航，
-            而"有未保存改动时的确认"由 `useUnsavedGuard` 在**捕获阶段**统一拦截。
-            若这里再加一次 `confirmLeave()`，同一次点击就会问两遍——这是推理（两处都会弹），
-            故直接避免重复，而不是让用户去忍第二次。
-          */}
-          <a href="#/wiki/list" className="gw-focus-ring rounded-sm text-accent hover:underline">
-            知识库
-          </a>
-          <ChevronRight className="size-3.5 shrink-0 text-muted" aria-hidden="true" />
-        </li>
-
         {crumbs.map((c, i) => (
           <li
-            key={c.path}
+            key={`${i}:${c.path}`}
             className={cn(
               'min-w-0 items-center gap-1.5',
               /*
                * 中间层在窄屏收起（只留首段与末段），靠下面的省略提示告诉用户还有层级。
                *
-               * ⚠️ 两个坑（都实测踩过）：
-               * 1. **不能**同时写 `flex` 与 `hidden`：两者都是 display 工具类，谁生效取决于
-               *    生成的 CSS 顺序而非 class 属性顺序（实测 `hidden` 被 `flex` 盖掉，窄屏收起失效）。
-               *    正确写法是"基础态 `hidden` + 断点态 `sm:flex`"。
-               * 2. 判据是 **`!c.isLast`**，**不能**写成 `i > 0 && !c.isLast`——
-               *    `crumbs` 里只有"映射出来的"层级，最前面的「知识库」是外层单独的 `<li>`，
-               *    于是 `crumbs[0]` 其实已经是中间层了。用 `i > 0` 会让第一层中间项永远可见。
+               * ⚠️ **不能**同时写 `flex` 与 `hidden`：两者都是 display 工具类，谁生效取决于
+               * 生成的 CSS 顺序而非 class 属性顺序（实测 `hidden` 被 `flex` 盖掉，窄屏收起失效）。
+               * 正确写法是"基础态 `hidden` + 断点态 `sm:flex`"。
                */
-              !c.isLast ? 'hidden sm:flex' : 'flex',
+              i > 0 && !c.isLast ? 'hidden sm:flex' : 'flex',
             )}
           >
-            {!c.isLast && (
-              <span className="hidden shrink-0 text-muted sm:inline" aria-hidden="true">
-                <ChevronRight className="size-3.5" />
-              </span>
+            {/*
+              分隔符的**唯一渲染点**：规则来自 `hasSeparatorBefore`（除首项外每项之前恰好一个）。
+              它**不加响应式类**是刻意的：中间层 `<li>` 在窄屏整体隐藏，会连带隐藏它自己的分隔符；
+              而末项这个始终可见，于是窄屏恰好剩下 `知识库 › 当前页`。
+              若把它写成 `hidden sm:inline`，窄屏就会变成 `知识库 当前页`（丢了分隔）。
+            */}
+            {hasSeparatorBefore(i) && (
+              <ChevronRight className="size-3.5 shrink-0 text-muted" aria-hidden="true" />
             )}
             {c.isLast ? (
               <span aria-current="page" className="truncate font-medium text-ink" title={title}>
                 {title}
               </span>
-            ) : c.hasPage ? (
+            ) : c.href !== null ? (
+              /*
+                只用 `href`，**不叠 onClick**：应用监听 `hashchange` 完成导航，
+                而"有未保存改动时的确认"由 `useUnsavedGuard` 在**捕获阶段**统一拦截。
+                若这里再加一次 `confirmLeave()`，同一次点击就会问两遍，故直接避免重复。
+              */
               <a
-                href={wikiHref(c.path)}
+                href={c.href}
                 className="gw-focus-ring shrink-0 rounded-sm text-accent hover:underline"
-                title={c.path}
+                title={c.path === '' ? undefined : c.path}
               >
                 {c.label}
               </a>
@@ -616,12 +606,12 @@ function Breadcrumb({
         ))}
 
         {/*
-          窄屏省略提示：中间层的数量 = 非末项的数量（`crumbs.length - 1`）。
+          窄屏省略提示：中间层数量 = 总数 - 根项 - 当前页。
           用 `sm:hidden` 与上面中间层的 `hidden sm:flex` 互补——宽屏看全层级，窄屏看省略提示。
         */}
-        {crumbs.length > 1 && (
+        {intermediate > 0 && (
           <li className="flex items-center text-muted sm:hidden" aria-hidden="true">
-            前面还有 {crumbs.length - 1} 级…
+            前面还有 {intermediate} 级…
           </li>
         )}
       </ol>

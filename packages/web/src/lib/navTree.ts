@@ -172,3 +172,111 @@ export function countPages(nodes: readonly NavNode[]): number {
   }
   return n
 }
+
+/* ------------------------------ 面包屑 ------------------------------ */
+
+/**
+ * 面包屑的一项。**列表顺序即层级顺序**（根在首、当前页在末）。
+ *
+ * 为什么把「当前页」也放进这个数组（而不是像过去那样让组件自己补一个「知识库」根项）：
+ * 过去分隔符有**两个来源**——根项 `<li>` 尾部硬编码一个 `ChevronRight`，而每个非末项
+ * 又在**自己开头**再画一个——于是渲染成 `知识库 › › 指南 撰写指南`：
+ * 第一个间隙出现**两个**分隔符，而末项之前**一个都没有**（因为末项不画）。
+ * 根因不是"少写了一个分隔符"，而是**同一件事有两处负责**。
+ * 现在改成：面包屑的全部项由本函数产出，分隔符只有**一条规则**（见 `hasSeparatorBefore`）。
+ */
+export interface BreadcrumbItem {
+  /** 显示文本：有对应页面时用页面标题，纯分组退回该段路径片段，末项用传入的 `title` */
+  label: string
+  /** 可点击目标；`null` = 不可点（纯分组，或当前页自身） */
+  href: string | null
+  /** 是否为当前页（恒为数组最后一项） */
+  isLast: boolean
+  /** 该项对应的 slug 前缀；根项为 `''` */
+  path: string
+  /** 该项是否有对应的页面（false = 纯分组，用于 `title` 说明与测试断言） */
+  hasPage: boolean
+}
+
+/** 面包屑根项（知识库列表）的文案与地址 */
+export const BREADCRUMB_ROOT_LABEL = '知识库'
+export const BREADCRUMB_ROOT_HREF = '#/wiki/list'
+
+/**
+ * 构造面包屑（纯函数）。
+ *
+ * `hrefOf` 由调用方注入（详情页传 `wikiHref`）而不是在本模块 import 组件模块——
+ * 避免 `lib → components` 的反向依赖，同时让单测不必碰浏览器（传一个朴素实现即可）。
+ *
+ * 三种输入的输出：
+ * - 顶层页面（`standalone`）⇒ `[知识库, 当前页]`；
+ * - 中间层是页面（`guides` 存在）⇒ 中间项 `href != null`（可点）；
+ * - 中间层是纯分组（只有 `guides/authoring`）⇒ 中间项 `href === null` 且 `hasPage === false`。
+ *   **刻意不链到列表页**：那会给出"看起来能到、实际到别处"的假链接。
+ * - 新建页（`slug` 为空）没有层级可拆 ⇒ `[知识库, {label: title}]`（否则末项会整个消失）。
+ */
+export function buildBreadcrumb(
+  slug: string,
+  title: string,
+  pagesBySlug: ReadonlyMap<string, { title: string }>,
+  hrefOf: (slug: string) => string,
+): BreadcrumbItem[] {
+  const root: BreadcrumbItem = {
+    label: BREADCRUMB_ROOT_LABEL,
+    href: BREADCRUMB_ROOT_HREF,
+    isLast: false,
+    path: '',
+    hasPage: true,
+  }
+  const paths = ancestorPaths(slug)
+  if (paths.length === 0) {
+    return [root, { label: title, href: null, isLast: true, path: '', hasPage: false }]
+  }
+  const rest = paths.map((path, i) => {
+    const page = pagesBySlug.get(path)
+    const isLast = i === paths.length - 1
+    const seg = path.split('/').pop() ?? path
+    return {
+      path,
+      // 末项用传入的 title（详情已加载的最新标题），其余用清单里的标题
+      label: isLast ? title : (page?.title ?? seg),
+      // 当前页不可点；纯分组不可点
+      href: isLast || page === undefined ? null : hrefOf(path),
+      isLast,
+      hasPage: page !== undefined,
+    }
+  })
+  return [root, ...rest]
+}
+
+/**
+ * 分隔符的**唯一规则**：除首项外，每项**之前**恰好一个分隔符。
+ *
+ * N 项 ⇒ N-1 个分隔符，且与标签**严格交替**（`label (› label)*`）。
+ * 渲染与测试都走这一个函数，所以"多一个 `›`"不可能再出现——它需要第二处代码去画第二个。
+ */
+export function hasSeparatorBefore(index: number): boolean {
+  return index > 0
+}
+
+/**
+ * 把面包屑摊平成"用户看到的那一行"的 token 序列（供单测直接断言交替性）。
+ *
+ * 用 `SEP` 占位而不是 `›` 字面量：真实分隔符是 lucide 图标（DOM 里没有文本），
+ * 这里只需要表达"**一个**分隔符位置"，避免把图标选择与断言耦合。
+ */
+export const BREADCRUMB_SEP = '›'
+
+export function breadcrumbTokens(items: readonly BreadcrumbItem[]): string[] {
+  const out: string[] = []
+  items.forEach((item, i) => {
+    if (hasSeparatorBefore(i)) out.push(BREADCRUMB_SEP)
+    out.push(item.label)
+  })
+  return out
+}
+
+/** 中间层（既非根、也非当前页）的数量——窄屏省略提示要用 */
+export function intermediateCrumbCount(items: readonly BreadcrumbItem[]): number {
+  return Math.max(0, items.length - 2)
+}
