@@ -57,6 +57,31 @@ importers:
         specifier: 3.18.0
         version: 3.18.0
 
+  packages/plugin-ai:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      '@geewiki/llm':
+        specifier: workspace:*
+        version: link:../plugin-llm
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@geewiki/db-sqlite':
+        specifier: workspace:*
+        version: link:../db-sqlite
+      '@geewiki/search':
+        specifier: workspace:*
+        version: link:../plugin-search
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
   packages/plugin-echo:
     dependencies:
       '@geewiki/core':
@@ -122,6 +147,9 @@ importers:
 
   packages/server:
     dependencies:
+      '@geewiki/ai':
+        specifier: workspace:*
+        version: link:../plugin-ai
       '@geewiki/core':
         specifier: workspace:*
         version: link:../core

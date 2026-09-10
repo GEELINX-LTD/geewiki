@@ -31,6 +31,7 @@ import {
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
+import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
@@ -695,6 +696,13 @@ export function defaultRegistry(
       source: 'builtin',
     },
     { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin, source: 'builtin' },
+    // AI 问答（检索增强问答的检索-only 形态）：提供 ai-service。
+    // requires 点名 search-service 与 llm-service 两个**服务**（不是插件名），故管理器会保证
+    // 检索与模型契约层先激活；**没有模型也能用**——无 provider 时降级为检索结果 + 抽取式摘要，
+    // 这正是产品承诺"没有 API key 时也完整可用"的落点。
+    // 与 @geewiki/echo / @geewiki/llm 同形态：**只登记、不写进默认基础层清单**（已注册未启用），
+    // 由使用者在管理台按需热启用；是否默认启用见 docs 的部署建议。
+    { name: '@geewiki/ai', manifest: aiManifest as GeeWikiManifest, module: AiPlugin, source: 'builtin' },
   ]
 }
 

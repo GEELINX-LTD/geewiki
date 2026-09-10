@@ -1,9 +1,9 @@
 {
-  "name": "@geewiki/wiki",
+  "name": "@geewiki/ai",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "GeeWiki Wiki 核心插件：页面 CRUD + 版本历史（REST）",
+  "description": "GeeWiki AI 问答插件：检索增强问答（RAG），无 API key 时降级为检索-only 抽取式摘要",
   "exports": {
     ".": "./src/index.ts"
   },
@@ -13,10 +13,13 @@
   },
   "dependencies": {
     "@geewiki/core": "workspace:*",
+    "@geewiki/llm": "workspace:*",
     "cordis": "^4.0.0-rc.10",
     "schemastery": "3.18.0"
   },
   "devDependencies": {
+    "@geewiki/db-sqlite": "workspace:*",
+    "@geewiki/search": "workspace:*",
     "@types/node": "^22.0.0"
   }
 }

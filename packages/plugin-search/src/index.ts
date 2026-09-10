@@ -87,6 +87,12 @@ export interface SearchHit {
   slug: string
   title: string
   snippet: string
+  /**
+   * 相关度：FTS 路为 BM25 取负后的值（**越大越相关**），LIKE 路恒为 0。
+   *
+   * **只在同一次查询的结果内部可比**：它不是归一化分数（值域无界），量级随语料规模与
+   * 查询词变化，跨查询比大小无意义；两种 mode 的 score 也不可比。
+   */
   score: number
   updated_at: string
 }
@@ -191,7 +197,7 @@ interface SearchHitRow {
   title: string
   content: string
   updated_at: string
-  /** FTS 路为 BM25（负值，越小越相关）；LIKE 路恒为 0 */
+  /** FTS 路为 FTS5 `rank` 原始值（BM25，**负值**，越小越相关）；LIKE 路恒为 0 */
   score?: number
 }
 
@@ -267,7 +273,9 @@ export const SearchPlugin = {
           [phrase, limit],
         )
         mode = 'fts'
-        // BM25 原始值是**负的**（越小越相关），归一化成"越大越相关"再对外
+        // BM25（FTS5 的 `rank`）原始值是**负的**，越小越相关；这里**取负**换成
+        // "越大越相关"再对外。**这不是归一化**：值域没有界、量级随语料规模与查询词
+        // 变化，故**只在同一次查询的结果内部可比**，跨查询（乃至跨库）比大小无意义。
         scoreOf = (row) => -(row.score ?? 0)
       } else {
         const pattern = `%${escapeLike(q)}%`

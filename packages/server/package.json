@@ -14,13 +14,14 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@geewiki/ai": "workspace:*",
     "@geewiki/core": "workspace:*",
     "@geewiki/db-sqlite": "workspace:*",
-    "cordis": "^4.0.0-rc.10",
     "@geewiki/echo": "workspace:*",
     "@geewiki/llm": "workspace:*",
     "@geewiki/manager": "workspace:*",
     "@geewiki/search": "workspace:*",
-    "@geewiki/wiki": "workspace:*"
+    "@geewiki/wiki": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
   }
 }
