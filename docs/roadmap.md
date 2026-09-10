@@ -7,8 +7,8 @@
 | Phase 0 | 基础骨架 | monorepo + core 类型 + db-sqlite + server 宿主 | ✅ 完成（07bb411） |
 | Phase 1 | 插件管理器 | 依赖图/双层状态/迁移控制器/看门狗/REST | ✅ 完成（e97ce6b） |
 | Phase 2 | 前端可视化 + Wiki MVP | React 19 管理台 + React Flow + Wiki CRUD/版本 | ✅ 完成（本次提交） |
-| Phase 3 | AI 原生能力 | Slots 插槽、LLM/RAG、编辑器组插件 | ⏳ 候选 |
-| Phase 4 | 稳定性加固 | PG 适配、配置热更新表单（容器镜像与 Compose 部署已提前完成，见 [deployment.md](deployment.md)） | ⏳ 候选 |
+| Phase 3 | AI 原生能力 | Slots 插槽、LLM/RAG、编辑器组插件 | 🟡 部分落地：配置系统、外部插件发现、**宿主侧** Slot 已完成；LLM/RAG、编辑器组插件、后端 `ctx.slot()` 注册链路仍为候选 |
+| Phase 4 | 稳定性加固 | PG 适配、配置热更新表单（容器镜像与 Compose 部署已提前完成，见 [deployment.md](deployment.md)） | 🟡 部分落地：配置热更新表单**已完成**；PG 适配**已裁决延期**；容器镜像与 Compose 部署已提前完成 |
 
 ## Phase 0：基础骨架 ✅
 
@@ -45,22 +45,28 @@
 
 **验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 15/15（`packages/manager/test/deps.test.ts` 8 例 + `manager.test.ts` 7 例）、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
 
-> 后续治理批次（同一实现期）在 `manager.test.ts` 增补崩溃自愈、persist 跳过失败条目、enable 事务性、看门狗决策、卸载排空与缓存清理等用例，并新增 `repo-paths.test.ts`（3 例，路径解析与进程工作目录解耦）与 `packages/server/test/router.test.ts`（11 例，覆盖 HTTP 路由排空/413/端口选项）；当前累计单测 **35/35**（deps 8 + manager 13 + repo-paths 3 + server 11）。
+> 后续治理批次（同一实现期）在 `manager.test.ts` 增补崩溃自愈、persist 跳过失败条目、enable 事务性、看门狗决策、卸载排空与缓存清理等用例，并新增 `repo-paths.test.ts`（3 例，路径解析与进程工作目录解耦）与 `packages/server/test/router.test.ts`（11 例，覆盖 HTTP 路由排空/413/端口选项）；该批累计单测 **35/35**（deps 8 + manager 13 + repo-paths 3 + server 11）。
+>
+> **当前口径（插件平台批次 A–D 落地后实跑）**：单测 **72/72 全绿** = `packages/manager` **58**（`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11），`pnpm typecheck` 7 个包 0 错误。因此上文 Phase 2 验收里的 15/15 与本段的 35/35 均为**历史时点口径**，不代表当前工作树；契约迁移（`layer` = 持久化层、无 schema 插件接受原始 JSON）已完成、两条旧断言已随新契约更新，逐条记录见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 6 节。
 
 ## Phase 3（候选）：AI 原生能力
 
-- [ ] Slots 插槽机制：`ctx.slot(name, component)` 注册 + 前端 `header-slots` / `editor-toolbar-slots` / `admin-page-slots` 扩展点
-- [ ] Suspense + use Hook 懒加载远端插件 JS Bundle；热卸载自动 Fallback、主界面不白屏
+- [x] Slots 插槽机制（**宿主侧**已落地）：宿主经 `window.__GEEWIKI_HOST__` 暴露 `registerSlot(name, component)` / `unregisterSlot`（`packages/web/src/lib/slots.tsx`、`packages/web/src/lib/hostSdk.ts`，SDK 版本 `0.1.0`）；插件 UI bundle 从 `/plugins-ui/<name>/client.js` 动态加载后调用 `register(host)` 注册。**插槽名是白名单，当前仅 `app-header` 与 `app-footer` 两个**，未知插槽名告警并忽略；`SlotOutlet` 外层包 ErrorBoundary——插件组件抛错只丢该插槽内容，主界面不白屏
+- [ ] 后端注册链路与更多扩展点：`ctx.slot(name, component)`、`editor-toolbar-slots`、`admin-page-slots`（**尚未提供**）
+- [ ] Suspense + use Hook 懒加载远端插件 JS Bundle —— 当前为**入口表静态 JSON**（`/plugins-ui/registry.json`）+ 显式 `import()`：加载时机是手动刷新（`window.__GEEWIKI_PLUGIN_UI__.refresh()`），**未绑定 fork 生命周期**（插件停用不会自动撤销其 UI）；热卸载只撤销插槽注册与移除插件 CSS，**ESM 模块实例不回收**
 - [ ] LLM 组插件（OpenAI/Anthropic 示例，configSchema 含密码字段）+ RAG 检索管线
 - [ ] 编辑器组插件（Milkdown / TipTap 示例）替换 textarea
 - [ ] 插件级静态资源注入（每插件可携带前端资源目录，随激活挂载）
 
 ## Phase 4（候选）：稳定性加固与生产化
 
-- [ ] @geewiki/db-pg：PostgreSQL 适配插件（conflictGroup database-provider 与 sqlite 互斥切换）
-- [ ] 配置热更新：`POST /api/plugins/:name/config`（fiber.update 热重跑 apply）+ configSchema 自动生成 React 表单
-- [ ] 卸载排空倒计时 UI（drainTimeout 展示）——**后端已就绪**：管理器在统一卸载出口按 `runtime.drainTimeout` 排空在途请求（见 architecture §5.1），仅缺前端展示
-- [ ] 冲突组替换交互（加载同组新插件时提示替换）
+- [ ] @geewiki/db-pg：PostgreSQL 适配插件（conflictGroup database-provider 与 sqlite 互斥切换）——**已裁决延期**（DB 不在当前关键路径上；`DatabaseAdapter` 的 3 处实际消费点、双轨接口 `DatabaseAdapterAsync` + `isAsyncAdapter()`、以及唯一防返工项 `GeeWikiMeta.migrations` 扩为双路径，见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 5 节 L-9）
+- [x] 配置热更新 + 自动表单 —— **已完成**：`GET` / `PUT /api/plugins/:name/config`（服务端 schemastery 校验 + 白名单裁剪 + 原子落盘，已激活插件经 `fork.update()` 热重跑 apply，失败双向回滚并返回 409）+ 管理台按 `configSchema` 自动生成 React 表单（`packages/web/src/components/SchemaForm.tsx`）；无 schema 插件退回 JSON 原文编辑（不校验、不裁剪）
+- [ ] 卸载排空倒计时 UI（drainTimeout 展示）——**后端已就绪**：管理器在统一卸载出口按 `runtime.drainTimeout` 排空在途请求（见 architecture §5.1），仅缺前端展示。**注意排空粒度是"全站"在途请求，不是被卸载插件的 owner 级**（见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 5 节 L-1）
+- [ ] 冲突组替换交互（加载同组新插件时提示替换）——**设计已定稿、代码未落地**：新增 `POST /api/plugins/:name/replace`（含新错误码 `replace_rollback_failed` 与待新增的 `collectDependentsClosure`），见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 4 节 G-1
+- [ ] `enable` 失败回滚作用域修复——**已确认缺陷、修法已定稿、代码未落地**：`activatedByThisCall` 是每递归帧局部数组，依赖深度 ≥2 时孙依赖由子帧激活并 `addToSession` 落盘，目标插件激活失败时孙依赖残留且 session 清单泄漏（见 G-2 与第 5 节 L-2）
+- [ ] `meta.role: 'password'` 脱敏输入框（当前除 `textarea` 外的 `role` 一律退化为普通文本框，密码类字段在管理台明文显示，见 architecture §5.7）
+- [ ] 发现期 issues 的前端提示位（后端 `GET /api/plugins` 的 `issues` 字段已对外可见，管理台尚未展示"有插件被跳过"，见第 5 节 L-14）
 - [ ] 依赖阻止卸载弹窗提示（当前 409 文案展示）
 - [x] docker-compose 应用镜像多阶段构建（web build → server），容器自愈联动实测 —— **已完成**：`Dockerfile`（多阶段、非 root 运行、`HEALTHCHECK` 判 `ok && db.present`）+ `docker compose up -d --build` 已实测（构建、持久化、插件启停持久化、SIGTERM 优雅退出、数据目录不可写时如实变 `unhealthy`）；详见 [deployment.md](deployment.md)
 - [ ] 端到端故障演练：注入崩溃/慢查询验证熔断与数据无损
