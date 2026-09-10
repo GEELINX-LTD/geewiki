@@ -10,13 +10,14 @@
  * - 5.5 迁移控制器：激活前执行 ctx.db.migrate(插件迁移目录)，失败阻止加载（事务已回滚）
  * - 5.6 看门狗：健康探针轮询；Session 插件 5 秒试用期内探针失败即回滚；
  *       连续失败达阈值（默认 3 次）触发熔断：清空 Session 后以退出码 1 退出（容器重启回 Base）
- * - 5.7 配置热更新：REST enable 携带 config，经 JSON Schema（configSchema）由上层校验
+ * - 5.7 插件配置：REST enable 携带 config（JSON 原文），激活时原样传给插件 apply；
+ *       configSchema 驱动的自动表单与配置热更新校验排期 Phase 4（见 roadmap），当前仅透传
  *
  * 本插件由 @geewiki/server 引导加载（内核组件，不入清单），清单中的插件由本管理器
  * 按依赖拓扑依次激活；REST 路由经 @geewiki/http 的路由服务挂载。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { basename, dirname } from 'node:path'
 import type { Context } from 'cordis'
 import { type DatabaseAdapter, type FiberLike, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
 export type { RegisteredPlugin } from './deps.js'
@@ -28,6 +29,28 @@ import {
   topologicalOrder,
   type RegisteredPlugin,
 } from './deps.js'
+import { decideWatchdog } from './watchdog.js'
+
+/* ====================== 崩溃标记（架构 §5.3 自愈） ====================== */
+
+/**
+ * 写崩溃标记文件。宿主进程在捕获致命异常（uncaughtException /
+ * unhandledRejection / 启动失败）后、退出前调用；下次 boot 检测到该标记
+ * 即认为"上次是崩溃而非优雅退出"，忽略会话层装配（回滚至基础层）。
+ */
+export function writeCrashMarker(file: string, reason: string): void {
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), reason }, null, 2)}\n`, 'utf8')
+}
+
+/** 删除崩溃标记（优雅退出路径；文件不存在视为已清理，不抛错） */
+export function removeCrashMarker(file: string): void {
+  try {
+    unlinkSync(file)
+  } catch {
+    /* 不存在即已清理 */
+  }
+}
 
 /* ============================== 类型定义 ============================== */
 
@@ -55,6 +78,12 @@ export interface ManagerConfig {
   gracePeriodMs?: number
   /** 熔断连续失败阈值（默认 3） */
   meltdownThreshold?: number
+  /**
+   * 崩溃标记文件路径（架构 §5.3 自愈）：缺省不启用崩溃恢复；
+   * boot 发现标记 → 醒目日志 + 忽略会话层装配 + 删除标记；
+   * disposeAll 优雅卸载成功时删除标记。通常由宿主进程置于 data/ 下。
+   */
+  crashMarkerFile?: string
 }
 
 export interface PluginSnapshot {
@@ -124,14 +153,16 @@ interface ManagedPlugin {
   layer: Layer | null
   error: string | null
   config: Record<string, unknown> | undefined
-  activatedAt: number | null
   /** ctx.plugin() 返回的 cordis fiber 句柄（dispose 动态卸载） */
   fiber: FiberLike | null
 }
 
 export class GeeWikiManager {
   readonly ctx: Context
-  private readonly config: Required<Omit<ManagerConfig, 'registry'>> & { registry: RegisteredPlugin[] }
+  private readonly config: Required<Omit<ManagerConfig, 'registry' | 'crashMarkerFile'>> & {
+    registry: RegisteredPlugin[]
+    crashMarkerFile?: string
+  }
   private readonly plugins = new Map<string, ManagedPlugin>()
   /** 激活顺序（dispose 时逆序卸载） */
   private readonly activationOrder: string[] = []
@@ -139,6 +170,9 @@ export class GeeWikiManager {
   private session: PluginListFile = { enabled: [] }
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
   private bootErrors: string[] = []
+  /** 最近一次会话层激活的插件（看门狗试用期回滚归因目标） */
+  private lastEnabledName: string | null = null
+  private lastEnabledAt: number | null = null
 
   constructor(ctx: Context, config: ManagerConfig) {
     this.ctx = ctx
@@ -149,6 +183,7 @@ export class GeeWikiManager {
       watchdogIntervalMs: config.watchdogIntervalMs ?? 5000,
       gracePeriodMs: config.gracePeriodMs ?? 5000,
       meltdownThreshold: config.meltdownThreshold ?? 3,
+      crashMarkerFile: config.crashMarkerFile,
     }
   }
 
@@ -220,11 +255,30 @@ export class GeeWikiManager {
       this.bootErrors.push((err as Error).message)
       this.base = { enabled: [] }
     }
-    try {
-      this.session = readList(this.config.sessionFile)
-    } catch (err) {
-      this.bootErrors.push((err as Error).message)
+    // 崩溃恢复（架构 §5.3）：上次进程异常退出（崩溃标记残留）→ 忽略会话层装配
+    const marker = this.config.crashMarkerFile
+    const crashed = marker !== undefined && existsSync(marker)
+    if (crashed) {
+      console.error(
+        `[manager] 检测到崩溃标记（${marker}）：上次进程异常退出。按架构 §5.3 本次启动忽略会话层（Session），回滚至基础层（Base）`,
+      )
+      this.bootErrors.push('检测到崩溃标记（上次进程异常退出），本次启动已忽略会话层并回滚至基础层')
       this.session = { enabled: [] }
+      // 与看门狗熔断路径（writeList sessionFile 空态后 exit(1)）对称：同步清空会话清单文件，
+      // 否则残留的会话条目会在下一次正常启动（无标记）时被重新装配，自愈只保护一次 boot
+      try {
+        writeList(this.config.sessionFile, { enabled: [] })
+      } catch (err) {
+        console.error('[manager] 崩溃恢复：清空会话清单文件失败:', err)
+      }
+      removeCrashMarker(marker)
+    } else {
+      try {
+        this.session = readList(this.config.sessionFile)
+      } catch (err) {
+        this.bootErrors.push((err as Error).message)
+        this.session = { enabled: [] }
+      }
     }
     const desired = new Map<string, { config: Record<string, unknown>; layer: Layer }>()
     for (const e of this.base.enabled) {
@@ -246,6 +300,11 @@ export class GeeWikiManager {
       if (!intent) continue
       try {
         await this.activateCore(name, intent.config, intent.layer)
+        if (intent.layer === 'session') {
+          // 看门狗试用期归因基准：最近一次会话层激活
+          this.lastEnabledName = name
+          this.lastEnabledAt = Date.now()
+        }
       } catch (err) {
         const p = this.plugins.get(name)
         if (p) p.error = (err as Error).message
@@ -269,6 +328,15 @@ export class GeeWikiManager {
         `${name} 未声明 runtime.supportsHotReload: true，仅支持持久化安装 + 进程重启（冷操作）`,
       )
     }
+    // 冲突预检（在任何副作用之前）：目标所在冲突组已有活动成员 → 直接 409，零残留
+    const preConflict = findConflict(this.config.registry, this.activeNames(), name)
+    if (preConflict) {
+      throw new ManagerError(
+        'conflict_group',
+        `冲突组 "${m.conflictGroup}" 已有激活插件 ${preConflict}，同组互斥`,
+        { with: preConflict },
+      )
+    }
     const violations = checkHotChain(this.config.registry, this.activeNames(), name)
     if (violations.length > 0) {
       throw new ManagerError(
@@ -277,11 +345,30 @@ export class GeeWikiManager {
         { path: violations },
       )
     }
-    // 未激活依赖先递归启用（同样走会话层热路径）
-    for (const dep of directDependencies(this.config.registry, name)) {
-      if (!this.plugins.get(dep)?.active) await this.enable(dep)
+    // 事务性启用：先递归启用未激活依赖（同样走会话层热路径），任一环节失败
+    // 则逆序回滚本次新增激活的插件并移出会话清单，不留半激活残留
+    const activatedByThisCall: string[] = []
+    try {
+      for (const dep of directDependencies(this.config.registry, name)) {
+        if (!this.plugins.get(dep)?.active) {
+          await this.enable(dep)
+          activatedByThisCall.push(dep)
+        }
+      }
+      await this.activateCore(name, config ?? {}, 'session')
+    } catch (err) {
+      for (const n of [...activatedByThisCall].reverse()) {
+        try {
+          await this.deactivateCore(n)
+        } catch (rollbackErr) {
+          console.error(`[manager] 启用 ${name} 失败后的回滚卸载 ${n} 出错:`, rollbackErr)
+        }
+        this.removeFromSession(n)
+      }
+      throw err
     }
-    await this.activateCore(name, config ?? {}, 'session')
+    this.lastEnabledName = name
+    this.lastEnabledAt = Date.now()
     this.addToSession(name, config ?? {})
     return this.snapshotOf(name)
   }
@@ -293,7 +380,7 @@ export class GeeWikiManager {
     if (p.layer !== 'session') {
       throw new ManagerError(
         'base_layer',
-        `${name} 属于基础层（冷操作），请编辑 ${this.config.baseFile} 后重启进程`,
+        `${name} 属于基础层（冷操作），请编辑基础层清单 ${basename(this.config.baseFile)} 后重启进程`,
       )
     }
     const dependents = collectDependents(this.config.registry, this.activeNames(), name)
@@ -304,16 +391,23 @@ export class GeeWikiManager {
     this.removeFromSession(name)
   }
 
-  /** 应用并持久化：Session 层全部变更合并进 Base，清空会话（构想 5.3 的"应用并持久化"） */
+  /** 应用并持久化：Session 层"活动"条目合并进 Base，清空会话（构想 5.3 的"应用并持久化"）。
+   * 激活失败（error 态/未装配）的条目不提升——避免坏配置被持久化后每次启动报错。 */
   persistSession(): { promoted: string[] } {
     const promoted: string[] = []
     for (const entry of this.session.enabled) {
+      const p = this.plugins.get(entry.name)
+      if (!p?.active) {
+        console.warn(
+          `[manager] persistSession: 跳过未激活条目 ${entry.name}（激活失败或未装配，不提升进基础层）`,
+        )
+        continue
+      }
       const existing = this.base.enabled.find((e) => e.name === entry.name)
       if (existing) existing.config = entry.config
       else this.base.enabled.push({ ...entry })
       promoted.push(entry.name)
-      const p = this.plugins.get(entry.name)
-      if (p) p.layer = 'base'
+      p.layer = 'base'
     }
     this.session = { enabled: [] }
     writeList(this.config.baseFile, this.base)
@@ -325,7 +419,7 @@ export class GeeWikiManager {
 
   private registryOf(name: string): RegisteredPlugin {
     const entry = this.config.registry.find((p) => p.name === name)
-    if (!entry) throw new ManagerError('not_found', `未知插件: ${name}（未注册，registry 含: ${this.config.registry.map((p) => p.name).join(', ')}）`)
+    if (!entry) throw new ManagerError('not_found', `未知插件: ${name}（未注册）`)
     return entry
   }
 
@@ -353,7 +447,7 @@ export class GeeWikiManager {
     const entry = this.registryOf(name)
     let managed = this.plugins.get(name)
     if (!managed) {
-      managed = { entry, active: false, layer: null, error: null, config: undefined, activatedAt: null, fiber: null }
+      managed = { entry, active: false, layer: null, error: null, config: undefined, fiber: null }
       this.plugins.set(name, managed)
     }
     if (managed.active) {
@@ -401,7 +495,6 @@ export class GeeWikiManager {
     managed.layer = layer
     managed.error = null
     managed.config = config
-    managed.activatedAt = layer === 'session' ? Date.now() : null
     this.activationOrder.push(name)
   }
 
@@ -418,7 +511,10 @@ export class GeeWikiManager {
     managed.fiber = null
     managed.active = false
     managed.layer = null
-    managed.activatedAt = null
+    if (this.lastEnabledName === name) {
+      this.lastEnabledName = null
+      this.lastEnabledAt = null
+    }
     this.activationOrder.splice(this.activationOrder.indexOf(name), 1)
   }
 
@@ -447,22 +543,31 @@ export class GeeWikiManager {
     const router = this.ctx.get('http') as HttpRouterService | undefined
     if (!router) return
     const stats = router.stats()
-    const now = Date.now()
+    const last = this.lastEnabledName ? this.plugins.get(this.lastEnabledName) : undefined
+    const decision = decideWatchdog({
+      consecutiveFailures: stats.consecutiveFailures,
+      meltdownThreshold: this.config.meltdownThreshold,
+      gracePeriodMs: this.config.gracePeriodMs,
+      now: Date.now(),
+      lastEnabledName: this.lastEnabledName,
+      lastEnabledAt: this.lastEnabledAt,
+      lastEnabledActive: last?.active === true,
+      sessionNonEmpty: this.session.enabled.length > 0,
+    })
 
-    // 试用期（Grace Period）：Session 插件激活后 5 秒内探针出现失败 → 回滚该插件
-    for (const [name, p] of this.plugins) {
-      if (!p.active || p.layer !== 'session' || p.activatedAt === null) continue
-      if (now - p.activatedAt > this.config.gracePeriodMs) continue
-      if (stats.consecutiveFailures > 0) {
-        console.warn(`[manager:watchdog] 试用期内探针失败，回滚会话插件 ${name}`)
-        this.disable(name).catch((err) => console.error(`[manager:watchdog] 回滚失败 ${name}:`, err))
-      }
+    if (decision.action === 'rollback') {
+      console.warn(
+        `[manager:watchdog] 会话插件 ${decision.name} 试用期内（${this.config.gracePeriodMs}ms）健康探针失败，回滚该插件`,
+      )
+      this.disable(decision.name).catch((err) =>
+        console.error(`[manager:watchdog] 回滚失败 ${decision.name}:`, err),
+      )
+      return
     }
-
-    // 熔断：连续失败达阈值且存在会话变更 → 清空会话 + 退出码 1（容器重启自愈回 Base）
-    if (stats.consecutiveFailures >= this.config.meltdownThreshold && this.session.enabled.length > 0) {
+    // 熔断：连续失败达阈值且存在会话层变更 → 清空会话 + 退出码 1（容器重启自愈回 Base）
+    if (decision.action === 'meltdown') {
       console.error(
-        `[manager:watchdog] 连续 ${stats.consecutiveFailures} 次健康探针失败，触发熔断：清空会话层并重启`,
+        `[manager:watchdog] 连续 ${stats.consecutiveFailures} 次健康探针失败且存在会话层变更，触发熔断：清空会话层并重启`,
       )
       try {
         writeList(this.config.sessionFile, { enabled: [] })
@@ -475,7 +580,7 @@ export class GeeWikiManager {
 
   /* --------------------------- 卸载 --------------------------- */
 
-  /** 逆序卸载全部活动插件（管理器 dispose 时调用） */
+  /** 逆序卸载全部活动插件（管理器 dispose 时调用）；成功后清除崩溃标记（优雅退出） */
   async disposeAll(): Promise<void> {
     this.stopWatchdog()
     const errors: string[] = []
@@ -492,6 +597,9 @@ export class GeeWikiManager {
       }
     }
     if (errors.length > 0) throw new Error(`卸载失败: ${errors.join('; ')}`)
+    this.lastEnabledName = null
+    this.lastEnabledAt = null
+    if (this.config.crashMarkerFile) removeCrashMarker(this.config.crashMarkerFile)
   }
 }
 
@@ -536,12 +644,24 @@ function ok(h: RouteHandlerContext, body: unknown): void {
 
 function fail(h: RouteHandlerContext, err: unknown): void {
   if (err instanceof ManagerError) {
-    const status = err.code === 'not_found' ? 404 : err.code === 'conflict_group' || err.code === 'hot_reload_not_supported' || err.code === 'hot_dependency_not_supported' || err.code === 'has_dependents' || err.code === 'base_layer' || err.code === 'migration_failed' ? 409 : 400
+    const status =
+      err.code === 'not_found'
+        ? 404
+        : err.code === 'payload_too_large'
+          ? 413
+          : err.code === 'conflict_group' ||
+              err.code === 'hot_reload_not_supported' ||
+              err.code === 'hot_dependency_not_supported' ||
+              err.code === 'has_dependents' ||
+              err.code === 'base_layer' ||
+              err.code === 'migration_failed'
+            ? 409
+            : 400
     send(h, status, { ok: false, error: err.code, message: err.message, details: err.details })
     return
   }
   console.error('[manager:api] 未预期错误:', err)
-  send(h, 500, { ok: false, error: 'internal', message: (err as Error).message })
+  send(h, 500, { ok: false, error: 'internal', message: '服务器内部错误（详见服务端日志）' })
 }
 
 function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): void {
@@ -583,10 +703,28 @@ function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): voi
   console.log('[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/session')
 }
 
-function readJsonBody(h: RouteHandlerContext): Promise<Record<string, unknown>> {
+/** 读取 enable 请求体 JSON（1MB 上限：先回 413 再销毁连接，防内存 DoS） */
+function readJsonBody(h: RouteHandlerContext, limit = 1_000_000): Promise<Record<string, unknown>> {
   return new Promise((resolveBody, rejectBody) => {
     const chunks: Buffer[] = []
-    h.req.on('data', (c: Buffer) => chunks.push(c))
+    let size = 0
+    h.req.on('data', (c: Buffer) => {
+      size += c.length
+      if (size > limit) {
+        rejectBody(new ManagerError('payload_too_large', `请求体过大（上限 ${limit} 字节）`))
+        try {
+          if (!h.res.headersSent && !h.res.writableEnded) {
+            h.res.writeHead(413, { 'content-type': 'application/json; charset=utf-8' })
+            h.res.end(JSON.stringify({ ok: false, error: 'payload_too_large', message: '请求体过大' }))
+          }
+        } catch {
+          /* 客户端已断连则忽略 */
+        }
+        h.req.destroy()
+        return
+      }
+      chunks.push(c)
+    })
     h.req.on('end', () => {
       try {
         const text = Buffer.concat(chunks).toString('utf8')

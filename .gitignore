@@ -23,6 +23,9 @@ data/
 *.db-shm
 *.db-wal
 
+# 运行期会话清单（运行时被改写，属本机状态；基础层清单 plugins.base.json 保留入库）
+config/plugins.session.json
+
 # 日志
 logs/
 *.log

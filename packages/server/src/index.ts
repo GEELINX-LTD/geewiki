@@ -16,6 +16,7 @@ import { isAbsolute, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from 'cordis'
 import {
+  DEFAULT_DATA_DIR,
   DEFAULT_PORT,
   HEALTH_PATH,
   type GeeWikiManifest,
@@ -27,7 +28,10 @@ import {
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
-import { PluginManagerPlugin, type RegisteredPlugin } from '@geewiki/manager'
+import { PluginManagerPlugin, removeCrashMarker, writeCrashMarker, type RegisteredPlugin } from '@geewiki/manager'
+
+/** 崩溃标记路径：与数据库文件同目录（<GEEWIKI_DATA_DIR 或 ./data>），随 data/ 一起被 gitignore */
+const crashMarkerFile = resolve(process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR, 'crash.marker')
 
 /* =========================== HTTP 路由服务 =========================== */
 
@@ -112,6 +116,8 @@ class HttpRouter implements HttpRouterService {
     }
 
     const json = (status: number, body: unknown): void => {
+      // write-after-end 防护：响应已结束（前置处理器已应答/连接已断）时静默忽略
+      if (res.writableEnded || res.destroyed) return
       finish(status)
       if (!res.headersSent) {
         res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
@@ -293,6 +299,8 @@ export const HttpPlugin = {
     })
     server.on('error', (err) => {
       console.error('[@geewiki/http] 监听失败:', err)
+      // 假活防护：端口被占/地址非法时进程无法服务，直接失败退出（容器 restart 策略负责恢复）
+      process.exit(1)
     })
     server.listen(port, host, () => {
       const shown = host === '0.0.0.0' ? '127.0.0.1' : host
@@ -359,6 +367,7 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
     registry: options.registry ?? defaultRegistry(webDist),
     baseFile: resolve(configDir, 'plugins.base.json'),
     sessionFile: resolve(configDir, 'plugins.session.json'),
+    crashMarkerFile,
   })
 
   return {
@@ -372,7 +381,33 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
 /* =========================== 入口（直接运行） =========================== */
 
 async function main(): Promise<void> {
-  const { dispose } = await startServer()
+  // 崩溃自愈（架构 §5.3）：致命异常 → 记录崩溃标记后退出（退出码 1）。
+  // 下次启动 manager boot 检测到标记即忽略会话层（Session），回滚至基础层，
+  // 防止"会话插件导致崩溃 → 重启 crash-loop"。优雅退出（disposeAll 成功）会删除标记。
+  const fatal = (kind: string) => (err: unknown): void => {
+    console.error(`[server] ${kind}:`, err)
+    try {
+      writeCrashMarker(crashMarkerFile, `${kind}: ${err instanceof Error ? err.message : String(err)}`)
+    } catch (markerErr) {
+      console.error('[server] 写崩溃标记失败:', markerErr)
+    }
+    process.exit(1)
+  }
+  process.on('uncaughtException', fatal('uncaughtException'))
+  process.on('unhandledRejection', fatal('unhandledRejection'))
+
+  let handle: { dispose: () => Promise<void> }
+  try {
+    handle = await startServer()
+  } catch (err) {
+    console.error('[server] 启动失败:', err)
+    try {
+      writeCrashMarker(crashMarkerFile, `startup: ${err instanceof Error ? err.message : String(err)}`)
+    } catch {
+      /* 标记写入失败不阻断退出 */
+    }
+    process.exit(1)
+  }
 
   let shuttingDown = false
   const shutdown = async (signal: string): Promise<void> => {
@@ -380,7 +415,8 @@ async function main(): Promise<void> {
     shuttingDown = true
     console.log(`[server] 收到 ${signal}，正在优雅退出...`)
     try {
-      await dispose()
+      await handle.dispose()
+      removeCrashMarker(crashMarkerFile)
       console.log('[server] 已清理全部插件，退出')
       process.exit(0)
     } catch (err) {
@@ -395,8 +431,5 @@ async function main(): Promise<void> {
 // 仅当本文件作为入口被执行时启动（被 import 时不自动启动，便于测试）
 const entry = process.argv[1] ? fileURLToPath(new URL(`file://${process.argv[1]}`)) : null
 if (entry && entry === fileURLToPath(import.meta.url)) {
-  main().catch((err) => {
-    console.error('[server] 启动失败:', err)
-    process.exitCode = 1
-  })
+  main()
 }

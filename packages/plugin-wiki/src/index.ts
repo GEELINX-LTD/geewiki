@@ -24,7 +24,9 @@ export const manifest: GeeWikiManifest = {
   version: '0.1.0',
   geewiki: {
     provides: 'wiki-service',
-    requires: ['@geewiki/http', '@geewiki/db-sqlite'], // REST 挂载点 + 数据库适配
+    // 依赖以服务标识声明（非具体插件名）：数据库切换（SQLite→PG）对业务插件透明，
+    // 依赖边由管理器按 provides 解析（deps.ts resolveDependency）
+    requires: ['http-service', 'database-provider'],
     conflictGroup: undefined,
     migrations: undefined, // 表结构由 db-sqlite 的 0001 迁移建立（本插件在 db 之后激活）
     runtime: {
@@ -75,9 +77,19 @@ function readBody(req: RouteHandlerContext['req'], limit = 1_000_000): Promise<u
   })
 }
 
-/** 从请求体提取 { title, content } 并做基础校验 */
+/** slug 服务端校验正则（与前端 WikiPage 一致）：字母/数字开头，仅 a-z 0-9 . _ -，≤80 字符 */
+const SLUG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
+
+/** 从请求体提取 { title, content }：白名单字段，未知字段/超限一律 400 */
 function parseSaveBody(body: unknown): { title: string; content: string } {
   const b = (body ?? {}) as Record<string, unknown>
+  if (typeof b !== 'object' || Array.isArray(b)) {
+    throw new Error('invalid_body: 请求体须为 JSON 对象')
+  }
+  const unknown = Object.keys(b).filter((k) => k !== 'title' && k !== 'content')
+  if (unknown.length > 0) {
+    throw new Error(`invalid_body: 未知字段: ${unknown.join(', ')}`)
+  }
   const title = typeof b.title === 'string' ? b.title.trim() : ''
   const content = typeof b.content === 'string' ? b.content : ''
   if (!title) throw new Error('invalid_title: 标题不能为空')
@@ -168,16 +180,19 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('PUT', '/api/pages/:slug', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!slug || slug.length > 80) {
-          h.json(400, { ok: false, error: 'invalid_slug', message: '页面标识非法（≤80 字符）' })
+        if (!SLUG_RE.test(slug)) {
+          h.json(400, {
+            ok: false,
+            error: 'invalid_slug',
+            message: '页面标识非法：须以字母或数字开头，仅含 a-z 0-9 . _ -，≤80 字符',
+          })
           return
         }
         let save: { title: string; content: string }
         try {
           save = parseSaveBody(await readBody(h.req))
         } catch (err) {
-          const msg = (err as Error).message
-          h.json(msg.startsWith('invalid') ? 400 : 400, { ok: false, error: 'invalid_body', message: msg })
+          h.json(400, { ok: false, error: 'invalid_body', message: (err as Error).message })
           return
         }
         const now = new Date().toISOString()

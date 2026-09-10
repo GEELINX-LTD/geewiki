@@ -210,7 +210,6 @@ function PluginRow(props: {
   onDisable: () => void
 }): ReactNode {
   const { p, busy, configOpen, configText, onConfigText, onOpenConfig, onEnable, onDisable } = props
-  const rowBusy = busy === `enable:${p.name}` || busy === `disable:${p.name}`
   const hot = p.hotReloadable
   return (
     <>
@@ -251,7 +250,7 @@ function PluginRow(props: {
               </>
             )}
             {p.state === 'active' && p.layer === 'session' && (
-              <button className="btn small danger" disabled={busy !== '' || rowBusy} onClick={onDisable}>
+              <button className="btn small danger" disabled={busy !== ''} onClick={onDisable}>
                 停用
               </button>
             )}

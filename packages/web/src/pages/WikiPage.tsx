@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { marked } from 'marked'
 import { api, type PageDetail, type PageSummary } from '../api'
+import { mdToHtml } from '../lib/sanitize'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -15,14 +15,18 @@ function slugOk(slug: string): boolean {
 export function WikiPage(props: { sub: string; onNavigate: (path: string) => void }): ReactNode {
   const { sub, onNavigate } = props
   const seg = sub.split('/').filter(Boolean)
+  // 未知深层路径 → 导航副作用收敛到 useEffect（不在 render 期改 location）
+  const unknownDeep = seg.length >= 2 && seg[1] !== 'edit'
+  useEffect(() => {
+    if (unknownDeep) onNavigate('')
+  }, [unknownDeep, onNavigate])
+  if (unknownDeep) return null
   if (seg.length === 0 || seg[0] === 'list') return <WikiList onOpen={(slug) => onNavigate(slug)} onNew={() => onNavigate('new')} />
   if (seg[0] === 'new') return <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
   // 20 行起 seg.length ≥ 1 且首段非 list/new：非空 slug
   const slug = seg[0] ?? ''
   if (seg.length === 1) return <WikiDetail key={slug} slug={slug} onEdit={() => onNavigate(`${slug}/edit`)} onDeleted={() => onNavigate('')} onNavigate={onNavigate} />
   if (seg[1] === 'edit') return <WikiEdit key={slug} slug={slug} onDone={() => onNavigate(slug)} onCancel={() => onNavigate(slug)} />
-  // 未知深层路径 → 回列表
-  onNavigate('')
   return null
 }
 
@@ -100,7 +104,13 @@ function WikiDetail(props: {
   const [page, setPage] = useState<PageDetail | null>(null)
   const [err, setErr] = useState('')
   const [notice, setNotice] = useState('')
-  const [versionContent, setVersionContent] = useState<{ id: number; saved_at: string; content: string } | null>(null)
+  // versionContent: id=快照主键（API 定位用）；label=per-page 版本号（展示/恢复提示用，与历史行一致）
+  const [versionContent, setVersionContent] = useState<{
+    id: number
+    saved_at: string
+    content: string
+    label: number
+  } | null>(null)
   const [restoring, setRestoring] = useState(false)
 
   const load = (): void => {
@@ -120,23 +130,23 @@ function WikiDetail(props: {
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
   }
 
-  const showVersion = (id: number, savedAt: string): void => {
+  const showVersion = (id: number, savedAt: string, label: number): void => {
     setVersionContent(null)
     setErr('')
     api
       .version(slug, id)
-      .then((v) => setVersionContent({ id, saved_at: v.saved_at, content: v.content }))
+      .then((v) => setVersionContent({ id, saved_at: v.saved_at, content: v.content, label }))
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
   }
 
-  const restore = (id: number): void => {
+  const restore = (): void => {
     if (!versionContent || !page) return
-    if (!window.confirm(`将 v${id} 的内容保存为最新版本？当前正文将先写入历史。`)) return
+    if (!window.confirm(`将 v${versionContent.label} 的内容保存为最新版本？当前正文将先写入历史。`)) return
     setRestoring(true)
     api
       .savePage(slug, { title: page.title, content: versionContent.content })
       .then((r) => {
-        setNotice(`已恢复 v${id} 内容（当前 v${r.version}）`)
+        setNotice(`已恢复 v${versionContent.label} 内容（当前 v${r.version}）`)
         setVersionContent(null)
         void load()
       })
@@ -155,8 +165,8 @@ function WikiDetail(props: {
   }
   if (!page) return <div className="page"><div className="empty">加载中…</div></div>
 
-  const html = marked.parse(page.content, { async: false, gfm: true, breaks: true }) as string
-  const htmlVersion = versionContent ? (marked.parse(versionContent.content, { async: false, gfm: true, breaks: true }) as string) : ''
+  const html = mdToHtml(page.content)
+  const htmlVersion = versionContent ? mdToHtml(versionContent.content) : ''
 
   return (
     <div className="page page-detail">
@@ -198,9 +208,9 @@ function WikiDetail(props: {
                   <td>v{page.version - i - 1}</td>
                   <td className="muted">{fmtTime(v.saved_at)}</td>
                   <td>
-                    <button className="btn small ghost" onClick={() => showVersion(v.id, v.saved_at)}>查看内容</button>
+                    <button className="btn small ghost" onClick={() => showVersion(v.id, v.saved_at, page.version - i - 1)}>查看内容</button>
                     {versionContent?.id === v.id && (
-                      <button className="btn small" disabled={restoring} onClick={() => restore(v.id)}>
+                      <button className="btn small" disabled={restoring} onClick={restore}>
                         {restoring ? '恢复中…' : '↺ 恢复此版本'}
                       </button>
                     )}
@@ -213,7 +223,7 @@ function WikiDetail(props: {
         {versionContent && (
           <div className="version-preview">
             <div className="version-preview-head">
-              <strong>v{versionContent.id} 快照（{fmtTime(versionContent.saved_at)}）预览</strong>
+              <strong>v{versionContent.label} 快照（{fmtTime(versionContent.saved_at)}）预览</strong>
               <button className="btn small ghost" onClick={() => setVersionContent(null)}>✕ 关闭</button>
             </div>
             <div className="md-body" dangerouslySetInnerHTML={{ __html: htmlVersion }} />
@@ -284,7 +294,7 @@ function WikiEdit(props: { slug: string; onDone: (slug: string) => void; onCance
 
   if (loading) return <div className="page"><div className="empty">加载中…</div></div>
 
-  const previewHtml = marked.parse(content, { async: false, gfm: true, breaks: true }) as string
+  const previewHtml = mdToHtml(content)
 
   return (
     <div className="page page-edit">
