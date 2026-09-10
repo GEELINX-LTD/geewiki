@@ -10,7 +10,8 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from 'cordis'
@@ -98,8 +99,64 @@ async function startUiFixture(): Promise<UiFixture> {
   }
 }
 
-/* ------------------------------ 用例 ------------------------------ */
+interface TwoRootFixture extends UiFixture {
+  /** 高优先级根（`<dir>/dist`）里的入口文件路径 */
+  extEntry: string
+  /** 次优先根（`<webDist>/plugins-ui/<名>`）里的入口文件路径 */
+  webEntry: string
+}
 
+/**
+ * 双根并存夹具：同一插件的**两个候选根都有同名入口文件**，内容不同以便区分实际命中的根。
+ *
+ * 用途单一但关键——验证"根表的寿命必须与入口表一致"：静态层若把"用哪个根"缓存成一次性
+ * 求值，则高优先级根消失后仍会指着旧根 → 404，而入口表（每次现算）已回退到次优先根并在表里
+ * 继续列出该插件，前端就会照表里的值去 import 一个 404 的资产。
+ */
+async function startTwoRootFixture(): Promise<TwoRootFixture> {
+  const root = mkdtempSync(join(tmpdir(), 'gw-ui-2root-'))
+  const pluginDir = join(root, 'both-ext')
+  const webDist = join(root, 'web')
+  const configDir = join(root, 'config')
+  const extEntry = join(pluginDir, 'dist', 'client.js')
+  const webEntry = join(webDist, 'plugins-ui', '@ext', 'both', 'client.js')
+  mkdirSync(join(pluginDir, 'dist'), { recursive: true })
+  mkdirSync(join(webDist, 'plugins-ui', '@ext', 'both'), { recursive: true })
+  mkdirSync(configDir, { recursive: true })
+  // 两个根都放同名入口，正文不同（含可 grep 的标记）
+  writeFileSync(extEntry, 'export const register = () => {}\n// CONTENT: plugin-dir-dist\n', 'utf8')
+  writeFileSync(webEntry, 'export const register = () => {}\n// CONTENT: web-dist-plugins-ui\n', 'utf8')
+
+  const both = externalUiPlugin('@ext/both', pluginDir)
+  const registry = [both]
+  const port = await freePort()
+  const httpEntry = httpRegistryEntry(webDist, { port, host: '127.0.0.1' }, () =>
+    pluginUiRootsFor(registry, webDist),
+  )
+  const fullRegistry = [httpEntry, ...registry]
+  writeFileSync(
+    join(configDir, 'plugins.base.json'),
+    `${JSON.stringify({ enabled: fullRegistry.map((e) => ({ name: e.name })) }, null, 2)}\n`,
+    'utf8',
+  )
+  writeFileSync(join(configDir, 'plugins.session.json'), `${JSON.stringify({ enabled: [] }, null, 2)}\n`, 'utf8')
+
+  const handle = await startServer({ registry: fullRegistry, port, host: '127.0.0.1', configDir, webDist })
+  await waitForHealth(port)
+  return {
+    port,
+    webDist,
+    pluginDir,
+    extEntry,
+    webEntry,
+    cleanup: async () => {
+      await handle.dispose()
+      rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+
+/* ------------------------------ 用例 ------------------------------ */
 test('静态层：插件自带产物根能提供 bundle（200 + text/javascript / text/css）', async () => {
   const fx = await startUiFixture()
   try {
@@ -217,6 +274,53 @@ test('静态层：入口表与静态层对同一插件给出同一个根（不�
       assert.equal(res.status, 200, `入口表列出的 ${name} 必须可取到 ${info.entry}`)
       await res.arrayBuffer()
     }
+  } finally {
+    await fx.cleanup()
+  }
+})
+
+test('静态层：高优先级根消失后必须回退次优先根（根表判定与入口表同寿命，禁止一次性缓存）', async () => {
+  const fx = await startTwoRootFixture()
+  try {
+    const url = `http://127.0.0.1:${fx.port}/plugins-ui/@ext/both/client.js`
+
+    // 1) 两个根都有产物时：高优先级 <dir>/dist 生效
+    const first = await fetch(url)
+    assert.equal(first.status, 200, '两个根都有产物时应 200')
+    const firstBody = await first.text()
+    assert.match(firstBody, /CONTENT: plugin-dir-dist/, '应先命中高优先级根 <dir>/dist')
+
+    // 2) 删除高优先级根里的入口文件（模拟插件产物被清掉/挂载点变化）
+    rmSync(fx.extEntry, { force: true })
+
+    // 3) 同一资产必须回退到次优先根并仍为 200——若"用哪个根"被一次性缓存，这里会是 404
+    const second = await fetch(url)
+    assert.equal(
+      second.status,
+      200,
+      '高优先级根消失后必须回退 <webDist>/plugins-ui/<名>，不得 404（根表不得缓存）',
+    )
+    const secondBody = await second.text()
+    assert.match(secondBody, /CONTENT: web-dist-plugins-ui/, '回退后正文应来自次优先根')
+
+    // 4) 表与资产一致：入口表仍列出该插件，且它给出的 rev 必须正是静态层此刻真正服务的那个文件
+    const tableRes = await fetch(`http://127.0.0.1:${fx.port}/api/plugins/ui`)
+    assert.equal(tableRes.status, 200)
+    const table = (await tableRes.json()) as {
+      plugins: Record<string, { entry: string; rev: string }>
+    }
+    const listed = table.plugins['@ext/both']
+    assert.ok(listed, '入口表应仍列出 @ext/both（现算后回退到次优先根）')
+    const info = statSync(fx.webEntry)
+    const expectedRev = createHash('sha1')
+      .update(`${info.mtimeMs}-${info.size}`)
+      .digest('hex')
+      .slice(0, 8)
+    assert.equal(
+      listed?.rev,
+      expectedRev,
+      '入口表的 rev 必须与静态层实际服务的文件同源（表说有 rev、资产却是旧的/404 即为两真源不一致）',
+    )
   } finally {
     await fx.cleanup()
   }

@@ -521,13 +521,19 @@ export const HttpPlugin = {
     const port = config.port ?? Number(process.env.GEEWIKI_PORT ?? DEFAULT_PORT)
     const host = config.host ?? '0.0.0.0'
     const startedAt = Date.now()
-    // 插件 UI 根表的懒求值包装：注入的闭包可能被调用多次（每个 /plugins-ui 资产请求一次），
-    // 首次求值后缓存——避免每次请求都重走"注册表 × stat 全部产物"。
-    let pluginUiRootsCache: Record<string, string> | null = null
-    const pluginUiRoots = (): Record<string, string> => {
-      if (!pluginUiRootsCache) pluginUiRootsCache = config.pluginUiRoots?.() ?? {}
-      return pluginUiRootsCache
-    }
+    // 插件 UI 根表：**每次静态请求现算，禁止缓存**。
+    //
+    // 入口表 `GET /api/plugins/ui`（管理器的 `uiTable()`）是每次请求现算的，而根表若只求值
+    // 一次并永久缓存，两者寿命就不同 → 会出现「入口表说该插件就绪（并给出 rev），静态层却
+    // 从已消失的根取文件 → 404」，而前端还会照入口表的值去 import 那个 404 的资产。
+    // 触发条件很具体：同名入口文件在两个候选根都存在（`<pluginDir>/dist` 与
+    // `webDist/plugins-ui/<名>`），随后高优先级那个根消失——`resolvePluginUiHit` 会回退到
+    // 次优先根并在表里继续列出该插件，而缓存仍指着已消失的高优先级根。
+    //
+    // 代价可控：`pluginUiRootsFor()` 只对"声明了 client 的插件"做几次 stat，注册表只有几条。
+    // 注意这里保留"函数"形态（而非快照对象）是**另一件事**——它解开的是"http 条目早于外部
+    // 插件发现"的注册顺序陷阱，与缓存无关，不要改回快照。
+    const pluginUiRoots = (): Record<string, string> => config.pluginUiRoots?.() ?? {}
     const router = new HttpRouter((h) => {
       const db = ctx.get('db')
       h.json(200, {
