@@ -1,0 +1,21 @@
+{
+  "name": "@geewiki-plugin/ui-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 示例插件：演示「插件自带前端 UI 产物」这条链路（计数器 + 错误边界演示件），不属于内置产品功能",
+  "geewiki": {
+    "provides": "ui-demo-service",
+    "requires": ["http-service"],
+    "runtime": {
+      "supportsHotReload": true,
+      "requiresCachePurge": false,
+      "drainTimeout": 5
+    },
+    "entry": "src/index.ts",
+    "client": {
+      "entry": "client.js",
+      "css": "client.css"
+    }
+  }
+}

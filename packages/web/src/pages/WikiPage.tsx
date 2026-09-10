@@ -2,8 +2,10 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { ApiError, api, type PageDetail, type PageSummary } from '../api'
 import { AskPanel } from '../components/AskPanel'
 import { SearchView } from '../components/SearchView'
+import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
 import { mdToHtml } from '../lib/sanitize'
 import { checkQuery } from '../lib/searchPlan'
+import { useDocumentTitle } from '../lib/useDocumentTitle'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -252,6 +254,10 @@ function WikiDetail(props: {
   } | null>(null)
   const [restoring, setRestoring] = useState(false)
 
+  // 详情页标题需要页面数据（异步）：拿到后覆盖 App 设的路由级基线标题；
+  // 拿不到时 titleForRoute 会退化为「知识库 · GeeWiki」，不会显示 slug。
+  useDocumentTitle(titleForRoute(`wiki/${slug}`, page?.title ?? null))
+
   const load = (): void => {
     setErr('')
     api
@@ -304,7 +310,9 @@ function WikiDetail(props: {
   }
   if (!page) return <div className="page"><div className="empty">加载中…</div></div>
 
-  const html = mdToHtml(page.content)
+  // 页面标题单独渲染一次（下面的 h1），若正文自己又以 `# 同名标题` 开头就会重复出现，
+  // 故渲染前把重复的首个一级标题剥掉（纯字符串操作，正文仍照常经 mdToHtml 消毒）。
+  const html = mdToHtml(stripDuplicateLeadingTitle(page.content, page.title))
   const htmlVersion = versionContent ? mdToHtml(versionContent.content) : ''
 
   return (

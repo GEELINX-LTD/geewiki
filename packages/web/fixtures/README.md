@@ -3,12 +3,23 @@
 这是一份**演示/验收夹具**：用来端到端验证宿主侧插槽基础设施
 （`packages/web/src/lib/slots.tsx`、`hostSdk.ts`、`pluginUi.ts` + `packages/web/public/host-sdk/*.js`）。
 
-它**不是**产品代码。它同时演示两条产物路径：
+它**不是**产品代码，**也不再挂在任何内置插件名下**。产物落到两个**示例插件**里（默认都不启用）：
 
 | 构建 | 输出位置 | 演示的链路 |
 | --- | --- | --- |
-| 第一次（`FIXTURE_OUT=@geewiki/wiki`，默认） | `packages/web/public/plugins-ui/@geewiki/wiki/` | **宿主侧约定根**：dev 由后端以 `public` 为**内置插件 UI 资产根**（`GEEWIKI_PLUGIN_UI_DIST`）提供、prod 由 `vite build` 拷进 `dist/`（内置根缺省回落 `GEEWIKI_WEB_DIST`） |
-| 第二次（`FIXTURE_OUT=@geewiki-plugin/hello` + `FIXTURE_OUT_DIR=../../../plugins/hello-geewiki/dist`） | `plugins/hello-geewiki/dist/` | **插件自带产物根**：外部插件把自己的 UI 产物放在插件目录里（Docker 下 `plugins/` 是 bind mount，这是"安装即生效、无需重建 web 包"的路径） |
+| 第一次（`FIXTURE_OUT_DIR=../../../plugins/ui-demo/dist`） | `plugins/ui-demo/dist/` | **插件自带产物根**：示例插件把自己的 UI 产物放在插件目录里（Docker 下 `plugins/` 是 bind mount，这是"安装即生效、无需重建 web 包"的路径） |
+| 第二次（`FIXTURE_OUT=@geewiki-plugin/hello` + `FIXTURE_OUT_DIR=../../../plugins/hello-geewiki/dist`） | `plugins/hello-geewiki/dist/` | 同上（另一份示例，用于"插件启用/停用后 UI 自动挂载/卸载"的验收） |
+
+## ⚠️ 为什么不再构建到 `public/plugins-ui/@geewiki/wiki/`
+
+早先第一次构建的默认输出是 `public/plugins-ui/@geewiki/wiki/`，也就是**挂在 `@geewiki/wiki`
+这个内置插件名下**。而 `@geewiki/wiki` 是基础层默认激活的，于是**测试脚手架冒充成了 wiki
+插件的界面贡献**：产品页头出现一个 `+1` 计数器、页脚出现一个「触发错误」按钮。
+
+现在 `@geewiki/wiki` 不再声明 `geewiki.client`（它确实没有前端界面），夹具搬到示例插件
+`plugins/ui-demo/`（**默认不启用**）。要看演示就在管理台启用它。
+
+脚本开头的 `rm -rf public/plugins-ui` 仍保留：清掉历史遗留的陈旧产物，避免入口表与实际文件不一致。
 
 ## 构建
 
@@ -16,17 +27,15 @@
 pnpm --filter @geewiki/web build:fixtures
 ```
 
-脚本会先清空 `packages/web/public/plugins-ui/`（避免上一版留下的陈旧产物让入口表与实际文件不一致），
-再做上面两次构建。
-
 产物是**生成物，且不随仓库提交**：
 
+- `plugins/ui-demo/dist/`、`plugins/hello-geewiki/dist/` —— 由 `.gitignore` 的 `dist/` 一行排除；
 - `packages/web/public/plugins-ui/` —— 由 `.gitignore` 的 `packages/web/public/plugins-ui/` 一行排除
-  （`git ls-files packages/web/public/` 只列出 `host-sdk/react.js` 与 `host-sdk/jsx-runtime.js`）；
-- `plugins/hello-geewiki/dist/` —— 由 `.gitignore` 的 `dist/` 一行排除。
+  （`git ls-files packages/web/public/` 只列出 `host-sdk/react.js` 与 `host-sdk/jsx-runtime.js`）。
 
-因此全新克隆后需先执行上面的 `build:fixtures`，管理台上才会有示例插件 UI；缺失时宿主不会报错，
-只是没有插件 UI 可加载。修改夹具源码后重新执行 `build:fixtures` 即可覆盖。
+因此全新克隆后需先执行上面的 `build:fixtures`，再**启用示例插件**，管理台上才会有插件 UI；
+缺失时宿主不会报错，只是没有插件 UI 可加载（入口表把它记为 `skipped: entry_missing`）。
+修改夹具源码后重新执行 `build:fixtures` 即可覆盖。
 
 ## 入口表（后端下发）
 
@@ -36,7 +45,7 @@ pnpm --filter @geewiki/web build:fixtures
 ```json
 {
   "ok": true, "version": 1, "revision": "1ab05a4e258c",
-  "plugins": { "@geewiki/wiki": { "entry": "client.js", "css": "client.css", "rev": "e9cbef75" } },
+  "plugins": { "@geewiki-plugin/ui-demo": { "entry": "client.js", "css": "client.css", "rev": "e9cbef75" } },
   "skipped": [{ "name": "@geewiki-plugin/hello", "reason": "inactive" }]
 }
 ```
@@ -68,8 +77,8 @@ window.__GEEWIKI_HOST__          // 宿主 SDK：React / jsxRuntime / registerSl
 window.__GEEWIKI_PLUGIN_UI__.loaded()                    // 已加载界面的插件名
 window.__GEEWIKI_PLUGIN_UI__.sync()                      // 拉一次入口表并让界面与之对齐（幂等、单飞）
 window.__GEEWIKI_PLUGIN_UI__.revision()                  // 最近一次成功解析的整表指纹
-window.__GEEWIKI_PLUGIN_UI__.unload('@geewiki/wiki')     // 卸载某个插件的界面贡献
-window.__GEEWIKI_PLUGIN_UI__.base('@geewiki/wiki')       // 插件名 → 界面目录 URL（非法名返回 undefined）
+window.__GEEWIKI_PLUGIN_UI__.unload('@geewiki-plugin/ui-demo')  // 卸载某个插件的界面贡献
+window.__GEEWIKI_PLUGIN_UI__.base('@geewiki-plugin/ui-demo')    // 插件名 → 界面目录 URL（非法名返回 undefined）
 ```
 
 ## 端到端验收脚本

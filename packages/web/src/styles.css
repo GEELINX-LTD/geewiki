@@ -310,6 +310,38 @@ h2 + .empty { padding: 8px; }
   padding: 16px; border-top: 1px solid var(--line); background: #fff;
 }
 
+/*
+  页脚只作为 app-footer 插槽的宿主：没有插件贡献界面（data-count="0"）时整条不占位，
+  否则会留下一条空白横条（页脚不再放产品自身的文案，见 App.tsx 注释）。
+  `:has()` 不被支持时退化为"空横条可见"，不影响功能。
+*/
+.app-footer:has(> .slot-outlet[data-count='0']:only-child) { display: none; }
+
+/* ---------- 次级菜单（管理入口：插件管理 / 依赖图） ---------- */
+
+.more-menu { position: relative; display: flex; }
+
+.more-caret { font-size: 10px; opacity: 0.7; margin-left: 2px; }
+
+.more-panel {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30;
+  min-width: 168px; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(16 24 40 / 14%);
+  display: flex; flex-direction: column; gap: 2px;
+}
+
+.more-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  border: 0; background: transparent; cursor: pointer; text-align: left;
+  color: var(--ink); font-size: 14px; padding: 8px 10px; border-radius: 8px;
+}
+
+.more-item:hover { background: var(--bg); }
+.more-item.active { background: #eef2ff; color: var(--accent); font-weight: 600; }
+.more-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+
 /* ---------- 插件配置表单（SchemaForm：由 configSchema 自动生成） ---------- */
 
 .badge-builtin { background: #f1f5f9; color: #475569; border-color: #e2e8f0; margin-left: 6px; }

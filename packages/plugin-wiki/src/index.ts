@@ -117,10 +117,14 @@ export const manifest: GeeWikiManifest = {
       drainTimeout: 5,
     },
     configSchema: WikiConfigSchema,
-    // 客户端 UI 入口（`geewiki.client`）：声明后宿主会把本插件的界面产物加载进插槽
-    // （入口表由后端 GET /api/plugins/ui 从活状态派生）。产物缺失只会被归入 skipped:
-    // entry_missing，不产生任何请求噪声，故这里可以放心声明。
-    client: { entry: 'client.js', css: 'client.css' },
+    // **本插件当前没有真实的前端界面**，故不声明 `geewiki.client`。
+    //
+    // 曾经这里声明过 `client`，而 `packages/web/fixtures/` 的验收夹具（计数器 + 抛错按钮）
+    // 正好被构建到了 `plugins-ui/@geewiki/wiki/`，于是**测试脚手架冒充成本插件的 UI 贡献**，
+    // 出现在产品页头/页脚的插槽里。夹具现已改为独立示例插件（`plugins/ui-demo/`）。
+    //
+    // 将来若真做出 wiki 的界面产物，把 `client` 加回来即可 —— 契约与入口表机制
+    // （`GeeWikiClient` 类型、`GET /api/plugins/ui`）都未改动。
   },
 }
 
