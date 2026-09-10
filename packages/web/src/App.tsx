@@ -24,8 +24,10 @@ export function App(): ReactNode {
   const route = useRoute()
   const root = route.split('/')[0] ?? 'wiki'
   const active = TABS.some((t) => t.id === root) ? root : 'wiki'
+  /** 统一 hash 跳转：规范化首尾斜杠，避免产生 '#/wiki/'（尾斜杠）或 '#/'（空路由）这类 URL */
   const nav = (id: string): void => {
-    window.location.hash = `/${id}`
+    const clean = id.replace(/^\/+/, '').replace(/\/+$/, '')
+    window.location.hash = clean ? `/${clean}` : '/wiki'
   }
 
   let body: ReactNode
