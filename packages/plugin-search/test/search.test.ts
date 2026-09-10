@@ -21,6 +21,7 @@ import { Context as CordisContext } from 'cordis'
 import { SqliteDatabase } from '@geewiki/db-sqlite'
 import type { HttpRouterService, RouteHandler, RouteHandlerContext } from '@geewiki/core'
 import {
+  MAX_QUERY_LENGTH,
   MIN_TRIGRAM_LENGTH,
   SEARCH_MIGRATIONS_DIR,
   SearchPlugin,
@@ -922,4 +923,112 @@ test('纯函数：buildTermQuery（CJK 3-gram / ASCII 切词 / 去重 / 空输�
   for (const t of buildTermQuery('知识库"OR"x')) {
     assert.match(toFtsPhrase(t), /^".*"$/, `词元应被包成字面短语: ${t}`)
   }
+})
+
+/* ================= 非汉字 CJK 与查询护栏（外部审查报出的两处） ================= */
+
+test('buildTermQuery：假名/谚文必须按 3-gram 切分（它们不属于 Han，曾被整串当一个词元）', () => {
+  // 缺陷现场：假名与谚文都是 \p{L}，落在"非 CJK 分支"时会被 \p{L}+ 当成**一个整词**，
+  // 于是整句成一个 15 字词元 → 短语匹配 → 恒 0 命中（等于把已修的中文缺陷搬到日文）。
+  const kana = buildTermQuery('けんさくかくちょうせいせいとは何か')
+  assert.ok(kana.length > 1, `假名长句必须切出多个词元，实际 ${JSON.stringify(kana)}`)
+  assert.ok(
+    kana.every((t) => [...t].length === MIN_TRIGRAM_LENGTH),
+    `假名词元应都是 3 字：${JSON.stringify(kana)}`,
+  )
+  assert.equal(kana[0], 'けんさ', '首个词元应是前 3 字')
+  // 谚文（韩文音节）
+  const hangul = buildTermQuery('한국어검색시스템')
+  assert.ok(hangul.length > 1, `谚文长句必须切出多个词元，实际 ${JSON.stringify(hangul)}`)
+  assert.equal(hangul[0], '한국어')
+  // 片假名
+  const katakana = buildTermQuery('カタカナテスト')
+  assert.equal(katakana[0], 'カタカ')
+})
+
+test('buildTermQuery：BMP 外的 CJK 扩展字按码点切分（不得把代理对拆成半个字符）', () => {
+  // 𠀀 等扩展 B 区字是代理对：若用 seg[i] 按下标取，切出的 3-gram 永远不可能命中索引
+  const terms = buildTermQuery('𠀀𠀁𠀂𠀃')
+  assert.equal(terms.length, 2, `4 个字应切出 2 个 3-gram，实际 ${JSON.stringify(terms)}`)
+  assert.deepEqual(terms, ['𠀀𠀁𠀂', '𠀁𠀂𠀃'])
+  assert.ok(terms.every((t) => [...t].length === MIN_TRIGRAM_LENGTH), '每个词元应是 3 个码点')
+})
+
+test('端到端：日文长问句能召回（缺陷回归）', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('ja1', '検索の設計', 'けんさくかくちょうせいせい とは、まず資料を探すことです。')
+    h.putPage('ja2', '無関係', '全く別の内容。')
+    // 短语语义（搜索框）对整句问句恒 0 命中——这正是原缺陷
+    const phrase = await searchAs(h, `q=${encodeURIComponent('けんさくかくちょうせいせいとは何か')}`, 'fts')
+    assert.equal(phrase.total, 0, '前置：整句按短语匹配命中 0（缺陷现场）')
+    // terms 语义（问句）应能召回
+    const terms = await searchAs(
+      h,
+      `q=${encodeURIComponent('けんさくかくちょうせいせいとは何か')}&mode=terms`,
+      'fts',
+    )
+    assert.equal(terms.total, 1, '词元检索必须召回该页')
+    assert.deepEqual(slugs(terms), ['ja1'])
+  } finally {
+    h.dispose()
+  }
+})
+
+test('buildTermQuery：去重改为 Set（长查询不退化，且结果与去重语义一致）', () => {
+  // 行为不变式：重复片段只出现一次、顺序稳定
+  assert.deepEqual(buildTermQuery('检索检索检索'), ['检索检', '索检索'])
+  // 长输入：词元数应线性增长而非爆炸（O(n²) 的 includes 在 1800 字时已可观测）
+  const long = '检索增强生成'.repeat(150) // 900 字
+  const started = process.hrtime.bigint()
+  const terms = buildTermQuery(long)
+  const ms = Number(process.hrtime.bigint() - started) / 1e6
+  // 「检索增强生成」的 6 个字只有 6 种跨复读边界的 3-gram（4 个内部 + 2 个跨重复处）：
+  // 检索增 / 索增强 / 增强生 / 强生成 / 成检索 / 生成检 —— 重复片段全部被去重。
+  assert.equal(terms.length, 6, `期望 6 种去重后的 3-gram，实际 ${terms.length}`)
+  assert.ok(ms < 200, `900 字查询切词耗时应远小于 200ms，实际 ${ms.toFixed(1)}ms`)
+})
+
+test('search-service：超长查询抛错而不是静默截断（消费方不受 REST 请求行上限保护）', async () => {
+  const h = makeHarness()
+  try {
+    const svc = h.ctx.get('search-service') as SearchService
+    const long = '检'.repeat(MAX_QUERY_LENGTH + 1)
+    assert.throws(
+      () => svc.search(long),
+      /过长/,
+      '超长查询必须显式报错（截断会给出"看起来正常但只搜了一部分"的结果）',
+    )
+    // 边界内应放行
+    assert.doesNotThrow(() => svc.search('检'.repeat(MAX_QUERY_LENGTH)))
+  } finally {
+    h.dispose()
+  }
+})
+
+test('REST：超长查询 → 400 too_long（与 /api/ai/ask 同口径），而非 500', async () => {
+  const h = makeHarness()
+  try {
+    const res = await h.search(`q=${encodeURIComponent('检'.repeat(MAX_QUERY_LENGTH + 1))}`)
+    assert.equal(res.status, 400, `必须是 400（500 会被误读成服务器故障）: ${JSON.stringify(res.body)}`)
+    assert.equal(res.body['error'], 'too_long')
+    assert.match(String(res.body['message']), /过长/)
+    // 边界值放行
+    const okRes = await h.search(`q=${encodeURIComponent('检'.repeat(MAX_QUERY_LENGTH))}`)
+    assert.equal(okRes.status, 200, '恰好 MAX_QUERY_LENGTH 应放行')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('语义记录：混排里的 <3 字符片段不参与 FTS 召回（既有取舍，此处钉住行为）', () => {
+  // 「检索 ab」：ab 只有 2 字符，切不出词元（trigram 下 MATCH 恒为空），故被丢弃；
+  // 保留的是「检索」切出的 3-gram？——「检索」本身只有 2 字，也切不出。
+  // 因此整串只有 ASCII 侧的 ab 与中文侧的 检索 都不足 3 → 无词元。
+  assert.deepEqual(buildTermQuery('检索 ab'), [], '中文 2 字 + 英文 2 字母都不足 3 字符 → 无词元')
+  // 但一旦有一侧够长，就只召回那一侧（短片段不参与）——这是有意的取舍，避免合并
+  // FTS 与 LIKE 两路结果带来的 mode 语义变化。
+  const mixed = buildTermQuery('检索增强 ab')
+  assert.ok(mixed.length > 0, '中文侧够长时应切出词元')
+  assert.ok(mixed.every((t) => !t.includes('ab')), '过短的 ASCII 片段不产生词元')
 })

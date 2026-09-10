@@ -420,8 +420,13 @@ test('apply：config.apiKeyEnv 填了疑似密钥值 → 激活失败（抛错�
   // 注意：cordis 的 apply 是**异步结算**的，错误不会从 ctx.plugin() 同步抛出，
   // 必须 await 返回的 PromiseLike 才会看到失败（类型见 FiberLike & PromiseLike<FiberLike>）
   const fork = ctx.plugin(LlmPlugin, { apiKeyEnv: 'sk-abcdefghijklmnop' })
-  await assert.rejects(async () => await fork, /密钥值本身/, '明文密钥必须让插件激活失败')
-  assert.equal(fork.state, FIBER_FAILED, 'fork 应处于 FAILED 态')
+  // 该校验现已**下沉到 Config schema**（白名单，见 credentials.ts 的 isEnvVarName），
+  // 因此报错文本来自 schemastery 的 pattern 校验：只断言它指出字段名。
+  // apply 自身仍有一道同规则的闸门，由 credentials.test.ts 直接调用 apply 覆盖。
+  await assert.rejects(async () => await fork, /apiKeyEnv/, '明文密钥必须让插件激活失败')
+  // schema 层拒绝发生在 fiber 启动**之前**，故状态停在 PENDING（0）而不是 FAILED（3）。
+  // 关键语义不变：它绝不允许变成 ACTIVE（即绝不放行）。
+  assert.notEqual(fork.state, FIBER_ACTIVE, 'fork 不得进入 ACTIVE 态')
   assert.ok(!ctx.get(LLM_SERVICE_KEY), '激活失败不得注册服务')
 
   // 报错信息本身不得回显那个密钥

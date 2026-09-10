@@ -138,6 +138,21 @@ export const MIN_TRIGRAM_LENGTH = 3
 /** limit 的硬上限（与 configSchema 的 max 一致，防止手改配置绕过校验） */
 const MAX_LIMIT = 100
 
+/**
+ * 查询串长度上限（服务层护栏）。
+ *
+ * 与 `@geewiki/ai` 的 `MAX_QUERY_LENGTH = 500` **刻意保持一致**：REST 端点与 AI 插件
+ * 对"多长的问句算合理"应有同一口径，否则从两个入口进来的同一句话会有不同结果。
+ * 这里不复用对方的常量：search 是下层（ai 依赖 search-service），下层不能反向依赖上层，
+ * 故两处各自持有该数值并在注释里互相指认。
+ *
+ * 为什么需要护栏：`buildTermQuery` 的词元数随长度线性增长，而 MATCH 表达式长度随之增长；
+ * REST 侧本来就受 Node 的请求行上限（约 16KB）保护，但**直接调用 search-service 的消费方
+ * 不受此保护**，可传入任意长度（例如把整篇正文当查询）。超限一律拒绝而不是静默截断——
+ * 截断会给出"看起来正常但实际只搜了一部分"的结果，比报错更难定位。
+ */
+export const MAX_QUERY_LENGTH = 500
+
 /** HTML 转义：片段会被前端以 HTML 渲染，正文来自用户，必须转义后再插 <mark> */
 export function escapeHtml(text: string): string {
   return text
@@ -170,6 +185,26 @@ export function toFtsPhrase(query: string): string {
 }
 
 /**
+ * **逐字切分**的文字系统：这些文字没有词边界（不靠空格分词），trigram 索引里存的是
+ * 3 字符片段，因此查询必须同样按 3 字符滑窗切，否则整串会被当成一个 token 而恒不命中。
+ *
+ * 覆盖范围（用 Unicode script 属性而非手写码点区间）：
+ * - `Han`：汉字（含扩展 A/B… 与 BMP 外的扩展区——属性转义天然覆盖代理对）；
+ * - `Hiragana` / `Katakana`：日文假名（含半角片假名）；
+ * - `Hangul`：韩文谚文（音节 + 字母）。
+ *
+ * 为什么必须显式列出假名/谚文：它们**不属于 Han**，而按"非 CJK 分支"处理时会被
+ * `\p{L}+` 当成**一个整词**（假名与谚文都是字母类），于是复现"整句一个词元 → 恒 0 命中"
+ * 的原缺陷（实测 `けんさくかくちょうせいせいとは何か` 曾整串成一个 15 字词元）。
+ */
+const NEEDS_TRIGRAM = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
+
+/** 把查询切成"连续的需要 3-gram 的片段"与"其余片段"交替的序列（split 保留捕获组） */
+function splitCjkRuns(q: string): string[] {
+  return q.split(/([\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+)/u)
+}
+
+/**
  * 把查询切成**可检索词元**（`mode:'terms'` 用），每段分别加引号后以 OR 连接。
  *
  * 为什么需要它：`toFtsPhrase` 把**整串**当一个短语，于是自然语言问句
@@ -179,39 +214,46 @@ export function toFtsPhrase(query: string): string {
  *
  * 切分规则（由 trigram 分词器的硬约束决定：**短于 3 字符的 token 在 MATCH 下恒为空**，
  * 因为索引用的是 3 字符片段）：
- * - **CJK 连续片段**：取长度 3 的滑窗 3-gram（「检索增强怎么做」→ 检索增/索增强/…）。
- *   取窗口而非整段，是为了让"词元在正文里出现"这一条件退化成"该 3-gram 在正文里出现"，
- *   从而绕过 trigram 无法按词匹配的限制；长度 <3 的片段切不出词元，交由调用方回退 LIKE。
- * - **ASCII/数字片段**：按空白与常见标点切词，只保留**长度 ≥3** 的词元（<3 在 MATCH 下
- *   恒为空——实测 `MATCH '"42"'` 命中 0，即使正文含「42」）。
+ * - **无词边界的文字（汉字/假名/谚文）连续片段**：取长度 3 的滑窗 3-gram
+ *   （「检索增强怎么做」→ 检索增/索增强/…）。取窗口而非整段，是为了让"词元在正文里出现"
+ *   这一条件退化成"该 3-gram 在正文里出现"，从而绕过 trigram 无法按词匹配的限制。
+ * - **有词边界的文字（拉丁字母、数字）**：按空白与常见标点切词，只保留**长度 ≥3** 的词元
+ *   （<3 在 MATCH 下恒为空——实测 `MATCH '"42"'` 命中 0，即使正文含「42」）。
  * - 去重且保持出现顺序（顺序稳定便于测试与排障）。
+ *
+ * **已知语义（<3 字符的片段被丢弃）**：中文 2 字词（「检索」）与英文 2 字母词切不出词元，
+ * 会被本函数**丢弃**；整串都切不出词元时由调用方回退 LIKE 兜底（结果仍然正确）。
+ * 但**混排**场景下（「检索 abc」这类）被丢弃的短片段**不参与** FTS 召回——这是既有取舍：
+ * 把短片段并入 LIKE 需要把 FTS 与 LIKE 两路结果合并去重，会改变 `mode` 的语义与返回结构，
+ * 代价大于收益。REST 端点对 <3 字符的**整串**查询仍走 LIKE，行为不受影响。
  *
  * **返回值不是 SQL**：调用方必须对每个词元调用 {@link toFtsPhrase} 再拼 OR——
  * 本函数只负责"切词"，绝不负责"转义"，两者分开才能保证注入防护只有一处实现。
  */
 export function buildTermQuery(q: string): string[] {
   const terms: string[] = []
+  // Set 去重：`terms.includes` 是 O(n²)，长查询（例如把整段正文当查询）会明显退化
+  const seen = new Set<string>()
   const push = (t: string): void => {
-    if (t.length >= MIN_TRIGRAM_LENGTH && !terms.includes(t)) terms.push(t)
+    if (t.length >= MIN_TRIGRAM_LENGTH && !seen.has(t)) {
+      seen.add(t)
+      terms.push(t)
+    }
   }
 
-  // CJK 统一表意文字（含扩展 A 区与兼容区）：按"连续片段"取 3-gram。
-  // 用码点范围而非 \p{Script=Han}：后者依赖 Unicode 属性转义，且会把日文汉字等一并算入
-  // （本仓库语料以中文为主，码点范围更可控、无正则引擎差异）。
-  const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
-  const segments = q.split(/([\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+)/)
-
-  for (const seg of segments) {
+  for (const seg of splitCjkRuns(q)) {
     if (seg === '') continue
-    if (CJK.test(seg)) {
-      // CJK 连续片段：滑窗 3-gram
+    if (NEEDS_TRIGRAM.test(seg)) {
+      // 逐字切分的文字系统：滑窗 3-gram。
+      // 用 `[...seg]` 展开而非 `seg[i]`：BMP 外的 CJK 扩展字是**代理对**，
+      // 按下标取会把它拆成两个半个字符，切出的 3-gram 永远不可能命中索引。
       const chars = [...seg]
       for (let i = 0; i + MIN_TRIGRAM_LENGTH <= chars.length; i += 1) {
         push(chars.slice(i, i + MIN_TRIGRAM_LENGTH).join(''))
       }
       continue
     }
-    // 非 CJK 片段：按空白与常见标点切词，逐词判断长度
+    // 其余片段（拉丁字母、数字等有词边界的文字）：按空白与标点切词，逐词判断长度
     for (const word of seg.split(/[^\p{L}\p{N}_]+/u)) {
       if (word !== '') push(word)
     }
@@ -298,6 +340,13 @@ export const SearchPlugin = {
       // `SqliteError: fts5: syntax error near ""`（FTS5 不接受空表达式）。
       // 端点另在解析阶段用 400 invalid_query 拦下（HTTP 语义），此处是服务层兜底。
       if (!q) return { mode: 'like', total: 0, hits: [] }
+      // 长度护栏（服务层）：直接调用 search-service 的消费方不受 REST 的请求行上限保护，
+      // 可传入任意长度（例如把整篇正文当查询）→ 词元数与 MATCH 表达式随之膨胀。
+      // 这里抛错而不是静默截断：截断会给出"看起来正常但只搜了一部分"的结果。
+      // REST 端点在解析阶段另有 400（HTTP 语义），不会走到这里。
+      if (q.length > MAX_QUERY_LENGTH) {
+        throw new RangeError(`查询串过长（${q.length} 字符，上限 ${MAX_QUERY_LENGTH}）`)
+      }
 
       let limit = defaultLimit
       if (opts?.limit !== undefined) {
@@ -425,6 +474,18 @@ export const SearchPlugin = {
             ok: false,
             error: 'invalid_query',
             message: '查询串不能为空（请提供 q 参数，且不能只有空白字符）',
+          })
+          return
+        }
+        // 长度上限：必须在调用 search() **之前**拦下并给出 400——search() 对超长查询抛
+        // RangeError，而路由层对同步抛错统一转成 **500**（见 server 的 dispatch catch），
+        // 那是"服务器故障"的语义，与"调用方传得太长"不符。
+        // 错误码 `too_long` 与 @geewiki/ai 的 `/api/ai/ask` 保持一致口径。
+        if (q.length > MAX_QUERY_LENGTH) {
+          h.json(400, {
+            ok: false,
+            error: 'too_long',
+            message: `查询串过长（${q.length} 字符，上限 ${MAX_QUERY_LENGTH}）`,
           })
           return
         }

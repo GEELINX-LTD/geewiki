@@ -13,7 +13,7 @@
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
 import { type GeeWikiManifest } from '@geewiki/core'
-import { detectSuspiciousCredential } from './redact.js'
+import { ENV_VAR_NAME_FIELD_RE, isEnvVarName } from './credentials.js'
 import { LLM_SERVICE_KEY, NULL_PROVIDER, createLlmService } from './service.js'
 
 export type {
@@ -27,7 +27,14 @@ export type {
   LlmUsage,
 } from './types.js'
 export { MIN_REDACT_LENGTH, SENSITIVE_HEADER_NAMES, SECRET_PATTERN_SOURCES, detectSuspiciousCredential, redact } from './redact.js'
-export { resolveCredential, type CredentialResult } from './credentials.js'
+export {
+  ENV_VAR_NAME_CONVENTION_RE,
+  ENV_VAR_NAME_FIELD_RE,
+  ENV_VAR_NAME_RE,
+  isEnvVarName,
+  resolveCredential,
+  type CredentialResult,
+} from './credentials.js'
 export { LLM_SERVICE_KEY, NULL_PROVIDER, createLlmService, type LlmServiceOptions } from './service.js'
 
 export interface LlmConfig {
@@ -40,8 +47,10 @@ export interface LlmConfig {
   /**
    * 默认凭据的**环境变量名**（不是密钥值！）。
    *
-   * 本字段由内置兜底路由与后续 adapter 共享；填密钥值会被 `apply` 直接拒绝——
-   * 理由是配置会落盘进入库的 `config/plugins.base.json`。
+   * 本字段由内置兜底路由与后续 adapter 共享。**只接受惯例形态的环境变量名**
+   * （全大写 + 至少一个下划线，如 `DEEPSEEK_API_KEY`；空串 = 未配置），
+   * 因为配置会落盘进入库的 `config/plugins.base.json`——填密钥值等于把密钥提交进 git。
+   * 校验同时挂在 `LlmConfigSchema`（schema 层，覆盖激活与热更新两条路径）与 `apply` 上。
    */
   apiKeyEnv?: string
 }
@@ -64,9 +73,24 @@ export const LlmConfigSchema = Schema.object({
     .min(0)
     .max(2)
     .description('默认采样温度'),
+  /**
+   * **白名单**：只接受惯例形态的环境变量名（全大写 + 至少一个下划线）。
+   *
+   * 这条 pattern 是阻止密钥落盘的**主闸门**：`Manager.updateConfig` 与激活前校验都走
+   * `validateConfig(schema, …)`，因此**启动与热更新两条路径**都在 schema 层被拦下，
+   * 不会走到 `persistConfig` 写进入库的 `config/plugins.base.json`。
+   *
+   * 为什么是白名单而非"像不像密钥"的黑名单：`a1b2c3…`（32 位 hex）、
+   * `ABCDEF1234…`（全大写 32 位）、`Xk9mQ2pL7vR4tN8w`（16 字符混合）在语法上都是
+   * 合法标识符，黑名单拦不住，而它们恰是随机密钥最常见的形态。
+   *
+   * 注意 pattern 必须**显式允许空串**（`^$|…`）：schemastery 会对 `default('')` 一并校验，
+   * 写成"不接受空串"会让默认配置直接抛错、插件无法激活。
+   */
   apiKeyEnv: Schema.string()
     .default('')
-    .description('凭据的**环境变量名**（如 DEEPSEEK_API_KEY；此处不要填密钥本身）'),
+    .pattern(ENV_VAR_NAME_FIELD_RE)
+    .description('凭据的**环境变量名**（全大写 + 下划线，如 DEEPSEEK_API_KEY；此处不要填密钥本身）'),
 })
 
 /** GeeWiki Manifest：提供 llm-service；无冲突组（多 provider 共存）；可热插拔 */
@@ -94,14 +118,18 @@ export const LlmPlugin = {
   Config: LlmConfigSchema,
 
   apply(ctx: Context, config: LlmConfig = {}) {
-    // ① 配置里出现"像密钥的值"→ 激活失败。这是**配置错误**，不是运行期故障：
+    // ① 配置里填的不是环境变量名 → 激活失败。这是**配置错误**，不是运行期故障：
     //    这里 throw（让本插件激活失败并显式报错），而**不是** process.exit(1)——
     //    后者会把一个可恢复的配置问题升级成整站不可用，且其它插件本可照常装载。
+    //    这条是 schema pattern 之外的**第二道闸门**：schema 覆盖配置读写路径，这里覆盖
+    //    "直接以代码构造 config 调 ctx.plugin()"（测试、程序化装配）的路径。
+    //    报错信息**不回显**该值——它可能就是密钥本身。
     const rawApiKeyEnv = (config.apiKeyEnv ?? '').trim()
-    if (rawApiKeyEnv !== '' && detectSuspiciousCredential(rawApiKeyEnv)) {
+    if (!isEnvVarName(rawApiKeyEnv)) {
       throw new Error(
-        '@geewiki/llm: 配置项 apiKeyEnv 里填的看起来是**密钥值本身**而不是环境变量名。' +
-          '请改为环境变量名（如 DEEPSEEK_API_KEY）——插件配置会落盘进入库文件，不得存放密钥。',
+        '@geewiki/llm: 配置项 apiKeyEnv 必须是**环境变量名**（全大写 + 下划线，如 DEEPSEEK_API_KEY），' +
+          '当前值不是该形态。插件配置会落盘进入库文件，不得存放密钥；' +
+          '密钥请放在该环境变量里，配置里只写变量名。',
       )
     }
 
