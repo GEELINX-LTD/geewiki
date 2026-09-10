@@ -3,6 +3,7 @@
  * 后端约定：成功 { ok: true, ... }；失败 { ok: false, error, message, details }，
  * HTTP 状态码与 ManagerError.code 映射（404 not_found / 409 冲突类 / 400 / 500）。
  */
+import { createAiStreamDecoder, type AiStreamEvent } from './lib/aiStreamPlan'
 
 export interface ApiFailure {
   ok: false
@@ -273,6 +274,75 @@ export interface AiCapabilitiesResponse {
   message: string
 }
 
+/* --------------------------- 流式问答 --------------------------- */
+
+export interface AiStreamOptions {
+  limit?: number
+  extractive?: boolean
+  /** 供组件卸载/切换页面/重新提交时取消。**取消不是失败**，调用方不应渲染成错误 */
+  signal?: AbortSignal
+  onEvent: (ev: AiStreamEvent) => void
+}
+
+/**
+ * `POST /api/ai/stream`：**逐帧**流式问答（SSE 文本帧）。
+ *
+ * 为什么必须用 `fetch` + `getReader()` 而**不用 `EventSource`**：原生 `EventSource` 只能发
+ * GET、不能带请求体与自定义头，而问答必然要 POST 一个 JSON body。
+ *
+ * 错误面（调用方需分别处理）：
+ * 1. **流开始前**的非 2xx：后端按普通 JSON 返回（`400` / `404` 插件未启用 / `429` 并发超限 /
+ *    `500`），这里统一抛 `ApiError`（含 `status` 与 `code`）——`404` 是**回退到一次性端点**的信号。
+ * 2. **流中途**失败：由后端发 `error` 帧（本函数不抛错，交给 `onEvent` 的 `error` 事件）。
+ * 3. **取消**：`signal` 触发时 `reader.read()` 会抛 `AbortError`，原样向上抛，由调用方识别。
+ */
+export async function aiAskStream(q: string, opts: AiStreamOptions): Promise<void> {
+  const res = await fetch('/api/ai/stream', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      q,
+      ...(opts.limit === undefined ? {} : { limit: opts.limit }),
+      ...(opts.extractive === undefined ? {} : { extractive: opts.extractive }),
+    }),
+    signal: opts.signal,
+  })
+
+  if (!res.ok) {
+    let data: unknown = null
+    try {
+      data = await res.json()
+    } catch {
+      /* 非 JSON 错误体（例如网关返回 HTML）：退化为状态码 */
+    }
+    const f = (data ?? {}) as Partial<ApiFailure>
+    throw new ApiError(res.status, f.error ?? 'http_' + res.status, f.message ?? `请求失败 (${res.status})`, f.details)
+  }
+
+  const body = res.body
+  if (body === null) throw new ApiError(res.status, 'no_body', '响应没有可读的流')
+  if (typeof TextDecoder === 'undefined') throw new ApiError(res.status, 'no_decoder', '当前环境不支持流式解码')
+
+  const decoder = createAiStreamDecoder()
+  const reader = body.getReader()
+  try {
+    for (;;) {
+      const step = await reader.read()
+      if (step.done) break
+      if (step.value) for (const ev of decoder.push(step.value)) opts.onEvent(ev)
+    }
+    // 收尾：把解码器/解析器里可能残留的最后半个字符与末帧取回
+    for (const ev of decoder.flush()) opts.onEvent(ev)
+  } finally {
+    // 提前退出（取消或异常）时释放底层 reader，避免连接悬挂
+    try {
+      reader.releaseLock()
+    } catch {
+      /* 已释放 */
+    }
+  }
+}
+
 export const api = {
   /* 插件管理 */
   plugins: () =>
@@ -317,4 +387,6 @@ export const api = {
       ...(opts?.extractive === undefined ? {} : { extractive: opts.extractive }),
     }),
   aiCapabilities: () => request<AiCapabilitiesResponse>('GET', '/api/ai/capabilities'),
+  /** 流式问答（见 `aiAskStream` 的文档：取消与三类错误面） */
+  aiAskStream: (q: string, opts: AiStreamOptions) => aiAskStream(q, opts),
 }

@@ -394,3 +394,26 @@ h2 + .empty { padding: 8px; }
 .ask-source:last-child { border-bottom: 0; }
 .ask-source-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ask-source-unused { opacity: 0.62; }
+
+/* 流式渲染：生成中的光标 + 失败态。
+   用既有 `--muted`/`--err` 变量，不新造配色。 */
+.ask-answer-streaming { position: relative; }
+.ask-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--muted);
+  animation: ask-cursor-blink 1s steps(2, start) infinite;
+}
+@keyframes ask-cursor-blink {
+  to { visibility: hidden; }
+}
+/* 尊重"减少动效"偏好：不要为了好看而违反无障碍设置 */
+@media (prefers-reduced-motion: reduce) {
+  .ask-cursor { animation: none; }
+}
+.ask-answer-error { color: var(--err); }
+.ask-answer-error .muted { color: var(--muted); }
+
