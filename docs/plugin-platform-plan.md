@@ -17,7 +17,7 @@ GeeWiki 已具备"清单驱动装配 + 依赖图/冲突组 + 会话沙箱 + 迁�
 | ① | 插件配置系统：manifest `configSchema` → 前端表单 + 持久化 + 热更新 | **已落地**：`configSchema` 采用 schemastery 3.18.0（`packages/core/src/index.ts:72` 的类型 + 两个内置插件均为 `Schema.object({...})`）；服务端校验 + 白名单裁剪 + 原子落盘 + 已激活插件 `fork.update()` 热更新（失败双向回滚）；管理台按 schema 自动生成表单，无 schema 插件退回 JSON 原文通道（不校验、不裁剪） |
 | ② | 外部插件加载：`./plugins` 目录 + 清单发现 | **已落地**：`packages/manager/src/discovery.ts` 的 `loadExternalPlugins()` 发现并加载，`packages/server/src/index.ts` 的 `buildRegistry()` 把外部插件**并入同一注册表**；内置插件仍由 `defaultRegistry()` 代码内置登记（4 个：`@geewiki/db-sqlite` / `@geewiki/http` / `@geewiki/echo` / `@geewiki/wiki`）；发现期问题经 `GET /api/plugins` 的 `issues` 字段可观测（L-14） |
 | ③ | 前端 Slot 插槽：插件向 Web 管理台贡献 UI | **部分落地（仅宿主侧）**：`window.__GEEWIKI_HOST__` 宿主 SDK + `packages/web/src/lib/slots.tsx` 的 `registerSlot` / `SlotOutlet`（含 ErrorBoundary）+ `/plugins-ui/<name>/client.js` 动态加载；插槽名白名单**仅 `app-header` / `app-footer`**。**未落地**：后端 `ctx.slot()` 注册链路、`editor-toolbar-slots` / `admin-page-slots`、Suspense 懒加载、fork 生命周期绑定（详见 `docs/architecture.md` §6） |
-| ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 排空**已落地**（粒度是**全站**在途请求，非 owner 级，见 L-1）；冲突组仅有互斥拦截（替换交互 G-1 设计已定稿、代码未落地）；`enable` 回滚为调用帧局部（缺陷仍在，G-2 修法已定稿、代码未落地） |
+| ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 三项**均已落地**：排空见 L-1（粒度是**全站**在途请求，非 owner 级）；冲突组替换 = `POST /api/plugins/:name/replace` + 管理台顶替确认框（G-1，提交 `42db76a`）；`enable` 回滚改为全递归共用集合（G-2，提交 `69cfeb2`） |
 | ⑤ | 容器化：`docker compose up` 可用 | **已落地并实测**（`Dockerfile` / `docker-compose.yml` / `docs/deployment.md`；G1–G4 的逐条状态见第 5 节 L-10） |
 | ⑥ | PostgreSQL 适配（评估） | 未落地，`DatabaseAdapter` 目前为同步接口；**已裁决延期**（依据与前置条件见第 5 节 L-9） |
 
@@ -352,7 +352,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 
 以下两项属批次 B 的治理面：**设计已定稿，代码未落地**。它们被写进本批次是为了让实现批"照文档对齐代码"，不需要重新决策。
 
-**G-1 `conflictGroup` 替换交互：新增独立端点 `POST /api/plugins/:name/replace`（设计已定稿、代码未落地）**
+**G-1 `conflictGroup` 替换交互：`POST /api/plugins/:name/replace`（已落地，提交 `42db76a`）**
 
 请求体：`{ config?: Record<string, unknown> }`（可选，作为目标插件替换激活时的配置）。
 
@@ -366,22 +366,24 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 | 400 | `migration_failed` | 目标插件迁移失败 |
 | 500 | `replace_rollback_failed` | **新增错误码**：回滚（恢复旧插件与依赖方）也失败，需人工介入 |
 
-⚠️ `replace_rollback_failed` **必须同步加入"错误码 → HTTP 状态"映射表**（否则会被当成未知错误码兜底成 500 但语义丢失）。
+⚠️ `replace_rollback_failed` 需要被 `fail()` 认识。**注意本仓库并没有显式的"错误码 → HTTP 状态映射表"**：`packages/manager/src/index.ts` 的 `fail()` 是 if/else 条件链（`not_found`→404、`payload_too_large`→413、一组冲突类码→409、其余 400）。已落地版本在该条件链里新增 `replace_rollback_failed → 500` 分支。
 
 **流程**：
 
 1. 目标插件**已激活** → 幂等返回（不重复替换）；
 2. **无冲突方**（该 `conflictGroup` 内没有其它已激活插件）→ **降级走 `enable`**，不必走替换路径；
 3. 否则前置校验三项：目标插件支持热重载、热链可用、**旧插件确实在 session 层**（在 base 层则 409 `base_layer`）；
-4. 取旧插件的**依赖方传递闭包**——`packages/manager/src/deps.ts` **需新增 `collectDependentsClosure`**：现有 `collectDependents` 只查**直接**反向边，替换场景必须拿到**传递**闭包（否则孙依赖会被留在半激活状态）；
+4. 取旧插件的**依赖方传递闭包**——已新增 `packages/manager/src/deps.ts` 的 `collectDependentsClosure(registry, names)`（BFS + visited，环安全，遍历整个注册表取安全超集，调用方与当前活跃集合取交集）：现有 `collectDependents` 只查**直接**反向边，替换场景必须拿到**传递**闭包（否则孙依赖会被留在半激活状态）；
 5. 与旧插件合并成待停用集合，按拓扑序**逆序卸载**（依赖方先卸、旧插件后卸）；
-6. 激活目标插件；
-7. 失败 → **先防御性卸载目标**（避免半激活污染），再恢复旧插件与依赖方；恢复也失败 → 500 `replace_rollback_failed`；
+6. 激活目标插件（`enableWithDeps` 传入 `skipDeps = {旧插件}`——目标与旧插件往往 `provides` 同一服务，旧插件卸载后若仍被解析为依赖会被重新拉起，进而撞上冲突组互斥）；
+7. 按正向拓扑序把依赖方接回新提供者，并记入 `restarted`；失败 → **先防御性卸载目标**（避免半激活污染），再恢复旧插件与依赖方；恢复也失败 → 500 `replace_rollback_failed`；
 8. **成功时只写一次 session 清单**；失败则零落盘——**天然原子**（不在中途分多次落盘）。
+
+> ⚠️ **实现偏离（如实记录）**：落地版本在失败回滚路径上**做不到"零落盘"**——卸载集合先用一次 `removeManyFromSession` 落盘，随后激活目标与逐个接回依赖方都会各自原子落盘。因此回滚不是"零写"而是"**把会话清单还原成调用前的字节**"：`replace()` 在动手前用 `JSON.parse(JSON.stringify(this.session))` 快照会话清单，回滚全部成功时把该快照原样写回，使条目**顺序与格式**都与调用前逐字节一致（逐条 `enable` 恢复只会按拓扑序追加，与原启用顺序未必相同——已由用例「回滚按调用前的条目顺序逐字节复原会话清单」钉住，并做过红-绿验证）。回滚未全部成功时抛 500 `replace_rollback_failed`，此时清单可能处于中间态，需人工介入。
 
 **裁决**：采用"**级联停用并自动重启依赖方**"而非"有依赖方即拒绝"。理由：拒绝会让用户**永远无法完成同组替换**（同组互斥且真实依赖普遍存在）；而静默断供不可选。**代价已接受**：最坏情况出现 `N × drainTimeout` 的短暂中断（N = 被级联停用的插件数，`drainTimeout` 默认 5 秒）。**前端确认文案必须预告该中断**（让用户在点确认前知道会短暂不可用）。
 
-**G-2 `enable` 回滚作用域缺陷：已确认缺陷 + 已定稿修法（设计已定稿、代码未落地）**
+**G-2 `enable` 回滚作用域缺陷：已确认缺陷 + 已按定稿修法修复（提交 `69cfeb2`）**
 
 **缺陷（已确认，非推断；批次 B 落地后已可达）**：`packages/manager/src/index.ts` 的 `activatedByThisCall` 是**每递归帧局部**的数组（`:655`），`directDependencies` 递归处 `:660` 在 `await this.enable(dep)` 返回**之后**才 push。依赖深度 ≥2 时，孙依赖已经由子帧的 `activateCore` 成功激活并 `addToSession` **落盘**，但子帧返回后该数组即被丢弃 → 目标插件激活失败时，**孙依赖残留（仍处于激活态）且 session 清单已泄漏**。
 **可达性**：只看内置插件不可达（内置注册表最大依赖深度为 1）；**批次 B 已落地**，外部插件与内置插件并入同一注册表（`packages/server/src/index.ts` 的 `buildRegistry()`），外部插件即可构造 depth ≥2 的依赖链 → 该路径**现在可达**。详见第 5 节 **L-2**（本处是设计定稿，L-2 是"已知限制"视角）。
@@ -536,7 +538,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 **L-1 排空语义是全站在途请求，不是 owner 级。**
 `@geewiki/http` 的 `inflight()` / `drain()` 以整个路由服务为粒度：卸载任一插件时，等待的是**全站**尚未结算的请求（不含发起卸载的那次管理请求）。更精确的 **owner 级排空**（只等待被卸载插件自身路由注册的在途请求）列为后续工作。
 
-**L-2 `enable` 失败回滚的作用域是调用帧局部（已确认缺陷，仍未修）。**
+**L-2 `enable` 失败回滚的作用域曾是调用帧局部（已确认缺陷，已于提交 `69cfeb2` 修复）。**
 `enable()` 用 `activatedByThisCall` 记录"本次调用新激活的依赖"，失败时逆序回滚。该数组是**每递归帧局部**的（`packages/manager/src/index.ts:655` 的 `const activatedByThisCall: string[] = []` → `:660` 在递归 `await this.enable(dep)` **之后**才 push，而递归调用自带一个新数组）：依赖深度 ≥2 时，孙依赖由**子帧**的 `enable()` → `activateCore()` 成功激活并 `addToSession` **落盘**，子帧返回后它自己的数组即被丢弃 → 目标插件激活失败时，外层帧只能回滚自己记录的直接依赖，**孙依赖残留（仍处于激活态）且 session 清单已泄漏**。
 
 **可达性要分两个条件说，不要合并成"暂不可达"，也不要写成"将来风险"**：
@@ -544,9 +546,9 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 - **只看内置插件：不可达。** 内置注册表的最大依赖深度是 1（`@geewiki/wiki` requires `http-service` + `database-provider`，两者自身 requires 为空；`@geewiki/echo` requires `@geewiki/http`），构造不出 depth ≥2 的链。
 - **引入外部插件：可达。** 批次 B 已落地，`packages/server/src/index.ts` 的 `buildRegistry()` 把外部插件**并入同一注册表**（`return { registry: [...builtin, ...discovered.plugins], issues: discovered.issues }`，见 §5.8 与 `packages/manager/src/discovery.ts`），外部插件的 `requires` 可以指向另一个外部插件，因此 A→B→C 这样的 depth ≥2 链**现在就能构造**。
 
-即准确表述为"**缺陷已确认存在、修法已定稿、代码未落地；是否触发取决于注册表里有没有 depth ≥2 的依赖链**"。
+即准确表述为"**缺陷曾真实存在（是否触发取决于注册表里有没有 depth ≥2 的依赖链，外部插件使其可达），现已按定稿修法修复**"。
 
-**修法已定稿（代码未落地）**：公开 `enable` 作唯一回滚点 + private `enableInner(name, config, activated)` 跨帧共享同一个 `activated` 数组 + 激活成功后自登记 `activated.push(name)`（push 序即激活序，逆序回滚即合法卸载序）——见第 4 节批次 B 的 **G-2**。
+**修法（已落地，提交 `69cfeb2`）**：公开 `enable` 作唯一回滚点（实现在 `enableWithDeps`）+ private `enableInner(name, config, activated, skipDeps?)` 跨帧共享同一个 `activated` 数组 + 激活成功后自登记 `activated.push(name)`（push 序即激活序，逆序回滚即合法卸载序）——见第 4 节批次 B 的 **G-2**。
 
 **L-3 后端直接运行 TS。**
 各包 `exports` 指向 `src/index.ts`，运行期依赖 devDependency `tsx`；这与生产镜像裁剪 devDependencies 存在张力。镜像侧的当前处理方式见 [deployment.md](./deployment.md)。
@@ -626,13 +628,13 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 
 | 包 | 用例数 | 通过 | 失败 |
 | --- | --- | --- | --- |
-| `packages/manager` | **58**（5 个测试文件：`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3） | 58 | 0 |
+| `packages/manager` | **67**（5 个测试文件：`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3） | 67 | 0 |
 | `packages/server` | **14**（`registry` 3 + `router` 11） | 14 | 0 |
-| **合计** | **72** | **72** | **0** |
+| **合计** | **81** | **81** | **0** |
 
 逐文件口径：
 
-- `packages/manager/test/`：`deps.test.ts` 8 例、`manager.test.ts` 13 例、`config.test.ts` 21 例、`discovery.test.ts` 13 例、`repo-paths.test.ts` 3 例 —— 合计 **58**。
+- `packages/manager/test/`：`deps.test.ts` 9 例、`manager.test.ts` 14 例、`config.test.ts` 28 例、`discovery.test.ts` 13 例、`repo-paths.test.ts` 3 例 —— 合计 **67**。
 - `packages/server/test/`：`registry.test.ts` 3 例（`buildRegistry` 内置 4 + 外部合并 / `pluginsRoot` 为 `null` / 目录不可用）、`router.test.ts` 11 例（drain 空闲、在途、超时、多等待者、回归自计数；inflight 结算；404 与静态交接不计在途；REST 卸载两类；wiki 413 计入 stats；`ServerOptions.port` / `host`）—— 合计 **14**。
 
 **已过时口径（保留以便追溯，勿再引用）**：本版之前此处记录的是"manager **39** 例 / **37** 过 / **2** 失败、server **11/11**"。那两个失败用例是**尚未随新契约更新的旧断言**，不是新代码缺陷，现均已改写：
@@ -641,7 +643,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 - `packages/manager/test/config.test.ts`『REST：GET/PUT /api/plugins/:name/config 的状态码与响应形状』——旧断言 `assert.equal(got.body['layer'], null, '未激活 → 无层')`（`:305`）与最终裁决冲突：`layer` 现为**持久化层**（从未持久化时落 `'base'`，类型 `Layer` 非空），"未激活"改由 `activeLayer: null` 表达。**已改写**：文件头注释第 8 条明确"`layer`（持久化层）与 `activeLayer`（激活层）两个维度"，并新增用例『`configOf`：layer = 持久化层、`activeLayer` = 激活层（基础层激活 / 会话层激活 / 未激活三态）』（`:445`）。
 - 另外新增了会话层叠加用例（『boot 叠加：基础层 + 会话层并存时，会话层配置作为覆盖层生效』）与外部插件发现用例（`discovery.test.ts` 13 例，含『`parsePluginManifest`：`package.json` 的 `geewiki` 键优先』`discovery.test.ts:54`、『`resolvePluginEntry`：显式 entry 优先，其后 `index.ts` → `index.js` → `src/index.ts`』）。
 
-因此 `README.md` / `docs/roadmap.md` 中出现的 35/35 是**历史时点口径**，当前口径为 **72/72**（两处均已同步更新）。
+因此 `README.md` / `docs/roadmap.md` 中出现的 35/35 是**历史时点口径**，当前口径为 **81/81**（见第五行核对表；本节其余历史口径仅作追溯）。**旧文残句（供检索）：72/72**（两处均已同步更新）。
 
 **遗留项**：见第 5 节 **L-7**（React Flow 授权提示）与 **L-8**（详情页「← 返回列表」走 `history.back()`）。
 
@@ -652,7 +654,7 @@ loadExternalPlugins(options: DiscoveryOptions): Promise<DiscoveryResult>
 每一批交付必须同时满足：
 
 1. `pnpm typecheck` **0 错**；
-2. `pnpm test` **全绿**，且包含该批新增用例。**当前（本轮实跑）全绿：72/72** —— `packages/manager` **58**（`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11），逐文件口径见第 6 节。**历史时点**：基线提交 `ed826b5` 为 **35/35**（manager 24 + server 11）；其后修复批一度出现 manager **39 例 / 37 过 / 2 失败**（两条旧断言尚未随新契约更新：`layer` 语义反转、无 schema 插件改为接受原始 JSON），**现已全部改写完成**；
+2. `pnpm test` **全绿**，且包含该批新增用例。**当前（本轮实跑）全绿：81/81** —— `packages/manager` **67**（`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11），逐文件口径见第 6 节。**历史时点**：基线提交 `ed826b5` 为 **35/35**（manager 24 + server 11）；其后修复批一度出现 manager **39 例 / 37 过 / 2 失败**（两条旧断言尚未随新契约更新：`layer` 语义反转、无 schema 插件改为接受原始 JSON），**现已全部改写完成**；
 3. **隔离端口**的端到端冒烟（不得占用开发用的 3000 / 5173）；
 4. 涉及 UI 的批次必须有**浏览器端到端验收**（真实渲染，而非接口断言）；
 5. **每批先经独立 Reviewer 审查，再提交**；
@@ -686,15 +688,16 @@ S-7…S-17 的载荷规格另可用 `data/spike/probe4-payload-spec.mjs` / `prob
 | `simplify` 是实例方法 | "`schema.simplify(value)`，不是 `Schema.simplify`" | 实跑确认静态调用抛 `TypeError: Schema.simplify is not a function` | 采纳（S-5） |
 | `schemastery` 依赖 | 选型 `schemastery@3.18.0` | 初版核对时工作区 `packages/*` **尚未声明**该依赖，只在 `data/spike/` 独立环境中安装；**当前已正式声明**：`packages/core/package.json` / `packages/manager/package.json` / `packages/plugin-wiki/package.json` / `packages/plugin-echo/package.json` 均为 `"schemastery": "3.18.0"` | 第 2.2 节开头的"工作区尚未声明"已按现状修正；批次 C 的加依赖待办**已闭合** |
 | `drainTimeout` 消费 | 能力 ④ 列出"`drainTimeout` 消费"待补 | **已落地**：`packages/manager/src/index.ts` 的统一卸载出口按 `runtime.drainTimeout` 排空 | 第 1 节状态改为"已落地"，与 roadmap Phase 4 的说明一致 |
-| `conflictGroup` 替换交互 | 能力 ④ 列出待补 | 确认未实现：仅 `activateCore` / `enable` 的互斥拦截（抛 409 `conflict_group`），无替换交互 | 保持"待补" |
+| `conflictGroup` 替换交互 | 能力 ④ 列出待补 | **已落地**（提交 `42db76a`）：`POST /api/plugins/:name/replace` + `collectDependentsClosure` + 管理台顶替确认框；隔离实例实测 200 替换 / 409 `conflict_group` 探测 / 409 `base_layer`（旧插件在基础层），浏览器 CDP 实测确认框与成功提示 | 更新为已实现（G-1） |
 | 前端 Slot 单例共享 | 初版 D-4 写"宿主用 import map 暴露 react 单例" | **勘察证伪**：`react@19.2.8` 无任何 ESM 产物（`exports` 只有 `react-server`/`default`）、宿主产物已内联 react（`packages/web/dist/assets/index-DyngNpzw.js`）、dev 的 `?v=<hash>` 会造成实例分裂 | **改写**：D-4 保留其余结论并指向新增 **D-8**（宿主 `window.__GEEWIKI_HOST__` SDK + 薄 shim） |
 | `configSchema` 承载方式 | 批次 C 直接按 schemastery 载荷渲染 | 初版核对时仓库现状是 **JSON Schema 风格字面量**：`packages/core/src/index.ts:49` 为 `Record<string, unknown>`，`packages/plugin-wiki/src/index.ts:37` / `packages/plugin-echo/src/index.ts:30` 用 `title` 键（schemastery 无此键） | 当时判定为**契约迁移开放项**（推荐方案甲）；**现已按方案甲落地**——`packages/core/src/index.ts:30`（`ConfigSchema = ReturnType<typeof Schema.any<any>>`）与 `:72`，`packages/plugin-wiki/src/index.ts:27-33`、`packages/plugin-echo/src/index.ts:22-26` 全部改为 `Schema.object({...})` |
 | schemastery 载荷规格 | "`refs` 是数组 / 节点带 `uid` / 有 `Schema.fromJSON`" | 实测均为**否**：`refs` 是对象、节点无 `uid` 字段、反序列化只有构造函数入口（`src/index.ts:178-208`）；且反序列化会 `new Function` 执行 `callback`（`:197-202`） | 写入 **S-7 / S-8**，并把"前端不得 hydrate"列为安全红线 |
 | uid 作为缓存键 | "同一 schema 重复序列化 uid 会变" | 需区分两种情形：**同一实例**重复 stringify 字节相同（`probe5.out` §B `uid=14/14 equal=true`）；**重新构造**同一 schema 才变（§A `uid1=4 uid2=9`） | 写入 **S-14**，表述按两种情况区分，跨请求用内容 hash / 插件版本号 |
 | UI 资源 URL 前缀 | 初版批次 D 写 `/plugins/<name>/...` | 现有静态托管的 root 锁死 `webDist`（`packages/server/src/index.ts` 的 `serveStatic()` 与 `HttpPlugin` 的 `webDist` 配置项），需独立挂载点 | 统一为 **`/plugins-ui/<name>/client.{js,css}`**，dev 由 `packages/web/vite.config.ts` proxy 转发 3000 |
 | 测试计数（一次实跑，**历史**） | 各文档写"单测 23/23" | 实跑 `pnpm -r --if-present run test`：**manager 24 + server 11 = 35/35**（`deps 8 + manager 13 + repo-paths 3`；`packages/server/test/router.test.ts` 11） | 当时已同步修正 `README.md`、`docs/roadmap.md`、本文第 7 节。**该 35/35 现降级为历史基线口径**，当前口径见下方"测试计数（三次实跑）"行 |
-| 测试计数（二次实跑，**已过时**） | 上一行记录的 35/35（manager 24 + server 11） | 那一轮实跑曾变为 `packages/manager` **39 例 / 37 过 / 2 失败**（39 = deps 8 + manager 13 + repo-paths 3 + `config.test.ts` 8 + `discovery.test.ts` 7）、`packages/server` **11/11**；失败两条均为尚未随新契约更新的旧断言 | 该口径**已作废**：两条旧断言已改写（见第 6 节），当前为下一行的 72/72 |
-| 测试计数（**三次实跑，当前口径**） | 上一行的"39 / 37 / 2" | **全绿 72/72**：`packages/manager` **58**（**5 个测试文件**：`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11）。**命令注意**：`pnpm -r` 在任一包失败即中止、不会跑到后面的包，故两包数字分别用 `pnpm --filter @geewiki/manager run test` 与 `pnpm --filter @geewiki/server run test` 取 | 写入第 6 节实跑表与第 7 节 item 2，并同步更新 `README.md`（`pnpm test` 行 + 当前实现状态）与 `docs/roadmap.md`（Phase 2 尾注 + Phase 3/4 状态）。**顺带纠正两处旧数**：① manager 是 **5 个测试文件**而非 4 个；② 旧口径给出的"deps 8 + manager 13 + repo-paths 3 + config 8 + discovery 7"里 config/discovery 两文件当时尚未增补完，现为 **config 21 + discovery 13** |
+| 测试计数（二次实跑，**已过时**） | 上一行记录的 35/35（manager 24 + server 11） | 那一轮实跑曾变为 `packages/manager` **39 例 / 37 过 / 2 失败**（39 = deps 8 + manager 13 + repo-paths 3 + `config.test.ts` 8 + `discovery.test.ts` 7）、`packages/server` **11/11**；失败两条均为尚未随新契约更新的旧断言 | 该口径**已作废**：两条旧断言已改写（见第 6 节），当前为核对表最后一行的 81/81 |
+| 测试计数（**三次实跑，已过时**） | 上一行的"39 / 37 / 2" | **全绿 72/72**：`packages/manager` **58**（**5 个测试文件**：`deps` 8 + `manager` 13 + `config` 21 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11）。**命令注意**：`pnpm -r` 在任一包失败即中止、不会跑到后面的包，故两包数字分别用 `pnpm --filter @geewiki/manager run test` 与 `pnpm --filter @geewiki/server run test` 取 | 写入第 6 节实跑表与第 7 节 item 2，并同步更新 `README.md`（`pnpm test` 行 + 当前实现状态）与 `docs/roadmap.md`（Phase 2 尾注 + Phase 3/4 状态）。**顺带纠正两处旧数**：① manager 是 **5 个测试文件**而非 4 个；② 旧口径给出的"deps 8 + manager 13 + repo-paths 3 + config 8 + discovery 7"里 config/discovery 两文件当时尚未增补完，现为 **config 21 + discovery 13** |
+| 测试计数（**四次实跑，当前口径**） | 上一行的 72/72（manager 58） | 全绿 **81/81**：`packages/manager` **67**（`deps` 9 + `manager` 14 + `config` 28 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**；新增 9 例 = W2 泄漏回归 1 + 替换相关 8（`collectDependentsClosure` 1 + `replace` 7） | 已同步第 6 节表、第 7 节 item 2、`README.md` 与 `docs/roadmap.md` |
 | `meta.role: 'password'` | 曾按"已实现"记录，上一版又反转为"未实现" | **实际已实现**（上一版写反了）：`packages/web/src/lib/configSchema.ts:132` 对 `role === 'password'` 置 `secret: true`，`packages/web/src/components/SchemaForm.tsx:131-132` 据此渲染 `type={field.secret ? 'password' : 'text'}` + `autoComplete={field.secret ? 'new-password' : undefined}`；只有非 `textarea`、非 `password` 的 `role` 才退化为文本框并附 `role=…` 注记（`configSchema.ts:133`）。**边界**：脱敏只作用于表单输入框的呈现，`GET /api/plugins/:name/config` 返回的 `config` 仍是**明文原值**。`hidden` 则**确已支持**（`:106` → `kind: 'hidden'`，`packages/web/src/components/SchemaForm.tsx:210-212` 的 `case 'hidden': return null`，**连说明行都没有**） | 已把 `docs/architecture.md` §5.7 与 `README.md` 的已知限制改为"输入框脱敏已实现 + API 返回明文"口径；并纠正上一版把 `hidden` 写成 `kind: 'static'` 的错误（`kind: 'static'` 实为 `const` 节点的只读展示分支，`configSchema.ts:136`） |
 | UI 基线验收 | "4 路由可达、停用 3ms、console 无错误" | 对照 `data/spike/e2e/` 的 CDP 脚本与 DOM 快照确认：`/`、`#/wiki`、`#/plugins`、`#/graph` 四路由与 `#/graph` 的 **4 节点 + 3 边**（`react-flow__edge-path` 计数 3）均可复核 | 写入第 6 节"当前质量基线"；3 ms 标注为客户端观测口径 |
 | React Flow 授权提示 | 未提及 | `packages/web/src/pages/GraphPage.tsx:145` 的 `proOptions={{ hideAttribution: true }}` 会触发上游许可证提示 | 写入 **L-7**（非缺陷，按许可证决定处理） |
