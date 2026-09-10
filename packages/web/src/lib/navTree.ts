@@ -117,6 +117,50 @@ export function containsSlug(node: NavNode, slug: string): boolean {
 }
 
 /**
+ * 按**展示顺序**展平树，得到"可阅读的页面序列"。
+ *
+ * 顺序定义与 {@link Sidebar} 的渲染顺序**逐字对应**：先节点自身的页面（若有），再递归其子节点。
+ * 这条对应关系是本函数的全部意义——"上一篇/下一篇"必须与用户在侧边栏看到的上下关系一致，
+ * 否则会出现"下一篇"从「指南」组跳到「运维手册」组这种断裂（先用 `updated_at DESC` 时的实际症状）。
+ *
+ * 中间层若没有页面（纯分组，如只有 `a/b/c` 而没有 `a`）**不入序列**：它不可打开，
+ * 不该在翻页里占一步（否则用户点"下一篇"会落到一个打不开的分组名上）。
+ *
+ * 输入假定已由 {@link buildNavTree} 排好序（本函数不重新排序，以免与侧边栏出现两套顺序）。
+ */
+export function flattenPages(nodes: readonly NavNode[]): NavPage[] {
+  const out: NavPage[] = []
+  const walk = (list: readonly NavNode[]): void => {
+    for (const node of list) {
+      if (node.page !== null) out.push(node.page)
+      walk(node.children)
+    }
+  }
+  walk(nodes)
+  return out
+}
+
+/**
+ * 取某页在**展示顺序**里的相邻页（第一项无上一篇、最后一项无下一篇）。
+ *
+ * 同 slug 出现多次时以第一次为准（`buildNavTree` 已做防御性去重，这里保持一致）。
+ * 找不到该 slug 时返回 `index: -1` 且两个邻居都为 `undefined`——调用方据此不渲染翻页条。
+ */
+export function neighborsOf(
+  nodes: readonly NavNode[],
+  slug: string,
+): { prev: NavPage | undefined; next: NavPage | undefined; index: number } {
+  const flat = flattenPages(nodes)
+  const index = flat.findIndex((p) => p.slug === slug)
+  if (index < 0) return { prev: undefined, next: undefined, index: -1 }
+  return {
+    prev: index > 0 ? flat[index - 1] : undefined,
+    next: index < flat.length - 1 ? flat[index + 1] : undefined,
+    index,
+  }
+}
+
+/**
  * 树的规模统计（供"全部展开/折叠"与空态判断用）。
  * 返回的是**可导航条目**数量（分组本身若没有页面则不计），用于侧边栏标题的"N 个页面"。
  */

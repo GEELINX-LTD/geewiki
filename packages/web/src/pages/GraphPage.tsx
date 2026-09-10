@@ -22,6 +22,7 @@ import {
   STATE_TEXT,
   estimateNodeWidth,
   labelSegments,
+  displayNameOf,
   plainName,
   stateTone,
 } from '../lib/pluginDisplay'
@@ -29,7 +30,9 @@ import {
 /* ---------- 节点 ---------- */
 
 interface FlowData extends Record<string, unknown> {
-  /** 完整标识（`@geewiki/wiki`）；节点上显示的是去 scope 的短名，全名进 tooltip/详情 */
+  /** 图上显示的**人读名**（manifest 的 `displayName`，缺失回退去 scope 短名） */
+  label: string
+  /** 完整标识（`@geewiki/wiki`）；节点上不显示，进 tooltip/详情，信息不丢 */
   fullName: string
   state: GraphNodeInfo['state']
   layer: string | null
@@ -64,7 +67,6 @@ function BreakableLabel({ text }: { text: string }): ReactNode {
 
 function FlowNode({ data, selected }: NodeProps): ReactNode {
   const d = data as FlowData
-  const short = plainName(d.fullName)
   return (
     <div
       className={[
@@ -74,9 +76,9 @@ function FlowNode({ data, selected }: NodeProps): ReactNode {
       ].join(' ')}
     >
       <Handle type="target" position={Position.Left} />
-      {/* 全名放 tooltip 与详情对话框，节点上只显示可读短名（信息不丢，只是不挤在图上） */}
+      {/* 全名放 tooltip 与详情对话框，节点上只显示可读名（信息不丢，只是不挤在图上） */}
       <div className="text-[13px] leading-snug font-medium break-normal text-ink" title={d.fullName}>
-        <BreakableLabel text={short} />
+        <BreakableLabel text={d.label} />
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-1">
         <Badge tone={stateTone(d.state)}>{STATE_TEXT[d.state]}</Badge>
@@ -135,7 +137,19 @@ const edgeTypes = { flow: FlowEdge }
 
 /* ---------- 分层布局（无外部图算法依赖）：被依赖方在左，箭头指向依赖方 ---------- */
 
-function layoutGraph(g: GraphData): { nodes: Node[]; edges: Edge[]; width: number } {
+/**
+ * 节点宽度：在共享的 {@link estimateNodeWidth} 之上给**含 CJK** 的名字一个更高的下限。
+ *
+ * 为什么需要：`estimateNodeWidth` 按 8.2px/字符估算，那是 latin 字号的宽度；中文（CJK）在
+ * 13px 字号下每字约 13px，故纯中文名会被估窄、折成两三行。这里只**抬高下限**（不改共享函数，
+ * 以免影响管理台表格的既有表现），让「OpenAI 兼容模型」这类名字尽量排成一行。
+ */
+function nodeWidthFor(label: string): number {
+  const base = estimateNodeWidth(label)
+  return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(label) ? Math.max(base, 168) : base
+}
+
+function layoutGraph(g: GraphData, labelOf: (id: string) => string): { nodes: Node[]; edges: Edge[]; width: number } {
   const ids = g.nodes.map((n) => n.id)
   const idSet = new Set(ids)
   const byId = new Map(g.nodes.map((n) => [n.id, n]))
@@ -164,7 +178,7 @@ function layoutGraph(g: GraphData): { nodes: Node[]; edges: Edge[]; width: numbe
   }
   const GAP_X = 70
   const ROW_H = 86
-  const widthOf = new Map(ids.map((id) => [id, estimateNodeWidth(plainName(id))]))
+  const widthOf = new Map(ids.map((id) => [id, nodeWidthFor(labelOf(id))]))
   const colWidth = new Map<number, number>()
   for (const [l, list] of byLevel) {
     colWidth.set(l, Math.max(120, ...list.map((id) => widthOf.get(id) ?? 120)))
@@ -191,6 +205,7 @@ function layoutGraph(g: GraphData): { nodes: Node[]; edges: Edge[]; width: numbe
       position: { x: colX.get(l) ?? 24, y: 24 + idx * ROW_H },
       style: { width: w },
       data: {
+        label: labelOf(n.id),
         fullName: n.label,
         state: n.state,
         layer: n.layer,
@@ -209,8 +224,8 @@ function layoutGraph(g: GraphData): { nodes: Node[]; edges: Edge[]; width: numbe
     // 加宽不可见命中区，否则细线几乎 hover 不到
     interactionWidth: 18,
     data: {
-      from: plainName(byId.get(e.source)?.label ?? e.source),
-      to: plainName(byId.get(e.target)?.label ?? e.target),
+      from: labelOf(e.source),
+      to: labelOf(e.target),
     } satisfies FlowEdgeData,
   }))
   return { nodes, edges, width: x }
@@ -220,6 +235,16 @@ function layoutGraph(g: GraphData): { nodes: Node[]; edges: Edge[]; width: numbe
 
 export function GraphPage(): ReactNode {
   const [graph, setGraph] = useState<GraphData | null>(null)
+  /*
+   * 人读名映射（name → displayName）。**为什么单独取一次 `/api/plugins`**：
+   * `GET /api/plugins/graph` 的节点只有包名（`label` = 插件名），没有 `displayName`；
+   * 而同一产品里管理台表格显示的是人读名（「SQLite 数据库」），依赖图却显示 `db-sqlite`
+   * ——两处叫法不一致正是"开发味"的一种。这里按插件名关联，把图上的名字对齐到管理台。
+   *
+   * 失败**不阻塞**依赖图：拿不到映射就退回 `plainName`（去 scope 短名），图形照常渲染。
+   * 这是刻意的降级——一个展示层的映射不该让整张图打不开。
+   */
+  const [displayNames, setDisplayNames] = useState<ReadonlyMap<string, string>>(new Map())
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(true)
   const [detail, setDetail] = useState<string | null>(null)
@@ -235,9 +260,36 @@ export function GraphPage(): ReactNode {
   }, [])
   useEffect(load, [load])
 
+  /*
+   * 只在图加载成功后取一次插件列表（展示层增强）。与 `load` 分开：它的失败只记 debug，
+   * 不设置 `err`（否则会把"图能画但名字是短名"误报成"依赖图加载失败"）。
+   */
+  useEffect(() => {
+    if (graph === null) return
+    let alive = true
+    api
+      .plugins()
+      .then((r) => {
+        if (!alive) return
+        setDisplayNames(new Map(r.plugins.map((p) => [p.name, displayNameOf(p)])))
+      })
+      .catch((e: unknown) => {
+        console.debug('[graph] 人读名映射不可用，回退到短名：', e instanceof Error ? e.message : e)
+      })
+    return () => {
+      alive = false
+    }
+  }, [graph])
+
+  /** 图上/边上的显示名：优先人读名，缺失时回退去 scope 短名（图上**不显示**包名全称） */
+  const labelOf = useCallback(
+    (id: string): string => displayNames.get(id) ?? plainName(id),
+    [displayNames],
+  )
+
   const { nodes, edges } = useMemo<{ nodes: Node[]; edges: Edge[] }>(
-    () => (graph ? layoutGraph(graph) : { nodes: [], edges: [] }),
-    [graph],
+    () => (graph ? layoutGraph(graph, labelOf) : { nodes: [], edges: [] }),
+    [graph, labelOf],
   )
   const detailNode = detail !== null ? (graph?.nodes.find((n) => n.id === detail) ?? null) : null
 
@@ -331,7 +383,7 @@ export function GraphPage(): ReactNode {
       {/* 节点详情：把全名与依赖关系讲清楚，避免"图上看不懂" */}
       <Dialog open={detailNode !== null} onOpenChange={(open) => !open && setDetail(null)}>
         <DialogContent
-          title={detailNode ? plainName(detailNode.label) : ''}
+          title={detailNode ? labelOf(detailNode.id) : ''}
           description={detailNode?.label}
           footer={
             <DialogClose asChild>
@@ -367,7 +419,7 @@ export function GraphPage(): ReactNode {
                       .filter((e) => e.source === detailNode.id)
                       .map((e) => (
                         <Badge key={e.id} tone="neutral">
-                          {plainName(graph.nodes.find((n) => n.id === e.target)?.label ?? e.target)}
+                          {labelOf(e.target)}
                         </Badge>
                       ))}
                   </span>
@@ -383,7 +435,7 @@ export function GraphPage(): ReactNode {
                       .filter((e) => e.target === detailNode.id)
                       .map((e) => (
                         <Badge key={e.id} tone="neutral">
-                          {plainName(graph.nodes.find((n) => n.id === e.source)?.label ?? e.source)}
+                          {labelOf(e.source)}
                         </Badge>
                       ))}
                   </span>

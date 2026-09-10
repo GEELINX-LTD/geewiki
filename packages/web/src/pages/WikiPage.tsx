@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { parseWikiRoute } from '../lib/wikiRoute'
 import { invalidatePages, usePages } from '../lib/pagesStore'
-import { Sidebar, SidebarDrawer } from '../components/Sidebar'
+import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
 import {
   ChevronLeft,
   ChevronRight,
@@ -43,6 +43,7 @@ import {
   type PageFormErrors,
 } from '../lib/pageFormPlan'
 import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
+import { ancestorPaths, buildNavTree, neighborsOf } from '../lib/navTree'
 import { checkQuery } from '../lib/searchPlan'
 import { useActiveHeading } from '../lib/useActiveHeading'
 import { useDocumentTitle } from '../lib/useDocumentTitle'
@@ -510,23 +511,120 @@ function WikiList(props: {
 
 /* ============================ 详情 ============================ */
 
-/** 面包屑：知识库 / 当前页。末项用 `aria-current="page"`。 */
-function Breadcrumb({ title }: { title: string }): ReactNode {
+/**
+ * 面包屑：`知识库 / 指南 / 撰写指南`——**完整层级**，不再是"知识库 / 当前页"两段。
+ *
+ * 为什么需要知道"哪些前缀真的有页面"：层级 slug 里中间层**可能是页面**（`guides` 存在 ⇒ 可打开），
+ * 也**可能只是分组**（只有 `guides/authoring` 时 `guides` 没有页面）。两种情况的处理不同：
+ * - 有页面 ⇒ 渲染成链接指向该页（可中键新开、可复制）；
+ * - 无页面 ⇒ **不可点**（渲染为文本 + `title` 说明它是分组）。
+ *   **刻意不链到列表页**：那会给出一个"看起来能到、实际到别处"的假链接；
+ *   而新增一条"按前缀过滤"的路由需要改 `App.tsx`（本次不得触碰）。可访问性上用 `aria-current`
+ *   之外不加链接语义，读屏不会把它当可导航项。
+ *
+ * 语义用 `<nav aria-label>` + `<ol>`（面包屑的标准形态：有序、层级即顺序）。
+ *
+ * 窄屏策略：只保留"第一段 + 最后一段"，中间层折叠为 `…`（CSS 控制，`sm` 以上全展开）。
+ * 用 CSS 而非 JS 是因为它不依赖测量、不会在 resize 时抖动；完整层级仍在无障碍树里。
+ */
+function Breadcrumb({
+  slug,
+  title,
+  pages,
+}: {
+  slug: string
+  title: string
+  pages: readonly PageSummary[] | null
+}): ReactNode {
+  const bySlug = useMemo(() => new Map((pages ?? []).map((p) => [p.slug, p])), [pages])
+  const paths = useMemo(() => ancestorPaths(slug), [slug])
+
+  /*
+   * 每一段的显示名：**有页面就用页面标题**（人读），否则退回该段自己的路径片段。
+   * 退回片段（而不是整个 slug）是为了"能对上 URL"——分组没有标题可用，显示 `guides` 最诚实。
+   */
+  const crumbs = useMemo(() => {
+    const built = paths.map((path, i) => {
+      const page = bySlug.get(path)
+      const seg = path.split('/').pop() ?? path
+      return { path, label: page?.title ?? seg, hasPage: page !== undefined, isLast: i === paths.length - 1 }
+    })
+    // 新建页（slug 为空）没有层级可拆：只保留"当前页"这一段，否则末段会整个消失
+    if (built.length === 0) return [{ path: '', label: title, hasPage: false, isLast: true }]
+    return built
+  }, [paths, bySlug, title])
+
   return (
-    <nav aria-label="面包屑" className="flex min-w-0 items-center gap-1.5 text-[13px]">
-      {/*
-        只用 `href`，**不叠 onClick**：应用监听 `hashchange` 完成导航，
-        而"有未保存改动时的确认"由 `useUnsavedGuard` 在**捕获阶段**统一拦截。
-        若这里再加一次 `confirmLeave()`，同一次点击就会问两遍——这是推理（两处都会弹），
-        故直接避免重复，而不是让用户去忍第二次。
-      */}
-      <a href="#/wiki/list" className="gw-focus-ring rounded-sm text-accent hover:underline">
-        知识库
-      </a>
-      <ChevronRight className="size-3.5 shrink-0 text-muted" aria-hidden="true" />
-      <span aria-current="page" className="truncate font-medium text-ink">
-        {title}
-      </span>
+    <nav aria-label="面包屑" className="min-w-0 text-[13px]">
+      <ol className="m-0 flex list-none flex-wrap items-center gap-x-1.5 gap-y-1 p-0">
+        <li className="flex min-w-0 items-center gap-1.5">
+          {/*
+            只用 `href`，**不叠 onClick**：应用监听 `hashchange` 完成导航，
+            而"有未保存改动时的确认"由 `useUnsavedGuard` 在**捕获阶段**统一拦截。
+            若这里再加一次 `confirmLeave()`，同一次点击就会问两遍——这是推理（两处都会弹），
+            故直接避免重复，而不是让用户去忍第二次。
+          */}
+          <a href="#/wiki/list" className="gw-focus-ring rounded-sm text-accent hover:underline">
+            知识库
+          </a>
+          <ChevronRight className="size-3.5 shrink-0 text-muted" aria-hidden="true" />
+        </li>
+
+        {crumbs.map((c, i) => (
+          <li
+            key={c.path}
+            className={cn(
+              'min-w-0 items-center gap-1.5',
+              /*
+               * 中间层在窄屏收起（只留首段与末段），靠下面的省略提示告诉用户还有层级。
+               *
+               * ⚠️ 两个坑（都实测踩过）：
+               * 1. **不能**同时写 `flex` 与 `hidden`：两者都是 display 工具类，谁生效取决于
+               *    生成的 CSS 顺序而非 class 属性顺序（实测 `hidden` 被 `flex` 盖掉，窄屏收起失效）。
+               *    正确写法是"基础态 `hidden` + 断点态 `sm:flex`"。
+               * 2. 判据是 **`!c.isLast`**，**不能**写成 `i > 0 && !c.isLast`——
+               *    `crumbs` 里只有"映射出来的"层级，最前面的「知识库」是外层单独的 `<li>`，
+               *    于是 `crumbs[0]` 其实已经是中间层了。用 `i > 0` 会让第一层中间项永远可见。
+               */
+              !c.isLast ? 'hidden sm:flex' : 'flex',
+            )}
+          >
+            {!c.isLast && (
+              <span className="hidden shrink-0 text-muted sm:inline" aria-hidden="true">
+                <ChevronRight className="size-3.5" />
+              </span>
+            )}
+            {c.isLast ? (
+              <span aria-current="page" className="truncate font-medium text-ink" title={title}>
+                {title}
+              </span>
+            ) : c.hasPage ? (
+              <a
+                href={wikiHref(c.path)}
+                className="gw-focus-ring shrink-0 rounded-sm text-accent hover:underline"
+                title={c.path}
+              >
+                {c.label}
+              </a>
+            ) : (
+              // 纯分组：不可导航，但仍要能"看见层级"
+              <span className="shrink-0 text-muted" title={`${c.path}（分组，没有对应页面）`}>
+                {c.label}
+              </span>
+            )}
+          </li>
+        ))}
+
+        {/*
+          窄屏省略提示：中间层的数量 = 非末项的数量（`crumbs.length - 1`）。
+          用 `sm:hidden` 与上面中间层的 `hidden sm:flex` 互补——宽屏看全层级，窄屏看省略提示。
+        */}
+        {crumbs.length > 1 && (
+          <li className="flex items-center text-muted sm:hidden" aria-hidden="true">
+            前面还有 {crumbs.length - 1} 级…
+          </li>
+        )}
+      </ol>
     </nav>
   )
 }
@@ -553,6 +651,32 @@ function WikiDetail(props: {
    */
   const pagesState = usePages()
   const siblings = pagesState.pages
+
+  /*
+   * 上一篇/下一篇：**按层级树的展示顺序**，与侧边栏完全一致。
+   *
+   * 改动前用的是列表页顺序（后端 `ORDER BY p.updated_at DESC, p.id DESC`），即"最近修改优先"。
+   * 那个顺序对"阅读"没有意义（"下一篇"应该是"下一章"，不是"第二近修改的页"），而且与用户
+   * 眼前的侧边栏层次**脱节**——实测症状：侧栏里「撰写指南」的父分组是「指南」、兄弟是「插件开发」，
+   * 但"下一篇"直接跳到另一个组的「运维手册」。
+   *
+   * 现在用 `neighborsOf(buildNavTree(pages), slug)`：深度优先、与侧栏同一套比较器，
+   * 因此"下一篇"必然是侧栏里紧邻的下一项。中间层若没有页面（纯分组）不会被计入——
+   * 它不可打开，不当占一步。
+   *
+   * 降级：页面列表还没取到时（`pages` 为 null）两个邻居都是 undefined ⇒ 不渲染翻页条，
+   * 而不是回退到"最近修改"那套错误顺序。
+   *
+   * ⚠️ 这个 `useMemo` **必须在下面的任何 early return 之前**：本组件有 `if (err && !page)`
+   * 与 `if (!page)` 两个提前返回，把 hook 放到它们之后会让两次渲染的 hook 数量不同，
+   * React 直接抛 #310（"Rendered more hooks than during the previous render"）并白屏。
+   */
+  const neighbors = useMemo(() => {
+    if (siblings === null) return { prev: undefined, next: undefined }
+    return neighborsOf(buildNavTree(siblings), slug)
+  }, [siblings, slug])
+  const prev = neighbors.prev
+  const next = neighbors.next
   // versionContent: id=快照主键（API 定位用）；label=per-page 版本号（展示/恢复提示用）
   const [versionContent, setVersionContent] = useState<{
     id: number
@@ -649,7 +773,7 @@ function WikiDetail(props: {
   if (err && !page) {
     return (
       <div className="flex flex-col gap-3.5">
-        <Breadcrumb title={slug} />
+        <Breadcrumb slug={slug} title={slug} pages={siblings} />
         <EmptyState
           icon={<FileText className="size-8" />}
           title="页面不存在"
@@ -672,17 +796,6 @@ function WikiDetail(props: {
     )
   }
 
-  // 上一篇/下一篇：沿用列表页顺序（后端 `ORDER BY p.updated_at DESC, p.id DESC`）。
-  //
-  // 该排序**是稳定的**：后端加了次级键 `p.id DESC`，且它的注释明确写了"这不是装饰，
-  // 是正确性要求"——因为 `updated_at` 是秒级 ISO 字符串，同一秒内保存的多页若无次级键，
-  // 顺序在不同查询计划下会反转（后端有实测记录）。因此这里可以放心假设顺序唯一。
-  // （本注释上一版写的是"先后由 SQLite 决定、不保证稳定"，那是后端加次级键之前的旧口径。）
-  const list = siblings ?? []
-  const idx = list.findIndex((p) => p.slug === slug)
-  const prev = idx > 0 ? list[idx - 1] : undefined
-  const next = idx >= 0 && idx < list.length - 1 ? list[idx + 1] : undefined
-
   const versionHtml = versionContent
     ? // 与正文同款处理：历史快照也可能以 `# 标题` 开头，直接渲染会出现重复标题
       renderMarkdownBodyForPreview(stripDuplicateLeadingTitle(versionContent.content, page.title))
@@ -690,7 +803,7 @@ function WikiDetail(props: {
 
   return (
     <div className="flex flex-col gap-4">
-      <Breadcrumb title={page.title} />
+      <Breadcrumb slug={slug} title={page.title} pages={siblings} />
 
       {/* 操作条：默认操作（编辑）在最右，破坏性操作（删除）用 danger 变体且与主操作隔开 */}
       <div className="flex flex-wrap items-center gap-2">
@@ -955,6 +1068,12 @@ function WikiEdit(props: {
   const [pendingDraft, setPendingDraft] = useState<DraftRecord | null>(null)
   /** 草稿最近一次落盘时间（0 = 尚未写过），给用户"到底存没存"的确定性 */
   const [draftSavedAt, setDraftSavedAt] = useState(0)
+  /*
+   * 面包屑要展示完整层级，这需要"哪些前缀真的有页面"。编辑页同样从**共享 store** 取，
+   * 不额外发请求（与侧栏、详情页同一份数据）。
+   * ⚠️ 必须在下面的 early return 之前调用（hook 顺序不能随分支改变，否则 React 抛 #310）。
+   */
+  const editPages = usePages().pages
   /** 保存冲突：服务端的 updated_at 与本页加载时不同 */
   const [conflictAt, setConflictAt] = useState<string | null>(null)
   const [origSlug, setOrigSlug] = useState('')
@@ -1144,9 +1263,11 @@ function WikiEdit(props: {
   const titleError = fieldErrors.title
   const previewEmpty = previewSource.trim() === ''
 
+  const editSlug = isNew ? '' : origSlug !== '' ? origSlug : slug
+
   return (
     <div className="flex flex-col gap-4">
-      <Breadcrumb title={isNew ? '新建页面' : origSlug !== '' ? origSlug : slug} />
+      <Breadcrumb slug={editSlug} title={isNew ? '新建页面' : editSlug} pages={editPages} />
 
       {/* 操作条 */}
       <div className="flex flex-wrap items-center gap-2">
