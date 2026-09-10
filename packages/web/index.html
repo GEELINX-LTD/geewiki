@@ -17,6 +17,38 @@
         }
       }
     </script>
+    <!--
+      主题（浅色/深色）的**首帧应用**脚本，必须内联且同步。
+      理由：React 要等 bundle 下载执行完才渲染，那时浏览器已经画过一帧白底了——
+      深色模式用户会看到明显的白闪（FOUC）。内联脚本在 <head> 里同步执行，
+      早于任何绘制，因此不会闪。
+
+      与 src/lib/theme.ts 的约定（test/theme.test.ts 会校验两处一致）：
+      - 存储键名 `geewiki-theme`；
+      - 三态语义：'light' | 'dark' | 其它/缺失 = 跟随系统；
+      - 脚本**最小化**：不引依赖、失败静默（try/catch）——主题脚本报错会阻塞解析，
+        代价远大于收益。
+
+      位置：刻意放在 import map **之后**，以保持"import map 是 head 第一个元素"
+      这一不变量（插件 bundle 依赖它解析 react）。本脚本是 classic script，
+      不影响 import map 与 module script 的相对顺序。
+    -->
+    <script>
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('geewiki-theme')
+          var choice = stored === 'light' || stored === 'dark' ? stored : null
+          var resolved =
+            choice ||
+            (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+          var root = document.documentElement
+          if (choice) root.classList.add(choice)
+          root.style.colorScheme = resolved
+        } catch (e) {
+          /* localStorage 被禁用（隐私模式）等：保持默认，不影响功能 */
+        }
+      })()
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="GeeWiki —— AI-Native 插件化知识库" />

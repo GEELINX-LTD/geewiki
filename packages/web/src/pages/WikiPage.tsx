@@ -1,11 +1,14 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { FileText, MessageSquareText, Plus, RefreshCw, Search } from 'lucide-react'
 import { ApiError, api, type PageDetail, type PageSummary } from '../api'
 import { AskPanel } from '../components/AskPanel'
 import { SearchView } from '../components/SearchView'
+import { SEARCH_INPUT_ID } from '../lib/domIds'
 import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
 import { mdToHtml } from '../lib/sanitize'
 import { checkQuery } from '../lib/searchPlan'
 import { useDocumentTitle } from '../lib/useDocumentTitle'
+import { Button, Card, CardBody, CardHeader, EmptyState, Input, SkeletonTable } from '../ui'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -122,7 +125,18 @@ function WikiList(props: {
         setSearchReady(false)
         setAiReady(false)
       })
-    // 能力探测：未启用 @geewiki/ai 时该端点 404 —— 按契约静默降级，绝不产生 console error
+  }, [])
+
+  /**
+   * 能力探测：**只在问答插件确实激活时才调用** `/api/ai/capabilities`。
+   *
+   * 为什么不无条件探测：未启用 `@geewiki/ai` 时该端点返回 404，虽然代码里已静默
+   * 降级（只 console.debug），但**浏览器自身**会把 404 响应记为 error 级网络日志
+   * （"Failed to load resource: 404"）——用户看到的是控制台一片红。既然后端
+   * `/api/plugins` 已经给出了权威的"是否激活"，就没有必要再去撞一次 404。
+   */
+  useEffect(() => {
+    if (aiReady !== true) return
     api
       .aiCapabilities()
       .then((c) => setModelReady(c.available))
@@ -130,7 +144,7 @@ function WikiList(props: {
         console.debug('[geewiki-wiki] 问答能力探测跳过：', e instanceof Error ? e.message : e)
         setModelReady(null)
       })
-  }, [])
+  }, [aiReady])
 
   const submitSearch = (): void => {
     // 与检索视图共用同一套校验（空串 / 超长），这样超长查询在**原地**就给出提示、不必先跳转
@@ -144,40 +158,57 @@ function WikiList(props: {
   }
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <h1>知识库</h1>
-        <div className="page-actions">
-          {err && <span className="notice err">{err}</span>}
-          <button className="btn" onClick={load}>↻ 刷新</button>
-          <button className="btn primary" onClick={onNew}>＋ 新建页面</button>
+    <div className="flex flex-col gap-3.5">
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="m-0 text-xl font-semibold">知识库</h1>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {err !== '' && (
+            <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink">
+              {err}
+            </span>
+          )}
+          <Button icon={<RefreshCw className="size-3.5" />} onClick={load}>
+            刷新
+          </Button>
+          <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={onNew}>
+            新建页面
+          </Button>
         </div>
       </div>
 
-      {/* 检索与问答入口（宿主原生 UI；插件未启用时隐藏对应入口） */}
-      <div className="wiki-tools">
+      {/* 检索与问答入口（宿主原生 UI；插件未启用时隐藏/禁用对应入口） */}
+      <div className="flex flex-wrap items-center gap-2.5">
         <form
-          className="search-form"
+          className="flex min-w-[260px] flex-1 items-center gap-2"
           onSubmit={(e) => {
             e.preventDefault()
             submitSearch()
           }}
         >
-          <input
-            className="search-input"
+          <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
+            检索知识库
+          </label>
+          <Input
+            id={SEARCH_INPUT_ID}
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder={searchReady === false ? '检索插件未启用' : '检索知识库内容…'}
-            aria-label="检索知识库"
+            placeholder={searchReady === false ? '检索插件未启用' : '检索知识库内容…（⌘K 或 / 聚焦此处）'}
             disabled={searchReady === false}
+            className="flex-1"
           />
-          <button className="btn primary" type="submit" disabled={searchReady === false}>
+          <Button
+            variant="primary"
+            type="submit"
+            icon={<Search className="size-3.5" />}
+            disabled={searchReady === false}
+          >
             搜索
-          </button>
+          </Button>
         </form>
+
         {aiReady === true && (
-          <button
-            className="btn"
+          <Button
+            icon={<MessageSquareText className="size-3.5" />}
             onClick={() => onAsk('')}
             title={
               modelReady === false
@@ -185,50 +216,122 @@ function WikiList(props: {
                 : '基于知识库检索的问答'
             }
           >
-            💬 AI 问答
-            {modelReady === false && <span className="muted small">（无模型）</span>}
-          </button>
+            AI 问答
+            {modelReady === false && <span className="text-xs text-muted">（无模型）</span>}
+          </Button>
         )}
         {aiReady === false && (
-          <span className="muted small" title="问答插件 @geewiki/ai 未激活（端点 /api/ai/ask 会 404）">
+          <span
+            className="text-xs text-muted"
+            title="问答插件 @geewiki/ai 未激活（端点 /api/ai/ask 会 404）"
+          >
             问答插件未启用
           </span>
         )}
-        {queryNotice && <span className="notice err">{queryNotice}</span>}
+        {queryNotice !== '' && (
+          <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink">
+            {queryNotice}
+          </span>
+        )}
       </div>
 
-      <section className="card">
-        <table className="table">
-          <thead>
-            <tr>
-              <th>标题</th>
-              <th>页面标识</th>
-              <th>版本</th>
-              <th>最近更新</th>
-            </tr>
-          </thead>
-          <tbody>
-            {pages === null && (
-              <tr>
-                <td colSpan={4} className="empty">加载中…</td>
-              </tr>
-            )}
-            {pages?.length === 0 && (
-              <tr>
-                <td colSpan={4} className="empty">还没有页面 —— 点击右上角「新建页面」开始记录</td>
-              </tr>
-            )}
-            {pages?.map((p) => (
-              <tr key={p.slug} className="clickable" onClick={() => onOpen(p.slug)}>
-                <td className="title-cell">{p.title}</td>
-                <td><code className="chip">{p.slug}</code></td>
-                <td>v{p.version}</td>
-                <td className="muted">{fmtTime(p.updated_at)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
+      <Card>
+        <CardHeader
+          title="全部页面"
+          description={
+            pages === null
+              ? '正在加载…'
+              : pages.length === 0
+                ? '还没有内容'
+                : `共 ${pages.length} 个页面`
+          }
+          actions={
+            <span className="text-xs text-muted">
+              按标题打开页面；也可用上方检索
+            </span>
+          }
+        />
+        {/*
+          可滚动区域的键盘可达性：`tabIndex={0}` 让键盘用户能把焦点落到表格上，
+          随后用方向键滚动（否则横向溢出时键盘用户看不到右侧列）。
+          这是 WCAG 2.1.1（键盘）在"可滚动区域"上的具体要求，VitePress 等实现亦如此。
+          `aria-label` 给这个可聚焦区域一个名字（否则屏幕阅读器只念"表格"）。
+        */}
+        {pages === null ? (
+          <SkeletonTable rows={4} cols={4} />
+        ) : pages.length === 0 ? (
+          <EmptyState
+            icon={<FileText className="size-8" />}
+            title="还没有任何页面"
+            hint="知识库是空的。创建第一个页面来记录团队知识——保存后会自动生成版本历史，随时可以回溯。"
+            action={
+              <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={onNew}>
+                新建页面
+              </Button>
+            }
+          />
+        ) : (
+          <div className="overflow-x-auto">
+            <table
+              tabIndex={0}
+              aria-label="知识库页面列表"
+              className="w-full border-collapse text-sm"
+            >
+              <thead>
+                <tr>
+                  {['标题', '页面标识', '版本', '最近更新'].map((h) => (
+                    <th
+                      key={h}
+                      scope="col"
+                      className="border-b border-line px-3 py-2 text-left text-xs font-semibold whitespace-nowrap text-muted"
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {pages.map((p) => (
+                  /*
+                    行的可访问性语义选择：**标题单元格内放真正的 <a>**，而不是
+                    给 <tr> 加 tabIndex + role="link"。
+                    理由：<tr> 一旦改成 role="link" 就破坏了表格语义（屏幕阅读器不再
+                    播报行列关系），而表格的语义价值正是"这是列表、有几列"。
+                    放链接则两全：链接是原生可聚焦元素（Tab 可达、可中键新开、
+                    可被读作"链接"），表格结构完好。整行点击仅作为**鼠标便利**保留，
+                    且不承担键盘可达性职责。
+                  */
+                  <tr
+                    key={p.slug}
+                    className="cursor-pointer transition-colors duration-150 hover:bg-hover"
+                    onClick={() => onOpen(p.slug)}
+                  >
+                    <td className="border-b border-line px-3 py-2.5 align-top font-semibold">
+                      <a
+                        href={`#/wiki/${encodeURIComponent(p.slug)}`}
+                        className="gw-focus-ring rounded-sm py-1 text-accent hover:underline"
+                      >
+                        {p.title}
+                      </a>
+                    </td>
+                    <td className="border-b border-line px-3 py-2.5 align-top">
+                      <code className="rounded-sm bg-hover px-1.5 py-0.5 font-mono text-[11px] text-ink-soft">
+                        {p.slug}
+                      </code>
+                    </td>
+                    <td className="border-b border-line px-3 py-2.5 align-top text-muted">
+                      v{p.version}
+                    </td>
+                    <td className="border-b border-line px-3 py-2.5 align-top text-muted">
+                      {fmtTime(p.updated_at)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
     </div>
   )
 }

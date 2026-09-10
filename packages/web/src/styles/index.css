@@ -1,0 +1,35 @@
+/*
+ * GeeWiki 样式入口
+ * ============================================================================
+ *
+ * 层叠顺序（本文件最关键的一行，决定了新旧样式如何共存）：
+ *
+ *   theme < base < components < legacy < utilities
+ *
+ * 为什么必须**显式声明层序**：CSS 的层叠层按「首次出现」排序，而 Tailwind 的
+ * `@import "tailwindcss"` 会先声明 `theme, base, components, utilities` 四层。
+ * 若把旧样式放进一个**之后**才出现的 `legacy` 层，legacy 会排在 utilities **之后**
+ * ⇒ 旧类会盖住 Tailwind 工具类（迁移期最难查的一类 bug：写了 `px-4` 却不生效）。
+ * 因此在所有 @import 之前用 @layer 语句把 legacy 钉在 utilities 之前。
+ * （CSS 规范允许 `@layer` 语句出现在 `@import` 之前。）
+ *
+ * 由此得到的共存保证：
+ *  1. **工具类 > 旧类**：外壳与列表页可以放心用 Tailwind 覆盖同名/同属性旧类；
+ *  2. **旧类 > preflight（base）**：四个未迁移页面沿用既有类时，Tailwind 的
+ *     preflight 重置**不会**把它们改坏——凡是旧类显式声明过的属性，旧类都赢；
+ *  3. **旧类 > theme**：不可能冲突（theme 层只放变量声明）。
+ *
+ * 文件分工：
+ *   - `tokens.css`       —— 设计 token（`@theme` + 深浅两套语义色）
+ *   - `styles.css`       —— 旧样式，整体收进 `@layer legacy`（未迁移页面仍依赖它）
+ *   - `legacy-bridge.css` —— 无层的旧变量→新 token 桥接，让旧页面白得深色模式
+ */
+
+@layer theme, base, components, legacy, utilities;
+
+@import 'tailwindcss';
+@import './tokens.css';
+/* 旧样式在 src/styles.css（上一层），整体收进 legacy 层 */
+@import '../styles.css' layer(legacy);
+@import './legacy-bridge.css';
+@import './focus.css';

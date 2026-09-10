@@ -1,0 +1,41 @@
+/*
+ * 旧变量 → 新 token 的桥接（**无层规则**，优先级高于任何 @layer）
+ * ============================================================================
+ *
+ * 目的：让**未迁移的四个页面**（详情 / 编辑 / 管理台 / 依赖图）在完全不改自己
+ * CSS 的前提下获得深色模式。
+ *
+ * 原理：这些页面用的是旧变量名（`--bg` / `--panel` / `--ink` / …）。只要把它们
+ * 重新指向新的语义 token，而新 token 已随 `.dark` 切换，旧页面就跟着变。
+ *
+ * 为什么放在**无层**（不写进任何 @layer）：
+ *   `styles.css` 已被收进 `@layer legacy`，而它在自己的 `:root` 里也声明过同名变量
+ *   （那是我们这次要去掉的字面量）。无层规则的优先级高于所有层，因此这里的指向
+ *   一定赢——不需要 `!important`，也不依赖声明顺序。
+ *
+ * 注意 `--text`：它在旧 `styles.css` 的 `.schema-label` 里被引用，**但从未定义过**
+ * （既有 bug：那条规则一直静默失效、回退到继承色）。这里补上定义，顺带修掉它。
+ */
+
+:root {
+  /* 主色板 */
+  --bg: var(--gw-bg);
+  --panel: var(--gw-surface);
+  --ink: var(--gw-ink);
+  --muted: var(--gw-ink-muted);
+  --line: var(--gw-line);
+
+  /* 品牌与状态 */
+  --accent: var(--gw-accent);
+  --accent-ink: var(--gw-accent-ink);
+  --ok: var(--gw-ok);
+  --warn: var(--gw-warn);
+  --err: var(--gw-danger);
+
+  /* 形状 */
+  --radius: var(--radius-lg);
+  --shadow: var(--shadow-sm);
+
+  /* 补齐既有 bug：被引用却从未定义的变量 */
+  --text: var(--gw-ink-soft);
+}

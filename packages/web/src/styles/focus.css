@@ -1,0 +1,43 @@
+/*
+ * 焦点环（focus ring）—— **唯一实现**，全站组件经 `ui/a11y.ts` 的 `focusRing` 常量引用。
+ *
+ * 为什么用原生 CSS 而不是 Tailwind 的 outline 工具类（实测踩到的坑）：
+ *   Tailwind v4 的 `outline-none` 会设置 `--tw-outline-style: none`，而 `outline-2`
+ *   把 `outline-style` 解析为 `var(--tw-outline-style)`。两者叠在同一个元素上时，
+ *   即便 `focus-visible:outline-2` 生效，**computed outline-style 仍是 `none`** ——
+ *   结果是"看起来写了焦点环、实际完全不可见"（实测：`outline: none 2px rgb(37,99,235)`，
+ *   宽度和颜色都对，只有 style 是 none）。
+ *   这里改用显式 `outline: 2px solid …`，不依赖任何变量间接层，行为确定。
+ *
+ * 无障碍依据：
+ * - **WCAG 2.2 · 1.4.11 非文本对比度 ≥3:1**：`--gw-focus-ring`（浅色 blue-600、
+ *   深色 blue-300）对各自主题的表面底色均 >5:1（见验收脚本的实测对比度）。
+ * - **2.4.11 焦点不被遮挡**：顶栏是 sticky，故给聚焦元素留出滚动外边距
+ *   （`scroll-margin-top` = 顶栏高度 + 余量）。
+ * - 只在 `:focus-visible` 时出现：鼠标点击不显示（减少噪声），键盘 Tab 必显示。
+ *   浏览器对 `:focus-visible` 的原生行为已经保证这一点，因此**不需要**再写
+ *   `outline: none` 去压制默认环——直接用同属性覆盖即可。
+ *
+ * 放在 `components` 层：晚于 base/legacy，但早于 utilities，
+ * 因此具体组件仍可用工具类按需覆盖（例如深色顶栏上换更亮的环）。
+ */
+
+@layer components {
+  .gw-focus-ring:focus-visible {
+    outline: 2px solid var(--gw-focus-ring);
+    outline-offset: 2px;
+    /* 已被遮挡风险的锚点/聚焦元素：滚动时留出 sticky 顶栏的高度 */
+    scroll-margin-top: calc(var(--spacing-header) + 8px);
+  }
+
+  /*
+   * Windows 高对比度模式：系统会用自身颜色覆盖 outline，
+   * 但如果 outline-style 被设为 none 就什么也看不到。上面的 solid 已足够；
+   * 这里额外保证 transparent 不会被误用。
+   */
+  @media (forced-colors: active) {
+    .gw-focus-ring:focus-visible {
+      outline: 2px solid Highlight;
+    }
+  }
+}

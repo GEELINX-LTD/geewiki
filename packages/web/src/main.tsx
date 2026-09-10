@@ -4,7 +4,9 @@ import './lib/hostSdk'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import '@xyflow/react/dist/style.css'
-import './styles.css'
+// 样式入口：tokens（@theme 设计 token）→ 旧样式（整体收进 legacy 层）→ 旧变量桥接。
+// 层序与新旧共存策略见该文件头部注释。
+import './styles/index.css'
 import { App } from './App'
 import { startPluginUiSync } from './lib/pluginUi'
 

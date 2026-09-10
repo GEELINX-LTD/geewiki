@@ -1,0 +1,332 @@
+/*
+ * GeeWiki 设计 token 层（Tailwind CSS v4 的 CSS-first 配置）
+ * ============================================================================
+ *
+ * 为什么用 `@theme` 而不是 tailwind.config.js：
+ *   Tailwind v4 起，配置在 CSS 里声明（`@import "tailwindcss"` + `@theme`），不需要
+ *   tailwind.config.js，也不需要 postcss 配置——`@tailwindcss/vite` 插件直接接管。
+ *   来源：https://tailwindcss.com/docs/theme
+ *
+ * token 命名分两类，**这是本层最重要的约定**：
+ *
+ *  1. 语义色（`--color-surface` / `--color-ink` / …）：在 `@theme` 里注册，
+ *     因而自动获得 Tailwind 工具类（`bg-surface` / `text-ink` / `border-line` …），
+ *     并且**自动跟随深色模式**——做法是让它们指向真正随主题切换的变量。
+ *
+ *     ⚠️ 关键实现细节：`@theme` 的变量是**静态声明**，而深色模式需要它**动态变化**。
+ *     因此这里用「`@theme` 里声明 → 值指向 `--gw-*` 原始变量 → `--gw-*` 在
+ *     `:root` / `.dark` 下分别赋值」的两段式。直接在 `@theme` 里写死颜色会导致
+ *     深色模式失效（Tailwind 会把 `bg-surface` 编译成静态的 `var(--color-surface)`，
+ *     而 `--color-surface` 的值必须能被 `.dark` 覆盖，故它只能间接指向 `--gw-*`）。
+ *
+ *  2. 原始 palette / 尺度（`--gw-*`）：不注册进 `@theme`（避免生成无人使用的工具类，
+ *     也避免污染 Tailwind 的命名空间），仅供上面第一类与少量手写 CSS 引用。
+ *
+ * 尺度（spacing/radius/shadow/duration/z-index）同样走「两段式」没有意义——它们不随
+ * 主题变化，因此**直接**注册进 `@theme`，获得 `p-*` / `rounded-*` / `shadow-*` /
+ * `duration-*` / `z-*` 等工具类。
+ */
+
+/* ---------------------------------------------------------------------------
+ * 1. 原始尺度与调色板（不生成工具类，供语义层与手写 CSS 引用）
+ * ------------------------------------------------------------------------- */
+
+:root {
+  /* 中性色阶（cool gray，蓝调，与品牌蓝同源；阶距近似 WCAG 可用的对比度步进） */
+  --gw-gray-0: #ffffff;
+  --gw-gray-25: #fbfcfe;
+  --gw-gray-50: #f5f7fa;
+  --gw-gray-100: #eef2f7;
+  --gw-gray-150: #e8edf4;
+  --gw-gray-200: #e3e9ef;
+  --gw-gray-300: #cbd5e1;
+  --gw-gray-400: #94a3b8;
+  --gw-gray-500: #6b7a8c;
+  --gw-gray-600: #55637a;
+  --gw-gray-700: #45566a;
+  --gw-gray-800: #29323d;
+  --gw-gray-850: #1c2733;
+  --gw-gray-900: #131c27;
+  --gw-gray-950: #0b131d;
+
+  /* 品牌蓝（与既有 --accent #2563eb 同一色相，补出按下/浅底/深色态的阶） */
+  --gw-blue-50: #eff6ff;
+  --gw-blue-100: #dbeafe;
+  --gw-blue-200: #bfdbfe;
+  --gw-blue-300: #93c5fd;
+  --gw-blue-500: #3b82f6;
+  --gw-blue-600: #2563eb;
+  --gw-blue-700: #1d4fd7;
+  --gw-blue-800: #1e40af;
+
+  /* 语义状态色（成功 / 警告 / 危险）：浅色底 + 深色字 + 边框，三件套成对出现 */
+  --gw-green-50: #ecfdf3;
+  --gw-green-200: #bbf7d0;
+  --gw-green-600: #16a34a;
+  --gw-green-700: #15803d;
+  --gw-green-800: #166534;
+
+  --gw-amber-50: #fffbeb;
+  --gw-amber-200: #fde68a;
+  --gw-amber-600: #d97706;
+  --gw-amber-700: #b45309;
+  --gw-amber-900: #78350f;
+
+  --gw-red-50: #fef2f2;
+  --gw-red-200: #fecaca;
+  --gw-red-600: #dc2626;
+  --gw-red-700: #b91c1c;
+  --gw-red-900: #7f1d1d;
+
+  /* 深色模式专用的「状态底色」：浅色模式的 50 号色在深色下会刺眼，故单独给出暗底 */
+  --gw-dk-green-bg: #0d2a1c;
+  --gw-dk-green-line: #1d5136;
+  --gw-dk-green-ink: #6ee7a8;
+  --gw-dk-amber-bg: #2a1f08;
+  --gw-dk-amber-line: #5c4413;
+  --gw-dk-amber-ink: #fbbf24;
+  --gw-dk-red-bg: #2c1214;
+  --gw-dk-red-line: #5f2126;
+  --gw-dk-red-ink: #fca5a5;
+  --gw-dk-blue-bg: #10203a;
+  --gw-dk-blue-line: #1e3a68;
+  --gw-dk-blue-ink: #93c5fd;
+
+  /* 顶栏：两种主题下都保持深色（产品外壳的既有观感），因此不随主题切换 */
+  --gw-header-bg: #0f1a28;
+  --gw-header-ink: #e8eef6;
+  --gw-header-ink-dim: #c3d0df;
+  --gw-header-ink-mute: #8fa3ba;
+  --gw-header-hover: rgb(255 255 255 / 8%);
+  --gw-header-active: rgb(255 255 255 / 14%);
+
+  /* 字体栈：中文优先落到系统黑体，等宽用于标识符与代码 */
+  --gw-font-sans: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  --gw-font-mono: ui-monospace, 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
+}
+
+/* ---------------------------------------------------------------------------
+ * 2. 语义色 —— 浅色模式（默认）
+ * ------------------------------------------------------------------------- */
+
+:root {
+  color-scheme: light;
+
+  --gw-bg: var(--gw-gray-50);
+  --gw-surface: var(--gw-gray-0);
+  --gw-surface-sunken: var(--gw-gray-25);
+  --gw-surface-hover: var(--gw-gray-100);
+  --gw-ink: var(--gw-gray-850);
+  --gw-ink-soft: var(--gw-gray-700);
+  --gw-ink-muted: var(--gw-gray-500);
+  --gw-line: var(--gw-gray-200);
+  --gw-line-strong: var(--gw-gray-300);
+
+  --gw-accent: var(--gw-blue-600);
+  --gw-accent-hover: var(--gw-blue-700);
+  --gw-accent-ink: var(--gw-gray-0);
+  --gw-accent-soft: var(--gw-blue-50);
+  --gw-accent-soft-line: var(--gw-blue-200);
+  --gw-accent-soft-ink: var(--gw-blue-800);
+
+  --gw-ok: var(--gw-green-600);
+  --gw-ok-bg: var(--gw-green-50);
+  --gw-ok-line: var(--gw-green-200);
+  --gw-ok-ink: var(--gw-green-700);
+
+  --gw-warn: var(--gw-amber-600);
+  --gw-warn-bg: var(--gw-amber-50);
+  --gw-warn-line: var(--gw-amber-200);
+  --gw-warn-ink: var(--gw-amber-700);
+
+  --gw-danger: var(--gw-red-600);
+  --gw-danger-bg: var(--gw-red-50);
+  --gw-danger-line: var(--gw-red-200);
+  --gw-danger-ink: var(--gw-red-700);
+
+  --gw-focus-ring: var(--gw-blue-600);
+  --gw-overlay: rgb(15 26 40 / 45%);
+}
+
+/* ---------------------------------------------------------------------------
+ * 3. 语义色 —— 深色模式
+ *    手动切换走 `.dark` 类（由 index.html 的内联脚本在首帧前写入 <html>），
+ *    系统偏好走 `prefers-color-scheme: dark`（未手动指定时才生效）。
+ * ------------------------------------------------------------------------- */
+
+.dark {
+  color-scheme: dark;
+}
+
+.dark,
+:root:not(.light):not(.dark) {
+  /* 占位：真正赋值在下面两条规则里，这里只是让选择器分组更清晰 */
+}
+
+/* 3a. 显式深色（用户在界面上选了深色） */
+.dark {
+  --gw-bg: var(--gw-gray-950);
+  --gw-surface: var(--gw-gray-900);
+  --gw-surface-sunken: var(--gw-gray-850);
+  --gw-surface-hover: var(--gw-gray-800);
+  --gw-ink: #e8eef6;
+  --gw-ink-soft: #c3d0df;
+  --gw-ink-muted: var(--gw-gray-400);
+  --gw-line: #263243;
+  --gw-line-strong: #35455c;
+
+  --gw-accent: var(--gw-blue-500);
+  --gw-accent-hover: var(--gw-blue-300);
+  --gw-accent-ink: #0b131d;
+  --gw-accent-soft: var(--gw-dk-blue-bg);
+  --gw-accent-soft-line: var(--gw-dk-blue-line);
+  --gw-accent-soft-ink: var(--gw-dk-blue-ink);
+
+  --gw-ok: #34d399;
+  --gw-ok-bg: var(--gw-dk-green-bg);
+  --gw-ok-line: var(--gw-dk-green-line);
+  --gw-ok-ink: var(--gw-dk-green-ink);
+
+  --gw-warn: #fbbf24;
+  --gw-warn-bg: var(--gw-dk-amber-bg);
+  --gw-warn-line: var(--gw-dk-amber-line);
+  --gw-warn-ink: var(--gw-dk-amber-ink);
+
+  --gw-danger: #f87171;
+  --gw-danger-bg: var(--gw-dk-red-bg);
+  --gw-danger-line: var(--gw-dk-red-line);
+  --gw-danger-ink: var(--gw-dk-red-ink);
+
+  --gw-focus-ring: var(--gw-blue-300);
+  --gw-overlay: rgb(0 0 0 / 62%);
+}
+
+/* 3b. 未手动选择时跟随系统偏好 */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light):not(.dark) {
+    --gw-bg: var(--gw-gray-950);
+    --gw-surface: var(--gw-gray-900);
+    --gw-surface-sunken: var(--gw-gray-850);
+    --gw-surface-hover: var(--gw-gray-800);
+    --gw-ink: #e8eef6;
+    --gw-ink-soft: #c3d0df;
+    --gw-ink-muted: var(--gw-gray-400);
+    --gw-line: #263243;
+    --gw-line-strong: #35455c;
+
+    --gw-accent: var(--gw-blue-500);
+    --gw-accent-hover: var(--gw-blue-300);
+    --gw-accent-ink: #0b131d;
+    --gw-accent-soft: var(--gw-dk-blue-bg);
+    --gw-accent-soft-line: var(--gw-dk-blue-line);
+    --gw-accent-soft-ink: var(--gw-dk-blue-ink);
+
+    --gw-ok: #34d399;
+    --gw-ok-bg: var(--gw-dk-green-bg);
+    --gw-ok-line: var(--gw-dk-green-line);
+    --gw-ok-ink: var(--gw-dk-green-ink);
+
+    --gw-warn: #fbbf24;
+    --gw-warn-bg: var(--gw-dk-amber-bg);
+    --gw-warn-line: var(--gw-dk-amber-line);
+    --gw-warn-ink: var(--gw-dk-amber-ink);
+
+    --gw-danger: #f87171;
+    --gw-danger-bg: var(--gw-dk-red-bg);
+    --gw-danger-line: var(--gw-dk-red-line);
+    --gw-danger-ink: var(--gw-dk-red-ink);
+
+    --gw-focus-ring: var(--gw-blue-300);
+    --gw-overlay: rgb(0 0 0 / 62%);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. 注册进 Tailwind：语义色 + 尺度
+ *    语义色「间接」指向 --gw-*，这样 .dark 覆盖 --gw-* 时工具类自动跟随。
+ * ------------------------------------------------------------------------- */
+
+@theme inline {
+  /* 语义色 → bg-* / text-* / border-* / ring-* / fill-* … */
+  --color-bg: var(--gw-bg);
+  --color-surface: var(--gw-surface);
+  --color-sunken: var(--gw-surface-sunken);
+  --color-hover: var(--gw-surface-hover);
+  --color-ink: var(--gw-ink);
+  --color-ink-soft: var(--gw-ink-soft);
+  --color-muted: var(--gw-ink-muted);
+  --color-line: var(--gw-line);
+  --color-line-strong: var(--gw-line-strong);
+
+  --color-accent: var(--gw-accent);
+  --color-accent-hover: var(--gw-accent-hover);
+  --color-accent-ink: var(--gw-accent-ink);
+  --color-accent-soft: var(--gw-accent-soft);
+  --color-accent-soft-line: var(--gw-accent-soft-line);
+  --color-accent-soft-ink: var(--gw-accent-soft-ink);
+
+  --color-ok: var(--gw-ok);
+  --color-ok-bg: var(--gw-ok-bg);
+  --color-ok-line: var(--gw-ok-line);
+  --color-ok-ink: var(--gw-ok-ink);
+
+  --color-warn: var(--gw-warn);
+  --color-warn-bg: var(--gw-warn-bg);
+  --color-warn-line: var(--gw-warn-line);
+  --color-warn-ink: var(--gw-warn-ink);
+
+  --color-danger: var(--gw-danger);
+  --color-danger-bg: var(--gw-danger-bg);
+  --color-danger-line: var(--gw-danger-line);
+  --color-danger-ink: var(--gw-danger-ink);
+
+  --color-header: var(--gw-header-bg);
+  --color-header-ink: var(--gw-header-ink);
+  --color-header-dim: var(--gw-header-ink-dim);
+  --color-header-mute: var(--gw-header-ink-mute);
+
+  --color-focus-ring: var(--gw-focus-ring);
+  --color-overlay: var(--gw-overlay);
+
+  /* 字体 */
+  --font-sans: var(--gw-font-sans);
+  --font-mono: var(--gw-font-mono);
+
+  /* 圆角阶 */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-full: 999px;
+
+  /* 阴影阶 */
+  --shadow-xs: 0 1px 2px rgb(16 24 40 / 6%);
+  --shadow-sm: 0 1px 3px rgb(16 24 40 / 8%);
+  --shadow-md: 0 2px 6px rgb(16 24 40 / 10%);
+  --shadow-lg: 0 8px 24px rgb(16 24 40 / 14%);
+  --shadow-xl: 0 16px 48px rgb(16 24 40 / 22%);
+
+  /* 动效 */
+  --ease-standard: cubic-bezier(0.2, 0, 0.13, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* z-index 阶（集中管理，避免各处随手写 20/30/40 造成层叠打架） */
+  --z-base: 0;
+  --z-sticky: 20;
+  --z-dropdown: 40;
+  --z-overlay: 50;
+  --z-modal: 60;
+  --z-toast: 70;
+}
+
+/*
+ * 间距刻度：显式定义（Tailwind 默认已有 0.25rem 基准的刻度，这里只补产品需要的
+ * 具名档位，避免与默认刻度重名冲突）。
+ * 行高/字号走 Tailwind 默认的 text-* 刻度（已足够密），故不再重复声明。
+ */
+@theme {
+  --spacing-gutter: 22px; /* 外壳左右内边距，与既有 styles.css 的 22px 对齐 */
+  --spacing-header: 56px; /* 顶栏高度，跳过链接与 sticky 定位都要用它 */
+  --spacing-measure: 68ch; /* 正文行宽：66~72ch 的中值（可读性硬指标） */
+}

@@ -1,5 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+// Tailwind CSS v4 的官方 Vite 插件：v4 是 CSS-first 配置（`@import "tailwindcss"` + `@theme`），
+// 不需要 tailwind.config.js，也不需要单独的 postcss 配置。见 src/styles/index.css。
+import tailwindcss from '@tailwindcss/vite'
 
 // 端口与代理目标可用环境变量覆盖，默认值就是 `pnpm dev` 的常用组合（5173 → 3000）。
 // 覆盖能力是给**验收脚本**用的：验收纪律要求跑在隔离端口上、不得占用开发用的 3000/5173
@@ -8,7 +11,7 @@ const apiTarget = process.env['GEEWIKI_DEV_API'] ?? 'http://127.0.0.1:3000'
 const devPort = Number(process.env['GEEWIKI_DEV_PORT'] ?? 5173)
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   // 开发模式：前端 dev server 把 /api 与 /plugins-ui 代理到 GeeWiki 后端
   server: {
     // 显式监听通配地址（Linux 上 '::' 为双栈），为保证 localhost 在 IPv4/IPv6 解析下都可访问：

@@ -389,4 +389,22 @@ export const api = {
   aiCapabilities: () => request<AiCapabilitiesResponse>('GET', '/api/ai/capabilities'),
   /** 流式问答（见 `aiAskStream` 的文档：取消与三类错误面） */
   aiAskStream: (q: string, opts: AiStreamOptions) => aiAskStream(q, opts),
+
+  /* 服务健康：「系统状态」面板用产品化方式呈现，不再把裸 JSON 端点做成头部链接 */
+  health: () => request<HealthResponse>('GET', '/api/health'),
+}
+
+/**
+ * `GET /api/health` 的响应形状（`packages/server/src/index.ts` 的 healthHandler）。
+ * `db.tables` / `db.migrations` 仅在数据库就绪时存在。
+ */
+export interface HealthResponse {
+  ok: true
+  uptime: number
+  timestamp: string
+  db: {
+    present: boolean
+    tables?: string[]
+    migrations?: string[]
+  }
 }
