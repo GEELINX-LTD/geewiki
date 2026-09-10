@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "GeeWiki 外部插件示例：零依赖，演示 plugins/ 目录发现 + 会话层热插拔",
+  "description": "GeeWiki 外部插件示例：零依赖，演示 plugins/ 目录发现 + 会话层热插拔 + 自带前端 UI 产物",
   "geewiki": {
     "provides": "hello-service",
     "requires": ["http-service"],
@@ -12,6 +12,10 @@
       "requiresCachePurge": false,
       "drainTimeout": 5
     },
-    "entry": "index.ts"
+    "entry": "index.ts",
+    "client": {
+      "entry": "client.js",
+      "css": "client.css"
+    }
   }
 }

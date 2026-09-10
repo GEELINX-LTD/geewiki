@@ -1,10 +1,14 @@
 # 插槽机制夹具（fixture）
 
-这是一份**过渡夹具**：在「插件自带客户端构建链」落地之前，用来端到端验证宿主侧插槽基础设施
+这是一份**演示/验收夹具**：用来端到端验证宿主侧插槽基础设施
 （`packages/web/src/lib/slots.tsx`、`hostSdk.ts`、`pluginUi.ts` + `packages/web/public/host-sdk/*.js`）。
 
-它**不是**产品代码，也**不是** `plugins/` 下真实插件的客户端入口；真实入口应由后端下发
-（见 `packages/web/src/lib/pluginUi.ts` 顶部 TODO 与 `docs/plugin-platform-plan.md` D-8）。
+它**不是**产品代码。它同时演示两条产物路径：
+
+| 构建 | 输出位置 | 演示的链路 |
+| --- | --- | --- |
+| 第一次（`FIXTURE_OUT=@geewiki/wiki`，默认） | `packages/web/public/plugins-ui/@geewiki/wiki/` | **宿主侧约定根**：dev 由后端以 `public` 为 webDist 提供、prod 由 `vite build` 拷进 `dist/` |
+| 第二次（`FIXTURE_OUT=@geewiki-plugin/hello` + `FIXTURE_OUT_DIR=../../../plugins/hello-geewiki/dist`） | `plugins/hello-geewiki/dist/` | **插件自带产物根**：外部插件把自己的 UI 产物放在插件目录里（Docker 下 `plugins/` 是 bind mount，这是"安装即生效、无需重建 web 包"的路径） |
 
 ## 构建
 
@@ -12,36 +16,39 @@
 pnpm --filter @geewiki/web build:fixtures
 ```
 
-产物（两份，同一份源码分别按两个插件名构建）：
+脚本会先清空 `packages/web/public/plugins-ui/`（避免上一版留下的陈旧产物让入口表与实际文件不一致），
+再做上面两次构建。
 
-- `packages/web/public/plugins-ui/@geewiki/wiki/client.{js,css}`
-- `packages/web/public/plugins-ui/@geewiki-plugin/hello/client.{js,css}`
+产物是**生成物，且不随仓库提交**：
 
-这两份产物是**生成物，且不随仓库提交**：`.gitignore` 的 `packages/web/public/plugins-ui/` 一行排除了整个目录（`git check-ignore -v packages/web/public/plugins-ui/x.js` → `.gitignore:15`；`git ls-files packages/web/public/` 只列出 `host-sdk/react.js` 与 `host-sdk/jsx-runtime.js`，无任何 `plugins-ui/` 文件）。因此全新克隆后需先执行上面的 `build:fixtures`，管理台上才会有示例插件 UI；缺失时宿主不会报错，只是没有插件 UI 可加载。修改夹具源码后重新执行 `build:fixtures` 即可覆盖。
+- `packages/web/public/plugins-ui/` —— 由 `.gitignore` 的 `packages/web/public/plugins-ui/` 一行排除
+  （`git ls-files packages/web/public/` 只列出 `host-sdk/react.js` 与 `host-sdk/jsx-runtime.js`）；
+- `plugins/hello-geewiki/dist/` —— 由 `.gitignore` 的 `dist/` 一行排除。
 
-`vite build` 会把 `public/` 原样拷进 `dist/`，所以 prod 模式（后端 3000 端口托管 dist）同样生效。
+因此全新克隆后需先执行上面的 `build:fixtures`，管理台上才会有示例插件 UI；缺失时宿主不会报错，
+只是没有插件 UI 可加载。修改夹具源码后重新执行 `build:fixtures` 即可覆盖。
 
-## 为什么目录名取这两个插件
+## 入口表（后端下发）
 
-宿主只加载「入口表里声明、且当前处于 active」的插件界面：
-
-- `@geewiki/wiki`：base 层必然激活 → **开箱即可看到插槽内容**，不需要改动任何插件状态；
-- `@geewiki-plugin/hello`：`plugins/hello-geewiki` 这个外部插件的状态取决于是否被启用，
-  启用后刷新页面即可看到它的界面（这条路径顺带验证了「外部插件 → 前端插槽」的全链路）。
-
-## 入口表
-
-宿主不猜 URL：它读 `public/plugins-ui/registry.json`（由本目录的构建**自动生成**，
-两个变体是先后两次构建，脚本读-改-写并清理指向已删除目录的陈旧条目）：
+宿主**不读任何静态 JSON**，而是请求 `GET /api/plugins/ui`——由后端从**活状态**派生：
+注册表（谁声明了 `geewiki.client`）× 当前激活集合 × 产物是否真的存在（双资产根，插件目录优先）。
 
 ```json
-{ "version": 1, "plugins": { "@geewiki/wiki": { "entry": "client.js", "css": "client.css" } } }
+{
+  "ok": true, "version": 1, "revision": "1ab05a4e258c",
+  "plugins": { "@geewiki/wiki": { "entry": "client.js", "css": "client.css", "rev": "e9cbef75" } },
+  "skipped": [{ "name": "@geewiki-plugin/hello", "reason": "inactive" }]
+}
 ```
 
 条目里的 `entry` / `css` 只允许**单段文件名**（宿主会校验，防路径穿越）。
-之所以不用「拼约定 URL + 试探」，见 `packages/web/src/lib/pluginUi.ts` 顶部：dev 下 Vite 会给动态
-import 注入 `?import` 并 500、缺失路径在 dev 返回 200+text/html（MIME 报错）、在 prod 返回 404
-（Chrome 记为控制台 error）——三种都会污染控制台。正式方案里这份入口表由后端随插件清单下发。
+`skipped` 的 `reason` 取值：`inactive` / `no_client` / `entry_missing` / `invalid_name` ——
+**`entry_missing` 是"产物缺失"的唯一可见出口**：产物没构建时插件根本不进表，前端也就不会去
+`import` 一个不存在的 URL，因此**不产生 404 与控制台错误**。
+
+之所以不用「拼约定 URL + 试探」，见 `packages/web/src/lib/pluginUiPlan.ts` 顶部：dev 下非绝对 URL 的
+动态 import 会被 Vite 注入 `?import` 并 500、缺失路径在 dev 返回 200+text/html（MIME 报错）、
+在 prod 返回 404（Chrome 记为控制台 error）——三种都会污染控制台。
 
 ## 夹具做了什么
 
@@ -50,22 +57,45 @@ import 注入 `?import` 并 500、缺失路径在 dev 返回 200+text/html（MIM
 | `CounterWidget`（`.gw-fixture-inc` / `.gw-fixture-count`） | `app-header` | hooks 可用 ⇒ 插件与宿主**共用同一个 React 实例**（双实例会报 `TypeError: Cannot read properties of null (reading 'useState')`） |
 | `ThrowerWidget`（`.gw-fixture-throw`，点击后抛错） | `app-footer` | 单个插件 UI 抛错被错误边界隔离，其它插槽与宿主照常工作 |
 
-手测/自动化断言可用的选择器：`[data-slot="app-header"]`、`[data-slot="app-footer"]`（带 `data-count`）、
-`.gw-fixture-count`、`[data-fixture="thrower"]`、`.slot-error[data-error]`。
+自动化断言可用的选择器：`[data-slot="app-header"]`、`[data-slot="app-footer"]`（带 `data-count`）、
+`.gw-fixture-count`、`.gw-fixture-label`、`[data-fixture="thrower"]`、`.slot-error[data-error]`、
+`link[data-plugin-ui="<插件名>"]`。
 
-调试入口（过渡期，见 `pluginUi.ts`）：
+调试入口（见 `pluginUi.ts` 末尾）：
 
 ```js
 window.__GEEWIKI_HOST__          // 宿主 SDK：React / jsxRuntime / registerSlot / unregisterSlot / version
 window.__GEEWIKI_PLUGIN_UI__.loaded()                    // 已加载界面的插件名
+window.__GEEWIKI_PLUGIN_UI__.sync()                      // 拉一次入口表并让界面与之对齐（幂等、单飞）
+window.__GEEWIKI_PLUGIN_UI__.revision()                  // 最近一次成功解析的整表指纹
 window.__GEEWIKI_PLUGIN_UI__.unload('@geewiki/wiki')     // 卸载某个插件的界面贡献
-window.__GEEWIKI_PLUGIN_UI__.refresh()                   // 重新按插件清单 + 入口表对齐
 window.__GEEWIKI_PLUGIN_UI__.base('@geewiki/wiki')       // 插件名 → 界面目录 URL（非法名返回 undefined）
+```
+
+## 端到端验收脚本
+
+`scripts/acceptance/plugin-ui-cdp.mjs`（零依赖，入库，**不接入 `pnpm test`**——它需要 Chrome
+与跑起来的实例）：
+
+```bash
+# prod（pnpm build && pnpm start 之后）
+node scripts/acceptance/plugin-ui-cdp.mjs http://127.0.0.1:3000 9451 \
+  --missing-asset=$PWD/plugins/hello-geewiki/dist/client.js
+
+# dev（必须单独跑一遍：Vite 的 ?import 改写只在 dev 出现）。用隔离端口，别占用开发用的 3000/5173：
+GEEWIKI_PORT=3313 GEEWIKI_WEB_DIST=$PWD/packages/web/public GEEWIKI_PLUGINS_DIR=$PWD/plugins \
+  pnpm start &
+GEEWIKI_DEV_PORT=5273 GEEWIKI_DEV_API=http://127.0.0.1:3313 pnpm --filter @geewiki/web exec vite &
+node scripts/acceptance/plugin-ui-cdp.mjs http://127.0.0.1:5273 9452 \
+  --missing-asset=$PWD/plugins/hello-geewiki/dist/client.js
 ```
 
 ## 已知边界
 
 - ESM 模块一旦被 `import()` 就无法从模块图里卸载，`unload` 只回滚**插槽注册与 CSS**；
-- 未做入口完整性/版本校验，也未与插件 fork 生命周期绑定（都记在 `pluginUi.ts` 的 TODO 里）；
+  因此**产物更新后需要整页刷新**才生效（给 URL 加 `?v=<rev>` 做缓存击穿已被实测证伪，见
+  `pluginUi.ts` 与 `pluginUiPlan.ts` 顶部说明）；
+- 未做入口完整性/签名校验与版本协商；
+- `plugins/<插件名>/dist/` 里的字体/图片等**子目录资源**当前不支持（只服务单段文件名）；
 - 夹具源码不在 `packages/web/tsconfig.json` 的 include 内，因此不参与 `pnpm typecheck`
   （构建由 Vite/esbuild 完成）。

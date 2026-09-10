@@ -48,6 +48,10 @@ export const manifest: GeeWikiManifest = {
       drainTimeout: 5,
     },
     configSchema: WikiConfigSchema,
+    // 客户端 UI 入口（`geewiki.client`）：声明后宿主会把本插件的界面产物加载进插槽
+    // （入口表由后端 GET /api/plugins/ui 从活状态派生）。产物缺失只会被归入 skipped:
+    // entry_missing，不产生任何请求噪声，故这里可以放心声明。
+    client: { entry: 'client.js', css: 'client.css' },
   },
 }
 

@@ -6,7 +6,7 @@ import { createRoot } from 'react-dom/client'
 import '@xyflow/react/dist/style.css'
 import './styles.css'
 import { App } from './App'
-import { refreshPluginUi } from './lib/pluginUi'
+import { startPluginUiSync } from './lib/pluginUi'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -14,6 +14,8 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 
-// 加载已激活插件的客户端界面：按约定 URL `/plugins-ui/<插件名>/client.js` 尝试 import，
-// 未提供界面的插件会被静默跳过（见 lib/pluginUi.ts 的过渡说明与 TODO）。
-void refreshPluginUi()
+// 加载已激活插件的客户端界面，并建立与 fork 生命周期的自动同步：入口表由后端下发
+// （GET /api/plugins/ui），启动时同步一次，之后由「管理台动作后 + 页面变可见 + 15s 轮询」跟随
+// 插件启停；未提供界面或产物缺失的插件由后端归入 skipped，前端不会去 import，故零控制台噪声。
+// 详见 lib/pluginUi.ts。
+startPluginUiSync()

@@ -7,8 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:fixtures": "vite build --config fixtures/vite.config.ts && FIXTURE_OUT=@geewiki-plugin/hello vite build --config fixtures/vite.config.ts",
-    "typecheck": "tsc --noEmit"
+    "build:fixtures": "rm -rf public/plugins-ui && vite build --config fixtures/vite.config.ts && FIXTURE_OUT=@geewiki-plugin/hello FIXTURE_OUT_DIR=../../../plugins/hello-geewiki/dist vite build --config fixtures/vite.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@xyflow/react": "^12.5.0",

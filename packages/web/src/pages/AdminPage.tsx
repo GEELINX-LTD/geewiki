@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState } from '../api'
 import { SchemaForm } from '../components/SchemaForm'
 import { describeRoot, type FieldDescriptor } from '../lib/configSchema'
+import { syncPluginUi } from '../lib/pluginUi'
 
 function fmtError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -77,6 +78,9 @@ export function AdminPage(): ReactNode {
       setPlugins(p.plugins)
       setSession(s)
       setIssues(p.issues ?? [])
+      // 插件 UI 与 fork 生命周期绑定：load() 是四条变更成功路径（act/confirmEnable/doReplace/
+      // saveConfig）的汇聚点，故只挂这一处即可让插槽跟随启停；revision 未变时同步是纯 no-op。
+      void syncPluginUi()
     } catch (err) {
       setNotice({ kind: 'err', text: `加载失败: ${fmtError(err)}` })
     }

@@ -6,7 +6,7 @@
   "description": "GeeWiki —— AI-Native 插件化知识库系统（Phase 0 骨架）",
   "packageManager": "pnpm@11.7.0",
   "scripts": {
-    "dev": "tsx packages/server/src/index.ts & SERVER_PID=$!; pnpm --filter @geewiki/web run dev; S=$?; kill $SERVER_PID 2>/dev/null; exit $S",
+    "dev": "GEEWIKI_WEB_DIST=packages/web/public tsx packages/server/src/index.ts & SERVER_PID=$!; pnpm --filter @geewiki/web run dev; S=$?; kill $SERVER_PID 2>/dev/null; exit $S",
     "dev:server": "tsx packages/server/src/index.ts",
     "dev:web": "pnpm --filter @geewiki/web run dev",
     "build": "pnpm -r --if-present run build",
