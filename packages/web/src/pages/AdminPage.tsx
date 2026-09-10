@@ -13,7 +13,8 @@ import {
 import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState } from '../api'
 import { SchemaForm } from '../components/SchemaForm'
 import { describeRoot, type FieldDescriptor } from '../lib/configSchema'
-import { describeError } from '../lib/errorText'
+import { describeError, errorLine } from '../lib/errorText'
+import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
 import { syncPluginUi, subscribePluginUiState, pluginUiState } from '../lib/pluginUi'
 import { classifyUiSkips, UI_SKIP_HELP, UI_SKIP_LABEL } from '../lib/pluginUiPlan'
@@ -46,7 +47,7 @@ import {
 } from '../ui'
 
 function fmtError(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+  return errorLine(err)
 }
 
 /**
@@ -190,6 +191,17 @@ export function AdminPage(): ReactNode {
   /** 错误态里"重试"的进行中标记（只服务于那个按钮的 loading 样式） */
   const [retrying, setRetrying] = useState(false)
   const slowAdmin = useSlowHint(plugins === null && loadError === null)
+  /*
+    表格区域四态（互斥）：与 `#/wiki` 列表用**同一个** `resolveAreaState`。
+    AdminPage 原本的 `loadError !== null ? … : plugins === null ? …` 顺序已经是"错误优先"、
+    本身正确；改用统一判据的目的是**把这条不变量固化成可测的东西**，避免将来有人把
+    加载判断挪到错误判断之前又回到"头部说加载中、正文说出错"。
+  */
+  const tableState = resolveAreaState({
+    loading: plugins === null && loadError === null,
+    hasError: loadError !== null,
+    isEmpty: plugins !== null && plugins.length === 0,
+  })
   const retryLoad = useCallback((): void => {
     setRetrying(true)
     void load().finally(() => setRetrying(false))
@@ -604,7 +616,7 @@ export function AdminPage(): ReactNode {
               : undefined
           }
         />
-        {loadError !== null ? (
+        {tableState === 'error' ? (
           /*
             三态优先级：**先错误**（请求没成功 ⇒ 不知道有没有插件），再加载，最后才判"确实为空"。
             顺序反了会把"加载失败"误报成"没有已注册的插件"——而插件其实都在，只是没读到。
@@ -616,17 +628,17 @@ export function AdminPage(): ReactNode {
             onRetry={describeError(loadError).retryable ? retryLoad : undefined}
             retrying={retrying}
           />
-        ) : plugins === null ? (
+        ) : tableState === 'loading' ? (
           <LoadingState slow={slowAdmin}>
             <SkeletonTable rows={5} cols={4} />
           </LoadingState>
-        ) : plugins.length === 0 ? (
+        ) : tableState === 'empty' ? (
           <EmptyState
             icon={<Package className="size-6" />}
             title="没有已注册的插件"
             hint="内置插件随宿主发布；外部插件放入插件目录后重启即可被发现。"
           />
-        ) : (
+        ) : plugins === null ? null : (
           <table className="w-full border-collapse text-left" tabIndex={0} aria-label="插件列表">
             <thead>
               <tr className="border-b border-line">

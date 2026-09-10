@@ -14,6 +14,7 @@
  * 无障碍：状态点 `aria-hidden`，语义由紧随其后的文字承担；对话框用 Radix Dialog
  * （焦点陷阱 + Escape + 归还焦点）。
  */
+import { errorLine } from '../lib/errorText'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Activity, Database, RefreshCw } from 'lucide-react'
 import { api, type HealthResponse } from '../api'
@@ -61,7 +62,7 @@ function StatusBody(): ReactNode {
     api
       .health()
       .then(setData)
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setErr(errorLine(e)))
   }
   // Dialog 内容只在打开时挂载（Radix 默认行为），故这里在挂载时拉一次即可
   useEffect(load, [])

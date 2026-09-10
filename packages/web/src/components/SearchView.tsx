@@ -11,7 +11,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ApiError, api, type SearchResponse } from '../api'
 import { checkQuery, scoreBadges, snippetToHtml } from '../lib/searchPlan'
 import { SearchX } from 'lucide-react'
-import { describeError } from '../lib/errorText'
+import { describeError, errorLine } from '../lib/errorText'
 import { Button, EmptyState, ErrorState } from '../ui'
 
 function fmtTime(iso: string): string {
@@ -62,10 +62,10 @@ export function SearchView(props: {
                 ? '请输入查询内容'
                 : e.code === 'invalid_limit'
                   ? '结果条数超出允许范围'
-                  : `检索失败：${e.message}`,
+                  : errorLine(e),
           )
         } else {
-          setErr(e instanceof Error ? e.message : String(e))
+          setErr(errorLine(e))
         }
       })
       .finally(() => setBusy(false))

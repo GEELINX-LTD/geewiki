@@ -37,7 +37,8 @@ import {
   intermediateCrumbCount,
   neighborsOf,
 } from '../lib/navTree'
-import { describeError } from '../lib/errorText'
+import { describeError, errorLine } from '../lib/errorText'
+import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
 import { checkQuery } from '../lib/searchPlan'
 import { useActiveHeading } from '../lib/useActiveHeading'
@@ -211,7 +212,21 @@ function WikiList(props: {
   // 列表数据来自共享 store（与侧边栏、详情页的上一篇/下一篇同源）
   const pagesState = usePages()
   const pages = pagesState.pages
-  const err = pagesState.error ?? ''
+  /*
+    列表区域的四态（**互斥**）：error / loading / empty / ready。
+    判据来自状态本身，**不是**从"数据是否存在"反推——请求失败时 `pages` 同样是 null，
+    用 `pages === null` 当"正在加载"会让头部说「正在加载…」而正文说「出错了」
+    （这是已修正的真实缺陷：同一屏上两种状态同时成立）。
+  */
+  /** 已加载的页面数（`pages` 在加载中/失败时为 null，故显式兜底，不靠状态分支去"保证"它非空） */
+  const pageCount = pages?.length ?? 0
+  const listState = resolveAreaState({
+    loading: pagesState.loading,
+    hasError: pagesState.error !== null,
+    // `pages` 在加载中/失败时是 null ⇒ 必须显式判空，否则 `pages.length` 会抛 TypeError。
+    // 这也再次说明"用数据形状反推状态"有多脆：空数组与"还没有数据"根本不是一个意思。
+    isEmpty: pages !== null && pages.length === 0,
+  })
   const [q, setQ] = useState('')
   /**
    * **即时过滤**（纯客户端）——与上方"检索"是两件事，刻意分开：
@@ -304,11 +319,13 @@ function WikiList(props: {
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="m-0 text-xl font-semibold">知识库</h1>
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          {err !== '' && (
-            <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink">
-              {err}
-            </span>
-          )}
+          {/*
+            这里**不再**挂"失败 chip"。原因（真实缺陷）：
+            1. 它会直接渲染原始 message（泄漏内部错误串）；
+            2. 它与下方列表区域的 ErrorState 是**同一个失败的两处呈现**，一屏两遍；
+            3. 它与「刷新」按钮并列时像"两个重试入口"，层级不清。
+            失败只在**它自己的归属区域**（列表卡片）里说一次，重试入口也只在那一处。
+          */}
           <Button icon={<RefreshCw className="size-3.5" />} onClick={load}>
             刷新
           </Button>
@@ -409,12 +426,19 @@ function WikiList(props: {
       <Card>
         <CardHeader
           title="全部页面"
+          /*
+            状态文本由 `listState` 决定，与下方正文**同源**——这是"头部说加载中、正文说出错"
+            那个矛盾的根治办法：两处都读同一个互斥状态，不可能各说一套。
+            注意 error 分支下**不写"正在加载…"**：失败是已确定的事实，继续宣称在加载会让人白等。
+          */
           description={
-            pages === null
-              ? '正在加载…'
-              : pages.length === 0
-                ? '还没有内容'
-                : `共 ${pages.length} 个页面`
+            listState === 'error'
+              ? '加载失败'
+              : listState === 'loading'
+                ? '正在加载…'
+                : listState === 'empty'
+                  ? '还没有内容'
+                  : `共 ${pageCount} 个页面`
           }
           actions={
             <span className="text-xs text-muted">
@@ -429,22 +453,23 @@ function WikiList(props: {
           `aria-label` 给这个可聚焦区域一个名字（否则屏幕阅读器只念"表格"）。
         */}
         {/*
-          三态的顺序即优先级：**先看错误**（请求没成功 ⇒ 我们不知道有没有数据），
-          再看加载，最后才判断"确实为空"。若把空态放在错误之前，请求失败会被误报成
-          "还没有页面"——用户会以为数据没了。
+          正文与头部**读同一个 `listState`**（互斥四态），因此不可能再出现
+          "头部说加载中、正文说出错"。优先级由 `resolveAreaState` 承担并有单测
+          （错误 > 加载 > 空 > 就绪）。
+          注意：这里是**唯一**的错误呈现点与**唯一**的重试入口（页头那个 chip 已删除）。
         */}
-        {pagesState.error !== null ? (
+        {listState === 'error' ? (
           <ErrorState
             title={describeError(pagesState.errorValue).title}
             hint={describeError(pagesState.errorValue).hint}
             onRetry={describeError(pagesState.errorValue).retryable ? load : undefined}
             retrying={pagesState.loading}
           />
-        ) : pages === null ? (
+        ) : listState === 'loading' ? (
           <LoadingState slow={slowList}>
             <SkeletonTable rows={4} cols={4} />
           </LoadingState>
-        ) : pages.length === 0 ? (
+        ) : listState === 'empty' ? (
           <EmptyState
             icon={<FileText className="size-8" />}
             title="还没有任何页面"
@@ -464,7 +489,7 @@ function WikiList(props: {
           <EmptyState
             icon={<SearchX className="size-8" />}
             title={`没有匹配「${filter.trim()}」的页面`}
-            hint={`共 ${pages.length} 个页面，但标题与标识都不含这个关键词。换个词，或清除筛选看全部。`}
+            hint={`共 ${pageCount} 个页面，但标题与标识都不含这个关键词。换个词，或清除筛选看全部。`}
             action={
               <Button variant="secondary" onClick={() => setFilter('')}>
                 清除筛选
@@ -658,6 +683,12 @@ function WikiDetail(props: {
 
   const [page, setPage] = useState<PageDetail | null>(null)
   const [err, setErr] = useState('')
+  /*
+    保留**错误原值**（不只是人话字符串）：详情页的失败要分两种处理——
+    404 是"服务明确说没有"，其它是"我们不知道"。此前两者都渲染成「页面不存在」，
+    把"不知道"说成了"不存在"，而且没有重试入口。
+  */
+  const [loadError, setLoadError] = useState<unknown>(null)
   const [notice, setNotice] = useState('')
   /*
    * 同级页面列表（用于"上一篇/下一篇"）：来自**共享 store**，不再是本组件自己的请求。
@@ -709,10 +740,14 @@ function WikiDetail(props: {
 
   const load = useCallback((): void => {
     setErr('')
+    setLoadError(null)
     api
       .page(slug)
       .then((r) => setPage(r))
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        setLoadError(e)
+        setErr(errorLine(e))
+      })
   }, [slug])
 
   useEffect(load, [load])
@@ -759,7 +794,7 @@ function WikiDetail(props: {
         void invalidatePages()
         onDeleted()
       })
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setErr(errorLine(e)))
   }
 
   const showVersion = (id: number, savedAt: string, label: number): void => {
@@ -768,7 +803,7 @@ function WikiDetail(props: {
     api
       .version(slug, id)
       .then((v) => setVersionContent({ id, saved_at: v.saved_at, content: v.content, label }))
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setErr(errorLine(e)))
   }
 
   const restore = (): void => {
@@ -783,26 +818,55 @@ function WikiDetail(props: {
         load()
         void invalidatePages() // 版本变了 ⇒ 列表里的"版本"列与排序都要更新
       })
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setErr(errorLine(e)))
       .finally(() => setRestoring(false))
   }
 
-  if (err && !page) {
+  /*
+    载入阶段的三态（互斥，由 `resolveAreaState` 判定）：错误 > 加载 > 就绪。
+    `isEmpty` 恒为 false——"页面不存在"不是"空列表"，它是 404 这一**错误类别**，
+    故在错误分支里按 `kind` 再分。
+  */
+  const detailState = resolveAreaState({
+    loading: page === null && loadError === null,
+    hasError: loadError !== null,
+    isEmpty: false,
+  })
+  if (detailState === 'error') {
+    const view = describeError(loadError)
+    const crumbs = <Breadcrumb slug={slug} title={slug} pages={siblings} />
+    // 404：服务明确说没有 ⇒ 空态；重试同样的 slug 也不会变出来，故不给"重试"
+    if (view.kind === 'notFound') {
+      return (
+        <div className="flex flex-col gap-3.5">
+          {crumbs}
+          <EmptyState
+            icon={<FileText className="size-8" />}
+            title="页面不存在"
+            hint="它可能已被删除，或者链接里的标识有误。"
+            action={<Button onClick={() => onNavigate('list')}>返回列表</Button>}
+          />
+        </div>
+      )
+    }
+    // 其它失败（网络/服务端）：我们**不知道**它是否存在 ⇒ 错误态 + 重试
     return (
       <div className="flex flex-col gap-3.5">
-        <Breadcrumb slug={slug} title={slug} pages={siblings} />
-        <EmptyState
-          icon={<FileText className="size-8" />}
-          title="页面不存在"
-          hint={err}
-          action={
-            <Button onClick={() => onNavigate('list')}>返回列表</Button>
-          }
+        {crumbs}
+        <ErrorState
+          title={view.title}
+          hint={view.hint}
+          onRetry={view.retryable ? load : undefined}
         />
       </div>
     )
   }
-  if (!page) {
+  /*
+    写成 `page === null` 而不是 `detailState === 'loading'`：两者在此**等价**
+    （error 分支已提前返回），但前者能让 TypeScript 收窄 `page` 的类型，
+    从而不必在下面十几处用非空断言。
+  */
+  if (page === null) {
     return (
       <div className="flex flex-col gap-4" aria-busy="true">
         <Skeleton className="h-4 w-48" />
@@ -1137,7 +1201,7 @@ function WikiEdit(props: {
         else if (decision === 'discard') removeDraft(slug)
       })
       .catch((e: unknown) => {
-        setErr(e instanceof Error ? e.message : String(e))
+        setErr(errorLine(e))
         setLoading(false)
       })
   }, [slug, isNew])
@@ -1226,7 +1290,7 @@ function WikiEdit(props: {
         void invalidatePages()
         onDone(isNew ? r.slug : slug)
       } catch (e) {
-        setErr(e instanceof Error ? e.message : String(e))
+        setErr(errorLine(e))
         setSaving(false)
       }
     },

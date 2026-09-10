@@ -20,7 +20,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ApiError, api, type AskResponse, type AskSource } from '../api'
 import { mdToHtml } from '../lib/sanitize'
 import { answerRenderer, checkQuery, degradedNotice, snippetToHtml } from '../lib/searchPlan'
-import { streamErrorText } from '../lib/errorText'
+import { streamErrorText, cleanHint, errorLine } from '../lib/errorText'
 import { Button, EmptyState, ErrorState } from '../ui'
 import { SearchX } from 'lucide-react'
 import {
@@ -60,11 +60,16 @@ function preStreamNotice(err: unknown): string {
     if (err.code === 'empty_query') return '请输入查询内容'
     if (err.code === 'too_long') return '查询过长，请缩短后重试'
     if (err.code === 'too_many_streams') return '同时进行的问答过多，请稍候再试'
-    if (err.code === 'invalid_extractive' || err.code === 'invalid_limit') return `请求参数不合法：${err.message}`
+    if (err.code === 'invalid_extractive' || err.code === 'invalid_limit') {
+      // 这两类是**我们自己的**参数校验（提问参数由前端组装），文案已经是中文且可读；
+      // 仍走 cleanHint 保证不会把技术串带出来。
+      return cleanHint(err.message) === '' ? '请求参数不合法' : `请求参数不合法：${cleanHint(err.message)}`
+    }
     if (err.status === 404) return '问答服务未启用（请先在插件管理中启用 @geewiki/ai）'
-    return `问答失败：${err.message}`
+    // 其它情况**绝不回显原始 message**（可能带 API 路径/英文）——统一走人话映射。
+    return errorLine(err)
   }
-  return err instanceof Error ? err.message : String(err)
+  return errorLine(err)
 }
 
 /** 一条来源：标题（可点）+ 高亮片段 + 引用状态 */
@@ -151,7 +156,7 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
           return
         }
         // 网络中断等：落在答案区，**保留已渲染的来源**
-        setState((s) => applyLocalFailure(s, 'stream_failed', err instanceof Error ? err.message : String(err)))
+        setState((s) => applyLocalFailure(s, 'stream_failed', errorLine(err)))
       }
     })()
   }, [])
@@ -237,7 +242,12 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
               现在按 code 映射成人话 + 给出该做什么；code 本身只在 title 里留作排障线索。
               同时补上「重试」（此前的错误态是死路，用户只能手工重打一遍问题）。
             */
-            <div className="ask-answer ask-answer-error" role="alert" title={state.error.code}>
+            /*
+              外层的 `role="alert"` 已删除：`ErrorState` 自身就是 `role="alert"`，
+              再包一层会造成**嵌套的两个 alert 区域**，读屏可能把同一件事播报两次。
+              错误码只在 `title` 里留作排障线索，不印在界面上。
+            */
+            <div className="ask-answer ask-answer-error" title={state.error.code}>
               <ErrorState
                 className="border-0 bg-transparent px-0 py-2"
                 title={streamErrorText(state.error.code).title}

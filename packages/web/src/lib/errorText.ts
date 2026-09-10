@@ -113,6 +113,21 @@ export function describeError(err: unknown): ErrorView {
 }
 
 /**
+ * 把任意 thrown 值压成**一行**可读文本（行内提示 / chip 用）。
+ *
+ * 为什么必须走这里而不是 `String(err)` / `err.message`：界面上任何位置直接渲染原始
+ * message 都是泄漏点——它可能带 API 路径、英文、甚至内部实现细节。本仓库已多次出现
+ * "页头挂一个 chip 直接印 message"的开发味实现，故把"压成一行"也收进这一层，
+ * 让**所有**行内提示只有一个入口，无法绕过清洗。
+ *
+ * 形态：`标题` 或 `标题：已清洗的补充说明`。标题永远不含变量，便于用户形成稳定预期。
+ */
+export function errorLine(err: unknown): string {
+  const view = describeError(err)
+  return view.hint === '' ? view.title : `${view.title}：${view.hint}`
+}
+
+/**
  * 流式问答的**内部错误码 → 人话**。
  *
  * 这些码（`LlmErrorCode`）是给程序分支用的稳定标识，**不该出现在界面上**——用户读到

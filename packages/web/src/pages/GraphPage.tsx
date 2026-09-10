@@ -16,7 +16,8 @@ import {
 import { AlertTriangle, Info, RefreshCw, Workflow } from 'lucide-react'
 import { api, type GraphData, type GraphNodeInfo } from '../api'
 import { Badge, Button, Dialog, DialogClose, DialogContent, ErrorState, LoadingState, Skeleton } from '../ui'
-import { describeError } from '../lib/errorText'
+import { describeError, errorLine } from '../lib/errorText'
+import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
 import {
   LAYER_HUMAN,
@@ -255,6 +256,16 @@ export function GraphPage(): ReactNode {
   const [errValue, setErrValue] = useState<unknown>(null)
   const [loading, setLoading] = useState(true)
   const slowGraph = useSlowHint(loading && graph === null)
+  /*
+    图区四态（互斥），与其他页面用同一个 `resolveAreaState`：
+    错误 > 加载 > 空 > 就绪。原先用 `loading` 与 `err` 两个独立条件分别渲染，
+    虽然实际互斥，但把这条不变量留在了"碰巧"而不是"判据"上。
+  */
+  const graphState = resolveAreaState({
+    loading,
+    hasError: err !== '',
+    isEmpty: graph !== null && graph.nodes.length === 0,
+  })
   const [detail, setDetail] = useState<string | null>(null)
 
   const load = useCallback((): void => {
@@ -265,7 +276,7 @@ export function GraphPage(): ReactNode {
       .then((r) => setGraph(r.graph))
       .catch((e: unknown) => {
         setErrValue(e)
-        setErr(e instanceof Error ? e.message : String(e))
+        setErr(errorLine(e))
       })
       .finally(() => setLoading(false))
   }, [])
@@ -314,11 +325,11 @@ export function GraphPage(): ReactNode {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {err !== '' && (
-            <span role="status" className="rounded-md border border-danger-line bg-danger-bg px-2.5 py-1 text-xs text-danger-ink">
-              {err}
-            </span>
-          )}
+          {/*
+            此处**不再**挂错误 chip：同一个失败已经由下方图区的 ErrorState 完整呈现
+            （含重试入口），页头再印一遍就是"一屏两处同一个错"，而且它紧挨「重新布局」
+            按钮时会像第二个重试入口，层级不清。
+          */}
           <Button icon={<RefreshCw className="size-3.5" />} onClick={load} loading={loading}>
             重新布局
           </Button>
@@ -346,14 +357,14 @@ export function GraphPage(): ReactNode {
       </div>
 
       <div className="h-[min(70vh,44rem)] overflow-hidden rounded-lg border border-line bg-sunken">
-        {loading && graph === null && (
+        {graphState === 'loading' && (
           <div className="grid h-full place-items-center p-6">
             <LoadingState className="w-full" slow={slowGraph}>
               <Skeleton className="h-[min(60vh,36rem)] w-full rounded-md" />
             </LoadingState>
           </div>
         )}
-        {!loading && err !== '' && (
+        {graphState === 'error' && (
           <div className="grid h-full place-items-center p-6">
             {/*
               用统一的 ErrorState（而不是就地再拼一个）：错误态的文案分级、重试入口、
@@ -368,7 +379,7 @@ export function GraphPage(): ReactNode {
             />
           </div>
         )}
-        {!loading && err === '' && graph !== null && graph.nodes.length === 0 && (
+        {graphState === 'empty' && (
           <div className="grid h-full place-items-center p-6 text-center">
             <div className="flex flex-col items-center gap-2">
               <Workflow className="size-6 text-muted" aria-hidden="true" />

@@ -147,7 +147,7 @@ export function parseAiStreamFrame(frame: SseFrame): AiStreamEvent {
   try {
     parsed = JSON.parse(frame.data)
   } catch (err) {
-    return { kind: 'invalid', reason: `JSON 解析失败：${err instanceof Error ? err.message : String(err)}` }
+    return { kind: 'invalid', reason: 'JSON 解析失败' }
   }
   const obj = asRecord(parsed)
   if (!obj) return { kind: 'invalid', reason: '载荷不是对象' }

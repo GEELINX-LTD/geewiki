@@ -186,9 +186,15 @@ function SidebarBody(props: SidebarProps & { closeOnNavigate?: boolean }): React
   }
 
   if (error !== null) {
+    /*
+      侧栏**不重复呈现**列表加载失败，也**不泄漏原始 message**。
+      理由：同一个失败已经在列表区域的 `ErrorState` 里说清并给了重试入口（重试入口只能有一个）；
+      侧栏若把同一句话再印一遍，一屏上就出现两处"同一个错"，而且原文可能带 API 路径等技术细节。
+      这里只表明"这一栏现在不可用"——它自己的状态，不是那个错误的副本。
+    */
     return (
-      <p className="m-0 px-1 text-xs text-danger-ink" role="status">
-        页面列表加载失败：{error}
+      <p className="m-0 px-1 text-xs text-muted" role="status">
+        目录暂不可用
       </p>
     )
   }

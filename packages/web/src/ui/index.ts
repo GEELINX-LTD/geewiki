@@ -15,6 +15,7 @@ export { Badge, type BadgeTone } from './Badge'
 export { Skeleton, SkeletonTable } from './Skeleton'
 export { LoadingState } from './LoadingState'
 export { ErrorState } from './ErrorState'
+export { ErrorNotice } from './ErrorNotice'
 export { EmptyState } from './EmptyState'
 export {
   DropdownMenu,

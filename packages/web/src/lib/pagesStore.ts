@@ -15,6 +15,7 @@
  * - **失败不缓存**：请求失败不写入缓存，下次调用会重试；订阅者收到 `error` 以便显示。
  * - **卸载安全**：`useSyncExternalStore` 的订阅在组件卸载时自动退订，不会对已卸载组件 setState。
  */
+import { errorLine } from './errorText'
 import { useCallback, useEffect, useSyncExternalStore } from 'react'
 import { api, type PageSummary } from '../api'
 
@@ -69,10 +70,16 @@ export function loadPages(options: { force?: boolean } = {}): Promise<void> {
       setState({ pages: r.pages, error: null, errorValue: null, loading: false })
     })
     .catch((e: unknown) => {
-      const msg = e instanceof Error ? e.message : String(e)
-      console.debug('[geewiki-pages] 页面列表加载失败：', msg)
+      /*
+        `error` 存的是**人话**（`errorLine`），不是原始 message——因为它是"是否失败"的
+        信号 + 曾经被下游直接插进 JSX 的显示文本。原始值另存 `errorValue`，供
+        `describeError` 分级（404 / 5xx / 连不上）与排障使用。
+        这是整条泄漏链的源头：这里若存原文，侧栏与页头就会把它原样印出来。
+      */
+      const human = errorLine(e)
+      console.debug('[geewiki-pages] 页面列表加载失败：', e instanceof Error ? e.message : e)
       // 失败时**不保留旧数据也不写缓存**：让 UI 能显示错误并允许重试
-      setState({ pages: null, error: msg, errorValue: e, loading: false })
+      setState({ pages: null, error: human, errorValue: e, loading: false })
     })
     .finally(() => {
       inflight = null
