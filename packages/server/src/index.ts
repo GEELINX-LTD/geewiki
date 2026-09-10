@@ -20,6 +20,8 @@ import {
   DEFAULT_DATA_DIR,
   DEFAULT_PORT,
   HEALTH_PATH,
+  PLUGIN_UI_FILE_SEGMENT,
+  PLUGIN_UI_PREFIX,
   normalizeRuntime,
   resolveProjectPath,
   type GeeWikiManifest,
@@ -34,6 +36,8 @@ import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
 import {
   PluginManagerPlugin,
   loadExternalPlugins,
+  pluginUiNameFromSegments,
+  pluginUiRootsFor,
   removeCrashMarker,
   writeCrashMarker,
   type DiscoveryIssue,
@@ -350,21 +354,106 @@ const STATIC_MIME: Record<string, string> = {
   '.map': 'application/json',
 }
 
+/** 静态资源的根集合：web 产物 + 插件 UI 的"按名查根"表 */
+interface StaticRoots {
+  /** 前端静态产物目录；null = 不启用 web 产物托管 */
+  webDist: string | null
+  /**
+   * 插件 UI 根表（**懒求值**，`{ [插件名]: 命中根绝对路径 }`）：由管理器的
+   * `pluginUiRootsFor(registry, webDist)` 产出。用函数而非快照是**必要**的——
+   * `httpRegistryEntry` 在 `defaultRegistry()` 内创建时外部插件尚未发现（注册顺序陷阱）。
+   */
+  pluginUiRoots?: () => Record<string, string>
+}
+
+/** 统一 404（JSON，与静态层既有格式一致） */
+function sendNotFound(res: ServerResponse): void {
+  if (res.headersSent) return
+  res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify({ ok: false, error: 'not_found' }))
+}
+
+/**
+ * 插件 UI 资产：`<PLUGIN_UI_PREFIX>/<插件名>/<文件名单段>`（插件名 1 段或 2 段 scope 形态）。
+ *
+ * 安全模型：**先按段还原插件名，再在根表里精确查名**——查不到直接 404，因此不存在由
+ * 不可信输入拼出的路径。文件名限定单段后仍做一次 `startsWith` 纵深防御。
+ * 插件名**不解码**：`%40geewiki` 查不到表 → 404（编码名一律不认，与前端约定一致）。
+ *
+ * 与普通静态资源的关键差别：**绝不回退 index.html**。缺失即 404，否则会被 SPA fallback
+ * 掩盖成 200 `text/html`，浏览器加载插件 bundle 时报 MIME 错误、且快照里看不出真因。
+ */
+async function servePluginUiAsset(
+  roots: StaticRoots,
+  pathname: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const segments = pathname
+    .slice(PLUGIN_UI_PREFIX.length)
+    .split('/')
+    .filter((s) => s !== '')
+  // 形状：1–2 段插件名 + 1 段文件名
+  if (segments.length < 2 || segments.length > 3) {
+    sendNotFound(res)
+    return
+  }
+  const fileName = segments[segments.length - 1] as string
+  const name = pluginUiNameFromSegments(segments.slice(0, -1))
+  if (!name || !PLUGIN_UI_FILE_SEGMENT.test(fileName)) {
+    sendNotFound(res)
+    return
+  }
+  const root = roots.pluginUiRoots?.()[name]
+  if (!root) {
+    sendNotFound(res)
+    return
+  }
+  const file = resolve(root, fileName)
+  // 纵深防御：文件名已是单段，这里再确认规范化结果仍在该根内
+  if (!file.startsWith(resolve(root))) {
+    sendNotFound(res)
+    return
+  }
+  const dot = fileName.lastIndexOf('.')
+  const ext = dot < 0 ? '' : fileName.slice(dot).toLowerCase()
+  try {
+    const info = await stat(file)
+    if (!info.isFile()) throw new Error('not a file')
+    const data = await readFile(file)
+    res.writeHead(200, {
+      'content-type': STATIC_MIME[ext] ?? 'application/octet-stream',
+      // 与既有非 hashed 资产策略一致：交给前端的 `?v=<rev>` 自行击穿缓存
+      'cache-control': 'no-cache',
+      'content-length': data.length,
+    })
+    res.end(req.method === 'HEAD' ? undefined : data)
+  } catch {
+    sendNotFound(res)
+  }
+}
+
 /**
  * 静态文件服务：优先精确文件；未命中且路径无扩展名时回退 index.html（SPA）。
  * 仅由 dispatch 返回 false 的请求进入（/api/* 已被路由层接管）。
  */
-async function serveStatic(root: string | null, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const notFound = (): void => {
-    if (res.headersSent) return
-    res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify({ ok: false, error: 'not_found' }))
-  }
-  if (!root || (req.method !== 'GET' && req.method !== 'HEAD')) {
+async function serveStatic(roots: StaticRoots, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const notFound = (): void => sendNotFound(res)
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
     notFound()
     return
   }
   const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+  // 插件 UI 资产走独立分支（可有独立资产根，且不做 SPA fallback）
+  if (pathname === PLUGIN_UI_PREFIX || pathname.startsWith(`${PLUGIN_UI_PREFIX}/`)) {
+    await servePluginUiAsset(roots, pathname, req, res)
+    return
+  }
+  const root = roots.webDist
+  if (!root) {
+    notFound()
+    return
+  }
   const rel = pathname === '/' ? 'index.html' : pathname.slice(1)
   // 路径穿越防护：规范化后必须仍位于静态根内
   const file = isAbsolute(rel) ? '' : resolve(root, rel)
@@ -408,6 +497,14 @@ export interface HttpConfig {
   host?: string
   /** 前端静态产物目录；null = 不启用静态服务 */
   webDist?: string | null
+  /**
+   * 插件 UI 的"按插件名查根"表（`{ [插件名]: 命中根绝对路径 }`），**懒求值**。
+   *
+   * 必须是函数：本插件的注册表条目由 `defaultRegistry()`/`httpRegistryEntry()` 创建，
+   * 那一刻外部插件**尚未被发现**（`buildRegistry()` 之后才合并进注册表），快照必然是空的。
+   * 与 `webDist` 同机制——由组合根注入、**不进入持久化清单**。
+   */
+  pluginUiRoots?: () => Record<string, string>
   /** 关停前等待在途 API 请求结算的上限（秒）；缺省取 httpManifest.runtime.drainTimeout（5） */
   drainTimeout?: number
 }
@@ -424,6 +521,13 @@ export const HttpPlugin = {
     const port = config.port ?? Number(process.env.GEEWIKI_PORT ?? DEFAULT_PORT)
     const host = config.host ?? '0.0.0.0'
     const startedAt = Date.now()
+    // 插件 UI 根表的懒求值包装：注入的闭包可能被调用多次（每个 /plugins-ui 资产请求一次），
+    // 首次求值后缓存——避免每次请求都重走"注册表 × stat 全部产物"。
+    let pluginUiRootsCache: Record<string, string> | null = null
+    const pluginUiRoots = (): Record<string, string> => {
+      if (!pluginUiRootsCache) pluginUiRootsCache = config.pluginUiRoots?.() ?? {}
+      return pluginUiRootsCache
+    }
     const router = new HttpRouter((h) => {
       const db = ctx.get('db')
       h.json(200, {
@@ -438,7 +542,7 @@ export const HttpPlugin = {
 
     const server: Server = createServer((req, res) => {
       if (!router.dispatch(req, res)) {
-        void serveStatic(config.webDist ?? null, req, res)
+        void serveStatic({ webDist: config.webDist ?? null, pluginUiRoots }, req, res)
       }
     })
     server.on('error', (err) => {
@@ -512,7 +616,11 @@ export interface RegistryBuildResult {
  * 优先级：清单（持久化）配置里的显式 `port`/`host` > 本处默认值（来自 startServer 的
  * `options ?? env ?? 内置默认`）> 插件内的环境变量兜底。
  */
-export function httpRegistryEntry(webDist: string | null, defaults: HttpEntryDefaults = {}): RegisteredPlugin {
+export function httpRegistryEntry(
+  webDist: string | null,
+  defaults: HttpEntryDefaults = {},
+  pluginUiRoots?: () => Record<string, string>,
+): RegisteredPlugin {
   return {
     name: '@geewiki/http',
     manifest: httpManifest,
@@ -524,6 +632,8 @@ export function httpRegistryEntry(webDist: string | null, defaults: HttpEntryDef
           ...(config.port === undefined && defaults.port !== undefined ? { port: defaults.port } : {}),
           ...(config.host === undefined && defaults.host !== undefined ? { host: defaults.host } : {}),
           webDist,
+          // 懒求值闭包：清单里不可能有这个函数，故无条件覆盖（与 webDist 同机制）
+          ...(pluginUiRoots ? { pluginUiRoots } : {}),
         })
       },
     },
@@ -531,7 +641,11 @@ export function httpRegistryEntry(webDist: string | null, defaults: HttpEntryDef
 }
 
 /** 内置插件注册表（default registry：服务器引导时注册的全部可管插件） */
-export function defaultRegistry(webDist: string | null, defaults: HttpEntryDefaults = {}): RegisteredPlugin[] {
+export function defaultRegistry(
+  webDist: string | null,
+  defaults: HttpEntryDefaults = {},
+  pluginUiRoots?: () => Record<string, string>,
+): RegisteredPlugin[] {
   return [
     {
       name: '@geewiki/db-sqlite',
@@ -540,7 +654,7 @@ export function defaultRegistry(webDist: string | null, defaults: HttpEntryDefau
       migrationsDir: DB_SQLITE_MIGRATIONS_DIR,
       source: 'builtin',
     },
-    { ...httpRegistryEntry(webDist, defaults), source: 'builtin' },
+    { ...httpRegistryEntry(webDist, defaults, pluginUiRoots), source: 'builtin' },
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
     { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin, source: 'builtin' },
   ]
@@ -558,8 +672,9 @@ export async function buildRegistry(
   webDist: string | null,
   defaults: HttpEntryDefaults = {},
   pluginsRoot: string | null = null,
+  pluginUiRoots?: () => Record<string, string>,
 ): Promise<RegistryBuildResult> {
-  const builtin = defaultRegistry(webDist, defaults)
+  const builtin = defaultRegistry(webDist, defaults, pluginUiRoots)
   if (!pluginsRoot) return { registry: builtin, issues: [] }
   const discovered = await loadExternalPlugins({
     root: pluginsRoot,
@@ -593,10 +708,17 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
       : resolveProjectPath(options.pluginsDir ?? process.env.GEEWIKI_PLUGINS_DIR ?? 'plugins', import.meta.url)
   if (pluginsRoot) console.log(`[server] 外部插件目录: ${pluginsRoot}`)
 
-  // 注册表来源：显式传入的 registry 优先（issues 为空），否则内置 + 外部插件发现
+  // 注册表来源：显式传入的 registry 优先（issues 为空），否则内置 + 外部插件发现。
+  //
+  // 插件 UI 根表存在"先后依赖"：它要读**已完成**的注册表（外部插件的 dir 来自发现阶段），
+  // 而它的闭包又必须在此之前交给 http 条目。因此用可变持有者打破循环——闭包在
+  // http 插件首次处理 `/plugins-ui` 请求时求值，那时 builtRef 必定已赋值。
+  let builtRef: RegistryBuildResult | null = null
+  const pluginUiRoots = (): Record<string, string> => pluginUiRootsFor(builtRef?.registry ?? [], webDist)
   const built: RegistryBuildResult = options.registry
     ? { registry: options.registry, issues: [] }
-    : await buildRegistry(webDist, { port, host }, pluginsRoot)
+    : await buildRegistry(webDist, { port, host }, pluginsRoot, pluginUiRoots)
+  builtRef = built
 
   const managerFiber = await app.plugin(PluginManagerPlugin, {
     registry: built.registry,
@@ -606,6 +728,8 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
     baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
     sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
     crashMarkerFile,
+    // 入口表的第二候选根（<webDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
+    webDist,
   })
 
   return {

@@ -44,6 +44,22 @@ export interface GeeWikiRuntime {
   drainTimeout?: number
 }
 
+/**
+ * `geewiki.client`：插件**客户端 UI 入口**声明。
+ *
+ * 缺省 = 该插件没有前端界面，宿主不会加载它（也不会产生任何请求噪声）。
+ * 与 `geewiki.entry` 的区别：后者是**后端**入口（index.ts 等），两者不可混用。
+ */
+export interface GeeWikiClient {
+  /**
+   * UI 入口**文件名**：必须单段（不含 `/`、不是 `.`/`..`），相对该插件的 UI 根。
+   * 缺省 `'client.js'`（配合 `pnpm --filter @geewiki/web build:fixtures` 的产物名）。
+   */
+  entry?: string
+  /** 可选样式**文件名**：同样单段，相对同一 UI 根；缺省 = 不注入样式 */
+  css?: string
+}
+
 /** `geewiki` 命名空间：插件元数据 */
 export interface GeeWikiMeta {
   /** 对外提供的服务/能力标识（如 "database-provider"、"ai-service"），供其他插件 requires 引用 */
@@ -62,6 +78,13 @@ export interface GeeWikiMeta {
   entry?: string
   /** 运行期能力声明 */
   runtime?: GeeWikiRuntime
+  /**
+   * 客户端 UI 入口（见 {@link GeeWikiClient}）。
+   *
+   * 声明后该插件会进入宿主下发的**入口表**（`GET /api/plugins/ui`），
+   * 由前端动态 import 其 bundle 并注册插槽组件；未声明则永不进入。
+   */
+  client?: GeeWikiClient
   /**
    * 插件配置 Schema（schemastery 实例，如 Schema.object({ port: Schema.number().default(3000) })）。
    *
@@ -168,6 +191,27 @@ export const HEALTH_PATH = '/api/health'
 
 /** 迁移登记表名 */
 export const MIGRATION_TABLE = '_migrations'
+
+/**
+ * 插件客户端 UI 资产的 URL 前缀：`<前缀>/<插件名>/<文件名单段>`。
+ *
+ * 插件名**保持未编码**（`@geewiki/wiki` 就是两段），编码名一律不认——编码后
+ * dev 下会落 Vite 的 SPA fallback（200 + text/html）、prod 下静态层不解码必 404。
+ *
+ * 注意：`packages/web` 不 import 本包（core 顶层依赖 node:fs，不能进浏览器 bundle），
+ * 前端在 `packages/web/src/lib/pluginUi.ts` 持有**同名副本**并互相注释指认；
+ * 两侧行为由测试表的同一组用例钉住。
+ */
+export const PLUGIN_UI_PREFIX = '/plugins-ui'
+
+/**
+ * UI 资产**文件名**的单段校验（入口表与静态层共用同一张规则）：
+ * 以字母/数字开头，其后允许字母、数字、`.`、`_`、`-`。
+ *
+ * 因此 `client.js`、`client.css`、`client-a1b2.js` 合法，而 `..`、`.env`、
+ * `a/b.js`、`x y.js`、空串非法。无 `g` 标志，`test()` 无 lastIndex 状态。
+ */
+export const PLUGIN_UI_FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 /**
  * 缓存清理事件名（架构 §5.7）：插件停用/卸载后，若其 manifest 声明

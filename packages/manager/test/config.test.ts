@@ -77,6 +77,8 @@ function cfgPlugin(
     requires?: string[]
     /** apply 恒抛错：用于"目标激活失败 → 整体回滚"路径 */
     failActivate?: boolean
+    /** 客户端 UI 入口声明（geewiki.client），供入口表用例 */
+    client?: { entry?: string; css?: string }
   } = {},
 ): RegisteredPlugin {
   const schema = opts.schema ?? MESSAGE_SCHEMA
@@ -91,6 +93,7 @@ function cfgPlugin(
         requires: opts.requires ?? [],
         conflictGroup: opts.conflictGroup,
         runtime: { supportsHotReload: true, requiresCachePurge: false, drainTimeout: 0 },
+        ...(opts.client === undefined ? {} : { client: opts.client }),
         ...(declared ? { configSchema: schema } : {}),
       },
     },
@@ -118,7 +121,37 @@ function makeManager(env: Env, registry: RegisteredPlugin[]): GeeWikiManager {
   })
 }
 
-/** 路由服务替身：记录路由表，可编程式调用处理器并取回状态码/响应体 */
+/** 带 webDist（入口表第二候选根）的管理器 */
+function makeManagerWithUi(env: Env, registry: RegisteredPlugin[], webDist: string | null): GeeWikiManager {
+  return new GeeWikiManager(new Context(), {
+    registry,
+    baseFile: env.baseFile,
+    sessionFile: env.sessionFile,
+    webDist,
+  })
+}
+
+/** UI 产物夹具：真实临时 webDist，内含 @t/with-ui 的 client.js / client.css（不含 @t/no-asset） */
+function makeUiEnv(): { webDist: string; cleanup: () => void } {
+  const webDist = mkdtempSync(join(tmpdir(), 'gw-ui-web-'))
+  const dir = join(webDist, 'plugins-ui', '@t/with-ui')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'client.js'), 'export function register() {}\n', 'utf8')
+  writeFileSync(join(dir, 'client.css'), '.gw-fixture { color: red; }\n', 'utf8')
+  return { webDist, cleanup: () => rmSync(webDist, { recursive: true, force: true }) }
+}
+
+/** 在替身路由上挂载管理器路由并请求入口表 */
+async function invokeUi(
+  manager: GeeWikiManager,
+  headers?: Record<string, string>,
+): Promise<{ status: number; body: Record<string, unknown>; headers: Record<string, string> }> {
+  const { service, invoke } = makeRouter()
+  registerRoutes(service, manager)
+  return invoke('GET', '/api/plugins/ui', {}, undefined, headers)
+}
+
+/** 路由服务替身：记录路由表，可编程式调用处理器并取回状态码/响应体/响应头 */
 function makeRouter(): {
   service: HttpRouterService
   invoke(
@@ -126,7 +159,8 @@ function makeRouter(): {
     path: string,
     params: Record<string, string>,
     body?: unknown,
-  ): Promise<{ status: number; body: Record<string, unknown> }>
+    headers?: Record<string, string>,
+  ): Promise<{ status: number; body: Record<string, unknown>; headers: Record<string, string> }>
 } {
   const routes = new Map<string, RouteHandler>()
   return {
@@ -140,21 +174,35 @@ function makeRouter(): {
       pending: () => 0,
       drain: () => Promise.resolve(true),
     },
-    invoke: (method, path, params, body) => {
+    invoke: (method, path, params, body, headers) => {
       const handler = routes.get(`${method} ${path}`)
       assert.ok(handler, `应已注册路由 ${method} ${path}`)
       const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
       const req = Readable.from(chunks) as unknown as IncomingMessage
-      // 补齐 headers：enable / replace 路由按 content-length 决定是否读取请求体
-      ;(req as unknown as { headers: Record<string, string> }).headers =
-        body === undefined ? {} : { 'content-length': String(chunks[0]?.length ?? 0) }
+      // 补齐 headers：enable / replace 路由按 content-length 决定是否读取请求体；
+      // ui 路由读 if-none-match；调用方可通过 headers 参数注入请求头。
+      ;(req as unknown as { headers: Record<string, string> }).headers = {
+        ...(body === undefined ? {} : { 'content-length': String(chunks[0]?.length ?? 0) }),
+        ...(headers ?? {}),
+      }
+      // 响应头替身：新路由会 setHeader（cache-control / etag），故必须有这两个方法
+      const responseHeaders: Record<string, string> = {}
+      const res = {
+        once: () => {},
+        headersSent: false,
+        setHeader: (name: string, value: unknown) => {
+          responseHeaders[name.toLowerCase()] = String(value)
+        },
+        getHeader: (name: string) => responseHeaders[name.toLowerCase()],
+      } as unknown as ServerResponse
       return new Promise((resolvePromise, rejectPromise) => {
         const h: RouteHandlerContext = {
           req,
-          res: { once: () => {} } as unknown as ServerResponse,
+          res,
           url: new URL(`http://localhost${path}`),
           params,
-          json: (status, payload) => resolvePromise({ status, body: payload as Record<string, unknown> }),
+          json: (status, payload) =>
+            resolvePromise({ status, body: payload as Record<string, unknown>, headers: responseHeaders }),
         }
         void Promise.resolve(handler(h)).catch(rejectPromise)
       })
@@ -1243,5 +1291,104 @@ test('REST：replace 的 409 分支（base_layer / provider_mismatch）', async 
     assert.equal(baseLayer.body['error'], 'base_layer')
   } finally {
     env.cleanup()
+  }
+})
+
+/* ------------------- 插件 UI 入口表（GET /api/plugins/ui） ------------------- */
+
+test('GET /api/plugins/ui：只列 active 且有产物的插件；停用后从表中消失', async () => {
+  const env = makeEnv()
+  const uiEnv = makeUiEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/with-ui', log, { client: { entry: 'client.js', css: 'client.css' } }),
+      cfgPlugin('@t/no-ui', log),
+    ]
+    const manager = makeManagerWithUi(env, registry, uiEnv.webDist)
+    await manager.boot()
+
+    // 两个插件默认都不在基础层（makeUiEnv 的产物目录里只有 @t/with-ui）
+    const empty = await invokeUi(manager)
+    assert.equal(empty.status, 200, '空表也必须 200（永不 404）')
+    assert.deepEqual(empty.body['plugins'], {}, '未激活插件不应进表')
+    assert.equal(empty.body['version'], 1)
+    assert.match(String(empty.body['revision']), /^[0-9a-f]{12}$/)
+
+    await manager.enable('@t/with-ui')
+    const one = await invokeUi(manager)
+    assert.equal(one.status, 200)
+    assert.deepEqual(Object.keys(one.body['plugins'] as object), ['@t/with-ui'])
+    const entry = (one.body['plugins'] as Record<string, { entry: string; css?: string; rev: string }>)['@t/with-ui']
+    assert.equal(entry?.entry, 'client.js')
+    assert.equal(entry?.css, 'client.css')
+    assert.match(String(entry?.rev), /^[0-9a-f]{8}$/)
+    assert.notEqual(one.body['revision'], empty.body['revision'], '激活后 revision 必须变化')
+
+    // 停用 → 该插件从入口表消失（"停用后 UI 自动消失"的服务端半边）
+    await manager.disable('@t/with-ui')
+    const afterDisable = await invokeUi(manager)
+    assert.deepEqual(afterDisable.body['plugins'], {}, '停用后不得再出现在入口表')
+    assert.notEqual(afterDisable.body['revision'], one.body['revision'], '停用后 revision 必须变化')
+    assert.ok(
+      (afterDisable.body['skipped'] as { name: string; reason: string }[]).some(
+        (s) => s.name === '@t/with-ui' && s.reason === 'inactive',
+      ),
+      `停用后应记 inactive: ${JSON.stringify(afterDisable.body['skipped'])}`,
+    )
+  } finally {
+    env.cleanup()
+    uiEnv.cleanup()
+  }
+})
+
+test('GET /api/plugins/ui：产物缺失记 entry_missing，插件不进表但端点仍 200', async () => {
+  const env = makeEnv()
+  const uiEnv = makeUiEnv()
+  try {
+    const log: string[] = []
+    const manager = makeManagerWithUi(env, [cfgPlugin('@t/no-asset', log, { client: {} })], uiEnv.webDist)
+    await manager.boot()
+    await manager.enable('@t/no-asset')
+
+    const res = await invokeUi(manager)
+    assert.equal(res.status, 200, '产物缺失不得变成 4xx/5xx')
+    assert.deepEqual(res.body['plugins'], {}, '入口缺失的插件不进表')
+    assert.deepEqual(res.body['skipped'], [{ name: '@t/no-asset', reason: 'entry_missing' }])
+  } finally {
+    env.cleanup()
+    uiEnv.cleanup()
+  }
+})
+
+test('GET /api/plugins/ui：ETag/If-None-Match 命中返回 304 且无 body；cache-control 为 no-store', async () => {
+  const env = makeEnv()
+  const uiEnv = makeUiEnv()
+  try {
+    const log: string[] = []
+    const manager = makeManagerWithUi(env, [cfgPlugin('@t/with-ui', log, { client: {} })], uiEnv.webDist)
+    await manager.boot()
+    await manager.enable('@t/with-ui')
+
+    const first = await invokeUi(manager)
+    const etag = first.headers['etag']
+    assert.equal(first.headers['cache-control'], 'no-store', '派生数据绝不能被中间缓存')
+    assert.equal(etag, `"${String(first.body['revision'])}"`, 'ETag 必须与 revision 一致')
+
+    // 回传同一 ETag → 304，且不携带响应体
+    const cached = await invokeUi(manager, { 'if-none-match': etag as string })
+    assert.equal(cached.status, 304)
+    assert.equal(cached.body, null, '304 不得带 body')
+    // 弱校验前缀与裸值也应命中（简化匹配：剥 W/ 与引号）
+    const weak = await invokeUi(manager, { 'if-none-match': `W/${String(etag)}` })
+    assert.equal(weak.status, 304)
+    const bare = await invokeUi(manager, { 'if-none-match': String(first.body['revision']) })
+    assert.equal(bare.status, 304)
+    // 不匹配 → 200 正常返回
+    const stale = await invokeUi(manager, { 'if-none-match': '"deadbeefcafe"' })
+    assert.equal(stale.status, 200)
+  } finally {
+    env.cleanup()
+    uiEnv.cleanup()
   }
 })

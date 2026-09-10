@@ -65,6 +65,22 @@ import {
   type RegisteredPlugin,
 } from './deps.js'
 import { decideWatchdog } from './watchdog.js'
+import { buildPluginUiTable, statFileSync, type PluginUiTable } from './plugin-ui.js'
+export {
+  buildPluginUiTable,
+  isPluginUiName,
+  pluginUiEntryOf,
+  pluginUiNameFromSegments,
+  pluginUiRootsFor,
+  resolvePluginUiHit,
+  resolvePluginUiRoots,
+  statFileSync,
+  type PluginUiSkipped,
+  type PluginUiTable,
+  type PluginUiTableEntry,
+  type UiFileStat,
+  type UiStatFile,
+} from './plugin-ui.js'
 import type { DiscoveryIssue } from './discovery.js'
 import {
   formatIssues,
@@ -133,6 +149,12 @@ export interface ManagerConfig {
    * 只读透出到 `GET /api/plugins` 的 `issues` 字段，让"目录里躺着但没被加载"的插件可见。
    */
   discoveryIssues?: DiscoveryIssue[]
+  /**
+   * 前端静态产物目录（绝对路径）：用于解析插件 UI 产物的**第二候选根**
+   * `<webDist>/plugins-ui/<插件名>`（第一候选根是外部插件自带的 `<插件目录>/dist`）。
+   * 仅影响 `GET /api/plugins/ui` 的入口表计算，与静态托管本身无关。null/缺省 = 只看插件自带产物。
+   */
+  webDist?: string | null
 }
 
 export interface PluginSnapshot {
@@ -267,6 +289,7 @@ export class GeeWikiManager {
       meltdownThreshold: config.meltdownThreshold ?? 3,
       crashMarkerFile: config.crashMarkerFile,
       discoveryIssues: config.discoveryIssues ?? [],
+      webDist: config.webDist ?? null,
     }
   }
 
@@ -277,6 +300,22 @@ export class GeeWikiManager {
     return this.config.registry
       .map((entry) => this.snapshotOf(entry.name))
       .sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  /**
+   * 插件客户端 UI 入口表（`GET /api/plugins/ui` 的数据源）。
+   *
+   * 每次调用**现算**：注册表只有几条，`existsSync`/`statSync` 的开销可忽略，
+   * 而缓存会引入"改了产物但表没更新"的一致性风险——不值得。
+   * 判定逻辑全部在 `plugin-ui.ts` 的纯函数里（含双根优先级与存在性），此处只喂真实 IO。
+   */
+  uiTable(): PluginUiTable {
+    return buildPluginUiTable({
+      registry: this.config.registry,
+      activeNames: this.activeNames(),
+      webDist: this.config.webDist,
+      statFile: statFileSync,
+    })
   }
 
   private snapshotOf(name: string): PluginSnapshot {
@@ -1378,6 +1417,29 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() }),
   )
   router.register('GET', '/api/plugins/graph', (h) => ok(h, { graph: manager.graph() }))
+  // 插件 UI 入口表（前端插槽用）：由注册表 × 激活集合 × 产物 stat 现算。
+  // 注册位置说明：本路由是 3 段（/api/plugins/ui），与既有 GET /api/plugins/graph 同形；
+  // 4 段路由（如 /api/plugins/:name/config）不受影响——某插件恰好叫 "ui" 时仅裸 3 段路径被占用。
+  router.register('GET', '/api/plugins/ui', (h) => {
+    try {
+      const table = manager.uiTable()
+      // 派生自活状态，绝不能被中间缓存当成静态文件：显式 no-store（HttpRouter.json 只在
+      // 未发送响应头时 writeHead，会与这里的 setHeader 合并）。
+      if (!h.res.headersSent) h.res.setHeader('cache-control', 'no-store')
+      const etag = `"${table.revision}"`
+      if (!h.res.headersSent) h.res.setHeader('etag', etag)
+      // If-None-Match：刻意只做简化匹配——剥离可选 W/ 与前后引号后与当前 revision 全等比较，
+      // 不做 RFC 7232 的列表/通配符解析（前端只会回传我们给出的那一个值）。
+      const inm = h.req.headers['if-none-match']
+      if (typeof inm === 'string' && stripEtagWeakness(inm) === table.revision) {
+        h.json(304, null)
+        return
+      }
+      ok(h, table)
+    } catch (err) {
+      fail(h, err)
+    }
+  })
   router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()))
   router.register('POST', '/api/plugins/:name/enable', async (h) => {
     try {
@@ -1447,8 +1509,17 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     }
   })
   console.log(
-    '[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/plugins/:name/config, /api/session',
+    '[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/plugins/ui, /api/plugins/:name/config, /api/session',
   )
+}
+
+/**
+ * 归一化 If-None-Match 的值用于比较：剥离可选的弱校验前缀 `W/` 与前后引号。
+ * 只处理"单个 ETag"这一实际形态（见路由内注释），不做 RFC 7232 完整解析。
+ */
+function stripEtagWeakness(value: string): string {
+  const trimmed = value.trim().replace(/^W\//, '')
+  return trimmed.replace(/^"(.*)"$/, '$1')
 }
 
 /** 读取 enable 请求体 JSON（1MB 上限）：超限暂停读取剩余请求体并以 payload_too_large 拒绝，
