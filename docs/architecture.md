@@ -95,11 +95,80 @@ AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search�
     超时则打印告警（含仍未结算的请求数）后**强制卸载**；`drainTimeout ≤ 0` 表示不等待。
     `@geewiki/http` 自身关停时同样先排空在途 API 请求再关闭监听。
 
+#### 5.1.1 长连接（SSE）出口与优雅排空的共存（提交 `2273006`）
+
+**结论先说**：长连接**不计入排空**，且**不能**用 `json()` 去"记一次指标"。这两条都是刻意的，各自有实测依据。
+
+**（a）长连接为什么不占在途——机理（`packages/server/src/index.ts:358-371`）**
+
+`dispatch` 只在 `isThenable(result)` 为真时才把 `exitHandler` 挂到 Promise 结算上：
+
+```ts
+const result: unknown = route.handler(h)
+if (isThenable(result)) { void Promise.resolve(result).then(() => this.exitHandler(state), …) }
+else { this.exitHandler(state) }
+```
+
+因此 **SSE 处理器只要同步返回非 thenable，就会在同一 tick 内结算**，在途计数立刻归零；而连接的存活状态由**提供方自己持有**（处理器已把 `res` 交给某个长生命周期对象持续写帧）。这就是"长连接不阻塞排空"的全部秘密——不需要任何特判计数逻辑。
+
+反过来说醒：**若把长连接算进在途**，卸载插件时 `drain()` 会一直等到连接关闭，必然空转满 `drainTimeout` 并打印**假的**"排空超时"告警。本仓曾在 REST 卸载路径上因同类归因错误稳定误报（对应回归用例在 `packages/server/test/router.test.ts`）。
+
+**（b）`noteStatus` 为什么必须存在——一条被实测证伪的设计设想（务必记档，后人最易重犯）**
+
+原设计设想：长连接出口"先 `res.writeHead(200, { 'content-type': 'text/event-stream' })` 再 `h.json(200, null)`，这样就恰好记了一次指标、又不结束响应"。**该设想已被实测证伪。**
+
+实测事实：
+
+- `writeHead` 之后，`res.headersSent` **立即为 `true`**，而 `res.writableEnded` **仍为 `false`**——所以 `json()` 开头那道 `if (res.writableEnded || res.destroyed) return` 的 write-after-end 防护**拦不住**这种情况。
+- `json()` 内的 `writeHead` 是**有条件**的（`if (!res.headersSent) res.writeHead(...)`，`packages/server/src/index.ts:298-300`），但紧随其后的 **`res.end(JSON.stringify(body))` 是无条件的**（`:301-306`）。
+- 合起来：会往 SSE 流里**追加字面 `null` 并立即终结流**。实测客户端读到的正文为：
+
+  ```
+  event: status
+  data: {"type":"status"}
+
+  null
+  ```
+
+因此**必须**另开一条"只记指标、绝不碰响应"的通路，即 `RouteHandlerContext.noteStatus?(status)`（`packages/core/src/index.ts:299`）。它与 `json()` **共用同一记账点**（`packages/server/src/index.ts:272-292`）——`settledStats` 幂等守卫保证**每个请求只记一次**：长连接先 `noteStatus(200)` 记状态码、随后（如异常收尾路径）仍可能经 `json()` 再走一次，重复记账会让 `stats()` 总数虚高、看门狗连续失败计数被放大。
+
+长连接出口的正确姿势：**确定状态码时调用 `noteStatus()` 记一次指标 → 自行持续写帧 → 自行 `res.end()` 收尾。**
+
+**（c）`trackStream` / `closeStreams`**
+
+- `HttpRouterService.trackStream?(res)`（`packages/core/src/index.ts:375`）登记长连接，返回**幂等**注销函数（`packages/server/src/index.ts:170-178` 用 `released` 布尔守卫）。登记的**唯一价值**是让路由服务在**自身卸载/关停**时能主动结束这些连接——否则客户端会一直挂着等一个再也不会来的字节。持有者若要按自己的生命周期收流，调用返回的注销函数即可。
+- **该集合不参与排空计数**（`packages/server/src/index.ts:128` 的 `private readonly activeStreams = new Set<ServerResponse>()`，注释 `:121-127` 明写"**刻意不计入 `inFlight`**"）。
+- **⚠️ `closeStreams()` 不在 `HttpRouterService` 接口上**——它是 `HttpRouter` **具体类**的方法（`packages/server/src/index.ts:186`，接口见 `packages/core/src/index.ts:340`）。也就是说：**其他包经 `ctx.get('http')`（静态类型为 `HttpRouterService`）拿到的服务上没有这个方法**，它是路由服务自身的**实现细节**，只由 `HttpPlugin.apply` 的 teardown 在自己的闭包里调用（那里持有的是具体类实例）。实现为逐个 `res.end()` 并 `try/catch`（`console.warn('[@geewiki/http] 结束长连接失败:', err)`），单个连接异常不得阻断其它连接的收尾；最后 `clear()`。
+- 与之对照，两个新成员里 `noteStatus` 与 `trackStream` 都做成**接口上的可选成员**（`?`）以保持向后兼容——既有 4 处测试替身无需改动。
+
+**（d）`HttpPlugin.apply` 的 teardown 现为五步（`packages/server/src/index.ts:627-654`）**
+
+```
+unprovide()                      // ① 先摘掉服务，后续 get('http') 拿不到
+→ closeStreams()                 // ② 主动结束全部活跃长连接（它们不计入排空，drain 不会等）
+→ await drain(drainTimeout×1000) // ③ 优雅排空在途 API 请求；长连接不占在途，故应立即返回
+→ server.closeIdleConnections?.()// ④ 只关空闲 keep-alive、保留在途（Node 22 有）
+→ server.close()                 // ⑤ 关闭监听
+```
+
+第 ④ 步**刻意不用 `closeAllConnections()`**：那会连测试里 undici 连接池的复用连接一并掐断，代价大于收益。第 ③ 步的**告警文案与语义一字未改**（超时仍打印 `[@geewiki/http] 排空超时（Nms，仍有 M 个请求在途），强制关闭监听`）。
+
+**（e）测试证据（`packages/server/test/sse-drain.test.ts`，6 例）**
+
+- 核心断言走的是**真实生产卸载路径**（REST `/disable` → `manager.disable()` → `deactivateCore` → `unloadPlugin` → `drainBeforeUnload` 生产排空代码 → `fiber.dispose()`），长连接由持有者插件自己的 `dispose` 收掉；其中一例覆盖 `HttpPlugin.apply` 的真实 teardown（经 `startServer().dispose()`）。
+- 一例是**负对照**：处理器返回**永不 resolve 的 thenable** → 排空确实等待、超时并打印告警——证明主用例（长连接不空转）**有判别力**，而不是"恰好没触发"。
+- 一例回归 `json()` 终结流的坑：`noteStatus` 恰好记一次指标，且**响应体不得出现字面 `null`**。
+- 一例覆盖 `trackStream` 注销的**幂等性**（重复调用不抛错、集合不残留）。
+- **两处变异取证**：① 在 `trackStream` 里加 `inFlight++`（把长连接算进在途）→ 用例红，报"长连接不得阻塞排空（实际 5004ms）"——正是本特性要消灭的假超时；② teardown 去掉 `closeStreams` → 用例红。两处变异均已还原。
+- **`packages/server/test/router.test.ts` 的 11 条一字未改**（`git diff --stat 2273006^ HEAD -- packages/server/test/router.test.ts` 为空）。
+
+> **本小节只铺了地基**：出口机制（登记/记账/主动收流/排空共存）已就绪，但**真实的流式输出仍未接线**——尚无任何插件向客户端持续写帧，`packages/plugin-ai/src/index.ts:261` 的 `generate()` 仍是唯一接线点（见 §9.7）。
+
 ### 5.2 依赖图谱与约束系统
 
 - 后端维护插件依赖数据并提供查询 API；前端使用 **React Flow** 将依赖图渲染为 DAG。
 - **加载时**：自动递归加载所有未激活的依赖项。
-- **卸载时**：计算下游依赖者（反向依赖）；若存在依赖者，则阻止卸载并弹窗提示。
+- **卸载时**：计算下游依赖者（反向依赖）；若存在依赖者，则阻止卸载并给出**专门说明块**（`409 has_dependents`）。管理台不再只显示泛化错误：`packages/web/src/pages/AdminPage.tsx:423-455` 的 `.dependents-block` 列出依赖方名单（来自响应 `details.dependents`；形状不符时退化为"后端未返回名单"的兜底文案），并给两段**可操作指引**——① 先在上表逐个停用依赖方，再回来停用目标；② 若目标是被同冲突组的其它插件顶替，可在目标插件那行点「启用」走**冲突组替换**（会连同依赖方一起安全接管）。**刻意不实现自动级联停用**（破坏性操作，不属本批）。
 - **节点颜色区分热能力**：绿色 = 支持热加载；红色 = 需重启。
 
 ### 5.3 会话层沙箱机制（防崩溃安全阀）
@@ -180,6 +249,10 @@ AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search�
 - **两条已实测证伪的做法（排障时最容易误判的点，`packages/web/src/lib/pluginUiPlan.ts:17-26`）**：① **不要给 bundle URL 加 `?v=<rev>` 之类的 cache-busting query**——给**根相对** URL 加 query 在 dev 下会触发 Vite 的 `injectQuery` 改写（`?import&v=…`）→ **必然 500**（`This file is in /public…`）；即便改用同源绝对 URL 绕开改写，`rev` 一变就产生**新模块实例**，而 `registerSlot` 是 append、已加载集合只按插件名去重 → **插槽条目翻倍**（实测 widget 2→4），且 ESM 无法从模块图卸载。故 `rev` **只用于变更检测、不进 URL**。② **`/* @vite-ignore */` 并不能阻止 Vite 改写动态 import**——dev 之所以没踩坑，是因为 `pluginUiBase()` 返回的是**同源绝对 URL**（首字符 `h`），而 `injectQuery` 只对以 `.` / `/` 开头的 URL 追加参数；这个"同源绝对 URL"的形态是**硬要求**，不要改成相对路径。
 - **生命周期自动同步**：`startPluginUiSync({ intervalMs = 15000 })`（`packages/web/src/main.tsx:21` 调用）先**立即同步一次**，再挂 `visibilitychange`（变可见时同步）与**可见期低频轮询**（`document.hidden` 为真时跳过；`If-None-Match` 让空闲期几乎零成本），返回幂等的停止函数；`syncPluginUi()` 本身**幂等 + 单飞**（在途请求复用同一个 Promise）。集成点是管理台 `AdminPage` 的 `load()`（`packages/web/src/pages/AdminPage.tsx:83`）——它是四条变更成功路径（act / confirmEnable / doReplace / saveConfig）的汇聚点，故**只挂这一处**即可让插槽跟随启停，`revision` 未变时同步是纯 no-op。轮询存在的理由：**外部变更不经过前端**（看门狗试用期回滚会在后端异步 `disable()`、CLI 直接改清单、其它标签页同理），只靠"动作后刷新"会让界面长期与后端不一致；因此**外部变更的 UI 收敛延迟上界是一次轮询间隔（默认 ≤15s）**，而管理台自身动作路径为**即时**。
 - **304 短路的一个真问题与修法**：`revision` 只是**表格内容**的哈希，"启用 → 停用 → 再启用"会回到**同一个**值；若此前某次加载失败，304 会让宿主**永久**漏加载那个插件（表内容一样、短路一直命中，界面永远起不来）。修法是 `isUiSettled(entries, loaded, failed)` 判定"界面是否已收敛到最近一次看到的入口表"：**未收敛时不带 `If-None-Match`**（强制取一次完整表重新对齐），并以 `rev` 为键**记忆加载失败**、把"已按同一 rev 失败过"视为已收敛——避免 15s 轮询对同一个坏产物反复 import 与重复告警，`rev` 变化后自然重新尝试。
+- **第二个 304 短路真问题：`revision` 不含 `skipped`（提交 `3bdcf4b` 修）**。`buildPluginUiTable` 的哈希输入**只有 `{version, plugins}`**（`packages/manager/src/plugin-ui.ts:255` 的 `createHash('sha1').update(JSON.stringify({ version: 1, plugins })).digest('hex').slice(0, 12)`，注释 `:221` 明写 `skipped` 不参与），因此"**未启用 / 无前端界面**的插件集合"发生变化时（例如新装了一个未启用的插件、或某插件从未启用变为无界面），`revision` **纹丝不动** ⇒ 客户端带着同一个 `If-None-Match` 请求，后端照旧回 **304** ⇒ 管理台**永远看不到**这类变化。这与上一条不同：上一条是"已加载集合与 revision 脱钩"，本条是"**展示字段根本不在指纹里**"。修法是给 `syncPluginUi` 加 **`force`** 参数（`packages/web/src/lib/pluginUi.ts:305-307` 的 `PluginUiSyncRequest.force`）：`useEtag = !force && lastRevision !== undefined && isSettled()`（`:333`），命中 304 直接 `return`（`:344`）；**管理台 `load()` 走 `syncPluginUi({ force: true })`**（`packages/web/src/pages/AdminPage.tsx:109`，不使用 `If-None-Match`），而 **`startPluginUiSync` 的 15s 可见期轮询仍走 304 短路**（`packages/web/src/lib/pluginUi.ts:400/404/412` 调无参 `syncPluginUi()`）——既保证展示字段的新鲜度，又不牺牲空闲期的零成本。
+- **`skipped` 的前端呈现按严重度分级（提交 `3bdcf4b`）**：`classifyUiSkips(skipped)`（`packages/web/src/lib/pluginUiPlan.ts:226`，纯函数）把跳过项分为 `attention`（`entry_missing` / `invalid_name`）与 `normal`（`inactive` / `no_client`）两组，各自按名排序保证渲染确定性。分级的理由：`entry_missing` 是"作者声明了界面、产物却没跟上"的**真实故障**（典型症状是发布漏带 `dist/`），必须显著；而 `inactive` / `no_client` 是**预期状态**，与故障同级用告警样式呈现只会让真正的故障淹没在噪声里。管理台据此渲染：`attention` → `.ui-skips-attention` 红系显著告警块（`AdminPage.tsx:385-402`）；`normal` → `.ui-skips-normal` **可折叠 `<details>`**（默认收起，`:404-421`）。四值的中文标签与解释见 `UI_SKIP_LABEL` / `UI_SKIP_HELP`（`pluginUiPlan.ts:240` / `:248`）。
+- **`skipped` 与"发现期 issues"语义不同，不可混为一谈**：`GET /api/plugins/ui` 的 `skipped` 是"**插件在（已注册/已发现），但它的前端界面没加载**"（唯一机器可读出口，典型情形：声明了 `client` 却忘了跑 `build:fixtures` → `entry_missing`）；`GET /api/plugins` 的 `issues` 是"**整个插件都没加载进来**"（发现/加载期失败：目录、清单、入口模块）。管理台的告警块文案已把这条区别写死："与上面的'发现期问题'不同：那一类是整个插件都没加载进来，这一类是插件在、界面缺。"
+- **订阅式读取路径**：`pluginUi.ts` 原有的 `parseUiTable` 会**直接丢弃** `skipped`（没有对外可读入口），故本批补了最小订阅式读取（`pluginUiState()` / `subscribePluginUiState()`，`packages/web/src/lib/pluginUi.ts:148/159`；快照引用稳定、仅在变更后通知），管理台用 `useSyncExternalStore` 消费（`AdminPage.tsx:96`）——**没有新写第二份 fetch**。解析侧 `readSkipped` **刻意从宽**：`skipped` 坏掉绝不能让"加载/卸载"也判为不可信（否则一个展示字段会拖垮入口表关键路径）。
 - **静态资源的托管**：URL 形态为 `/plugins-ui/<插件名>/<单段文件名>`，**插件名不做 URL 编码**（scope 名 `@geewiki/wiki` 就是两个路径段），**编码名一律 404**（编码后 dev 会落 Vite 的 SPA fallback 200 + text/html，prod 静态层不解码必 404）。资产有**双根**、顺序即优先级：① `<插件目录>/dist`（外部插件**自带**产物——Docker 里 `plugins/` 是 bind mount，这是"安装即生效、无需重建 web 包"的唯一路径）② `<pluginUiDist>/plugins-ui/<名>`（内置插件与夹具）。**内置根由 `GEEWIKI_PLUGIN_UI_DIST`（`ServerOptions.pluginUiDist`）指定、缺省 = `webDist`**——两者是**两个独立配置项**（dev 下根 `package.json` 的 `dev` 脚本把内置根设为 `packages/web/public`，而 app shell 仍走 `packages/web/dist`）。之所以必须拆开：`webDist` 一个项曾同时承担"前端产物根（app shell 与 `/assets/*`）"与"内置插件 UI 资产兜底根"两个职责，dev 为让插件 UI 免构建可用而把它指向 `packages/web/public`，那里**没有 `index.html`** → 静态层与 SPA fallback 都取不到 app shell → 后端首页 404（提交 `88e0c58` 修复）。**两个 null 的语义不同**（`packages/server/src/index.ts:605-614` 的类型注释）：`pluginUiDist: null` = **不使用内置根**（只看插件自带产物），`webDist: null` = **不启用静态服务**；且 `pluginUiDist` 缺省**回落 `webDist`**，故既有部署行为完全不变。"用哪个根 / 入口在不在"由 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit` **唯一**实现，被入口表与静态层的按名查根表（`pluginUiRootsFor`）**共同调用**——这是本机制最关键的不变式：两处若各算一遍，就会出现"表里说就绪、资产却 404"或"`rev` 变了内容还是旧的"这类**在快照里与"没报错"长得一样**的不一致。`/plugins-ui` 在静态层走**独立分支**且**绝不 SPA fallback**：路径不合法/插件不在根表/文件缺失一律 404 `application/json`（若回退 `index.html` 就会被掩盖成 200 `text/html`，浏览器报 MIME 错而真因不可见）。dev 下 `/plugins-ui` 由 `packages/web/vite.config.ts` 的 `server.proxy` 转发到后端——**必须**如此，因为资产可能来自 `plugins/<name>/dist`，位于 `publicDir` 之外。
 - **静态层根表禁止缓存（提交 `a24241a`）**：`packages/server/src/index.ts` 的 `pluginUiRoots` 必须**每请求现算**（`config.pluginUiRoots?.() ?? {}`），因为入口表也是每请求现算——两者寿命若不同，就会出现"入口表说该插件就绪（并给出 `rev`），静态层却从**已消失的根**取文件 → 404"，而前端还会照表去 import 那个 404 的资产。触发条件很具体：**同名入口文件在两个候选根都存在**，随后高优先级那个根消失——`resolvePluginUiHit` 会回退到次优先根并在表里继续列出该插件，而缓存仍指着已消失的根。代价可控（`pluginUiRootsFor()` 只对声明了 `client` 的插件做几次 stat，注册表只有几条）。注意保留"函数"形态（而非快照对象）是**另一件事**：它解开的是"http 条目早于外部插件发现"的**注册顺序陷阱**，与缓存无关。
 
@@ -324,7 +397,7 @@ AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search�
 
 - `phrase`（缺省，**搜索框语义**）：整串经 `toFtsPhrase()` 加引号当一个**字面短语**。
 - `terms`（**问句检索 / RAG 语义**）：把查询切成**词元**后以 **OR** 连接。切分规则由 trigram 的硬约束决定（<3 字符的词元在 `MATCH` 下恒为空）：**CJK 连续片段**取长度 3 的**滑窗 3-gram**（「检索增强怎么做」→ 检索增/索增强/…）；**ASCII/数字片段**按空白与常见标点切词，只保留长度 ≥3 者。**每个词元仍各自 `toFtsPhrase()` 后拼 OR**——切词与转义分开，"注入防护只有一处实现"。`terms` 切不出词元时（<3 字符、纯标点）**回退 LIKE**（不构造空 `MATCH`，它抛 `fts5: syntax error`）。`terms` 下 BM25 天然让"命中词元更多"的行排前（OR 的相关度是各词元得分之和）；`snippet` 的锚点也改为**逐个词元试**（问句本身不在正文里，用整句定位会让每条命中都高亮为空）。
-- **⚠️ 已知缺陷与修复状态（如实记录，以最终提交为准）**：`phrase` 作为缺省使 `@geewiki/ai` 的问答**按整串短语检索**，而自然语言问句几乎不可能逐字连续出现在正文里 ⇒ **恒为 0 命中**，问答的检索地基实际不可用。**修复**即上面的 `terms` 模式，并让 `@geewiki/ai` 一律走 `terms`（`packages/plugin-ai/src/index.ts` 的 `search.search(query, { limit, mode: 'terms' })`）。**截至本文取数时刻，该修复在工作树中已实现但尚未提交**：HEAD `585dbac` 的已提交版本仍是 `search(query, { limit })` 且端点不读 `mode` 参数。**本文不对"问答召回是否正常"下任何断言。**
+- **✅ 曾登记的缺陷与修复状态（该修复已落地并提交）**：`phrase` 作为缺省使 `@geewiki/ai` 的问答**按整串短语检索**，而自然语言问句几乎不可能逐字连续出现在正文里 ⇒ **恒为 0 命中**，问答的检索地基实际不可用。**修复**即上面的 `terms` 模式，并让 `@geewiki/ai` 一律走 `terms`（`packages/plugin-ai/src/index.ts:361` 的 `search.search(query, { limit, mode: 'terms' })`）。**该修复已提交为 `04c45c3`**（此前本文标注的"工作树已实现但尚未提交"已过时；HEAD `585dbac` 的旧行为是 `search(query, { limit })` 且端点不读 `mode` 参数）。**仍成立的边界**：`mode=terms` **未接入 Web UI**（搜索框保持 `phrase` 语义，`queryMode` 随响应下发备用）；**已知代价**：terms 召回更宽、精确率天然低于短语检索（提交说明原文），建议纳入后续检索质量评估。**未验证项**：端到端召回质量**未经本文档作者复跑验证**（无真实问答链路）。
 
 **服务契约** `SearchService`（`ctx.get('search-service')`）：`search(q, opts?: { limit?: number; mode?: SearchMode }): SearchResult`（`SearchMode = 'phrase' | 'terms'`，缺省 `'phrase'`）与 `contents(slugs: readonly string[]): ReadonlyMap<string, string>`。`search()` 与端点走**同一份实现**（端点只做 HTTP 层），故两者在同 `q` 同 `limit` 下结果逐字段一致；`limit` 非法时服务层抛 `RangeError`（对应端点的 400）。`contents()` 供 RAG 拼上下文，**只包含真实存在的 slug**（查不到的键不出现，消费方据此区分"页面不存在"与"正文为空串"）；占位符按 `slugs.length` 动态生成、值一律参数绑定（绝不把 slug 文本拼进 SQL）。插件卸载后调用**显式报错**，绝不返回空结果——"卸载后静默返回 0 命中"会被误读成"库里没有匹配内容"。
 
@@ -372,7 +445,7 @@ AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search�
 - 答案必须精确回传到响应的 `sources[].used` 与 `sources[].n` 上——否则前端会展示一批"看起来被引用了、实际没进 prompt"的来源。被丢弃者 `used: false` 且 `n: null`；**`n` 只对 `used: true` 者从 1 起连续编号**（故类型是 `number | null`），与 prompt 里的 `[n]` 严格一致。
 - 页面在"检索命中"与"取正文"之间被删除（竞态）时该条无法进上下文；注意区分"页面不存在"（`undefined`）与"页面正文为空串"——后者仍可只靠标题入上下文。
 - 抽取式摘要用**未截断**的原文定位命中词（命中点可能落在 `perSourceChars` 之外）。
-- **检索一律走 `mode: 'terms'`**：`search.search(query, { limit, mode: 'terms' })`（工作树状态，见 §9.3 的修复状态说明）。本插件的入口是**自然语言问句**，按整串短语检索会恒为 0 命中；词元切分复用 `@geewiki/search` 的单一实现（`buildTermQuery`），本插件**不重复实现分词**。
+- **检索一律走 `mode: 'terms'`**：`search.search(query, { limit, mode: 'terms' })`（`packages/plugin-ai/src/index.ts:361`，已提交 `04c45c3`）。本插件的入口是**自然语言问句**，按整串短语检索会恒为 0 命中；词元切分复用 `@geewiki/search` 的单一实现（`buildTermQuery`），本插件**不重复实现分词**。
 - 正文一律经 `search-service.contents()` 取，**不直连 wiki 的 `pages` 表**——否则 wiki 的表结构会变成跨包隐式契约。
 
 **唯一接线点**：`generate()`（`packages/plugin-ai/src/index.ts:261`）是本阶段**唯一有意未接线**的函数——没有厂商 adapter 时 `availableProviders()` 为空，它必然走降级分支。将来 adapter 批次只需在这一个函数里补齐"按需中断/超时、token 计量口径、SSE 增量外发"三件事，其余代码无需改动；prompt 拼装已拆成纯函数（`prompt.ts` 的 `buildContext` / `buildMessages` / `SYSTEM_PROMPT`）并有单测。
@@ -391,7 +464,7 @@ AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search�
 | 边界 | 状态 | 理由 / 后续方案 |
 | --- | --- | --- |
 | **无任何厂商 LLM adapter** | 现状 | `llm-service` 无可用 provider，问答**恒走 `retrieval-only`**；`rag` / `rag-partial` 两条路径目前**仅有"假 provider"的单测覆盖**，无真实模型链路验证 |
-| **流式（SSE）未做** | **有意不做** | 长连接在途期间会被**永久计入在途计数**，会让卸载/关停时的优雅排空（`drain`）空转满 `drainTimeout` 并打印**假的排空超时告警**。因此 SSE 出口**必须与排空语义一起设计**；方案已定：流式响应登记为"不阻塞排空" + 硬超时 / idle 超时 + `res.on('close')` 即取消上游。本阶段检索与问答均为一次成型返回 |
+| **流式（SSE）未做** | **有意不做**（地基已铺，见 §5.1.1） | **出口机制已就绪**（提交 `2273006`）：长连接经 `trackStream` 登记后**不参与排空计数**，`noteStatus` 提供"只记指标、不结束响应"的通路，teardown 五步内会主动收流——即"SSE 出口必须与排空语义一起设计"这件事**已经做完**。**仍未接线的是真实的流式输出**：目前没有任何插件向客户端持续写帧，检索与问答均为一次成型返回（`packages/plugin-ai/src/index.ts:261` 的 `generate()` 仍是唯一接线点）。尚未落地的两件：**硬超时 / idle 超时**与 **`res.on('close')` 即取消上游**。另须记住 §5.1.1(b) 的实测结论——**不要**用 `writeHead` + `h.json()` 去"记一次指标"，它会给事件流追加字面 `null` 并立即终结流 |
 | **向量 / 语义检索未做** | 有意后置 | 离线 + 零重依赖前提下不现实（本地 ONNX 需预烤模型与 ORT WASM 运行时）；只留接口位。当前检索是**纯字面**匹配，故同义改写、跨语言、模糊表述都搜不到 |
 | **`search` / `ask` 是保留 slug** | 现状 | 二者成为 wiki 下的**保留首段 slug**，不能再创建同名页面（判据见 `packages/web/src/pages/WikiPage.tsx:37` 的 `allowedSecond`） |
 | **密钥** | 边界 | 配置里只存**环境变量名**，**环境变量本身**由运维在外部设置；`GET /api/plugins/:name/config` 对**普通配置字段**仍**明文返回**（见 5.7），而 `apiKeyEnv` 只是变量名故不构成泄漏 |
