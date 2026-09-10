@@ -282,6 +282,21 @@ export interface RouteHandlerContext {
   params: Record<string, string>
   /** 发送 JSON 响应并结束 */
   json(status: number, body: unknown): void
+  /**
+   * **仅记录指标、不结束响应**——长连接（SSE 等）出口专用。
+   *
+   * 为什么必须单独有这条通路：{@link RouteHandlerContext.json} 除了（必要时）写响应头，
+   * **必然**执行 `res.end(...)`，因此对"已写出 SSE 响应头、但需要继续保持连接"的处理器
+   * 完全不适用——用它会把流立即终结；而且此时 `res.headersSent` 已为 true，json 会跳过
+   * writeHead 却仍然 `res.end(JSON.stringify(body))`，把 JSON 文本（如字面 `null`）
+   * 追加进事件流里污染协议。
+   *
+   * 长连接出口的正确姿势：确定状态码时调用本方法记一次指标 → 自行持续写帧 →
+   * 自行 `res.end()` 收尾。指标每个请求只记一次（{@link json} 与本法共用同一记账点）。
+   *
+   * 可选（`?`）以保持向后兼容：既有测试替身与只发 JSON 的实现无需立刻补齐。
+   */
+  noteStatus?(status: number): void
 }
 
 /** 路由处理器 */
@@ -341,4 +356,21 @@ export interface HttpRouterService {
    * @returns 是否在时限内排空（false = 仍有请求在执行）
    */
   drain(timeoutMs: number): Promise<boolean>
+  /**
+   * 登记一个长连接响应（SSE 等）；返回注销函数（**幂等**，重复调用安全）。
+   *
+   * 语义与为什么必须单独登记：
+   * - 长连接**不计入排空**（不出现在 {@link inflight} / {@link pending}）：排空等的是
+   *   "路由处理器是否结算"，而长连接的处理器应当**同步返回**（当拍结算），连接随后由
+   *   持有者继续写帧。若把长连接算进在途数，卸载插件时 drain() 会一直等到连接关闭，
+   *   必然空转满 drainTimeout 并打印**假的**"排空超时"告警——本仓库曾因同类归因错误
+   *   在 REST 卸载路径上稳定误报（见 server 包 router.test.ts 的回归用例）。
+   * - 登记的价值在于让路由服务在**自身卸载/关停**时能主动结束这些连接，
+   *   否则客户端会一直挂着等一个再也不会来的字节。
+   * - 持有者若要按自己的生命周期收起连接，调用返回的注销函数即可（例如某插件卸载时
+   *   先结束自己开的流，再注销）。
+   *
+   * 可选（`?`）以保持向后兼容：既有测试替身无需立刻提供。
+   */
+  trackStream?(res: import('node:http').ServerResponse): () => void
 }

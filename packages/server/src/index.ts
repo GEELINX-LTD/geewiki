@@ -118,6 +118,14 @@ class HttpRouter implements HttpRouterService {
    * 结果必然是空转到 drainTimeout 并打印假的超时告警。
    */
   private readonly requestScope = new AsyncLocalStorage<RequestState>()
+  /**
+   * 活跃长连接响应（SSE 等）：**刻意不计入 inFlight**。
+   *
+   * 长连接的处理器同步返回（当拍结算），连接本身随后由持有者持续写帧；把它算进在途数
+   * 会让 drain() 一直等到连接关闭 → 空转满 drainTimeout → 打印假的"排空超时"告警。
+   * 这个集合只用于"路由服务自身卸载时主动收掉这些连接"。
+   */
+  private readonly activeStreams = new Set<ServerResponse>()
 
   constructor(private readonly healthHandler: RouteHandler) {}
 
@@ -153,6 +161,38 @@ class HttpRouter implements HttpRouterService {
 
   inflight(): number {
     return this.inFlight
+  }
+
+  /**
+   * 登记长连接响应（见 HttpRouterService.trackStream 的语义说明）。
+   * 返回**幂等**的注销函数：重复调用只生效一次，集合不会残留。
+   */
+  trackStream(res: ServerResponse): () => void {
+    this.activeStreams.add(res)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.activeStreams.delete(res)
+    }
+  }
+
+  /**
+   * 结束全部活跃长连接（路由服务卸载/关停时调用）。
+   *
+   * 为什么需要主动收：长连接不计入排空，因此 drain() 不会等它们——若不在这里结束，
+   * 客户端会一直挂着；同时逐个 try/catch，单个连接的异常不得阻断其它连接的收尾。
+   */
+  closeStreams(): void {
+    for (const res of [...this.activeStreams]) {
+      try {
+        res.end()
+      } catch (err) {
+        // 连接可能已被对端断开：收尾失败不影响其它连接，也不应让卸载失败
+        console.warn('[@geewiki/http] 结束长连接失败:', err)
+      }
+    }
+    this.activeStreams.clear()
   }
 
   /** 除调用方自身请求外的在途数（请求之外调用时等同 inflight()） */
@@ -226,7 +266,13 @@ class HttpRouter implements HttpRouterService {
     this.counters.total++
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
     const method = req.method ?? 'GET'
+    // 指标记账点：json() 与 noteStatus() 共用，**每个请求只记一次**。
+    // 幂等是必要的：长连接先 noteStatus(200) 记状态码、随后（如异常收尾路径）仍可能经
+    // json() 再走一次；重复记账会让 stats() 的总数虚高、看门狗连续失败计数被放大。
+    let settledStats = false
     const finish = (status: number): void => {
+      if (settledStats) return
+      settledStats = true
       const ms = Date.now() - started
       this.lastMs = ms
       this.msHistory.push(ms)
@@ -238,6 +284,11 @@ class HttpRouter implements HttpRouterService {
         this.counters.ok++
         this.counters.consecutiveFailures = 0
       }
+    }
+
+    // 长连接出口的记账通路：只记指标、绝不碰响应（json() 会 res.end，故不能用于此）
+    const noteStatus = (status: number): void => {
+      finish(status)
     }
 
     const json = (status: number, body: unknown): void => {
@@ -262,7 +313,7 @@ class HttpRouter implements HttpRouterService {
       // 同步处理器：仍置于请求上下文中，保证下游（探针触发的卸载）视角一致
       this.requestScope.run(state, () => {
         try {
-          this.healthHandler({ req, res, url, params: {}, json })
+          this.healthHandler({ req, res, url, params: {}, json, noteStatus })
         } catch (err) {
           console.error('[http] 健康检查异常:', err)
           json(500, { ok: false, error: 'health_check_failed' })
@@ -297,7 +348,7 @@ class HttpRouter implements HttpRouterService {
         }
       }
       if (!matched) continue
-      const h: RouteHandlerContext = { req, res, url, params, json }
+      const h: RouteHandlerContext = { req, res, url, params, json, noteStatus }
       // 在途登记：插件卸载前的优雅排空以"处理器是否结算"为准（同步处理器即刻结算）
       const state: RequestState = { active: false }
       this.enterHandler(state)
@@ -576,7 +627,11 @@ export const HttpPlugin = {
     return () =>
       new Promise<void>((resolveClose) => {
         unprovide()
-        // 优雅排空（架构 §5.1）：先等在途 API 请求结算，再关闭监听（超时强制关闭）
+        // 1) 先主动结束全部长连接（SSE 等）：它们不计入排空，drain() 不会等它们，
+        //    不收掉的话客户端会一直挂着等一个再也不会来的字节
+        router.closeStreams()
+        // 2) 优雅排空（架构 §5.1）：先等在途 API 请求结算，再关闭监听（超时强制关闭）。
+        //    长连接不占在途，故这里应**立即**返回；若有真实在途请求，告警照常打印。
         const drainTimeoutMs = (config.drainTimeout ?? HTTP_DRAIN_TIMEOUT_SECONDS) * 1000
         void router
           .drain(drainTimeoutMs)
@@ -586,10 +641,14 @@ export const HttpPlugin = {
                 `[@geewiki/http] 排空超时（${drainTimeoutMs}ms，仍有 ${router.inflight()} 个请求在途），强制关闭监听`,
               )
             }
+            // 3) 关掉空闲 keep-alive 连接（只关空闲、保留在途）；不用 closeAllConnections()：
+            //    那会连测试里 undici 连接池的复用连接一并掐断，代价大于收益
+            server.closeIdleConnections?.()
             server.close(() => resolveClose())
           })
           .catch((err: unknown) => {
             console.error('[@geewiki/http] 排空异常:', err)
+            server.closeIdleConnections?.()
             server.close(() => resolveClose())
           })
       })
