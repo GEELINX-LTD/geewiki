@@ -1,0 +1,37 @@
+/* 夹具自带样式：验证「插件 CSS 由宿主集中注入 <link>」这条路径（lib 模式不会自动注入样式） */
+.gw-fixture-widget {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 2px 10px;
+  border: 1px solid #3b82f6;
+  border-radius: 999px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.gw-fixture-widget button {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.gw-fixture-count {
+  min-width: 1ch;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.gw-fixture-label {
+  opacity: 0.7;
+}
+
+.gw-fixture-throw {
+  text-decoration: underline;
+}

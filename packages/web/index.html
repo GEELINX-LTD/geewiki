@@ -1,6 +1,22 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
+    <!--
+      插件客户端 bundle 把 `react` / `react/jsx-runtime` 声明为 external，
+      靠这张 import map 解析到宿主单例（public/host-sdk/*.js）。
+      必须是 head 的第一个元素：import map 只对"解析时尚未加载"的 module script 生效，
+      Vite 构建时还会把它前移到第一个 module script 之前（见 docs/plugin-platform-plan.md D-8）。
+      注意：映射的目标必须是**真实存在**的 shim，因此这里只列 react 与 react/jsx-runtime，
+      不映射 react-dom / react-dom/client（插件不得自带框架）。
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "/host-sdk/react.js",
+          "react/jsx-runtime": "/host-sdk/jsx-runtime.js"
+        }
+      }
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="GeeWiki —— AI-Native 插件化知识库" />

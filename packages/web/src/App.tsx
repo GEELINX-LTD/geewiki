@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { SlotOutlet } from './lib/slots'
 import { AdminPage } from './pages/AdminPage'
 import { GraphPage } from './pages/GraphPage'
 import { WikiPage } from './pages/WikiPage'
@@ -54,8 +55,11 @@ export function App(): ReactNode {
         <a className="gh-link" href="/api/health" target="_blank" rel="noreferrer" title="健康检查 /api/health">
           ● 服务健康
         </a>
+        {/* 插件插槽：已激活插件可在此贡献界面（见 lib/slots.tsx 与 lib/pluginUi.ts） */}
+        <SlotOutlet name="app-header" />
       </header>
       <main className="app-main">{body}</main>
+      <SlotOutlet name="app-footer" />
       <footer className="app-footer">
         GeeWiki · cordis 插件化内核 · React 19 管理台 · SQLite（可切换 PostgreSQL）
       </footer>

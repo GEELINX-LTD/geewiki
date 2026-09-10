@@ -58,6 +58,61 @@ export interface PluginInfo {
   migrations?: string
   config?: Record<string, unknown>
   error?: string
+  /** 来源：内置（组合根登记）/ 外部（plugins/ 目录发现） */
+  source?: 'builtin' | 'external'
+  /** 是否声明了配置 schema（决定管理台渲染表单还是 JSON 编辑框） */
+  configurable?: boolean
+}
+
+/* --------------------- 插件配置 schema（schemastery） --------------------- */
+
+/** schema 载荷中的单个节点（refs 的值为节点；节点上没有 uid 字段） */
+export interface ConfigSchemaNode {
+  type?: string
+  meta?: Record<string, unknown>
+  dict?: Record<string, number>
+  list?: number[]
+  inner?: number
+  sKey?: number
+  bits?: Record<string, number>
+  value?: unknown
+}
+
+/** 后端下发的 schema 载荷：refs 是 uid 字符串到节点的映射（非数组） */
+export interface ConfigSchemaPayload {
+  uid: number
+  refs: Record<string, ConfigSchemaNode>
+}
+
+export interface ConfigIssue {
+  message: string
+  path?: (string | number)[]
+}
+
+export interface PluginConfigResponse {
+  ok: true
+  name: string
+  /** 配置的**持久化层**（存在哪个清单里、重启后是否生效） */
+  layer: PluginLayer
+  /** **激活层**（未激活为 null）；与 layer 是不同维度 */
+  activeLayer: PluginLayer | null
+  config: Record<string, unknown>
+  schema: ConfigSchemaPayload | null
+}
+
+export interface ConfigUpdateResult {
+  ok: true
+  config: Record<string, unknown>
+  hotUpdated: boolean
+  /** 未发生热更新（插件未激活）：配置已落盘，待下次激活/重启生效 */
+  requiresRestart: boolean
+}
+
+/** 外部插件发现期被跳过的目录（GET /api/plugins 的 issues） */
+export interface DiscoveryIssueInfo {
+  code: string
+  dir: string
+  message: string
 }
 
 export interface GraphNodeInfo {
@@ -113,13 +168,18 @@ export interface SaveResult {
 
 export const api = {
   /* 插件管理 */
-  plugins: () => request<{ ok: true; plugins: PluginInfo[] }>('GET', '/api/plugins'),
+  plugins: () =>
+    request<{ ok: true; plugins: PluginInfo[]; issues?: DiscoveryIssueInfo[] }>('GET', '/api/plugins'),
   graph: () => request<{ ok: true; graph: GraphData }>('GET', '/api/plugins/graph'),
   session: () => request<{ ok: true } & SessionState>('GET', '/api/session'),
   enable: (name: string, config?: Record<string, unknown>) =>
     request<{ ok: true; plugin: PluginInfo }>('POST', `/api/plugins/${encodeURIComponent(name)}/enable`, { config: config ?? {} }),
   disable: (name: string) =>
     request<{ ok: true }>('POST', `/api/plugins/${encodeURIComponent(name)}/disable`),
+  pluginConfig: (name: string) =>
+    request<PluginConfigResponse>('GET', `/api/plugins/${encodeURIComponent(name)}/config`),
+  updatePluginConfig: (name: string, config: Record<string, unknown>) =>
+    request<ConfigUpdateResult>('PUT', `/api/plugins/${encodeURIComponent(name)}/config`, { config }),
   persist: () => request<{ ok: true; promoted: string[] }>('POST', '/api/session/persist'),
 
   /* Wiki 页面 */

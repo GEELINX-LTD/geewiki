@@ -271,3 +271,33 @@ h2 + .empty { padding: 8px; }
   text-align: center; color: var(--muted); font-size: 12px;
   padding: 16px; border-top: 1px solid var(--line); background: #fff;
 }
+
+/* ---------- 插件配置表单（SchemaForm：由 configSchema 自动生成） ---------- */
+
+.badge-builtin { background: #f1f5f9; color: #475569; border-color: #e2e8f0; margin-left: 6px; }
+.badge-external { background: #ecfdf5; color: #047857; border-color: #a7f3d0; margin-left: 6px; }
+
+.schema-form { display: flex; flex-direction: column; gap: 10px; }
+.schema-field { display: flex; flex-direction: column; gap: 4px; }
+.schema-label { font-size: 12px; color: var(--text); display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.schema-label .required { color: #dc2626; font-style: normal; }
+.schema-field input[type='text'],
+.schema-field input[type='number'],
+.schema-field select,
+.schema-field textarea {
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  font-size: 13px; font-family: inherit; background: #fff; outline: none;
+  resize: vertical; width: 100%; box-sizing: border-box;
+}
+.schema-field input:focus, .schema-field select:focus, .schema-field textarea:focus { border-color: var(--accent); }
+.schema-checkbox { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.schema-group {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 10px; margin: 0;
+}
+.schema-group legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+.schema-list { display: flex; flex-direction: column; gap: 8px; }
+.schema-list-item { display: flex; gap: 8px; align-items: flex-end; }
+.schema-list-item > .schema-field { flex: 1; }
+.schema-json { display: flex; flex-direction: column; gap: 4px; }
+.schema-errors { margin-top: 2px; }
