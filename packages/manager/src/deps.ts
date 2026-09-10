@@ -89,6 +89,35 @@ export function collectDependents(
 }
 
 /**
+ * 收集依赖闭包：返回 `names` 的全部（传递）依赖方插件名，不含 `names` 自身。
+ *
+ * 供冲突组替换（replace）计算"必须连带卸载再恢复"的插件集合：要卸载旧插件，
+ * 就得先卸掉它的全部依赖方（无论层级多深）。遍历覆盖**整个注册表**（不限于活动
+ * 插件）——中间节点即便当前未激活也继续向上传播，取的是安全超集；调用方按当前
+ * 活动集合取交集即可。BFS + visited 保证环安全（每个节点最多入队一次）。
+ */
+export function collectDependentsClosure(
+  registry: readonly RegisteredPlugin[],
+  names: readonly string[],
+): string[] {
+  const seen = new Set<string>(names)
+  const out: string[] = []
+  const queue: string[] = [...seen]
+  while (queue.length > 0) {
+    const current = queue.shift() as string
+    for (const other of registry) {
+      if (seen.has(other.name)) continue
+      if (directDependencies(registry, other.name).includes(current)) {
+        seen.add(other.name)
+        out.push(other.name)
+        queue.push(other.name)
+      }
+    }
+  }
+  return out.sort()
+}
+
+/**
  * 热授权链检查：会话层激活（热加载）插件 X 时，X 及其"需要随热加载的
  * 未激活依赖"都必须 supportsHotReload: true。
  * @param registry 注册表

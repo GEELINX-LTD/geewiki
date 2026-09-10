@@ -56,6 +56,7 @@ export {
 import {
   checkHotChain,
   collectDependents,
+  collectDependentsClosure,
   directDependencies,
   findConflict,
   topologicalOrder,
@@ -635,7 +636,7 @@ export class GeeWikiManager {
   /**
    * 会话层热启用（enable）：校验热授权/依赖链/冲突/迁移后激活并写入 Session 清单。
    *
-   * **单一回滚点**：本方法是所有递归深度的唯一回滚处，递归主体见 enableInner。
+   * **单一回滚点**：本方法是所有递归深度的唯一回滚处（实现在 enableWithDeps），递归主体见 enableInner。
    * 回滚集合（activated）由 enableInner 各帧**共用**——历史缺陷（W2）：回滚集合曾是
    * 每递归帧各自的局部数组，且由父帧替子帧记账，导致目标插件激活失败时**深度 ≥2 的
    * 孙依赖**无人回滚，残留在 Session 清单文件里（落盘为已启用但进程内并不活跃）。
@@ -643,9 +644,22 @@ export class GeeWikiManager {
    * 内置插件并入同一注册表，深度 ≥2 的链路可由外部插件构造，故必须修。
    */
   async enable(name: string, config?: Record<string, unknown>): Promise<PluginSnapshot> {
+    return this.enableWithDeps(name, config)
+  }
+
+  /**
+   * enable 的带参入口：`skipDeps` 中的插件名在递归装配依赖时被跳过。
+   * 目前唯一用途是冲突组替换（replace）——目标插件与旧插件往往 `provides` 同一服务，
+   * 旧插件卸载后若仍把 requires 解析到它，会把它当依赖重新拉起来（进而撞上冲突组互斥）。
+   */
+  private async enableWithDeps(
+    name: string,
+    config: Record<string, unknown> | undefined,
+    skipDeps?: ReadonlySet<string>,
+  ): Promise<PluginSnapshot> {
     const activated: string[] = []
     try {
-      return await this.enableInner(name, config, activated)
+      return await this.enableInner(name, config, activated, skipDeps)
     } catch (err) {
       // 按**逆激活序**回滚本次调用新增激活的全部插件（含任意递归深度）：
       // 先卸依赖方再卸被依赖者，逐个移出会话清单，不留半激活残留
@@ -674,6 +688,7 @@ export class GeeWikiManager {
     name: string,
     config: Record<string, unknown> | undefined,
     activated: string[],
+    skipDeps?: ReadonlySet<string>,
   ): Promise<PluginSnapshot> {
     const entry = this.registryOf(name)
     const m = entry.manifest.geewiki
@@ -715,8 +730,9 @@ export class GeeWikiManager {
     // 未显式传配置时回退到清单里已持久化的配置（PUT /config 的成果应当生效）
     const effectiveConfig = config && Object.keys(config).length > 0 ? config : (this.persistedConfigOf(name) ?? {})
     for (const dep of directDependencies(this.config.registry, name)) {
+      if (skipDeps?.has(dep)) continue // 冲突组替换：被顶替的旧插件不当作依赖重新拉起
       if (!this.plugins.get(dep)?.active) {
-        await this.enableInner(dep, undefined, activated)
+        await this.enableInner(dep, undefined, activated, skipDeps)
       }
     }
     await this.activateCore(name, effectiveConfig, 'session')
@@ -727,6 +743,134 @@ export class GeeWikiManager {
     // 落盘用"生效配置"（activateCore 已按 schema 填默认值/裁剪未知字段）
     this.addToSession(name, this.plugins.get(name)?.config ?? effectiveConfig)
     return this.snapshotOf(name)
+  }
+
+  /**
+   * 冲突组替换（replace）：把同 conflictGroup 的会话层插件顶替掉，并热激活目标插件。
+   *
+   * 顺序即语义：
+   *  1. 目标已激活 → 幂等返回当前快照（不顶替任何插件，`replaced` 为 null）。
+   *  2. 无同组冲突 → 退化为普通会话层启用（`replaced` 为 null、`restarted` 为空）。
+   *  3. 有冲突 → 前置校验（目标 supportsHotReload、热依赖链、旧插件必须位于**会话层**：
+   *     基础层属冷操作，热替换无从谈起）——全部在做任何副作用之前完成。
+   *  4. 卸载集合 = 旧插件 ∪ 其（传递）依赖方中当前活跃者，按拓扑序**逆序**逐个卸载
+   *     （依赖方先卸、被依赖者后卸），再激活目标；随后按正向拓扑序把依赖方接回
+   *     （`skipDeps` 阻止旧插件被当依赖重新拉起）。成功返回的 `restarted` 即接回的依赖方。
+   *  5. 失败则回滚：先防御性卸下目标，再按正向激活序恢复旧插件与依赖方；
+   *     恢复也失败时抛 replace_rollback_failed（500），把当前真实状态写进 message 供人工介入。
+   *
+   * 注：整个过程会多次写会话清单（卸载集合一次 + 目标 + 每个接回的依赖方），每次都是
+   * tmp+rename 原子替换，因此任意时刻的清单文件都是自洽的；不追求"全程仅一次落盘"。
+   */
+  async replace(
+    name: string,
+    config?: Record<string, unknown>,
+  ): Promise<{
+    plugin: PluginSnapshot
+    replaced: { name: string; config?: Record<string, unknown> } | null
+    restarted: string[]
+  }> {
+    if (this.plugins.get(name)?.active) {
+      // 幂等：目标已在活动状态，没什么可顶替的
+      if (config && Object.keys(config).length > 0) await this.updateConfig(name, config)
+      return { plugin: this.snapshotOf(name), replaced: null, restarted: [] }
+    }
+    const conflict = findConflict(this.config.registry, this.activeNames(), name)
+    if (!conflict) {
+      // 无冲突：等价于一次普通会话层启用
+      const plugin = await this.enable(name, config)
+      return { plugin, replaced: null, restarted: [] }
+    }
+    // ---- 前置校验（零副作用）----
+    const m = this.registryOf(name).manifest.geewiki
+    if (m.runtime?.supportsHotReload !== true) {
+      throw new ManagerError(
+        'hot_reload_not_supported',
+        `${name} 未声明 runtime.supportsHotReload: true，无法热替换 ${conflict}`,
+      )
+    }
+    const violations = checkHotChain(this.config.registry, this.activeNames(), name)
+    if (violations.length > 0) {
+      throw new ManagerError(
+        'hot_dependency_not_supported',
+        `依赖链中存在不支持热加载的未激活依赖: ${violations.join('; ')}`,
+        { path: violations },
+      )
+    }
+    if (this.layerOf(conflict) !== 'session') {
+      throw new ManagerError(
+        'base_layer',
+        `${conflict} 属于基础层（冷操作），无法热替换：请编辑基础层清单 ${basename(this.config.baseFile)} 后重启进程`,
+      )
+    }
+    // ---- 计算卸载集合与顺序 ----
+    const active = this.activeNames()
+    const restarted = collectDependentsClosure(this.config.registry, [conflict]).filter((n) => active.has(n))
+    const unloadSet = [conflict, ...restarted]
+    const restoreOrder = this.safeTopological(unloadSet)
+    const unloadOrder = [...restoreOrder].reverse()
+    // 卸载前捕获各插件已落盘的配置：会话条目即将被移除，恢复时要原样写回
+    const captured = new Map<string, Record<string, unknown> | undefined>()
+    for (const n of unloadSet) captured.set(n, this.persistedConfigOf(n))
+    // 调用前的会话清单快照：回滚若全部成功就原样写回，使"替换失败不留痕"是**顺序与格式**层面的
+    // 真属性——逐条 enable 恢复只会把条目按拓扑序追加回去，与原顺序（用户启用顺序）不一定一致。
+    const sessionBackup = JSON.parse(JSON.stringify(this.session)) as PluginListFile
+    try {
+      for (const n of unloadOrder) await this.deactivateCore(n)
+      this.removeManyFromSession(unloadSet) // 卸载集合整体一次性落盘
+      // 目标先激活，再按正向拓扑序把依赖方接回新提供者（skipDeps 阻止旧插件被当依赖拉回）
+      const skip = new Set([conflict])
+      const plugin = await this.enableWithDeps(name, config, skip)
+      const restartedDone: string[] = []
+      for (const n of restoreOrder) {
+        if (n === conflict) continue
+        if (this.plugins.get(n)?.active) {
+          restartedDone.push(n)
+          continue
+        }
+        await this.enableWithDeps(n, captured.get(n) ?? {}, skip)
+        restartedDone.push(n)
+      }
+      return { plugin, replaced: { name: conflict, config: captured.get(conflict) }, restarted: restartedDone }
+    } catch (err) {
+      // ---- 回滚：卸下可能已激活的目标 → 按正向激活序恢复旧插件与依赖方 ----
+      try {
+        if (this.plugins.get(name)?.active) await this.deactivateCore(name)
+      } catch (unloadErr) {
+        console.error(`[manager] 替换 ${conflict} → ${name} 失败后卸下目标出错:`, unloadErr)
+      }
+      this.removeFromSession(name)
+      const failures: string[] = []
+      for (const n of restoreOrder) {
+        if (this.plugins.get(n)?.active) continue
+        try {
+          await this.enable(n, captured.get(n) ?? {})
+        } catch (restoreErr) {
+          failures.push(`${n}: ${(restoreErr as Error).message}`)
+        }
+      }
+      if (failures.length > 0) {
+        throw new ManagerError(
+          'replace_rollback_failed',
+          `替换 ${conflict} → ${name} 失败且回滚未完全成功，需人工介入（回滚失败项: ${failures.join('; ')}）。原始错误: ${(err as Error).message}`,
+          { failed: failures, cause: (err as Error).message, conflict, target: name },
+        )
+      }
+      // 全部恢复成功：会话清单还原成调用前的字节（条目顺序/配置一处不差，替换失败不留痕）
+      this.session = sessionBackup
+      writeList(this.config.sessionFile, this.session)
+      throw err
+    }
+  }
+
+  /** 拓扑排序的安全包装：存在依赖环时退回清单原序（后续逐个激活仍会各自失败并记录） */
+  private safeTopological(names: readonly string[]): string[] {
+    try {
+      return topologicalOrder(this.config.registry, names)
+    } catch (err) {
+      console.warn(`[manager] 依赖拓扑排序失败（${(err as Error).message}），退回清单原序:`, names)
+      return [...names]
+    }
   }
 
   /** 会话层停用（disable）：仅限 Session 层插件；有活动依赖者时阻止卸载 */
@@ -793,6 +937,14 @@ export class GeeWikiManager {
   private removeFromSession(name: string): void {
     this.session.enabled = this.session.enabled.filter((e) => e.name !== name)
     writeList(this.config.sessionFile, this.session)
+  }
+
+  /** 一次性移除多个会话条目并**只落盘一次**（冲突组替换整体卸载时用） */
+  private removeManyFromSession(names: readonly string[]): void {
+    const drop = new Set(names)
+    const before = this.session.enabled.length
+    this.session.enabled = this.session.enabled.filter((e) => !drop.has(e.name))
+    if (this.session.enabled.length !== before) writeList(this.config.sessionFile, this.session)
   }
 
   /**
@@ -1139,7 +1291,9 @@ function fail(h: RouteHandlerContext, err: unknown): void {
         ? 404
         : err.code === 'payload_too_large'
           ? 413
-          : err.code === 'conflict_group' ||
+          : err.code === 'replace_rollback_failed'
+            ? 500 // 回滚也未成功：状态不确定，需人工介入（非客户端错误）
+            : err.code === 'conflict_group' ||
               err.code === 'hot_reload_not_supported' ||
               err.code === 'hot_dependency_not_supported' ||
               err.code === 'has_dependents' ||
@@ -1195,6 +1349,20 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
       const body = await readJsonBody(h)
       if (!('config' in body)) throw new ManagerError('bad_request', '请求体缺少 config 字段')
       const result = await manager.updateConfig(name, body['config'])
+      ok(h, result)
+    } catch (err) {
+      fail(h, err)
+    }
+  })
+  router.register('POST', '/api/plugins/:name/replace', async (h) => {
+    try {
+      const name = h.params['name']
+      if (!name) throw new ManagerError('not_found', '缺少插件名')
+      let body: { config?: Record<string, unknown> } = {}
+      if (h.req.headers['content-length'] || h.req.headers['transfer-encoding']) {
+        body = await readJsonBody(h)
+      }
+      const result = await manager.replace(name, body.config)
       ok(h, result)
     } catch (err) {
       fail(h, err)

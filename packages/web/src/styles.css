@@ -310,3 +310,9 @@ h2 + .empty { padding: 8px; }
 .schema-list-item > .schema-field { flex: 1; }
 .schema-json { display: flex; flex-direction: column; gap: 4px; }
 .schema-errors { margin-top: 2px; }
+
+/* 冲突组替换确认（管理台：启用撞上同组已激活插件时的顶替确认） */
+.replace-prompt { margin: 8px 0; padding: 8px 12px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; }
+.replace-prompt h3 { margin: 0 0 4px; font-size: 13px; color: #b45309; }
+.replace-prompt p { margin: 0 0 8px; font-size: 12px; }
+.replace-prompt .chip { background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 6px; }

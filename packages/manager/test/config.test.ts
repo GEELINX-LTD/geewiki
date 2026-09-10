@@ -65,7 +65,19 @@ const MESSAGE_SCHEMA: ConfigSchema = Schema.object({
 function cfgPlugin(
   name: string,
   log: string[],
-  opts: { schema?: ConfigSchema; rejectWith?: string; declaredSchema?: boolean } = {},
+  opts: {
+    schema?: ConfigSchema
+    rejectWith?: string
+    declaredSchema?: boolean
+    /** 冲突组（同组互斥，供 replace 用例） */
+    conflictGroup?: string
+    /** 提供的服务标识 */
+    provides?: string
+    /** 依赖列表（按插件名或服务标识解析） */
+    requires?: string[]
+    /** apply 恒抛错：用于"目标激活失败 → 整体回滚"路径 */
+    failActivate?: boolean
+  } = {},
 ): RegisteredPlugin {
   const schema = opts.schema ?? MESSAGE_SCHEMA
   const declared = opts.declaredSchema ?? true
@@ -75,6 +87,9 @@ function cfgPlugin(
       name,
       version: '1.0.0',
       geewiki: {
+        provides: opts.provides,
+        requires: opts.requires ?? [],
+        conflictGroup: opts.conflictGroup,
         runtime: { supportsHotReload: true, requiresCachePurge: false, drainTimeout: 0 },
         ...(declared ? { configSchema: schema } : {}),
       },
@@ -84,6 +99,7 @@ function cfgPlugin(
       ...(declared ? { Config: schema } : {}),
       apply: (_ctx: unknown, config?: unknown) => {
         const value = (config ?? {}) as { message?: string }
+        if (opts.failActivate === true) throw new Error(`激活失败: ${name}`)
         if (opts.rejectWith !== undefined && value.message === opts.rejectWith) {
           throw new Error(`拒绝配置: ${opts.rejectWith}`)
         }
@@ -129,6 +145,9 @@ function makeRouter(): {
       assert.ok(handler, `应已注册路由 ${method} ${path}`)
       const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
       const req = Readable.from(chunks) as unknown as IncomingMessage
+      // 补齐 headers：enable / replace 路由按 content-length 决定是否读取请求体
+      ;(req as unknown as { headers: Record<string, string> }).headers =
+        body === undefined ? {} : { 'content-length': String(chunks[0]?.length ?? 0) }
       return new Promise((resolvePromise, rejectPromise) => {
         const h: RouteHandlerContext = {
           req,
@@ -765,6 +784,234 @@ test('boot 叠加失败：apply 抛错 → 进程内回滚为基础层配置（�
     // 叠加路径不落盘：两层清单字节保持不变（盘上已是用户意图）
     assert.deepEqual(readList(env.baseFile), [{ name: '@t/cfg', config: { message: 'base-ok', count: 1 } }])
     assert.deepEqual(readList(env.sessionFile), [{ name: '@t/cfg', config: { message: 'POISON', count: 1 } }])
+  } finally {
+    env.cleanup()
+  }
+})
+
+/* ------------------------- 冲突组替换（replace） ------------------------- */
+
+test('replace：同冲突组替换成功——旧插件卸载、目标激活、依赖方接回新提供者', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      // 依赖方按插件名依赖旧插件（替换后必须接回，且不得把旧插件当依赖拉回来）
+      cfgPlugin('@t/app', log, { requires: ['@t/old-db'] }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+
+    await manager.enable('@t/old-db', { message: 'old' })
+    await manager.enable('@t/app')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/app')?.state, 'active')
+
+    const result = await manager.replace('@t/new-db', { message: 'new' })
+    assert.equal(result.replaced?.name, '@t/old-db', '应报告被顶替的插件')
+    assert.deepEqual(result.replaced?.config, { message: 'old', count: 1 }, '应回报旧插件原配置')
+    assert.deepEqual(result.restarted, ['@t/app'], '依赖方应被接回并出现在 restarted')
+    assert.equal(result.plugin.state, 'active')
+
+    const states = new Map(manager.snapshot().map((p) => [p.name, p.state]))
+    assert.equal(states.get('@t/new-db'), 'active', '目标应激活')
+    assert.equal(states.get('@t/old-db'), 'inactive', '旧插件应卸载')
+    assert.equal(states.get('@t/app'), 'active', '依赖方应重新激活')
+    assert.deepEqual(
+      readList(env.sessionFile).map((e) => e.name).sort(),
+      ['@t/app', '@t/new-db'],
+      '会话清单应只剩目标与依赖方（旧插件条目必须移除）',
+    )
+    assert.deepEqual(readList(env.baseFile), [], '基础层不应被替换操作污染')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：无同组冲突时降级为普通会话层启用', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const manager = makeManager(env, [cfgPlugin('@t/solo', log, { conflictGroup: 'solo-group' })])
+    await manager.boot()
+
+    const result = await manager.replace('@t/solo', { message: 'hi' })
+    assert.equal(result.replaced, null, '无冲突不应报告被顶替者')
+    assert.deepEqual(result.restarted, [])
+    assert.equal(result.plugin.state, 'active')
+    assert.deepEqual(readList(env.sessionFile), [{ name: '@t/solo', config: { message: 'hi', count: 1 } }])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：目标已激活时幂等（不顶替、返回当前快照）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+
+    await manager.enable('@t/new-db', { message: 'first' })
+    const result = await manager.replace('@t/new-db', { message: 'second' })
+    assert.equal(result.replaced, null, '目标已激活：无可顶替对象')
+    assert.deepEqual(result.restarted, [])
+    assert.deepEqual(result.plugin.config, { message: 'second', count: 1 }, '显式配置不得被静默丢弃')
+    // 旧插件从未激活过；目标仍在会话层
+    assert.deepEqual(readList(env.sessionFile).map((e) => e.name), ['@t/new-db'])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：旧插件位于基础层 → base_layer（冷操作，不可热替换）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+    ]
+    const manager = makeManager(env, registry)
+    // 旧插件写进基础层清单 → boot 时以 base 层激活
+    writeFileSync(
+      env.baseFile,
+      `${JSON.stringify({ enabled: [{ name: '@t/old-db' }] }, null, 2)}\n`,
+      'utf8',
+    )
+    await manager.boot()
+    const before = readFileSync(env.sessionFile, 'utf8')
+
+    await assert.rejects(
+      () => manager.replace('@t/new-db'),
+      (err: unknown) => err instanceof ManagerError && err.code === 'base_layer',
+      '基础层插件不得被热替换',
+    )
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/old-db')?.state, 'active', '旧插件应仍在跑')
+    assert.equal(manager.snapshot().find((p) => p.name === '@t/new-db')?.state, 'inactive', '目标不得被激活')
+    assert.equal(readFileSync(env.sessionFile, 'utf8'), before, '失败路径不得改动会话清单')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：目标激活失败 → 旧插件与依赖方被恢复，会话清单逐字节复原', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, {
+        conflictGroup: 'database-provider',
+        provides: 'db-provider',
+        failActivate: true,
+      }),
+      cfgPlugin('@t/app', log, { requires: ['@t/old-db'] }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+
+    await manager.enable('@t/old-db', { message: 'old' })
+    await manager.enable('@t/app')
+    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+
+    await assert.rejects(
+      () => manager.replace('@t/new-db', { message: 'new' }),
+      (err: unknown) => err instanceof ManagerError,
+      '目标激活失败应抛 ManagerError（而非 500 回滚失败）',
+    )
+    // 回滚后：旧插件与依赖方都回来，目标不在
+    const states = new Map(manager.snapshot().map((p) => [p.name, p.state]))
+    assert.equal(states.get('@t/old-db'), 'active', '旧插件应被恢复')
+    assert.equal(states.get('@t/app'), 'active', '依赖方应被恢复')
+    // 失败目标留 error 态（本仓库既有语义：激活失败的插件不以 active 留存，而是记 error），关键是不得 active
+    assert.equal(states.get('@t/new-db'), 'error', '失败目标必须已卸载（留 error 态，不得 active）')
+    // 会话清单逐字节复原（旧插件配置原样写回）
+    assert.equal(readFileSync(env.sessionFile, 'utf8'), sessionBefore, '回滚后会话清单应与调用前逐字节一致')
+    assert.deepEqual(readList(env.sessionFile).map((e) => e.name).sort(), ['@t/app', '@t/old-db'])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('REST：POST /api/plugins/:name/replace 的状态码与响应形状', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/base-db', log, { conflictGroup: 'other-group', provides: 'other-provider' }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+    const { service, invoke } = makeRouter()
+    registerRoutes(service, manager)
+
+    await manager.enable('@t/old-db', { message: 'old' })
+    const okRes = await invoke('POST', '/api/plugins/:name/replace', { name: '@t/new-db' }, { config: { message: 'new' } })
+    assert.equal(okRes.status, 200, JSON.stringify(okRes.body))
+    assert.equal(okRes.body['ok'], true)
+    assert.equal((okRes.body['replaced'] as { name: string }).name, '@t/old-db')
+    assert.deepEqual(okRes.body['restarted'], [])
+
+    // 目标已激活 → 幂等 200
+    const again = await invoke('POST', '/api/plugins/:name/replace', { name: '@t/new-db' }, {})
+    assert.equal(again.status, 200)
+    assert.equal(again.body['replaced'], null)
+
+    // 未知插件 → 404 not_found
+    const missing = await invoke('POST', '/api/plugins/:name/replace', { name: '@t/nope' }, {})
+    assert.equal(missing.status, 404)
+    assert.equal(missing.body['error'], 'not_found')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('replace：回滚按调用前的条目顺序逐字节复原会话清单（依赖方启用顺序与拓扑序相反时也成立）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const registry = [
+      cfgPlugin('@t/old-db', log, { conflictGroup: 'database-provider', provides: 'db-provider' }),
+      cfgPlugin('@t/new-db', log, {
+        conflictGroup: 'database-provider',
+        provides: 'db-provider',
+        failActivate: true,
+      }),
+      // 两个互相独立的依赖方：故意按与拓扑序（按名排序）相反的顺序启用，钉住"顺序也要复原"
+      cfgPlugin('@t/zeta', log, { requires: ['@t/old-db'] }),
+      cfgPlugin('@t/alpha', log, { requires: ['@t/old-db'] }),
+    ]
+    const manager = makeManager(env, registry)
+    await manager.boot()
+
+    await manager.enable('@t/old-db', { message: 'old' })
+    await manager.enable('@t/zeta')
+    await manager.enable('@t/alpha')
+    assert.deepEqual(
+      readList(env.sessionFile).map((e) => e.name),
+      ['@t/old-db', '@t/zeta', '@t/alpha'],
+      '前置：会话条目按用户启用顺序排列（zeta 在 alpha 之前，与拓扑序相反）',
+    )
+    const sessionBefore = readFileSync(env.sessionFile, 'utf8')
+
+    await assert.rejects(() => manager.replace('@t/new-db'), (err: unknown) => err instanceof ManagerError)
+    assert.equal(
+      readFileSync(env.sessionFile, 'utf8'),
+      sessionBefore,
+      '回滚后会话清单必须逐字节复原（含条目顺序），不能只保证语义等价',
+    )
+    const states = new Map(manager.snapshot().map((p) => [p.name, p.state]))
+    assert.equal(states.get('@t/old-db'), 'active')
+    assert.equal(states.get('@t/zeta'), 'active')
+    assert.equal(states.get('@t/alpha'), 'active')
   } finally {
     env.cleanup()
   }

@@ -108,6 +108,16 @@ export interface ConfigUpdateResult {
   requiresRestart: boolean
 }
 
+/** 冲突组替换结果（POST /api/plugins/:name/replace） */
+export interface ReplaceResult {
+  ok: true
+  plugin: PluginInfo
+  /** 被顶替的插件（无冲突时为 null） */
+  replaced: { name: string; config?: Record<string, unknown> } | null
+  /** 被卸载后接回新提供者的依赖方插件名 */
+  restarted: string[]
+}
+
 /** 外部插件发现期被跳过的目录（GET /api/plugins 的 issues） */
 export interface DiscoveryIssueInfo {
   code: string
@@ -174,6 +184,9 @@ export const api = {
   session: () => request<{ ok: true } & SessionState>('GET', '/api/session'),
   enable: (name: string, config?: Record<string, unknown>) =>
     request<{ ok: true; plugin: PluginInfo }>('POST', `/api/plugins/${encodeURIComponent(name)}/enable`, { config: config ?? {} }),
+  /** 冲突组替换：顶替同 conflictGroup 的已激活插件（旧插件卸载、其依赖方接回新提供者） */
+  replace: (name: string, config?: Record<string, unknown>) =>
+    request<ReplaceResult>('POST', `/api/plugins/${encodeURIComponent(name)}/replace`, { config: config ?? {} }),
   disable: (name: string) =>
     request<{ ok: true }>('POST', `/api/plugins/${encodeURIComponent(name)}/disable`),
   pluginConfig: (name: string) =>

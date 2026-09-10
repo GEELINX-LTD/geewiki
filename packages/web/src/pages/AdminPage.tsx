@@ -63,6 +63,13 @@ export function AdminPage(): ReactNode {
   const [configErrors, setConfigErrors] = useState<Map<string, string[]>>(new Map())
   /** 外部插件发现期被跳过的目录（清单缺失/入口缺失/路径越界/重名/加载抛错等） */
   const [issues, setIssues] = useState<DiscoveryIssueInfo[]>([])
+  /** 冲突组顶替确认（启用撞上同组已激活插件时弹出） */
+  const [replacePrompt, setReplacePrompt] = useState<{
+    target: PluginInfo
+    conflict: string
+    dependents: string[]
+    config?: Record<string, unknown>
+  } | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -127,22 +134,98 @@ export function AdminPage(): ReactNode {
       })
   }
 
-  const confirmEnable = (p: PluginInfo): void => {
-    let config: Record<string, unknown> | undefined
-    if (editor?.name === p.name && editor.descriptor) {
-      config = editor.value
-    } else if (configFor === p.name && configText.trim()) {
-      // 与"保存配置"共用同一套解析+报错逻辑（无 schema 插件走 JSON 原文）
+  /**
+   * 依赖方闭包（前端预览，与后端 collectDependentsClosure 同语义）：
+   * 冲突组替换会把旧插件的依赖方一起卸载再接回，确认框需先如实告知用户。
+   */
+  const dependentsOf = useCallback(
+    (root: string): string[] => {
+      const list = plugins ?? []
+      const seen = new Set([root])
+      const out: string[] = []
+      const queue = [root]
+      while (queue.length > 0) {
+        const cur = queue.shift() as string
+        for (const p of list) {
+          if (seen.has(p.name)) continue
+          if (p.requires.includes(cur)) {
+            seen.add(p.name)
+            out.push(p.name)
+            queue.push(p.name)
+          }
+        }
+      }
+      return out.sort()
+    },
+    [plugins],
+  )
+
+  /** 取出「启用」时要一并提交的配置（与"保存配置"共用同一套解析+报错逻辑） */
+  const enableConfigOf = (p: PluginInfo): Record<string, unknown> | undefined | 'invalid' => {
+    if (editor?.name === p.name && editor.descriptor) return editor.value
+    if (configFor === p.name && configText.trim()) {
       const parsed = parseConfigText(configText)
       if (!parsed.ok) {
         setNotice({ kind: 'err', text: parsed.message })
-        return
+        return 'invalid'
       }
-      config = parsed.value
+      return parsed.value
     }
-    void act('enable', () => api.enable(p.name, config), `已启用 ${p.name}`)
+    return undefined
+  }
+
+  const confirmEnable = (p: PluginInfo): void => {
+    const config = enableConfigOf(p)
+    if (config === 'invalid') return
     setConfigFor(null)
     setEditor(null)
+    void (async () => {
+      setBusy('enable')
+      setNotice(null)
+      try {
+        await api.enable(p.name, config)
+        setNotice({ kind: 'ok', text: `已启用 ${p.name}` })
+        await load()
+      } catch (err) {
+        // 冲突组互斥（409 conflict_group）：不当作死路，转为"是否顶替"确认
+        if (err instanceof ApiError && err.code === 'conflict_group') {
+          const conflict = (err.details as { with?: string } | undefined)?.with
+          if (conflict) {
+            setReplacePrompt({ target: p, conflict, dependents: dependentsOf(conflict), config })
+            return
+          }
+        }
+        setNotice({ kind: 'err', text: fmtError(err) })
+      } finally {
+        setBusy('')
+      }
+    })()
+  }
+
+  /** 用户确认顶替：POST /replace（旧插件卸载、其依赖方接回新提供者） */
+  const doReplace = (): void => {
+    const prompt = replacePrompt
+    if (!prompt) return
+    setReplacePrompt(null)
+    void (async () => {
+      setBusy('replace')
+      setNotice(null)
+      try {
+        const res = await api.replace(prompt.target.name, prompt.config)
+        const text = [
+          `已用 ${prompt.target.name} 替换 ${res.replaced?.name ?? prompt.conflict}`,
+          res.restarted.length > 0 ? `接回依赖方: ${res.restarted.join('、')}` : '',
+        ]
+          .filter(Boolean)
+          .join('；')
+        setNotice({ kind: 'ok', text })
+        await load()
+      } catch (err) {
+        setNotice({ kind: 'err', text: `替换失败: ${fmtError(err)}` })
+      } finally {
+        setBusy('')
+      }
+    })()
   }
 
   /** 保存配置（PUT /config）：已激活插件热更新，未激活仅落盘（requiresRestart） */
@@ -224,6 +307,27 @@ export function AdminPage(): ReactNode {
               </li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {replacePrompt && (
+        <section className="replace-prompt">
+          <h3>冲突组互斥：是否用 {replacePrompt.target.name} 顶替 {replacePrompt.conflict}？</h3>
+          <p className="small">
+            两者同属冲突组 <code className="chip">{replacePrompt.target.conflictGroup ?? '—'}</code>，
+            同组内只能激活一个。确认后：先卸载 {replacePrompt.conflict}
+            {replacePrompt.dependents.length > 0 && <>（连同它的依赖方 {replacePrompt.dependents.join('、')}）</>}
+            ，再激活 {replacePrompt.target.name}
+            {replacePrompt.dependents.length > 0 && <>，并将依赖方接回新提供者</>}。全部为热操作，无需重启。
+          </p>
+          <div className="page-actions">
+            <button className="btn" onClick={() => setReplacePrompt(null)} disabled={busy !== ''}>
+              取消
+            </button>
+            <button className="btn primary" onClick={doReplace} disabled={busy !== ''}>
+              确认替换并启用
+            </button>
+          </div>
         </section>
       )}
 

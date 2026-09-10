@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import {
   checkHotChain,
   collectDependents,
+  collectDependentsClosure,
   directDependencies,
   findConflict,
   resolveDependency,
@@ -95,6 +96,21 @@ test('findConflict：同冲突组互斥，异组/无组不冲突', () => {
   assert.equal(findConflict(registry, new Set(['@gw/db']), '@gw/pg'), '@gw/db')
   assert.equal(findConflict(registry, new Set(['@gw/db']), '@gw/wiki'), undefined)
   assert.equal(findConflict(registry, new Set(), '@gw/pg'), undefined)
+})
+
+test('collectDependentsClosure：传递依赖方闭包（冲突组替换的卸载集合依据）', () => {
+  // @gw/db ← @gw/wiki ← @gw/editor-hot（多级）
+  assert.deepEqual(collectDependentsClosure(registry, ['@gw/db']), ['@gw/editor-hot', '@gw/wiki'])
+  // 中间层单独作为根：只闭包到它的依赖方
+  assert.deepEqual(collectDependentsClosure(registry, ['@gw/wiki']), ['@gw/editor-hot'])
+  // 叶子：无依赖方
+  assert.deepEqual(collectDependentsClosure(registry, ['@gw/editor-hot']), [])
+  // 空输入
+  assert.deepEqual(collectDependentsClosure(registry, []), [])
+  // 多根合并去重（@gw/http 同时被 wiki 依赖，与 db 同根时只应出现一次）
+  assert.deepEqual(collectDependentsClosure(registry, ['@gw/db', '@gw/http']), ['@gw/editor-hot', '@gw/wiki'])
+  // 环安全：a ↔ b 互相依赖，不会死循环且互为依赖方
+  assert.deepEqual(collectDependentsClosure(registry, ['@gw/cycle-a']), ['@gw/cycle-b'])
 })
 
 test('checkHotChain：热加载链上未激活冷依赖被拦截；已激活冷依赖放行', () => {
