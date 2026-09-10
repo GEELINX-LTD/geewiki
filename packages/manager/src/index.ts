@@ -518,7 +518,18 @@ export class GeeWikiManager {
     return { config, hotUpdated: true, requiresRestart: false }
   }
 
-  /** 插件在清单中的落盘位置（= 配置的**写入**目标层）：session 优先（会话层变更不应污染基础层），否则 base */
+  /**
+   * 插件在清单中的落盘位置（= 配置的**写入**目标层）：session 优先（会话层变更不应污染基础层），否则 base。
+   *
+   * ⚠️ **本方法不是激活层判据**：它只回答"会话清单里有没有该插件的条目"，而"有条目"≠"以会话层激活"。
+   * 真实激活层请用 `this.plugins.get(name)?.layer`（`disable()` 与 `replace()` 的守卫用的都是它）。
+   * 两者在"同一插件同时出现在基础层与会话层清单"的叠加态下**结论相反**：本方法返回 `'session'`，
+   * 而插件实际以 base 层激活（叠加语义见 `applySessionOverlay`）。
+   *
+   * 反面教材：`replace()` 曾用本方法判"被顶替的旧插件是否在会话层"，于是上述叠加态下**冷插件被热替换**，
+   * 且旧插件仍留在基础层清单里 → 重启后每次启动都撞冲突组互斥（已改用真实激活层）。
+   * 现存消费点只有配置写入（`updateConfig()` → `persistConfig()`）；新增调用前请先确认语义。
+   */
   private layerOf(name: string): Layer {
     return this.session.enabled.some((e) => e.name === name) ? 'session' : 'base'
   }

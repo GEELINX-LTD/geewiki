@@ -423,7 +423,13 @@ async function servePluginUiAsset(
     const data = await readFile(file)
     res.writeHead(200, {
       'content-type': STATIC_MIME[ext] ?? 'application/octet-stream',
-      // 与既有非 hashed 资产策略一致：交给前端的 `?v=<rev>` 自行击穿缓存
+      // 与既有非 hashed 资产策略一致：`no-cache`——浏览器每次都会回来校验/取用，不会长期缓存旧产物
+      // （本响应未设 ETag/Last-Modified，故实际等同于每次重新获取）。
+      // 刻意**不**依赖 `?v=<rev>` 之类的 query 做缓存击穿：该方案已实测证伪——给**根相对** URL 加 query
+      // 会被 dev 下的 Vite 改写成 `?import&v=…` → 必然 500；改用同源绝对 URL 虽能绕开改写，但 `rev`
+      // 一变就产生**新模块实例**，而 ESM 无法从模块图卸载 → 插槽条目翻倍。`rev` 只作**变更检测**，
+      // 真正换代码的路径是 unload → load（同 URL 命中模块缓存，新产物需整页刷新才生效）。
+      // 详细实测记录见 `packages/web/src/lib/pluginUiPlan.ts` 文件头。
       'cache-control': 'no-cache',
       'content-length': data.length,
     })
