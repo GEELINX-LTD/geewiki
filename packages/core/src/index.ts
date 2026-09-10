@@ -345,6 +345,21 @@ export interface HttpRouterStats {
   lastMs: number
   /** 平均请求耗时（毫秒） */
   avgMs: number
+  /**
+   * 长连接可观测性（当前在流数 / 累计被拒数）。
+   *
+   * **可选**（`?`）以保持向后兼容：既有测试替身与第三方实现无需提供；
+   * 真实路由服务（@geewiki/http）总会填上它。
+   */
+  streams?: HttpStreamStats
+}
+
+/** 长连接（SSE 等）的可观测性计数 */
+export interface HttpStreamStats {
+  /** 当前仍活跃的长连接数（已 trackStream 且尚未注销） */
+  active: number
+  /** 累计因并发上限被拒的长连接请求数（由持有者经 noteStreamRejected 上报） */
+  rejected: number
 }
 
 /**
@@ -386,7 +401,36 @@ export interface HttpRouterService {
    * - 持有者若要按自己的生命周期收起连接，调用返回的注销函数即可（例如某插件卸载时
    *   先结束自己开的流，再注销）。
    *
+   * @param owner **谁开的这条连接**（通常是插件名）。管理器在卸载该 owner 时据此定向回收
+   *   （见 {@link closeStreams}），这样"插件卸载 → 它自己开的流被收掉"由路由服务兜底，
+   *   而不是只依赖插件作者记得在自己的 dispose 里收流。
+   *   **契约**：未登记 owner（省略或传空串）的连接**无法被定向回收**，只能等路由服务
+   *   整体关停时被统一收掉——即"逃逸定向回收"是显式后果，不是静默行为。
+   *
    * 可选（`?`）以保持向后兼容：既有测试替身无需立刻提供。
    */
-  trackStream?(res: import('node:http').ServerResponse): () => void
+  trackStream?(res: import('node:http').ServerResponse, owner?: string): () => void
+
+  /**
+   * 结束长连接：不传 `owner` 关闭**全部**（路由服务卸载/关停时用），
+   * 传 `owner` 只关该 owner 开的那些（管理器在**卸载单个插件**时用）。
+   *
+   * 为什么要在服务接口上暴露 owner 形态：卸载是**管理器**发起的（REST /disable、
+   * 启停回滚、disposeAll 共用 `unloadPlugin`），而长连接只有路由服务知道。若不上接口，
+   * 管理器就得自己去翻插件的内部状态——那既越权也不可靠。
+   *
+   * 可选（`?`）以保持向后兼容。
+   */
+  closeStreams?(owner?: string): void
+
+  /**
+   * 上报"一次长连接请求因并发上限被拒"（用于可观测性，见 {@link HttpStreamStats.rejected}）。
+   *
+   * 并发上限是**持有者的策略**（例如 @geewiki/ai 的 MAX_CONCURRENT_STREAMS），
+   * 路由服务不参与判定；故由持有者在拒绝时主动上报，集中计入 stats()，
+   * 让运维能从 /api/health 看出"是否有人在被拒"。
+   *
+   * 可选（`?`）以保持向后兼容。
+   */
+  noteStreamRejected?(): void
 }

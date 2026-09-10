@@ -53,6 +53,10 @@ interface TestRouter {
   closeStreams(): void
   /** 当前在途处理器数 */
   inflight(): number
+  /** trackStream 收到的 owner 列表（按调用顺序；用于断言"插件登记的 owner 是自己的名字"） */
+  trackedOwners(): string[]
+  /** noteStreamRejected 被调用的次数（用于断言并发上限被拒时确实上报了） */
+  rejectedCount(): number
 }
 
 /**
@@ -65,6 +69,8 @@ interface TestRouter {
 function makeTestRouter(opts: { drainTimeoutMs?: number } = {}): TestRouter {
   const routes: { method: string; segments: string[]; handler: RouteHandler }[] = []
   const activeStreams = new Set<ServerResponse>()
+  const owners: string[] = []
+  let rejected = 0
   let inFlight = 0
   const isThenable = (v: unknown): v is PromiseLike<unknown> =>
     typeof (v as { then?: unknown } | null)?.then === 'function'
@@ -100,7 +106,8 @@ function makeTestRouter(opts: { drainTimeoutMs?: number } = {}): TestRouter {
           }
         }, 2)
       }),
-    trackStream: (res) => {
+    trackStream: (res: ServerResponse, owner?: string) => {
+      owners.push(owner ?? '')
       activeStreams.add(res)
       let released = false
       return () => {
@@ -108,6 +115,9 @@ function makeTestRouter(opts: { drainTimeoutMs?: number } = {}): TestRouter {
         released = true
         activeStreams.delete(res)
       }
+    },
+    noteStreamRejected: () => {
+      rejected++
     },
   }
 
@@ -150,6 +160,8 @@ function makeTestRouter(opts: { drainTimeoutMs?: number } = {}): TestRouter {
     service,
     handle,
     inflight: () => inFlight,
+    trackedOwners: () => [...owners],
+    rejectedCount: () => rejected,
     closeStreams: () => {
       for (const res of [...activeStreams]) {
         try {
@@ -257,6 +269,10 @@ interface Harness {
   /** 结束全部长连接（模拟 http 插件自身 teardown） */
   closeStreams(): void
   inflight(): number
+  /** trackStream 收到的 owner 列表 */
+  trackedOwners(): string[]
+  /** noteStreamRejected 的调用次数 */
+  rejectedCount(): number
   putPage(slug: string, title: string, content: string): void
   close(): Promise<void>
 }
@@ -301,6 +317,8 @@ async function makeHarness(
     disposePlugin,
     closeStreams: router.closeStreams,
     inflight: router.inflight,
+    trackedOwners: router.trackedOwners,
+    rejectedCount: router.rejectedCount,
     putPage: (slug, title, content) => {
       db.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
         slug,
@@ -875,6 +893,81 @@ test('流式与一次性问答口径一致：同一问题下 sources 相同（�
       askBody.sources.map((s) => ({ slug: s.slug, n: s.n, used: s.used })),
       '流式与一次性问答必须得到同一份来源（共用 retrieve/selectFrom）',
     )
+  } finally {
+    await h.close()
+  }
+})
+
+/* ============ owner 登记 / 拒流上报 / failFromError 脱敏（本批收敛的 advisory） ============ */
+
+test('owner：流式登记时带上本插件名（供管理器在卸载本插件时定向回收）', async () => {
+  const h = await makeHarness()
+  try {
+    h.putPage('owner-doc', '所有者', '这是用于 owner 断言的内容。')
+    const out = await postStream(h.port, { q: 'owner' })
+    assert.equal(out.status, 200)
+    assert.deepEqual(
+      h.trackedOwners(),
+      ['@geewiki/ai'],
+      'trackStream 必须收到本插件名作为 owner，否则管理器无法定向回收（会退化成静默悬空）',
+    )
+  } finally {
+    await h.close()
+  }
+})
+
+test('可观测性：并发超限时上报被拒计数（noteStreamRejected），让运维能从 health 看出被拒', async () => {
+  // 每条流都挂住（provider 发完 status 后长时间不结束），否则降级路径会立即完成、占不住额度
+  const h = await makeHarness({
+    provider: scriptedProvider({
+      steps: [{ type: 'status', provider: 'mock', model: 'mock-1' }, 10_000],
+    }),
+    ai: { streamIdleTimeoutMs: 20_000, streamHardTimeoutMs: 20_000 },
+  })
+  try {
+    h.putPage('cap-doc', '并发', '并发上限相关的内容。')
+    // 占满并发额度（不 await：让它们保持挂住）
+    const held = Array.from({ length: MAX_CONCURRENT_STREAMS }, () => postStream(h.port, { q: '并发' }))
+    // 等到最后一条也真正建立（收到 status 帧即证明已登记）
+    await sleep(150)
+    assert.equal(h.rejectedCount(), 0, '未超限时不应有被拒记录')
+
+    // 第 cap+1 条：应 429，且**必须**上报被拒计数
+    const over = await postStream(h.port, { q: '并发' })
+    assert.equal(over.status, 429, `超出并发上限应返回 429，实际 ${over.status}`)
+    assert.equal(h.rejectedCount(), 1, '超限被拒必须上报一次（否则 stats.streams.rejected 永远是 0）')
+    await Promise.all(held)
+  } finally {
+    await h.close()
+  }
+})
+
+test('failFromError：参数校验错误里回显的用户输入也经 redact 脱敏（密钥形态不得进响应体）', async () => {
+  const h = await makeHarness()
+  try {
+    h.putPage('redact-doc', '脱敏', '用于脱敏断言的内容。')
+    // 把形如密钥的串当作 limit 传入：错误信息会把它回显（`实际 ${String(raw)}`），
+    // 这正是 failFromError 未过 redact 时会把密钥写进响应体的通路。
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz0123456789'
+    const res = await fetch(`http://127.0.0.1:${h.port}/api/ai/stream`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ q: '脱敏', limit: secret }),
+    })
+    const body = await res.text()
+    assert.equal(res.status, 400, '非法 limit 应返回 400')
+    assert.equal(body.includes(secret), false, `响应体不得回显密钥形态的输入：${body}`)
+    assert.match(body, /invalid_limit/, '错误码应仍可读（脱敏不得吞掉可诊断性）')
+
+    // 对照：正常的可读校验信息逐字不变（脱敏只遮蔽"像密钥的长串"）
+    const okRes = await fetch(`http://127.0.0.1:${h.port}/api/ai/stream`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ q: '脱敏', limit: 0 }),
+    })
+    const okBody = await okRes.text()
+    assert.equal(okRes.status, 400)
+    assert.match(okBody, /limit 须为 1\.\./, `我们自己的校验文案应保持可读，实际: ${okBody}`)
   } finally {
     await h.close()
   }

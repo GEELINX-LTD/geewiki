@@ -122,13 +122,20 @@ class HttpRouter implements HttpRouterService {
    */
   private readonly requestScope = new AsyncLocalStorage<RequestState>()
   /**
-   * 活跃长连接响应（SSE 等）：**刻意不计入 inFlight**。
+   * 活跃长连接响应（SSE 等）：**刻意不计入 inFlight**，按 **owner** 分组。
    *
    * 长连接的处理器同步返回（当拍结算），连接本身随后由持有者持续写帧；把它算进在途数
    * 会让 drain() 一直等到连接关闭 → 空转满 drainTimeout → 打印假的"排空超时"告警。
-   * 这个集合只用于"路由服务自身卸载时主动收掉这些连接"。
+   * 这个集合用于两件事：
+   * 1. 路由服务**自身**卸载/关停时收掉全部连接；
+   * 2. **单个插件卸载**时只收掉该插件（owner）开的连接 —— 否则插件级 /disable 既不退在途
+   *    （它本来就不占），也不收流，客户端会**静默悬空**（外层表现为"没有报错但也没结束"）。
+   *
+   * owner 为空串表示"未登记 owner"：这类连接无法被定向回收，只能等整体关停。
    */
-  private readonly activeStreams = new Set<ServerResponse>()
+  private readonly activeStreams = new Map<string, Set<ServerResponse>>()
+  /** 累计被拒的长连接请求数（持有者经 noteStreamRejected 上报；见 HttpStreamStats） */
+  private streamsRejected = 0
 
   constructor(private readonly healthHandler: RouteHandler) {}
 
@@ -159,7 +166,15 @@ class HttpRouter implements HttpRouterService {
       consecutiveFailures: this.counters.consecutiveFailures,
       lastMs: this.lastMs,
       avgMs: Math.round(avgMs * 10) / 10,
+      streams: { active: this.streamCount(), rejected: this.streamsRejected },
     }
+  }
+
+  /** 当前活跃长连接总数（遍历各 owner 集合求和；连接数在个位量级，无需额外计数器） */
+  private streamCount(): number {
+    let n = 0
+    for (const set of this.activeStreams.values()) n += set.size
+    return n
   }
 
   inflight(): number {
@@ -168,34 +183,65 @@ class HttpRouter implements HttpRouterService {
 
   /**
    * 登记长连接响应（见 HttpRouterService.trackStream 的语义说明）。
-   * 返回**幂等**的注销函数：重复调用只生效一次，集合不会残留。
+   * 返回**幂等**的注销函数：重复调用只生效一次，集合不会残留（该 owner 空集时一并删除，
+   * 避免 Map 里堆积空 Set）。
    */
-  trackStream(res: ServerResponse): () => void {
-    this.activeStreams.add(res)
+  trackStream(res: ServerResponse, owner = ''): () => void {
+    let set = this.activeStreams.get(owner)
+    if (!set) {
+      set = new Set<ServerResponse>()
+      this.activeStreams.set(owner, set)
+    }
+    set.add(res)
+    const ownerKey = owner
     let released = false
     return () => {
       if (released) return
       released = true
-      this.activeStreams.delete(res)
+      const current = this.activeStreams.get(ownerKey)
+      if (!current) return
+      current.delete(res)
+      if (current.size === 0) this.activeStreams.delete(ownerKey)
     }
   }
 
   /**
-   * 结束全部活跃长连接（路由服务卸载/关停时调用）。
+   * 结束长连接：不传 owner 关闭全部（路由服务卸载/关停时调用），传 owner 只关该 owner 的。
    *
    * 为什么需要主动收：长连接不计入排空，因此 drain() 不会等它们——若不在这里结束，
    * 客户端会一直挂着；同时逐个 try/catch，单个连接的异常不得阻断其它连接的收尾。
    */
-  closeStreams(): void {
-    for (const res of [...this.activeStreams]) {
+  closeStreams(owner?: string): void {
+    if (owner === undefined) {
+      for (const [key, set] of [...this.activeStreams]) {
+        this.endStreamSet(key, set)
+        this.activeStreams.delete(key)
+      }
+      return
+    }
+    const set = this.activeStreams.get(owner)
+    if (!set) return
+    this.endStreamSet(owner, set)
+    this.activeStreams.delete(owner)
+  }
+
+  /** 结束一个 owner 名下的全部连接（失败只记日志：收尾失败不应让卸载失败） */
+  private endStreamSet(owner: string, set: Set<ServerResponse>): void {
+    for (const res of [...set]) {
       try {
-        res.end()
+        // 已结束/已销毁的连接不再 end：避免对已关闭的 socket 写入（Node 下虽多为 no-op，
+        // 但对 destroyed socket 调 end() 可能触发 'error' 事件）
+        if (res.writableEnded !== true && res.destroyed !== true) res.end()
       } catch (err) {
         // 连接可能已被对端断开：收尾失败不影响其它连接，也不应让卸载失败
-        console.warn('[@geewiki/http] 结束长连接失败:', err)
+        console.warn(`[@geewiki/http] 结束长连接失败（owner=${owner || '未登记'}）:`, err)
       }
     }
-    this.activeStreams.clear()
+  }
+
+  /** 上报一次"因并发上限被拒"的长连接请求（持有者调用；见 HttpRouterService 的说明） */
+  noteStreamRejected(): void {
+    this.streamsRejected++
   }
 
   /** 除调用方自身请求外的在途数（请求之外调用时等同 inflight()） */
@@ -599,6 +645,10 @@ export const HttpPlugin = {
     const pluginUiRoots = (): Record<string, string> => config.pluginUiRoots?.() ?? {}
     const router = new HttpRouter((h) => {
       const db = ctx.get('db')
+      // 长连接可观测性：让运维能从健康检查看出"是否有流卡住 / 是否有人在被拒"。
+      // **只新增字段**：既有 ok/uptime/timestamp/db 的形状与语义一字未改 ——
+      // Dockerfile 的 HEALTHCHECK 判据是 `j.ok===true && j.db && j.db.present===true`。
+      const { streams } = router.stats()
       h.json(200, {
         ok: true,
         uptime: Math.round((Date.now() - startedAt) / 1000),
@@ -606,6 +656,7 @@ export const HttpPlugin = {
         db: db
           ? { present: true, tables: db.listTables(), migrations: db.appliedMigrations() }
           : { present: false },
+        ...(streams ? { streams } : {}),
       })
     })
 

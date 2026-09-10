@@ -652,6 +652,9 @@ export const AiPlugin = {
           return
         }
         if (activeStreams.size >= MAX_CONCURRENT_STREAMS) {
+          // 上报被拒计数：并发上限是本插件的策略，路由服务不参与判定，
+          // 故由这里主动上报，让 /api/health 的 streams.rejected 能反映"有人在被拒"。
+          router.noteStreamRejected?.()
           h.json(429, {
             ok: false,
             error: 'too_many_streams',
@@ -673,7 +676,10 @@ export const AiPlugin = {
         try {
           h.noteStatus?.(200) // 只记指标、不结束响应（json() 会 res.end，长连接不能用）
           writeSseHead(h.res)
-          untrack = router.trackStream?.(h.res)
+          // owner = 本插件名：管理器卸载本插件时据此**定向回收**这些流
+          // （否则插件级 /disable 既不退在途也不收流，客户端会静默悬空）。
+          // 用 manifest.name 而非字面量，避免与清单漂移。
+          untrack = router.trackStream?.(h.res, manifest.name)
           // 客户端断连 → 立刻取消上游（用户关掉页面后不该继续烧 token）
           h.res.on('close', () => {
             if (!h.res.writableEnded) ac.abort()
@@ -816,9 +822,17 @@ export const AiPlugin = {
       })
     }
 
-    /** 统一的 400/413 出口（错误码与 @geewiki/wiki 的 readBody 前缀约定一致） */
+    /**
+     * 统一的 400/413 出口（错误码与 @geewiki/wiki 的 readBody 前缀约定一致）。
+     *
+     * **所有外发 message 一律经 `redact`**：本函数是"我们自己造的错误"与"用户输入"的
+     * 交汇点——`invalid_limit` / `invalid_extractive` 会把用户实际传入的值插进消息
+     * （`实际 ${String(raw)}`）。若用户把一段形如密钥的串当参数传进来，原样回显就等于让
+     * 该串进入响应体与访问日志。`redact` 只遮蔽**像密钥的**长串（≥16 字符），因此我们
+     * 自己的可读校验文案逐字不变，诊断性不受损（错误码仍由 code 前缀解析，见下）。
+     */
     const failFromError = (h: RouteHandlerContext, err: unknown): void => {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = redact(err instanceof Error ? err.message : String(err))
       if (msg.startsWith('payload_too_large:')) {
         // 剩余请求体未消费：响应刷出后关闭连接（413 仍走统一出口，计入 stats）
         h.json(413, { ok: false, error: 'payload_too_large', message: msg.slice('payload_too_large:'.length).trim() })

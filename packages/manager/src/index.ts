@@ -1233,6 +1233,13 @@ export class GeeWikiManager {
    * 卸载异常不在此抛出，而是返回给调用方决定处置（deactivateCore 记日志、disposeAll 聚合上抛）。
    */
   private async unloadPlugin(name: string, managed: ManagedPlugin): Promise<Error | null> {
+    // 先定向回收该插件自己开的长连接（SSE 等），再按 drainTimeout 排空在途请求。
+    //
+    // 顺序与理由：长连接**不计入排空**（见 HttpRouterService.trackStream 的语义），
+    // 所以 drain() 不会等它们；若不在这里收，插件级 /disable 既不退在途、也不收流，
+    // 客户端会**静默悬空**——历史上这被记为"把噪声故障换成了沉默故障"。
+    // 收流本身不改变排空语义与告警文案：真实在途请求该等还是要等、该告警还是要告警。
+    this.closeOwnStreams(name)
     await this.drainBeforeUnload(name, managed)
     let error: Error | null = null
     if (managed.fiber) {
@@ -1250,6 +1257,30 @@ export class GeeWikiManager {
   }
 
   /**
+   * 定向收掉某插件自己开的长连接（owner 粒度）。
+   *
+   * 落点说明：卸载统一出口 `unloadPlugin`（disable / enable 回滚 / disposeAll 共用），
+   * 因此在**所有**卸载路径上都生效，不需要每个调用点各自记得收流。
+   *
+   * 与 drainTimeout 无关：排空约束的是"在途请求"，而长连接不占在途数——
+   * 即便插件声明 drainTimeout: 0（不等待排空），它的长连接也必须被收掉，
+   * 否则客户端会一直挂着等一个再也不会来的字节。
+   *
+   * 路由服务未实现 `closeStreams`（例如测试替身）时静默跳过：这是可选成员，
+   * 缺失只意味着"该实现不支持流回收"，不应让卸载失败。
+   */
+  private closeOwnStreams(name: string): void {
+    const router = this.ctx.get('http') as HttpRouterService | undefined
+    if (!router?.closeStreams) return
+    try {
+      router.closeStreams(name)
+    } catch (err) {
+      // 收流失败不得让卸载失败（路由服务内部已逐个 try/catch，这里是兜底）
+      console.warn(`[manager] 插件 ${name} 的长连接回收出错（继续卸载）:`, err)
+    }
+  }
+
+  /**
    * 卸载前优雅排空（架构 §5.1）：按插件 manifest 的 `runtime.drainTimeout`（秒，缺省 5）
    * 等待"处理器尚未结算"的在途 HTTP 请求完成；超时则记录告警后强制卸载。
    * `drainTimeout <= 0` 表示不等待（立即卸载）。
@@ -1257,7 +1288,9 @@ export class GeeWikiManager {
    * 语义（与 HttpRouterService.drain 一致）：等待的是全站在途请求，
    * **不含发起本次卸载的那次管理请求本身**（REST 卸载由处理器内部调用，
    * 若把自己算进去就会等自己、必然空转满 drainTimeout）。
-   * 按插件（owner）粒度排空属于后续工作。
+   *
+   * 按插件（owner）粒度的**长连接回收**已在 {@link closeOwnStreams} 里完成；
+   * 按插件粒度的**在途请求**排空仍未实现（drain 是全站语义）。
    */
   private async drainBeforeUnload(name: string, managed: ManagedPlugin): Promise<void> {
     const { drainTimeout } = normalizeRuntime(managed.entry.manifest.geewiki.runtime)

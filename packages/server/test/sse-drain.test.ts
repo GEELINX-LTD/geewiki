@@ -406,3 +406,204 @@ test('负对照：处理器返回永不 resolve 的 thenable → 排空确实等
     await h.dispose()
   }
 })
+
+/* ============ 7. owner 级长连接回收（插件卸载时定向收掉自己的流） ============
+ *
+ * 背景（外部审查 C-1）：长连接不计入排空，因此 drain() 不会等它们；而 closeStreams()
+ * 原先**只在 @geewiki/http 自身 teardown 时调用**，插件级 /disable 既不退在途也不收流
+ * ⇒ 客户端**静默悬空**（"把噪声故障换成了沉默故障"）。
+ * 本组用例钉住新语义：**登记 owner 的连接，由管理器在卸载该插件时定向回收**，
+ * 不再只依赖"插件作者记得在自己的 dispose 里收流"。
+ */
+
+/** 开 SSE 长连接、**登记 owner**、但自己**不做任何清理**的插件。
+ *  唯一能收掉它的就是 owner 级回收——因此这条用例能真正判别该机制是否存在。 */
+function sseOwnedNoCleanupPlugin(name: string, path: string): RegisteredPlugin {
+  return testPlugin({
+    name,
+    apply: (_ctx, router) => {
+      router.register('GET', path, (h: RouteHandlerContext) => {
+        h.res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-transform',
+          connection: 'keep-alive',
+        })
+        h.noteStatus?.(200)
+        h.res.write('event: status\ndata: {"type":"status"}\n\n')
+        // 只登记 owner（第二个参数），**不**在自己的 dispose 里收流
+        router.trackStream?.(h.res, name)
+      })
+    },
+  })
+}
+
+test('SSE：owner 级回收只收该 owner 的流，其它 owner 的连接不受影响', async () => {
+  const h = await startHarness([
+    sseOwnedNoCleanupPlugin('@t/owner-a', '/api/t/stream-a'),
+    sseOwnedNoCleanupPlugin('@t/owner-b', '/api/t/stream-b'),
+  ])
+  try {
+    const a = await openStream(base(h, '/api/t/stream-a'))
+    const b = await openStream(base(h, '/api/t/stream-b'))
+    assert.match(a.first, /event: status/)
+    assert.match(b.first, /event: status/)
+
+    // 两条流都在册
+    assert.equal(h.router.stats().streams?.active, 2, '两条长连接都应登记在册')
+
+    // 只回收 owner A（管理器卸载单个插件时就是这么调的）
+    h.router.closeStreams?.('@t/owner-a')
+
+    const aRest = await readAllUntilClose(a.reader, 2000)
+    assert.equal(aRest.closed, true, '被回收的 owner 的连接应结束（客户端读到流结束）')
+
+    // 关键断言：B 必须**仍然存活**——否则"定向回收"就退化成了"全量关闭"
+    const bRest = await readAllUntilClose(b.reader, 400)
+    assert.equal(bRest.closed, false, '未回收的 owner 的连接不得被误关')
+    assert.equal(h.router.stats().streams?.active, 1, '回收后应只剩 1 条在册')
+
+    b.close()
+    await sleep(50)
+  } finally {
+    await h.dispose()
+  }
+})
+
+test('SSE：插件卸载时由管理器定向回收其长连接（插件自身不做清理也能收掉）', async () => {
+  const pluginName = '@t/owned-noclean'
+  const h = await startHarness([sseOwnedNoCleanupPlugin(pluginName, '/api/t/owned')], {
+    session: [pluginName],
+  })
+  try {
+    const pluginPath = encodeURIComponent(pluginName)
+    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), { method: 'POST' })
+    assert.equal(enabled.status, 200, '会话层热启用应成功')
+    await enabled.arrayBuffer()
+
+    const opened = await openStream(base(h, '/api/t/owned'))
+    assert.match(opened.first, /event: status/)
+    assert.equal(h.router.stats().streams?.active, 1, '流应已登记')
+
+    const { warns } = await captureConsole(async () => {
+      const startedAt = Date.now()
+      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), { method: 'POST' })
+      const elapsed = Date.now() - startedAt
+      assert.equal(res.status, 200, '停用应成功')
+      await res.arrayBuffer()
+      // (a) 长连接不得阻塞排空（该插件 drainTimeout=5s）
+      assert.ok(elapsed < 1000, `长连接不得阻塞排空（实际 ${elapsed}ms）`)
+    })
+    // (b) 不得产生假的排空超时告警（排空语义与告警文案一字未改）
+    assert.equal(
+      warns.some((line) => line.includes('排空超时')),
+      false,
+      `owner 级回收不应触发超时告警，实际告警: ${warns.join(' | ')}`,
+    )
+    // (c) 插件自己没做清理，但连接仍被收掉 → 客户端读到流结束（这正是本批新增的能力）
+    const rest = await readAllUntilClose(opened.reader, 2000)
+    assert.equal(rest.closed, true, '插件卸载后其长连接应被管理器定向收掉')
+    // (d) 在册数归零
+    await sleep(50)
+    assert.equal(h.router.stats().streams?.active, 0, '卸载后不应残留登记的流')
+  } finally {
+    await h.dispose()
+  }
+})
+
+test('SSE：未登记 owner 的连接无法被定向回收（显式契约，非静默行为）', async () => {
+  // ssePlugin() 就是"登记但不带 owner"的形态：closeStreams(owner) 不应收掉它
+  const h = await startHarness([ssePlugin('@t/no-owner')])
+  try {
+    const opened = await openStream(base(h, '/api/t/stream'))
+    assert.match(opened.first, /event: status/)
+
+    h.router.closeStreams?.('@t/no-owner')
+    const stillOpen = await readAllUntilClose(opened.reader, 400)
+    assert.equal(
+      stillOpen.closed,
+      false,
+      '未登记 owner 的连接不该被 owner 级回收关掉（它只能等整体关停）',
+    )
+
+    // 对照：整体关停仍能收掉它（既有语义未变）
+    const disposePromise = h.dispose()
+    const afterDispose = await readAllUntilClose(opened.reader, 3000)
+    assert.equal(afterDispose.closed, true, '整体关停仍应收掉未登记 owner 的连接')
+    await disposePromise
+  } finally {
+    await h.dispose()
+  }
+})
+
+/* ============ 8. 长连接可观测性（stats / health） ============ */
+
+/** 生产形态的持有者：登记 owner，并在客户端断开时**注销**（@geewiki/ai 在 finally 里做同样的事）。
+ *  用它才能断言 active 计数随真实生命周期归零——ssePlugin() 刻意不注销（见用例 5 的契约）。 */
+function sseObservedPlugin(name: string, path: string): RegisteredPlugin {
+  return testPlugin({
+    name,
+    apply: (_ctx, router) => {
+      router.register('GET', path, (h: RouteHandlerContext) => {
+        h.res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-transform',
+          connection: 'keep-alive',
+        })
+        h.noteStatus?.(200)
+        h.res.write('event: status\ndata: {"type":"status"}\n\n')
+        const untrack = router.trackStream?.(h.res, name)
+        // 客户端断开（或服务端收流）→ 注销登记，避免登记表里留下已死的连接
+        h.res.on('close', () => untrack?.())
+      })
+    },
+  })
+}
+
+test('SSE：stats() 保留既有字段并新增 streams 计数，随流的开闭与拒流变化', async () => {
+  const h = await startHarness([sseObservedPlugin('@t/obs', '/api/t/obs')])
+  try {
+    const before = h.router.stats()
+    // 既有字段一个都不能少（看门狗与既有断言依赖它们）
+    for (const key of ['total', 'ok', 'fail', 'consecutiveFailures', 'lastMs', 'avgMs'] as const) {
+      assert.equal(typeof before[key], 'number', `stats() 应保留既有字段 ${key}`)
+    }
+    assert.ok(before.streams, 'stats() 应新增 streams 计数')
+    assert.equal(before.streams?.active, 0, '未开流时 active 应为 0')
+    const rejectedBefore = before.streams?.rejected ?? 0
+
+    const opened = await openStream(base(h, '/api/t/obs'))
+    assert.equal(h.router.stats().streams?.active, 1, '开流后 active 应为 1')
+
+    // 被拒计数由持有者上报（并发上限是持有者策略，路由服务不参与判定）
+    h.router.noteStreamRejected?.()
+    assert.equal(h.router.stats().streams?.rejected, rejectedBefore + 1, '上报后 rejected 应 +1')
+
+    opened.close()
+    // 客户端断开 → 处理器 finally 里 untrack，active 应回到 0（轮询给注销留出时间）
+    for (let i = 0; i < 40 && h.router.stats().streams?.active !== 0; i++) await sleep(50)
+    assert.equal(h.router.stats().streams?.active, 0, '客户端断开并注销后 active 应回到 0')
+  } finally {
+    await h.dispose()
+  }
+})
+
+test('SSE：/api/health 带 streams 计数，且既有判据字段（ok / db.present）不变', async () => {
+  const h = await startHarness([ssePlugin('@t/health')])
+  try {
+    const body = (await (await fetch(base(h, '/api/health'))).json()) as {
+      ok?: unknown
+      db?: { present?: unknown }
+      streams?: { active?: unknown; rejected?: unknown }
+    }
+    // Dockerfile 的 HEALTHCHECK 判据是 `j.ok===true && j.db && j.db.present===true`：
+    // 既有字段的形状与语义必须一字不变，否则容器会误判为不健康。
+    assert.equal(body.ok, true, 'health 的 ok 必须仍为 true')
+    assert.equal(typeof body.db, 'object', 'health 必须仍带 db 对象')
+    assert.equal(typeof body.db?.present, 'boolean', 'db.present 必须仍是布尔')
+    // 新增的可观测字段
+    assert.equal(typeof body.streams?.active, 'number', 'health 应带 streams.active')
+    assert.equal(typeof body.streams?.rejected, 'number', 'health 应带 streams.rejected')
+  } finally {
+    await h.dispose()
+  }
+})
