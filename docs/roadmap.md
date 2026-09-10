@@ -65,7 +65,7 @@
 - [ ] 卸载排空倒计时 UI（drainTimeout 展示）——**后端已就绪**：管理器在统一卸载出口按 `runtime.drainTimeout` 排空在途请求（见 architecture §5.1），仅缺前端展示。**注意排空粒度是"全站"在途请求，不是被卸载插件的 owner 级**（见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 5 节 L-1）
 - [ ] 冲突组替换交互（加载同组新插件时提示替换）——**设计已定稿、代码未落地**：新增 `POST /api/plugins/:name/replace`（含新错误码 `replace_rollback_failed` 与待新增的 `collectDependentsClosure`），见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 4 节 G-1
 - [ ] `enable` 失败回滚作用域修复——**已确认缺陷、修法已定稿、代码未落地**：`activatedByThisCall` 是每递归帧局部数组，依赖深度 ≥2 时孙依赖由子帧激活并 `addToSession` 落盘，目标插件激活失败时孙依赖残留且 session 清单泄漏（见 G-2 与第 5 节 L-2）
-- [ ] `meta.role: 'password'` 脱敏输入框（当前除 `textarea` 外的 `role` 一律退化为普通文本框，密码类字段在管理台明文显示，见 architecture §5.7）
+- [x] `meta.role: 'password'` 脱敏输入框 —— **已完成**：`role: 'password'` 的字符串字段渲染为 `type="password"` + `autoComplete="new-password"` 输入框（`packages/web/src/lib/configSchema.ts` 置 `secret`、`packages/web/src/components/SchemaForm.tsx` 据此选控件）。**边界（仍未做）**：脱敏只作用于表单输入框的呈现，`GET /api/plugins/:name/config` 响应体里的 `config` 仍是**明文原值**（不在传输层脱敏），见 architecture §5.7
 - [ ] 发现期 issues 的前端提示位（后端 `GET /api/plugins` 的 `issues` 字段已对外可见，管理台尚未展示"有插件被跳过"，见第 5 节 L-14）
 - [ ] 依赖阻止卸载弹窗提示（当前 409 文案展示）
 - [x] docker-compose 应用镜像多阶段构建（web build → server），容器自愈联动实测 —— **已完成**：`Dockerfile`（多阶段、非 root 运行、`HEALTHCHECK` 判 `ok && db.present`）+ `docker compose up -d --build` 已实测（构建、持久化、插件启停持久化、SIGTERM 优雅退出、数据目录不可写时如实变 `unhealthy`）；详见 [deployment.md](deployment.md)

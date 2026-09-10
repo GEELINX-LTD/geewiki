@@ -134,7 +134,9 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
   | 方法与路径 | 语义 | 状态码 |
   | --- | --- | --- |
   | `GET /api/plugins/:name/config` | 返回 `{ ok, name, layer, activeLayer, config, schema }`；`layer` 为**持久化层**（这份配置存在哪、重启后是否生效），`activeLayer` 为**激活层**（未激活为 `null`）；`schema` 为清洗后的序列化载荷，无 schema 时为 `null` | 200 / 404 |
-  | `PUT /api/plugins/:name/config` | body `{ config }`：校验 → 原子落盘 → 已激活则 `fork.update` 热更新 | 200 / 400 `invalid_config`（附逐条 `{message,path}`）/ 400 `config_not_supported`（**不再由该路径产出**——仅保留错误码映射）/ 409 `hot_update_failed` |
+  | `PUT /api/plugins/:name/config` | body `{ config }`：校验 → 原子落盘 → 已激活则 `fork.update` 热更新 | 200 / 400 `invalid_config`（附逐条 `{message,path}`）/ 400 `config_not_supported`（**不再由该路径产出**——`packages/manager/src` 中已无该错误码的抛出点，无 schema 插件改走"JSON 原文"通道、形状非法时抛 `invalid_config`）/ 409 `hot_update_failed` |
+
+> **路径里的插件名必须 URL 编码**：`:name` 只占**单个路径段**——路由层先按 `/` 切分、再逐段 `decodeURIComponent`（`packages/server/src/index.ts:270-277`），因此 `GET /api/plugins/@geewiki/wiki/config` 会被切成 5 段而落 `404 not_found`，必须写成 `GET /api/plugins/%40geewiki%2Fwiki/config`（即 `encodeURIComponent(name)`）。包名含 `/` 的插件在 UI 上无影响（前端客户端已统一编码，`packages/web/src/api.ts:176-182`），但 curl / CLI 手工调用会踩。
 
 > **注意两个端点的 `layer` 不同义**：配置端点的 `layer` 是持久化层，列表端点 `GET /api/plugins` 的 `PluginSnapshot.layer` 仍是激活层（未激活 `null`）。判据见 `docs/plugin-platform-plan.md` 批次 C 的端点契约。
 
@@ -144,8 +146,8 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
   - **失败回滚**：`fork.update` 抛错时 `fiber.config` **已经是新值**（cordis 实测行为），因此管理器会显式再 `update(旧配置)` 把进程内配置回滚，并把磁盘也恢复成旧配置，然后以 409 返回回滚后的配置。作用域为"该插件的配置"，不涉及依赖方。
   - 每次 `persistConfig` 都是**原子写**（先写 `<文件>.tmp` 再 `rename`），避免进程在写中途被杀导致清单半截损坏——坏清单会让下次启动丢失全部插件装配。
 - 管理台按 schema 自动生成配置表单（`packages/web/src/components/SchemaForm.tsx` + `packages/web/src/lib/configSchema.ts`）：支持开关、数字（尊重 `min`/`max`/`step`）、文本、多行文本（`meta.role: 'textarea'`）、枚举下拉（`union` 且分支全为 `const`）、字段组（`object`）、可增删列表（`array`），其余类型（联合、字典、元组、bitset、transform 等）退化为 JSON 编辑框。**未声明 schema 的插件**（例如零依赖的外部插件）退回 JSON 原文编辑框：**接受并保存原始 JSON，不做结构化校验、不做字段裁剪**（属已知取舍——脚本式插件没有可校验的契约，强行校验只会把合法配置挡在门外）。
-- **`hidden` 字段语义**：schema 中声明为 `hidden` 的字段**仅保留默认值、不渲染输入控件**——它照常参与校验与默认值填充，写进快照与清单，但表单里只显示一条"沿用默认值"的静态说明（`packages/web/src/lib/configSchema.ts` 映射为 `kind: 'static'`，用于"由宿主或迁移写入、不该由管理员手改"的字段）。
-- **已知未落地**：`meta.role: 'password'` 的脱敏输入框**尚未实现**——当前除 `textarea` 外的 `role` 一律退化为普通文本框并附 `role=…` 注记，故密码类字段在管理台上仍以明文显示。修复方向是把 `role: 'password'` 映射为 `type="password"` 输入框。
+- **`hidden` 字段语义**：`meta.hidden === true` 的字段**表单完全不渲染该字段，也没有任何说明行**（`packages/web/src/lib/configSchema.ts:106` 对 `hidden === true` 直接返回 `kind: 'hidden'`，`packages/web/src/components/SchemaForm.tsx:210-212` 的 `case 'hidden': return null`）；它照常参与校验与默认值填充，写进快照与清单，只是**不提供任何编辑入口**。注意 **`kind: 'static'` 是"只读展示"分支而非 hidden 的映射**——它渲染成一段静态文本（`SchemaForm.tsx:213-219`），实际只用于 `const` 节点（`configSchema.ts:136`，即枚举字面量），与"由宿主或迁移写入、不该由管理员手改"无关。
+- **`meta.role: 'password'` 已实现表单脱敏，但边界明确**：`role: 'password'` 的字符串字段渲染为**密码输入框**——`packages/web/src/lib/configSchema.ts:132` 置 `secret: role === 'password'`，`packages/web/src/components/SchemaForm.tsx:131-132` 据此设 `type="password"` 与 `autoComplete="new-password"`；只有**非 `textarea`、非 `password`** 的 `role` 才退化为普通文本框并附 `role=…` 注记（`configSchema.ts:133`）。**脱敏只作用于表单输入框的呈现**：`GET /api/plugins/:name/config` 响应体里的 `config` 仍是**明文原值**（config 是普通 JSON 字段，不在传输层做脱敏），本仓库也没有"密钥加密存储"。
 - **安全红线（必须遵守）**：schemastery 的反序列化 `Schema(payload)` 会对节点里的 `callback` 字符串执行 `new Function('return ' + source)()`——插件是半可信输入，因此**前端绝不可对下发的载荷调用 `Schema(payload)`**。管理器在下发前经 `sanitizeSchemaPayload()` 剥离 `callback`/`preserve`/`constructor`，前端只按 `refs` 图渲染（载荷形态为 `{ uid, refs }`，`refs` 是 uid 字符串到节点的映射而非数组，节点上没有 `uid` 字段，`dict`/`list`/`inner`/`sKey` 的值都是数字 uid）。渲染还须做路径记忆与深度上限（schema 允许 DAG 共享与 `lazy` 自引用）。
 - 旧式 JSON Schema 字面量（普通对象而非 schemastery 实例）在运行期被视作"无 schema"：跳过结构化校验、只提供 JSON 编辑，并打印一次告警。
 - **缓存清理钩子（`runtime.requiresCachePurge`）**：统一卸载出口在 `fiber.dispose()` 完成后，对声明该字段的插件经 cordis 事件总线广播 `CACHE_PURGE_EVENT`（事件名 `geewiki/cache-purge`，常量定义于 `@geewiki/core`，参数为插件名），由持有派生缓存的插件/宿主自行清理。派发走 `ctx.parallel(...)`（内部 `Promise.allSettled`）而非同步 `ctx.emit(...)`：后者无 per-listener 保护，任一监听器抛错会**跳过其后的监听器**，导致后续插件的缓存清理被静默丢失；失败监听器由管理器聚合记录，不影响其它插件与卸载结果。
