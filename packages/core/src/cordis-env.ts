@@ -18,6 +18,20 @@ export interface FiberLike {
   dispose(): Promise<void>
   uid: number | null
   state: number
+  /**
+   * 当前生效的插件配置。
+   * 注意：`update()` 失败时它**已经**被置为新值（见 update 说明），
+   * 需要一致性的调用方必须显式回滚。
+   */
+  config?: unknown
+  /**
+   * 以新配置重启本插件（等价于 dispose 旧实例 → 用新配置重新 apply）。
+   *
+   * 实测语义（cordis 4.0.0-rc.10）：`resolveConfig` 校验失败时抛 ValidationError
+   * 且旧配置不被污染；apply 本身抛错时该错误向上传播、插件进入 FAILED 态，
+   * 但 `fiber.config` 已是新值——调用方若要回滚需再调一次 `update(旧配置)`。
+   */
+  update?(config: unknown, noSave?: boolean): Promise<void>
 }
 
 declare module 'cordis' {

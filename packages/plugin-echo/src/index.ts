@@ -6,12 +6,24 @@
  * disable 后路由自动摘除，全程无需重启进程。
  */
 import type { Context } from 'cordis'
+import Schema from 'schemastery'
 import { type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
 
 export interface EchoConfig {
   /** 返回的消息内容（可经 configSchema 配置，缺省 "hello from @geewiki/echo"） */
   message?: string
 }
+
+/**
+ * 配置 Schema（schemastery）：驱动管理台自动生成表单，并在配置热更新前做校验。
+ * 同一实例同时用于 manifest.geewiki.configSchema 与插件模块的 Config
+ * （后者让 cordis 在 ctx.plugin(plugin, raw) 时自动校验并填默认值）。
+ */
+export const EchoConfigSchema = Schema.object({
+  message: Schema.string()
+    .default('hello from @geewiki/echo')
+    .description('GET /api/echo 返回的消息内容'),
+})
 
 /** GeeWiki Manifest：声明服务标识与热加载授权（示例插件无状态、可热插拔） */
 export const manifest: GeeWikiManifest = {
@@ -27,18 +39,15 @@ export const manifest: GeeWikiManifest = {
       requiresCachePurge: false,
       drainTimeout: 5,
     },
-    configSchema: {
-      type: 'object',
-      properties: {
-        message: { type: 'string', title: 'Echo 消息' },
-      },
-    },
+    configSchema: EchoConfigSchema,
   },
 }
 
 /** cordis 插件本体 */
 export const EchoPlugin = {
   name: '@geewiki/echo',
+  /** cordis 约定：声明 Config 后由 cordis 负责校验与默认值填充 */
+  Config: EchoConfigSchema,
 
   apply(ctx: Context, config: EchoConfig = {}) {
     const router = ctx.get('http') as HttpRouterService | undefined

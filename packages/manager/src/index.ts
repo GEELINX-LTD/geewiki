@@ -6,31 +6,53 @@
  *       卸载前按 manifest.runtime.drainTimeout 优雅排空在途 HTTP 请求，超时才强制卸载
  * - 5.2 依赖图谱：清单驱动装配 + 依赖拓扑排序 + 反向依赖卸载拦截；graph() 供 React Flow
  * - 5.3 会话层沙箱：Base（plugins.base.json）/ Session（plugins.session.json）双层状态；
- *       临时操作仅落 Session；persistSession() 把会话合并进 Base；看门狗熔断时清空会话自愈
+ *       临时操作仅落 Session；persistSession() 把会话合并进 Base；看门狗熔断时清空会话自愈；
+ *       会话层是**叠加在基础层之上的覆盖层**：同名插件在两层的条目并存时，基础层负责激活、
+ *       会话层负责覆盖配置（boot 阶段经 fork.update 叠加，见 applySessionOverlay）
  * - 5.4 广义冲突组：conflictGroup 同组互斥，激活时自动检测冲突方
  * - 5.5 迁移控制器：激活前执行 ctx.db.migrate(插件迁移目录)，失败阻止加载（事务已回滚）
  * - 5.6 看门狗：健康探针轮询；Session 插件 5 秒试用期内探针失败即回滚；
  *       连续失败达阈值（默认 3 次）触发熔断：清空 Session 后以退出码 1 退出（容器重启回 Base）
- * - 5.7 插件配置：REST enable 携带 config（JSON 原文），激活时原样传给插件 apply；
- *       configSchema 驱动的自动表单与配置热更新校验排期 Phase 4（见 roadmap），当前仅透传；
- *       卸载声明 runtime.requiresCachePurge 的插件后，经事件总线广播 CACHE_PURGE_EVENT
+ * - 5.7 插件配置：GET/PUT /api/plugins/:name/config；声明 schemastery configSchema 的插件走
+ *       校验 + 默认值填充 + 白名单裁剪，未声明者按"JSON 原文"语义原样透传给 apply；
+ *       已激活插件的 PUT 走 fork.update 热更新（失败则内存/磁盘双向回滚），未激活只落盘
+ *       （响应 requiresRestart:true）；卸载声明 runtime.requiresCachePurge 的插件后，
+ *       经事件总线广播 CACHE_PURGE_EVENT
  *
  * 本插件由 @geewiki/server 引导加载（内核组件，不入清单），清单中的插件由本管理器
  * 按依赖拓扑依次激活；REST 路由经 @geewiki/http 的路由服务挂载。
  */
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import type { Context } from 'cordis'
 import {
   CACHE_PURGE_EVENT,
   closeAfterResponse,
   normalizeRuntime,
+  type ConfigSchema,
   type DatabaseAdapter,
   type FiberLike,
   type HttpRouterService,
   type RouteHandlerContext,
 } from '@geewiki/core'
 export type { RegisteredPlugin } from './deps.js'
+export {
+  DiscoveryError,
+  ENTRY_CANDIDATES,
+  isInsideDir,
+  isInsideDirReal,
+  listPluginDirs,
+  loadExternalPlugins,
+  parsePluginManifest,
+  resolvePluginEntry,
+  scanPluginDirs,
+  type DiscoveryIssue,
+  type DiscoveryOptions,
+  type DiscoveryResult,
+  type PluginDirScan,
+} from './discovery.js'
 import {
   checkHotChain,
   collectDependents,
@@ -40,6 +62,15 @@ import {
   type RegisteredPlugin,
 } from './deps.js'
 import { decideWatchdog } from './watchdog.js'
+import type { DiscoveryIssue } from './discovery.js'
+import {
+  formatIssues,
+  isSchemaInstance,
+  pruneUnknownFields,
+  sanitizeSchemaPayload,
+  validateConfig,
+  type ConfigSchemaPayload,
+} from './config-schema.js'
 
 /* ====================== 崩溃标记（架构 §5.3 自愈） ====================== */
 
@@ -94,6 +125,11 @@ export interface ManagerConfig {
    * disposeAll 优雅卸载成功时删除标记。通常由宿主进程置于 data/ 下。
    */
   crashMarkerFile?: string
+  /**
+   * 外部插件发现阶段的问题（组合根 `buildRegistry` 扫描 plugins/ 得到）：
+   * 只读透出到 `GET /api/plugins` 的 `issues` 字段，让"目录里躺着但没被加载"的插件可见。
+   */
+  discoveryIssues?: DiscoveryIssue[]
 }
 
 export interface PluginSnapshot {
@@ -108,6 +144,10 @@ export interface PluginSnapshot {
   migrations?: string
   config?: Record<string, unknown>
   error?: string
+  /** 来源：内置（组合根登记）/ 外部（plugins/ 目录发现） */
+  source: 'builtin' | 'external'
+  /** 是否声明了 schemastery configSchema（管理台据此决定渲染表单还是 JSON 编辑框） */
+  configurable: boolean
 }
 
 export interface PluginGraphNode {
@@ -152,7 +192,21 @@ function readList(file: string): PluginListFile {
 
 function writeList(file: string, list: PluginListFile): void {
   mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, `${JSON.stringify(list, null, 2)}\n`, 'utf8')
+  // 原子替换（先写 .tmp 再 rename）：避免进程在写中途被杀导致清单半截损坏，
+  // 坏清单会让下次启动丢失全部插件装配（readList 抛 invalid_list_file）。
+  // 临时名带 pid + 随机后缀并以 wx 独占创建：多实例共用同一 config 目录时互不覆盖。
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  try {
+    writeFileSync(tmp, `${JSON.stringify(list, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+    renameSync(tmp, file)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      // 清理失败不得掩盖原始错误
+    }
+    throw err
+  }
 }
 
 /* ============================= 管理器本体 ============================= */
@@ -180,6 +234,8 @@ export class GeeWikiManager {
   private session: PluginListFile = { enabled: [] }
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
   private bootErrors: string[] = []
+  /** 已就"configSchema 非 schemastery 实例"告警过的插件名（每个插件只吵一次） */
+  private readonly warnedLegacySchema = new Set<string>()
   /** 最近一次会话层激活的插件（看门狗试用期回滚归因目标） */
   private lastEnabledName: string | null = null
   private lastEnabledAt: number | null = null
@@ -194,6 +250,7 @@ export class GeeWikiManager {
       gracePeriodMs: config.gracePeriodMs ?? 5000,
       meltdownThreshold: config.meltdownThreshold ?? 3,
       crashMarkerFile: config.crashMarkerFile,
+      discoveryIssues: config.discoveryIssues ?? [],
     }
   }
 
@@ -223,6 +280,8 @@ export class GeeWikiManager {
       migrations: m.geewiki.migrations,
       config: p?.config,
       error: p?.error ?? undefined,
+      source: entry.source ?? 'builtin',
+      configurable: this.configSchemaOf(entry) !== undefined,
     }
   }
 
@@ -250,9 +309,213 @@ export class GeeWikiManager {
     return { nodes, edges }
   }
 
+  /** 外部插件发现阶段的问题（plugins/ 扫描所得），透出到 `GET /api/plugins` 的 issues */
+  discoveryIssues(): DiscoveryIssue[] {
+    return [...this.config.discoveryIssues]
+  }
+
   /** 双层清单内容（含启动时各插件的激活错误） */
   sessionState(): { base: PluginListFile; session: PluginListFile; bootErrors: string[] } {
     return { base: this.base, session: this.session, bootErrors: this.bootErrors }
+  }
+
+  /* ----------------------- 配置（架构 §5.7） ----------------------- */
+
+  /**
+   * 插件的配置 Schema：优先取 cordis 约定的 `module.Config`（设置后 cordis 会在
+   * `ctx.plugin(plugin, raw)` 时自动校验并填默认值），否则取 manifest 的 configSchema。
+   * 旧式 JSON Schema 字面量（普通对象）视为"无 schema"，仅告警一次。
+   */
+  private configSchemaOf(entry: RegisteredPlugin): ConfigSchema | undefined {
+    const fromModule = entry.module.Config
+    if (isSchemaInstance(fromModule)) return fromModule
+    const declared = entry.manifest.geewiki.configSchema
+    if (isSchemaInstance(declared)) return declared
+    if (declared !== undefined && !this.warnedLegacySchema.has(entry.name)) {
+      this.warnedLegacySchema.add(entry.name)
+      console.warn(
+        `[manager] 插件 ${entry.name} 的 configSchema 不是 schemastery Schema（旧式 JSON Schema 字面量？）：` +
+          '已跳过结构化校验与表单生成，仅提供 JSON 原文编辑',
+      )
+    }
+    return undefined
+  }
+
+  /**
+   * 配置查询（REST GET）：当前生效配置 + 清洗后的 schema 载荷 + 层信息。
+   *
+   * `layer` = **这份生效配置实际取自哪一层**（会话层条目带 config 时是会话层覆盖，
+   * 否则下沉到基础层；两层都无条目则为下次保存的默认落点 base），
+   * `activeLayer` = **激活层**（未激活为 null）。注意 `GET /api/plugins` 列表里的
+   * `PluginSnapshot.layer` 仍是激活层，两者是不同维度。
+   */
+  configOf(name: string): {
+    name: string
+    layer: Layer
+    activeLayer: Layer | null
+    config: Record<string, unknown>
+    schema: ConfigSchemaPayload | null
+  } {
+    const entry = this.registryOf(name)
+    const schema = this.configSchemaOf(entry)
+    const managed = this.plugins.get(name)
+    let config = managed?.config ?? this.persistedConfigOf(name)
+    if (config === undefined && schema) {
+      // 未激活且从未落盘：用 schema 校验空对象补齐默认值，与激活态的展示口径一致
+      const filled = validateConfig(schema, {})
+      if (filled.ok) config = pruneUnknownFields(schema, filled.value) as Record<string, unknown>
+    }
+    return {
+      name,
+      layer: this.effectiveConfigLayerOf(name),
+      activeLayer: managed?.layer ?? null,
+      config: config ?? {},
+      schema: schema ? sanitizeSchemaPayload(schema) : null,
+    }
+  }
+
+  /**
+   * 配置更新（REST PUT）：校验 → 原子落盘 → 已激活则 `fork.update` 热更新。
+   *
+   * 语义：
+   * - 声明了 schemastery configSchema：按 schema 校验、填默认值、按白名单裁剪未知字段；
+   * - 未声明 schema：按"JSON 原文编辑框"语义（架构 §5.7），只要求顶层是 JSON 对象，
+   *   不做结构化校验也不裁剪字段，原样透传给插件 apply；
+   * - 未激活：只落盘（按插件当前所在层写 session / base；从未出现过则写 base），不加载；
+   * - 已激活：落盘后热更新；`fork.update` 失败时**显式回滚**进程内配置与磁盘
+   *   （cordis 的 update 在 apply 抛错后会把 fiber.config 置为新值，不回滚就会内存/磁盘不一致）；
+   * - 未发生热更新时返回 `requiresRestart: true`：配置已落盘，待下次激活/重启生效；
+   * - 依赖方被连带重启是 cordis inject 的预期行为，不在此阻止。
+   */
+  async updateConfig(
+    name: string,
+    raw: unknown,
+  ): Promise<{ config: Record<string, unknown>; hotUpdated: boolean; requiresRestart: boolean }> {
+    const entry = this.registryOf(name)
+    const schema = this.configSchemaOf(entry)
+    let config: Record<string, unknown>
+    if (schema) {
+      const validation = validateConfig(schema, raw)
+      if (!validation.ok) {
+        throw new ManagerError('invalid_config', `配置校验失败: ${formatIssues(validation.issues)}`, {
+          issues: validation.issues,
+        })
+      }
+      config = pruneUnknownFields(schema, validation.value) as Record<string, unknown>
+    } else {
+      // 无 schema 插件：只校验"必须是 JSON 对象"这一形状约束，字段原样透传
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new ManagerError('invalid_config', `${name} 未声明 configSchema，配置必须是 JSON 对象`, {
+          issues: [{ message: '配置必须是 JSON 对象' }],
+        })
+      }
+      config = raw as Record<string, unknown>
+    }
+
+    const managed = this.plugins.get(name)
+    const previous = managed?.config
+    const layer = this.layerOf(name)
+    this.persistConfig(name, config, layer)
+
+    const fiber = managed?.active ? managed.fiber : null
+    if (!managed?.active || !fiber?.update) {
+      // 未激活（或运行期无热更新能力）：仅落盘，等待下次激活时生效
+      if (managed) managed.config = config
+      return { config, hotUpdated: false, requiresRestart: true }
+    }
+
+    try {
+      await fiber.update(config)
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err)
+      // 回滚磁盘：恢复旧配置（无旧配置则移除该条目的 config 字段）
+      try {
+        if (previous === undefined) this.removePersistedConfig(name)
+        else this.persistConfig(name, previous, layer)
+      } catch (rollbackErr) {
+        console.error(`[manager] 配置回滚（磁盘）失败 ${name}:`, rollbackErr)
+      }
+      // 回滚进程内：cordis 在 update 失败后 fiber.config 已是新值，需显式再 update 回旧值
+      let rolledBack = false
+      try {
+        await fiber.update(previous ?? {})
+        rolledBack = true
+      } catch (rollbackErr) {
+        console.error(`[manager] 配置回滚（进程内）失败 ${name}:`, rollbackErr)
+      }
+      if (managed) managed.config = previous
+      throw new ManagerError(
+        'hot_update_failed',
+        `配置热更新失败（进程内配置${rolledBack ? '已回滚' : '回滚失败，详见服务端日志'}）: ${reason}`,
+        { config: previous ?? {}, rolledBack },
+      )
+    }
+
+    managed.config = config
+    if (layer === 'session') {
+      // 与 enable 对称：会话层插件热更新后进入试用期，探针失败可被看门狗回滚
+      this.lastEnabledName = name
+      this.lastEnabledAt = Date.now()
+    }
+    console.log(`[manager] 插件 ${name} 配置已热更新（${layer} 层）`)
+    return { config, hotUpdated: true, requiresRestart: false }
+  }
+
+  /** 插件在清单中的落盘位置（= 配置的**写入**目标层）：session 优先（会话层变更不应污染基础层），否则 base */
+  private layerOf(name: string): Layer {
+    return this.session.enabled.some((e) => e.name === name) ? 'session' : 'base'
+  }
+
+  /**
+   * 生效配置**实际取自**哪一层（`configOf` 的 layer 口径）。
+   *
+   * 与 {@link layerOf}（写入目标层）的差别只在"会话条目没写 config"这一种情况：
+   * 会话层是叠加在基础层之上的覆盖层，条目存在但没有 config 就不构成有效覆盖，
+   * 此时生效值来自基础层 —— 若仍按"有条目即 session"上报，就会出现
+   * "报 session、实际生效的是 base"的自相矛盾。
+   */
+  private effectiveConfigLayerOf(name: string): Layer {
+    const inSession = this.session.enabled.find((e) => e.name === name)
+    return inSession?.config !== undefined ? 'session' : 'base'
+  }
+
+  /**
+   * 读取已落盘（清单文件）的配置；两层都没有该插件时返回 undefined。
+   * 会话条目未写 config 时不构成有效覆盖，继续下沉到基础层（叠加层语义）。
+   */
+  private persistedConfigOf(name: string): Record<string, unknown> | undefined {
+    const inSession = this.session.enabled.find((e) => e.name === name)
+    if (inSession?.config !== undefined) return inSession.config
+    return this.base.enabled.find((e) => e.name === name)?.config
+  }
+
+  /** 把配置写入对应层的清单并原子落盘 */
+  private persistConfig(name: string, config: Record<string, unknown>, layer: Layer): void {
+    const file = layer === 'session' ? this.session : this.base
+    const existing = file.enabled.find((e) => e.name === name)
+    if (existing) existing.config = config
+    else file.enabled.push({ name, config })
+    writeList(layer === 'session' ? this.config.sessionFile : this.config.baseFile, file)
+  }
+
+  /**
+   * 移除清单条目上的 config 字段并落盘（回滚路径：原先没有配置时恢复"无配置"状态）。
+   * 只写**真正包含该条目**的那个清单：失败的 PUT 不得顺手重写另一层的文件字节。
+   * 返回是否命中（未命中说明从未落盘，无需写盘）。
+   */
+  private removePersistedConfig(name: string): boolean {
+    let touched = false
+    for (const [file, path] of [
+      [this.session, this.config.sessionFile],
+      [this.base, this.config.baseFile],
+    ] as const) {
+      const existing = file.enabled.find((e) => e.name === name)
+      if (!existing) continue
+      delete existing.config
+      writeList(path, file)
+      touched = true
+    }
+    return touched
   }
 
   /* ------------------------- 装配与激活 ------------------------- */
@@ -294,8 +557,19 @@ export class GeeWikiManager {
     for (const e of this.base.enabled) {
       if (!desired.has(e.name)) desired.set(e.name, { config: e.config ?? {}, layer: 'base' })
     }
+    // 会话层是**叠加在基础层之上的覆盖层**（§5.3），不是"另一份激活意图"：
+    // 同名插件已在基础层时，其会话条目若仍按 activateCore(..., 'session') 走，会被
+    // "已激活早退（base 提升不降级）"整条丢弃 —— 于是重启后生效的仍是基础层旧值，
+    // 而 GET /config 又按"会话层有条目"上报 layer: session（报的层与生效的层不一致）。
+    // 因此这里把这类条目收集为"叠加意图"，等基础装配完成后再热更新进去。
+    const sessionOverlay = new Map<string, Record<string, unknown>>()
     for (const e of this.session.enabled) {
-      if (!desired.has(e.name)) desired.set(e.name, { config: e.config ?? {}, layer: 'session' })
+      if (!desired.has(e.name)) {
+        desired.set(e.name, { config: e.config ?? {}, layer: 'session' })
+        continue
+      }
+      // 条目没写 config 时不构成有效覆盖（生效值仍来自基础层），无需求叠加
+      if (e.config !== undefined) sessionOverlay.set(e.name, e.config)
     }
     const names = [...desired.keys()]
     let order: string[]
@@ -321,6 +595,21 @@ export class GeeWikiManager {
         this.bootErrors.push(`插件 ${name} 激活失败: ${(err as Error).message}`)
       }
     }
+    // 会话层叠加（基础装配之后，按同一拓扑序=依赖先叠）：
+    // 单条失败只记录不抛出，boot 不因此整体失败；插件继续以基础层配置服务。
+    for (const name of order) {
+      const overlayConfig = sessionOverlay.get(name)
+      if (overlayConfig === undefined) continue
+      const managed = this.plugins.get(name)
+      if (!managed?.active) continue // 基础层激活失败：上面的 catch 已记入 bootErrors，无处可叠
+      try {
+        await this.applySessionOverlay(name, managed, overlayConfig)
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err)
+        console.error(`[manager] 插件 ${name} 的会话层配置叠加失败（仍以基础层配置运行）: ${reason}`)
+        this.bootErrors.push(`插件 ${name} 会话层配置叠加失败（仍以基础层配置运行）: ${reason}`)
+      }
+    }
   }
 
   /** 会话层热启用（enable）：校验热授权/依赖链/冲突/迁移后激活并写入 Session 清单 */
@@ -329,7 +618,11 @@ export class GeeWikiManager {
     const m = entry.manifest.geewiki
 
     if (this.plugins.get(name)?.active) {
-      // 幂等：已在活动状态（无论 base 还是 session）视为成功
+      // 幂等：已在活动状态（无论 base 还是 session）视为成功。
+      // 但显式传入了非空配置时**不得静默丢弃**：委托到配置更新路径（已激活 → fork.update 热更新）
+      if (config && Object.keys(config).length > 0) {
+        await this.updateConfig(name, config)
+      }
       return this.snapshotOf(name)
     }
     if (m.runtime?.supportsHotReload !== true) {
@@ -357,6 +650,8 @@ export class GeeWikiManager {
     }
     // 事务性启用：先递归启用未激活依赖（同样走会话层热路径），任一环节失败
     // 则逆序回滚本次新增激活的插件并移出会话清单，不留半激活残留
+    // 未显式传配置时回退到清单里已持久化的配置（PUT /config 的成果应当生效）
+    const effectiveConfig = config && Object.keys(config).length > 0 ? config : (this.persistedConfigOf(name) ?? {})
     const activatedByThisCall: string[] = []
     try {
       for (const dep of directDependencies(this.config.registry, name)) {
@@ -365,7 +660,7 @@ export class GeeWikiManager {
           activatedByThisCall.push(dep)
         }
       }
-      await this.activateCore(name, config ?? {}, 'session')
+      await this.activateCore(name, effectiveConfig, 'session')
     } catch (err) {
       for (const n of [...activatedByThisCall].reverse()) {
         try {
@@ -379,7 +674,8 @@ export class GeeWikiManager {
     }
     this.lastEnabledName = name
     this.lastEnabledAt = Date.now()
-    this.addToSession(name, config ?? {})
+    // 落盘用"生效配置"（activateCore 已按 schema 填默认值/裁剪未知字段）
+    this.addToSession(name, this.plugins.get(name)?.config ?? effectiveConfig)
     return this.snapshotOf(name)
   }
 
@@ -492,10 +788,25 @@ export class GeeWikiManager {
       }
     }
 
+    // 5.7 配置校验：声明了 schema 的插件在加载前先校验并填入默认值，
+    // 使 managed.config（快照/热更新回滚基准）始终是"生效配置"而非原始入参
+    let effectiveConfig = config
+    const schema = this.configSchemaOf(entry)
+    if (schema) {
+      const validation = validateConfig(schema, config)
+      if (!validation.ok) {
+        managed.error = `配置校验失败: ${formatIssues(validation.issues)}`
+        throw new ManagerError('invalid_config', `插件 ${name} 的配置非法: ${formatIssues(validation.issues)}`, {
+          issues: validation.issues,
+        })
+      }
+      effectiveConfig = pruneUnknownFields(schema, validation.value) as Record<string, unknown>
+    }
+
     // cordis 动态加载：await 等激活完成（含 async apply）；激活失败经 _error 抛出
     let fiber: FiberLike
     try {
-      fiber = await this.ctx.plugin(entry.module, config)
+      fiber = await this.ctx.plugin(entry.module, effectiveConfig)
     } catch (err) {
       managed.error = (err as Error).message
       throw new ManagerError('load_failed', `加载失败 ${name}: ${(err as Error).message}`)
@@ -504,8 +815,59 @@ export class GeeWikiManager {
     managed.active = true
     managed.layer = layer
     managed.error = null
-    managed.config = config
+    managed.config = effectiveConfig
     this.activationOrder.push(name)
+  }
+
+  /**
+   * 会话层配置叠加（仅 boot 调用）：插件已由基础层激活时，把会话层条目的配置经
+   * `fork.update` 热更新进去 —— 等价于"进程内执行一次 PUT /config"，但**不落盘**
+   * （两个清单文件的字节都已是用户意图，重启不该改写它们；§5.3 会话层是覆盖层）。
+   *
+   * 与 `updateConfig` 的差异：不重新激活、不重跑迁移控制器（迁移是激活前置，
+   * 基础层激活时已执行）、不动 `managed.layer` 与看门狗试用期（这不是一次新的会话层激活，
+   * 激活层归属保持基础层，`GET /api/plugins` 的 layer 语义不变）。
+   * 与 `updateConfig` 一致：按 configSchema 校验 + 白名单裁剪（清单文件可被手工编辑），
+   * 且 `fork.update` 失败后显式回滚进程内配置 —— cordis 在 apply 抛错时会把 fiber.config
+   * 置为新值（方案文档 F-3），不回滚就会留下"上报配置 ≠ 实际 apply 配置"的残留。
+   */
+  private async applySessionOverlay(
+    name: string,
+    managed: ManagedPlugin,
+    config: Record<string, unknown>,
+  ): Promise<void> {
+    const fiber = managed.fiber
+    if (!fiber?.update) throw new Error('运行期句柄不支持 fork.update，无法叠加会话层配置')
+    let effective = config
+    const schema = this.configSchemaOf(managed.entry)
+    if (schema) {
+      const validation = validateConfig(schema, config)
+      if (!validation.ok) {
+        throw new ManagerError('invalid_config', `配置校验失败: ${formatIssues(validation.issues)}`, {
+          issues: validation.issues,
+        })
+      }
+      effective = pruneUnknownFields(schema, validation.value) as Record<string, unknown>
+    }
+    const previous = managed.config
+    if (isDeepStrictEqual(effective, previous)) {
+      // 覆盖值与基础层生效值相同（enable 写会话条目时通常就是这样）：跳过，
+      // 免得每次启动都白做一次 dispose + apply，并连带重启依赖方
+      return
+    }
+    try {
+      await fiber.update(effective)
+    } catch (err) {
+      try {
+        await fiber.update(previous ?? {})
+        console.error(`[manager] 插件 ${name} 会话层配置叠加失败，已回滚为基础层配置`)
+      } catch (rollbackErr) {
+        console.error(`[manager] 插件 ${name} 会话层配置叠加回滚失败:`, rollbackErr)
+      }
+      throw err
+    }
+    managed.config = effective
+    console.log(`[manager] 插件 ${name} 已叠加会话层配置（基础层激活 + 会话层覆盖生效）`)
   }
 
   private async deactivateCore(name: string): Promise<void> {
@@ -726,6 +1088,7 @@ function fail(h: RouteHandlerContext, err: unknown): void {
               err.code === 'hot_dependency_not_supported' ||
               err.code === 'has_dependents' ||
               err.code === 'base_layer' ||
+              err.code === 'hot_update_failed' ||
               err.code === 'migration_failed'
             ? 409
             : 400
@@ -738,8 +1101,12 @@ function fail(h: RouteHandlerContext, err: unknown): void {
   send(h, 500, { ok: false, error: 'internal', message: '服务器内部错误（详见服务端日志）' })
 }
 
-function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): void {
-  router.register('GET', '/api/plugins', (h) => ok(h, { plugins: manager.snapshot() }))
+/** 挂载管理器 REST 路由（导出以便集成测试直接以路由服务替身驱动，无需真实 HTTP） */
+export function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): void {
+  router.register('GET', '/api/plugins', (h) =>
+    // issues：外部插件目录里被跳过的目录/清单（机器可读 code），前端与 CLI 据此提示"装了但没加载"
+    ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() }),
+  )
   router.register('GET', '/api/plugins/graph', (h) => ok(h, { graph: manager.graph() }))
   router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()))
   router.register('POST', '/api/plugins/:name/enable', async (h) => {
@@ -752,6 +1119,27 @@ function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): voi
       }
       const snapshot = await manager.enable(name, body.config ?? {})
       ok(h, { plugin: snapshot })
+    } catch (err) {
+      fail(h, err)
+    }
+  })
+  router.register('GET', '/api/plugins/:name/config', (h) => {
+    try {
+      const name = h.params['name']
+      if (!name) throw new ManagerError('not_found', '缺少插件名')
+      ok(h, manager.configOf(name))
+    } catch (err) {
+      fail(h, err)
+    }
+  })
+  router.register('PUT', '/api/plugins/:name/config', async (h) => {
+    try {
+      const name = h.params['name']
+      if (!name) throw new ManagerError('not_found', '缺少插件名')
+      const body = await readJsonBody(h)
+      if (!('config' in body)) throw new ManagerError('bad_request', '请求体缺少 config 字段')
+      const result = await manager.updateConfig(name, body['config'])
+      ok(h, result)
     } catch (err) {
       fail(h, err)
     }
@@ -774,7 +1162,9 @@ function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): voi
       fail(h, err)
     }
   })
-  console.log('[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/session')
+  console.log(
+    '[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/plugins/:name/config, /api/session',
+  )
 }
 
 /** 读取 enable 请求体 JSON（1MB 上限）：超限暂停读取剩余请求体并以 payload_too_large 拒绝，

@@ -12,12 +12,25 @@
  *   DELETE /api/pages/:slug   删除页面（含历史）
  */
 import type { Context } from 'cordis'
+import Schema from 'schemastery'
 import { closeAfterResponse, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
 
 export interface WikiConfig {
   /** 页面详情中返回的最近版本历史条数上限 */
   recentVersions?: number
 }
+
+/**
+ * 配置 Schema（schemastery）：驱动管理台自动生成配置表单，并在配置热更新前做校验。
+ * 同一实例也作为插件模块的 Config（cordis 据此自动校验并填默认值）。
+ */
+export const WikiConfigSchema = Schema.object({
+  recentVersions: Schema.number()
+    .default(10)
+    .min(1)
+    .max(100)
+    .description('页面详情返回的最近版本历史条数上限'),
+})
 
 export const manifest: GeeWikiManifest = {
   name: '@geewiki/wiki',
@@ -34,12 +47,7 @@ export const manifest: GeeWikiManifest = {
       requiresCachePurge: false,
       drainTimeout: 5,
     },
-    configSchema: {
-      type: 'object',
-      properties: {
-        recentVersions: { type: 'number', title: '版本历史返回条数' },
-      },
-    },
+    configSchema: WikiConfigSchema,
   },
 }
 
@@ -112,6 +120,8 @@ function parseSaveBody(body: unknown): { title: string; content: string } {
 
 export const WikiPlugin = {
   name: '@geewiki/wiki',
+  /** cordis 约定：声明 Config 后由 cordis 负责校验与默认值填充 */
+  Config: WikiConfigSchema,
 
   apply(ctx: Context, config: WikiConfig = {}) {
     const db = ctx.get('db') as DatabaseAdapter | undefined

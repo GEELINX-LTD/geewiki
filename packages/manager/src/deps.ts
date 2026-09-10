@@ -13,10 +13,18 @@ import type { GeeWikiManifest } from '@geewiki/core'
 export interface RegisteredPlugin {
   name: string
   manifest: GeeWikiManifest
-  /** cordis 插件模块（对象形态 { name, apply }） */
-  module: { name: string; apply: (ctx: any, config?: any) => unknown } // eslint-disable-line @typescript-eslint/no-explicit-any -- cordis 插件形态多样，registry 统一收纳
+  /** cordis 插件模块（对象形态 { name, apply }；可选 Config schema 由 cordis 自动校验） */
+  module: {
+    name: string
+    apply: (ctx: any, config?: any) => unknown // eslint-disable-line @typescript-eslint/no-explicit-any -- cordis 插件形态多样，registry 统一收纳
+    Config?: unknown
+  }
   /** 迁移脚本目录绝对路径（激活前由迁移控制器执行；缺省则插件自管） */
   migrationsDir?: string
+  /** 来源：内置（组合根静态登记）或外部（<仓库根>/plugins/ 目录发现） */
+  source?: 'builtin' | 'external'
+  /** 外部插件的目录绝对路径（内置插件无此字段） */
+  dir?: string
 }
 
 /** 把 requires 列表项解析为具体插件：先按插件名、再按 provides 服务标识 */

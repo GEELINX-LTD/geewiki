@@ -11,9 +11,23 @@ import { existsSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
+import type Schema from 'schemastery'
 import './cordis-env.js'
 
 export type { FiberLike } from './cordis-env.js'
+
+/* ============================ 配置 Schema ============================ */
+
+/**
+ * 插件配置 Schema 的类型（schemastery 实例）。
+ *
+ * 用 `ReturnType<typeof Schema.any<any>>` 表达"任意 schemastery Schema"：
+ * object/union/array 等具体 Schema 都可赋值给它，且实例可调用（校验 + 填默认值）、
+ * 可 `toJSON()` 序列化。类型参数必须用 `any`——Schema 的调用签名参数处于逆变位置，
+ * 换成 `unknown` 会让所有具体 Schema 都不可赋值。
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- 逆变参数位必须用 any（见上方说明）
+export type ConfigSchema = ReturnType<typeof Schema.any<any>>
 
 /* ============================== 插件 Manifest ============================== */
 
@@ -40,13 +54,22 @@ export interface GeeWikiMeta {
   conflictGroup?: string
   /** 迁移脚本目录（相对插件根目录，SQL/JS），插件激活前由迁移控制器执行 */
   migrations?: string
+  /**
+   * 外部插件入口文件（相对插件目录，如 "index.ts"）。
+   * 仅外部插件（<仓库根>/plugins/<name>/）使用；缺省时按
+   * index.ts → index.js → src/index.ts 顺序探测。
+   */
+  entry?: string
   /** 运行期能力声明 */
   runtime?: GeeWikiRuntime
   /**
-   * JSON Schema 格式的配置定义与校验
-   * （如 { apiKey: { type: 'string', format: 'password' } }），驱动管理界面自动生成配置表单。
+   * 插件配置 Schema（schemastery 实例，如 Schema.object({ port: Schema.number().default(3000) })）。
+   *
+   * 驱动三件事：REST 层把配置下发/校验、管理台自动生成配置表单、配置热更新前的校验。
+   * 运行期兼容：若插件给的是普通对象（旧式 JSON Schema 字面量），管理器视为"无 schema"，
+   * 仅提供 JSON 原文编辑、不做校验，并打印一次告警。
    */
-  configSchema?: Record<string, unknown>
+  configSchema?: ConfigSchema
 }
 
 /**

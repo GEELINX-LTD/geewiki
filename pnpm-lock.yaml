@@ -19,6 +19,10 @@ importers:
         version: 5.9.3
 
   packages/core:
+    dependencies:
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
     devDependencies:
       cordis:
         specifier: ^4.0.0-rc.10
@@ -48,6 +52,10 @@ importers:
       cordis:
         specifier: ^4.0.0-rc.10
         version: 4.0.0-rc.10
+    devDependencies:
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
 
   packages/plugin-echo:
     dependencies:
@@ -57,6 +65,9 @@ importers:
       cordis:
         specifier: ^4.0.0-rc.10
         version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
 
   packages/plugin-wiki:
     dependencies:
@@ -66,6 +77,9 @@ importers:
       cordis:
         specifier: ^4.0.0-rc.10
         version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -960,6 +974,9 @@ packages:
   scheduler@0.27.0:
     resolution: {integrity: sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==}
 
+  schemastery@3.18.0:
+    resolution: {integrity: sha512-Jw2uxjoyyqc/yeurmChUEc/jbi8GsrdXV/KmqRUDZXJAXAmrJiPsz8vKa17l/VckyzljHZ9oGaul443CQiXxtA==}
+
   semver@6.3.1:
     resolution: {integrity: sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==}
     hasBin: true
@@ -1748,6 +1765,11 @@ snapshots:
       fsevents: 2.3.3
 
   scheduler@0.27.0: {}
+
+  schemastery@3.18.0:
+    dependencies:
+      '@standard-schema/spec': 1.1.0
+      cosmokit: 1.8.1
 
   semver@6.3.1: {}
 

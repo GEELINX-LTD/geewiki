@@ -1,0 +1,17 @@
+{
+  "name": "@geewiki-plugin/hello",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 外部插件示例：零依赖，演示 plugins/ 目录发现 + 会话层热插拔",
+  "geewiki": {
+    "provides": "hello-service",
+    "requires": ["http-service"],
+    "runtime": {
+      "supportsHotReload": true,
+      "requiresCachePurge": false,
+      "drainTimeout": 5
+    },
+    "entry": "index.ts"
+  }
+}

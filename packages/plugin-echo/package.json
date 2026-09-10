@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@geewiki/core": "workspace:*",
-    "cordis": "^4.0.0-rc.10"
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
   }
 }

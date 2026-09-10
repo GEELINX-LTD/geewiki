@@ -31,7 +31,14 @@ import {
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
-import { PluginManagerPlugin, removeCrashMarker, writeCrashMarker, type RegisteredPlugin } from '@geewiki/manager'
+import {
+  PluginManagerPlugin,
+  loadExternalPlugins,
+  removeCrashMarker,
+  writeCrashMarker,
+  type DiscoveryIssue,
+  type RegisteredPlugin,
+} from '@geewiki/manager'
 
 /**
  * 崩溃标记路径：与数据库文件同目录（<GEEWIKI_DATA_DIR 或 ./data>），随 data/ 一起被 gitignore。
@@ -481,6 +488,8 @@ export interface ServerOptions {
   configDir?: string
   /** 前端静态产物目录（默认 GEEWIKI_WEB_DIST 或仓库根下 packages/web/dist；相对路径以仓库根为基准） */
   webDist?: string | null
+  /** 外部插件目录（默认 GEEWIKI_PLUGINS_DIR 或仓库根下 plugins/；null = 不启用外部插件发现） */
+  pluginsDir?: string | null
   registry?: RegisteredPlugin[]
 }
 
@@ -488,6 +497,12 @@ export interface ServerOptions {
 export interface HttpEntryDefaults {
   port?: number
   host?: string
+}
+
+/** buildRegistry 的结果：registry 供管理器装配，issues 透出到 `GET /api/plugins` */
+export interface RegistryBuildResult {
+  registry: RegisteredPlugin[]
+  issues: DiscoveryIssue[]
 }
 
 /**
@@ -523,11 +538,34 @@ export function defaultRegistry(webDist: string | null, defaults: HttpEntryDefau
       manifest: dbSqliteManifest as GeeWikiManifest,
       module: SqliteDbPlugin,
       migrationsDir: DB_SQLITE_MIGRATIONS_DIR,
+      source: 'builtin',
     },
-    httpRegistryEntry(webDist, defaults),
-    { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin },
-    { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin },
+    { ...httpRegistryEntry(webDist, defaults), source: 'builtin' },
+    { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
+    { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin, source: 'builtin' },
   ]
+}
+
+/**
+ * 内置注册表 + 外部插件目录发现（架构 §4）：外部插件来自 `<仓库根>/plugins/<name>/`，
+ * 加载失败/清单缺失/重名/路径越界只记为 issue 并跳过，绝不阻断宿主启动。
+ * 外部插件不得与内置插件重名（重名者跳过并告警）。
+ *
+ * 返回 `{ registry, issues }`：issues 不是被丢弃的副产品，它会经 ManagerConfig 透出到
+ * `GET /api/plugins` 的 `issues` 字段，让"目录里躺着但没被加载"的插件在管理台可见。
+ */
+export async function buildRegistry(
+  webDist: string | null,
+  defaults: HttpEntryDefaults = {},
+  pluginsRoot: string | null = null,
+): Promise<RegistryBuildResult> {
+  const builtin = defaultRegistry(webDist, defaults)
+  if (!pluginsRoot) return { registry: builtin, issues: [] }
+  const discovered = await loadExternalPlugins({
+    root: pluginsRoot,
+    builtinNames: builtin.map((p) => p.name),
+  })
+  return { registry: [...builtin, ...discovered.plugins], issues: discovered.issues }
 }
 
 /** 启动应用宿主：引导插件管理器（管理器按双层清单激活全部插件）。返回清理句柄。 */
@@ -547,9 +585,23 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
   } else {
     webDist = resolveProjectPath('packages/web/dist', import.meta.url)
   }
+  // 外部插件目录：options > GEEWIKI_PLUGINS_DIR > 仓库根下 plugins/；
+  // null 表示不做外部插件发现（测试与最小部署可用）
+  const pluginsRoot =
+    options.pluginsDir === null
+      ? null
+      : resolveProjectPath(options.pluginsDir ?? process.env.GEEWIKI_PLUGINS_DIR ?? 'plugins', import.meta.url)
+  if (pluginsRoot) console.log(`[server] 外部插件目录: ${pluginsRoot}`)
+
+  // 注册表来源：显式传入的 registry 优先（issues 为空），否则内置 + 外部插件发现
+  const built: RegistryBuildResult = options.registry
+    ? { registry: options.registry, issues: [] }
+    : await buildRegistry(webDist, { port, host }, pluginsRoot)
 
   const managerFiber = await app.plugin(PluginManagerPlugin, {
-    registry: options.registry ?? defaultRegistry(webDist, { port, host }),
+    registry: built.registry,
+    // 发现期问题（跳过的插件目录等）透出到 GET /api/plugins 的 issues 字段
+    discoveryIssues: built.issues,
     // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
     baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
     sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
