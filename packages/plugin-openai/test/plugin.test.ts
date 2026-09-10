@@ -82,14 +82,18 @@ test('缺少 llm-service 时 apply 显式报错（不静默 no-op）', async () 
   )
 })
 
-test('配置里填密钥值本身 → apply 拒绝激活并指出去处', async () => {
+test('配置里填密钥值本身 → 拒绝激活并指出去处', async () => {
   const { root } = await setup()
   const fork = root.plugin(OpenAiPlugin, { route: 'leak', apiKeyEnv: 'sk-proj-ABCDEFGHIJKLMNOPQRSTUV' })
+  // 拒绝发生在 **schema 层**（cordis 的 resolveConfig → validateConfig），因为它覆盖了
+  // 激活与热更新两条路径，比 apply 层更早也更全。apply 层的第二道闸门见
+  // credential-guard.test.ts（那里直接调 apply 覆盖"绕过 schema 的程序化装配"）。
   await assert.rejects(
     async () => {
       await fork
     },
-    /看起来是\*\*密钥值本身\*\*而不是环境变量名/,
+    /match regexp|看起来是\*\*密钥值本身\*\*而不是环境变量名/,
+    '密钥形态的值必须被拒绝激活（schemastery 的 pattern 报 match regexp，apply 层报中文说明）',
   )
 })
 
