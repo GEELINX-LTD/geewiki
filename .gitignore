@@ -16,7 +16,7 @@ tmp/
 .env.*
 !.env.example
 
-# 本地数据（SQLite 数据库及运行期数据，data/ 为未来规划预留）
+# 运行时数据（SQLite 数据库 data/geewiki.db、崩溃标记 data/crash.marker 等本机状态）
 data/
 *.db
 *.db-journal

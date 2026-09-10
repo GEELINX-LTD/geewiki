@@ -1,33 +1,53 @@
 # GeeWiki —— Docker Compose 部署编排（Compose V2 规范，不使用已废弃的 version 字段）
 #
-# 默认体验（开箱即用）：docker compose up -d
+# ⚠️ 未就绪提示：本文件为 Phase 4 部署骨架，镜像构建所需的 Dockerfile 尚未提供，
+#    因此现在**无法**用本文件启动（下方 build 段已注释，仅保留 image 名称占位）。
+#    当前请改用本地开发方式运行：
+#      pnpm install && pnpm dev
+#    （开发形态：前端 http://localhost:5173、后端 http://127.0.0.1:3000；
+#      仅依赖一个 SQLite 文件，无需外部数据库服务。dev 形态由 Vite 提供前端，不读取构建产物）
+#
+# 镜像就绪后的默认体验（开箱即用）：docker compose up -d
 #   - 仅启动 geewiki-app，SQLite 数据持久化于 ./data，无需任何外部数据库服务。
 #
 # 生产部署（启用 PostgreSQL 数据库插件）：docker compose --profile production up -d
-#   - 同时启动 postgres 服务，应用内将激活 @geewiki/db-pg 互斥插件。
+#   - 同时启动 postgres 服务，应用内将激活 @geewiki/db-pg 互斥插件（该插件尚在规划中）。
 #   - 需先在 .env 中提供 DB_PASSWORD（本项目不提交 .env，避免泄露密钥，见 postgres 服务注释）。
 
 services:
   geewiki-app:
-    build: .
+    image: geewiki:latest   # 占位：镜像构建未就绪（Phase 4 提供 Dockerfile），暂勿执行 docker compose up
+    # build: .              # 取消注释前须先提供 Dockerfile（仓库当前无此文件，构建必然失败）
     ports:
       - "3000:3000"
     environment:
       NODE_ENV: production
-      GEEWIKI_BASE_PLUGINS: /app/config/plugins.base.json
-      GEEWIKI_SESSION_PLUGINS: /app/config/plugins.session.json
+      # 以下为 packages/server/src/index.ts 实际读取的环境变量
+      # （GEEWIKI_PORT / GEEWIKI_DATA_DIR / GEEWIKI_CONFIG_DIR / GEEWIKI_WEB_DIST），取值与下方挂载点一致；
+      # 插件清单文件名固定为 <config 目录>/plugins.base.json 与 plugins.session.json，无独立环境变量。
+      GEEWIKI_PORT: 3000
+      GEEWIKI_DATA_DIR: /app/data       # SQLite 数据库与 crash.marker 所在目录
+      GEEWIKI_CONFIG_DIR: /app/config   # 基础层 / 会话层插件清单目录
+      # 前端静态产物目录：默认值为 packages/web/dist（相对 cwd），依赖工作目录；
+      # 镜像内即便设置了 WORKDIR 也应显式给出，并由镜像构建阶段把前端产物生成到该路径（Phase 4 Dockerfile 负责）
+      GEEWIKI_WEB_DIST: /app/packages/web/dist
     volumes:
-      - ./data:/app/data        # SQLite 数据库与运行时数据（持久化）
-      - ./plugins:/app/plugins  # 外部插件挂载点（运行时挂载第三方插件）
+      - ./data:/app/data        # SQLite 数据库、crash.marker 等运行时数据（持久化）
+      - ./plugins:/app/plugins  # 预留：外部插件挂载点（插件发现/挂载机制尚在规划，见 docs/roadmap.md）
       - ./config:/app/config    # 基础层 / 会话层插件清单（plugins.base.json / plugins.session.json）
     restart: unless-stopped
-    # 自愈逻辑（由应用内启动脚本实现）：若进程崩溃且退出码为 1，
-    # 自动删除会话层配置（session 配置，即 GEEWIKI_SESSION_PLUGINS 指向的文件）并重启，
-    # 系统将忽略会话层、自动回滚至基础层（Base Layer）稳定状态。
+    # 自愈逻辑（已由应用实现；见 packages/manager/src/index.ts、packages/server/src/index.ts）：
+    #   - 仅在三种情形写入 <data 目录>/crash.marker：未捕获异常 / 未处理 Promise 拒绝 / startServer() 抛错；
+    #   - HTTP 监听失败（如端口被占用）不属于上述情形：进程以退出码 1 退出，但不写标记；
+    #   - 重启后启动阶段检测到该标记，即跳过会话层（Session Layer）装配并删除标记，
+    #     自动回滚至基础层（Base Layer）稳定状态，避免坏插件造成反复崩溃；
+    #   - 优雅退出（SIGINT/SIGTERM 且插件全部卸载成功）会删除该标记；
+    #   - 看门狗熔断时先清空会话层清单文件，再以退出码 1 退出。
 
   postgres:
     image: postgres:15
     profiles: ["production"]   # 仅当启用 PostgreSQL 插件（--profile production）时才启动该服务
+    # 不映射宿主端口：仅在同一 Compose 网络内以 postgres:5432 供 geewiki-app 访问
     environment:
       POSTGRES_DB: geewiki
       POSTGRES_USER: geewiki

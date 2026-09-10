@@ -1,6 +1,6 @@
 # GeeWiki 系统设计文档
 
-> 本文档是 GeeWiki 的系统设计蓝图，事实来源为项目构想全文，字段、键名与数值（如 `drainTimeout: 5`、5 秒试用期、退出码 1 等）均按原稿保留。代码实现将随 [docs/roadmap.md](docs/roadmap.md) 的各阶段逐步落地。
+> 本文档是 GeeWiki 的系统设计蓝图，事实来源为项目构想全文，字段、键名与数值（如 `drainTimeout: 5`、5 秒试用期、退出码 1 等）均按原稿保留。代码实现将随 [roadmap.md](./roadmap.md) 的各阶段逐步落地。
 
 ## 1. 总览与设计哲学
 
@@ -121,7 +121,11 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
 
 ## 7. 插件元数据规范（Manifest）
 
-每个插件根目录包含 `geewiki.manifest.json`（或扩展 `package.json`，将元数据嵌套在顶层 `geewiki` 键下）。完整示例：
+每个插件根目录包含 `geewiki.manifest.json`（或扩展 `package.json`，将元数据嵌套在顶层 `geewiki` 键下）。
+
+> 现状说明：当前仓库不存在清单文件，也未实现文件清单加载；内置插件由代码内置注册表静态登记（`packages/server/src/index.ts` 的 `defaultRegistry`，共 4 个：`@geewiki/http`、`@geewiki/db-sqlite`、`@geewiki/wiki`、`@geewiki/echo`）。文件清单加载列 Phase 3。
+
+完整示例：
 
 ```json
 {
@@ -158,8 +162,9 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
 
 部署编排见根目录 **docker-compose.yml**（Compose V2，无已废弃的 `version` 字段），要点：
 
-- **geewiki-app 服务**：`build: .`；端口 `3000:3000`；环境变量 `NODE_ENV=production`、`GEEWIKI_BASE_PLUGINS=/app/config/plugins.base.json`（基础层清单）、`GEEWIKI_SESSION_PLUGINS=/app/config/plugins.session.json`（会话层清单）；三个挂载卷 `./data:/app/data`（SQLite 数据）、`./plugins:/app/plugins`（外部插件挂载点）、`./config:/app/config`（插件清单）；`restart: unless-stopped`。
-- **自愈逻辑**：应用启动脚本内置——若进程崩溃退出码为 **1**，自动删除 session 配置并重启，系统回滚至基础层（与 5.3 会话层沙箱呼应）。
+- **geewiki-app 服务**：端口 `3000:3000`；环境变量 `NODE_ENV=production`，以及应用实际读取的 `GEEWIKI_PORT=3000`、`GEEWIKI_CONFIG_DIR=/app/config`（插件清单目录）、`GEEWIKI_DATA_DIR=/app/data`（SQLite 数据库与 `crash.marker` 所在目录）、`GEEWIKI_WEB_DIST=/app/packages/web/dist`（前端静态产物目录，其默认值 `packages/web/dist` 依赖 cwd，镜像内应显式给出）；三个挂载卷 `./data:/app/data`（SQLite 数据）、`./plugins:/app/plugins`（外部插件挂载点）、`./config:/app/config`（插件清单）；`restart: unless-stopped`。清单文件名固定为 `<config 目录>/plugins.base.json`（基础层）与 `plugins.session.json`（会话层），无独立环境变量。
+- **部署骨架状态**：镜像构建所需的 Dockerfile 属 Phase 4，尚未提供（compose 中镜像段为占位），因此当前无法直接 `docker compose up -d`；请以 `pnpm dev` 本地运行，compose 文件仅作部署形态参考。
+- **自愈逻辑**（已由应用实现，见 `packages/server/src/index.ts` 与 `packages/manager/src/index.ts`）：仅在三种情形写入 `<data 目录>/crash.marker` —— 未捕获异常、未处理 Promise 拒绝、`startServer()` 抛错；重启后启动阶段检测到该标记即跳过会话层装配并删除标记，系统回滚至基础层（与 5.3 会话层沙箱呼应）。**HTTP 监听失败（如端口被占用）不属于上述情形：进程以退出码 1 退出，但不写标记**。看门狗熔断则先清空会话层清单文件，再以退出码 **1** 退出。
 - **postgres 服务**：`image: postgres:15`，挂载在 `profiles: ["production"]` 之下（默认不启动，仅启用 PG 插件时通过 `docker compose --profile production up -d` 启动）；环境变量 `POSTGRES_DB=geewiki`、`POSTGRES_USER=geewiki`、`POSTGRES_PASSWORD=${DB_PASSWORD}`；数据保存在 named volume `pgdata`。
 - **密钥管理**：仓库不提交 `.env` 文件；`DB_PASSWORD` 由部署者在部署环境的 `.env` 中提供。
 - **默认开箱即用**：不启用任何 profile 时仅运行 geewiki-app，SQLite 持久化于 `./data`，无需额外数据库容器。

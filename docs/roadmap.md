@@ -1,6 +1,6 @@
 # GeeWiki 开发路线图
 
-> 阶段按依赖顺序推进。任务清单中的"清单文件"指 `plugins.base.json` / `plugins.session.json`，"双层状态"指基础层（Base Layer）与会话层（Session Layer）。设计细节见 [docs/architecture.md](docs/architecture.md)。
+> 阶段按依赖顺序推进。任务清单中的"清单文件"指 `plugins.base.json` / `plugins.session.json`，"双层状态"指基础层（Base Layer）与会话层（Session Layer）。设计细节见 [architecture.md](./architecture.md)。
 
 | 阶段 | 主题 | 里程碑 | 状态 |
 | --- | --- | --- | --- |
@@ -20,7 +20,7 @@
 
 **交付**：`packages/manager`（600 行核心）——
 
-- 依赖解析 `resolveDependency`（按插件名或 provides）/ `directDependencies` / `topologicalOrder`（字母序稳定 + 环检测抛错）/ `collectDependents`（反向依赖）/ `findConflict`（conflictGroup 同组互斥）/ `checkHotChain`（热插件依赖未激活冷依赖即违规）——纯函数 + 8 个单元测试全绿。
+- 依赖解析 `resolveDependency`（按插件名或 provides）/ `directDependencies` / `topologicalOrder`（字母序稳定 + 环检测抛错）/ `collectDependents`（反向依赖）/ `findConflict`（conflictGroup 同组互斥）/ `checkHotChain`（热插件依赖未激活冷依赖即违规）——纯函数，单元测试全绿（`packages/manager/test/deps.test.ts`，8 例）。
 - Session/Base 双层清单（`plugins.base.json` + `plugins.session.json`）合并去重装配；boot 逐个拓扑激活、失败记 `bootErrors` 继续。
 - `enable()`：会话层热操作——热授权（`supportsHotReload !== true` → 409 `hot_reload_not_supported`）、热链检查、未激活依赖递归启用、激活后写 session 文件。
 - `disable()`：基础层插件 → 409 `base_layer`；存在依赖者 → 409 `has_dependents`；卸载（`fiber.dispose()`）并清 session 记录。
@@ -43,7 +43,7 @@
   - `GET/PUT/DELETE /api/pages(/:slug)` + `GET /api/pages/:slug/versions/:id`；upsert 幂等（内容未变不产生版本）；每次保存先快照旧正文至 `page_versions`；删除显式事务级联清历史；body 大小/形状校验。
 - `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
 
-**验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 8/8、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
+**验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 15/15（`packages/manager/test/deps.test.ts` 8 例 + `manager.test.ts` 7 例）、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
 
 ## Phase 3（候选）：AI 原生能力
 
