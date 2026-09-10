@@ -20,6 +20,7 @@ import { focusRing } from './ui/a11y'
 import { ThemeToggle } from './components/ThemeToggle'
 import { SystemStatusDialog } from './components/SystemStatusDialog'
 import { MAIN_CONTENT_ID, SEARCH_INPUT_ID } from './lib/domIds'
+import { stripHashQuery } from './lib/hashAnchor'
 import { titleForRoute } from './lib/pageMeta'
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
@@ -28,11 +29,18 @@ import { GraphPage } from './pages/GraphPage'
 import { WikiPage } from './pages/WikiPage'
 import { cn } from './ui/cn'
 
-/** 简易 hash 路由：location.hash = '#/wiki/getting-started' → route = 'wiki/getting-started' */
+/**
+ * 简易 hash 路由：location.hash = '#/wiki/getting-started' → route = 'wiki/getting-started'
+ *
+ * **必须剥掉 hash 内的查询串**：页内锚点编码为 `#/wiki/foo?a=usage`（原因见
+ * `lib/hashAnchor.ts`——本应用是 hash 路由，裸 `#section` 会被当成一个新路由）。
+ * 若这里不剥，`wiki/foo?a=usage` 会被解析成"slug 叫 `foo?a=usage` 的页面"，
+ * 点一下目录就跳到不存在的页面。
+ */
 function useRoute(): string {
-  const [route, setRoute] = useState(() => window.location.hash.replace(/^#\/?/, ''))
+  const [route, setRoute] = useState(() => stripHashQuery(window.location.hash))
   useEffect(() => {
-    const onChange = (): void => setRoute(window.location.hash.replace(/^#\/?/, ''))
+    const onChange = (): void => setRoute(stripHashQuery(window.location.hash))
     window.addEventListener('hashchange', onChange)
     return () => window.removeEventListener('hashchange', onChange)
   }, [])

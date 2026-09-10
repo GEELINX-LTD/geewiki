@@ -1,23 +1,77 @@
-import { useEffect, useState, type ReactNode } from 'react'
-import { FileText, MessageSquareText, Plus, RefreshCw, Search } from 'lucide-react'
-import { ApiError, api, type PageDetail, type PageSummary } from '../api'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  ChevronLeft,
+  ChevronRight,
+  FileText,
+  History,
+  MessageSquareText,
+  Pencil,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Search,
+  Trash2,
+} from 'lucide-react'
+import { api, type PageDetail, type PageSummary } from '../api'
 import { AskPanel } from '../components/AskPanel'
+import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
+import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { SearchView } from '../components/SearchView'
+import { TableOfContents } from '../components/TableOfContents'
 import { SEARCH_INPUT_ID } from '../lib/domIds'
+import {
+  decideDraftRestore,
+  draftKey,
+  formatDraftAge,
+  isDraftExpired,
+  parseDraft,
+  serializeDraft,
+  type DraftRecord,
+} from '../lib/draftPlan'
+import { scrollToAnchor, settleHashAnchor } from '../lib/hashAnchor'
+import { renderMarkdownBody } from '../lib/markdownRender'
+import {
+  charCount,
+  hasErrors,
+  isDirty,
+  validatePageForm,
+  type PageDraft,
+  type PageFormErrors,
+} from '../lib/pageFormPlan'
 import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
-import { mdToHtml } from '../lib/sanitize'
 import { checkQuery } from '../lib/searchPlan'
+import { useActiveHeading } from '../lib/useActiveHeading'
 import { useDocumentTitle } from '../lib/useDocumentTitle'
-import { Button, Card, CardBody, CardHeader, EmptyState, Input, SkeletonTable } from '../ui'
+import { useHashAnchor } from '../lib/useHashAnchor'
+import { useUnsavedGuard } from '../lib/useUnsavedGuard'
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  Dialog,
+  DialogClose,
+  DialogContent,
+  EmptyState,
+  Input,
+  Skeleton,
+  SkeletonTable,
+  Spinner,
+} from '../ui'
+import { cn } from '../ui/cn'
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false })
 }
 
-function slugOk(slug: string): boolean {
-  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(slug)
-}
+/** 预览渲染的防抖时长（见 WikiEdit 的说明） */
+const PREVIEW_DEBOUNCE_MS = 200
+
+/** 草稿写入 localStorage 的防抖时长：比预览更长——写盘是"防丢失"，不必跟手 */
+const DRAFT_DEBOUNCE_MS = 900
 
 /** hash 段里的查询串解码（用户可能在地址栏手输，容错返回原文） */
 function decodeSegment(raw: string): string {
@@ -338,17 +392,43 @@ function WikiList(props: {
 
 /* ============================ 详情 ============================ */
 
+/** 面包屑：知识库 / 当前页。末项用 `aria-current="page"`。 */
+function Breadcrumb({ title }: { title: string }): ReactNode {
+  return (
+    <nav aria-label="面包屑" className="flex min-w-0 items-center gap-1.5 text-[13px]">
+      {/*
+        只用 `href`，**不叠 onClick**：应用监听 `hashchange` 完成导航，
+        而"有未保存改动时的确认"由 `useUnsavedGuard` 在**捕获阶段**统一拦截。
+        若这里再加一次 `confirmLeave()`，同一次点击就会问两遍——这是推理（两处都会弹），
+        故直接避免重复，而不是让用户去忍第二次。
+      */}
+      <a href="#/wiki/list" className="gw-focus-ring rounded-sm text-accent hover:underline">
+        知识库
+      </a>
+      <ChevronRight className="size-3.5 shrink-0 text-muted" aria-hidden="true" />
+      <span aria-current="page" className="truncate font-medium text-ink">
+        {title}
+      </span>
+    </nav>
+  )
+}
+
 function WikiDetail(props: {
   slug: string
   onEdit: () => void
   onDeleted: () => void
   onNavigate: (path: string) => void
 }): ReactNode {
-  const { slug, onEdit, onDeleted } = props
+  const { slug, onEdit, onDeleted, onNavigate } = props
+  // 当前页路由（锚点 href 要用它拼 `#/wiki/<slug>?a=<id>`，见 lib/hashAnchor.ts）
+  const route = `wiki/${slug}`
+
   const [page, setPage] = useState<PageDetail | null>(null)
   const [err, setErr] = useState('')
   const [notice, setNotice] = useState('')
-  // versionContent: id=快照主键（API 定位用）；label=per-page 版本号（展示/恢复提示用，与历史行一致）
+  /** 列表（用于"上一篇/下一篇"）：与列表页同一份数据、同一顺序 */
+  const [siblings, setSiblings] = useState<PageSummary[] | null>(null)
+  // versionContent: id=快照主键（API 定位用）；label=per-page 版本号（展示/恢复提示用）
   const [versionContent, setVersionContent] = useState<{
     id: number
     saved_at: string
@@ -356,19 +436,64 @@ function WikiDetail(props: {
     label: number
   } | null>(null)
   const [restoring, setRestoring] = useState(false)
+  const anchor = useHashAnchor()
 
-  // 详情页标题需要页面数据（异步）：拿到后覆盖 App 设的路由级基线标题；
-  // 拿不到时 titleForRoute 会退化为「知识库 · GeeWiki」，不会显示 slug。
-  useDocumentTitle(titleForRoute(`wiki/${slug}`, page?.title ?? null))
+  // 详情页标题需要页面数据（异步）：拿到后覆盖 App 设的路由级基线标题
+  useDocumentTitle(titleForRoute(route, page?.title ?? null))
 
-  const load = (): void => {
+  const load = useCallback((): void => {
     setErr('')
     api
       .page(slug)
       .then((r) => setPage(r))
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
-  }
-  useEffect(load, [slug])
+  }, [slug])
+
+  useEffect(load, [load])
+
+  // 同级页面列表：只为"上一篇/下一篇"。失败不阻塞阅读（静默），因此单独一个请求、单独 catch。
+  useEffect(() => {
+    let alive = true
+    api
+      .pages()
+      .then((r) => {
+        if (alive) setSiblings(r.pages)
+      })
+      .catch((e: unknown) => {
+        console.debug('[geewiki-wiki] 页面列表不可用，跳过上一篇/下一篇：', e instanceof Error ? e.message : e)
+        if (alive) setSiblings(null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [slug])
+
+  /*
+   * 正文渲染：先剥掉与页面标题重复的首个一级标题（既有行为），再一次性得到
+   * { html, toc }。TOC 与正文**必须同源**——分开渲染会让两边各自生成 id，
+   * 一旦算法有差异就会"目录点不动"。
+   */
+  const bodyMarkdown = useMemo(
+    () => (page === null ? '' : stripDuplicateLeadingTitle(page.content, page.title)),
+    [page],
+  )
+  const rendered = useRenderedMarkdown(bodyMarkdown, { route })
+  const tocIds = useMemo(() => rendered.toc.map((t) => t.id), [rendered.toc])
+  const activeId = useActiveHeading(tocIds)
+
+  /*
+   * 锚点滚动：URL 带 `?a=<id>` 时滚到该小节。
+   *
+   * 依赖 `rendered.html`：首次进入（或刷新带锚点的链接）时正文刚注入 DOM，
+   * 必须等它到位才能查到元素。`requestAnimationFrame` 再让一帧，避免与 React 提交赛跑。
+   */
+  useEffect(() => {
+    if (anchor === null) return
+    const raf = requestAnimationFrame(() => {
+      if (scrollToAnchor(anchor)) settleHashAnchor(anchor)
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [anchor, rendered.html])
 
   const remove = (): void => {
     if (!window.confirm(`确定删除页面「${page?.title ?? slug}」？版本历史将一并清除。`)) return
@@ -396,7 +521,7 @@ function WikiDetail(props: {
       .then((r) => {
         setNotice(`已恢复 v${versionContent.label} 内容（当前 v${r.version}）`)
         setVersionContent(null)
-        void load()
+        load()
       })
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
       .finally(() => setRestoring(false))
@@ -404,113 +529,354 @@ function WikiDetail(props: {
 
   if (err && !page) {
     return (
-      <div className="page">
-        <div className="page-head"><h1>页面不存在</h1></div>
-        <div className="empty err-text">{err}</div>
-        <button className="btn" onClick={() => window.history.back()}>← 返回</button>
+      <div className="flex flex-col gap-3.5">
+        <Breadcrumb title={slug} />
+        <EmptyState
+          icon={<FileText className="size-8" />}
+          title="页面不存在"
+          hint={err}
+          action={
+            <Button onClick={() => onNavigate('list')}>返回列表</Button>
+          }
+        />
       </div>
     )
   }
-  if (!page) return <div className="page"><div className="empty">加载中…</div></div>
+  if (!page) {
+    return (
+      <div className="flex flex-col gap-4" aria-busy="true">
+        <Skeleton className="h-4 w-48" />
+        <Skeleton className="h-8 w-2/3" />
+        <Skeleton className="h-40 w-full" />
+        <Spinner label="正在加载页面" />
+      </div>
+    )
+  }
 
-  // 页面标题单独渲染一次（下面的 h1），若正文自己又以 `# 同名标题` 开头就会重复出现，
-  // 故渲染前把重复的首个一级标题剥掉（纯字符串操作，正文仍照常经 mdToHtml 消毒）。
-  const html = mdToHtml(stripDuplicateLeadingTitle(page.content, page.title))
-  const htmlVersion = versionContent ? mdToHtml(versionContent.content) : ''
+  // 上一篇/下一篇：沿用列表页顺序（后端 `ORDER BY updated_at DESC`）。
+  // **如实说明**：该排序没有次级排序键，若两页 `updated_at` 完全相同，
+  // 它们之间的先后由 SQLite 决定（不保证稳定）——极端情况下"下一篇"可能不是唯一的。
+  const list = siblings ?? []
+  const idx = list.findIndex((p) => p.slug === slug)
+  const prev = idx > 0 ? list[idx - 1] : undefined
+  const next = idx >= 0 && idx < list.length - 1 ? list[idx + 1] : undefined
+
+  const versionHtml = versionContent
+    ? // 与正文同款处理：历史快照也可能以 `# 标题` 开头，直接渲染会出现重复标题
+      renderMarkdownBodyForPreview(stripDuplicateLeadingTitle(versionContent.content, page.title))
+    : ''
 
   return (
-    <div className="page page-detail">
-      <div className="detail-top">
-        <button className="btn small ghost" onClick={() => window.history.back()}>← 返回列表</button>
-        {notice && <span className="notice ok">{notice}</span>}
-        {err && <span className="notice err">{err}</span>}
-        <div className="spacer" />
-        <span className="muted small">版本 v{page.version} · 更新于 {fmtTime(page.updated_at)}</span>
-        <button className="btn small" onClick={remove}>删除</button>
-        <button className="btn small primary" onClick={onEdit}>✎ 编辑</button>
+    <div className="flex flex-col gap-4">
+      <Breadcrumb title={page.title} />
+
+      {/* 操作条：默认操作（编辑）在最右，破坏性操作（删除）用 danger 变体且与主操作隔开 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1.5 text-xs text-muted">
+          <Badge tone="neutral">版本 v{page.version}</Badge>
+          <span>更新于 {fmtTime(page.updated_at)}</span>
+        </div>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {notice !== '' && (
+            <span className="rounded-md border border-ok-line bg-ok-bg px-3 py-1 text-[13px] text-ok-ink">
+              {notice}
+            </span>
+          )}
+          {err !== '' && (
+            <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink">
+              {err}
+            </span>
+          )}
+          <Button
+            variant="danger"
+            size="sm"
+            icon={<Trash2 className="size-3.5" />}
+            onClick={remove}
+            disabled={restoring}
+          >
+            删除
+          </Button>
+          <Button variant="primary" size="sm" icon={<Pencil className="size-3.5" />} onClick={onEdit}>
+            编辑
+          </Button>
+        </div>
       </div>
 
-      <article className="md-body">
-        <h1 className="md-title">{page.title}</h1>
-        {page.content.trim() === '' ? (
-          <p className="empty">（空白页面 —— 点击「编辑」写入内容）</p>
-        ) : (
-          <div dangerouslySetInnerHTML={{ __html: html }} />
-        )}
-      </article>
+      {/*
+        两栏：正文（含历史）在左，目录在右。
+        `xl`（1280px）以下回落成单栏，目录改为正文上方的可折叠块（两份 TOC 由组件内部
+        用 `xl:hidden` / `hidden xl:block` 互斥显示，因此任何时刻只有一份出现在无障碍树里）。
+      */}
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_15rem]">
+        <div className="flex min-w-0 flex-col gap-4">
+          <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="inline" />
 
-      <section className="card history-card">
-        <h2>版本历史</h2>
-        {page.versions.length === 0 ? (
-          <p className="empty">暂无历史版本 —— 每次保存正文变化都会在此留档</p>
-        ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>版本</th>
-                <th>保存时间</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {page.versions.map((v, i) => (
-                <tr key={v.id}>
-                  <td>v{page.version - i - 1}</td>
-                  <td className="muted">{fmtTime(v.saved_at)}</td>
-                  <td>
-                    <button className="btn small ghost" onClick={() => showVersion(v.id, v.saved_at, page.version - i - 1)}>查看内容</button>
-                    {versionContent?.id === v.id && (
-                      <button className="btn small" disabled={restoring} onClick={restore}>
-                        {restoring ? '恢复中…' : '↺ 恢复此版本'}
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-        {versionContent && (
-          <div className="version-preview">
-            <div className="version-preview-head">
-              <strong>v{versionContent.label} 快照（{fmtTime(versionContent.saved_at)}）预览</strong>
-              <button className="btn small ghost" onClick={() => setVersionContent(null)}>✕ 关闭</button>
-            </div>
-            <div className="md-body" dangerouslySetInnerHTML={{ __html: htmlVersion }} />
-          </div>
-        )}
-      </section>
+          <article className="rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
+            <h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>
+            {page.content.trim() === '' ? (
+              <p className="text-sm text-muted">（空白页面 —— 点击「编辑」写入内容）</p>
+            ) : (
+              <MarkdownBody html={rendered.html} className="md-body" />
+            )}
+          </article>
+
+          {(prev !== undefined || next !== undefined) && (
+            <nav aria-label="相邻页面" className="grid gap-3 sm:grid-cols-2">
+              <SiblingLink
+                kind="prev"
+                page={prev}
+                onNavigate={onNavigate}
+              />
+              <SiblingLink
+                kind="next"
+                page={next}
+                onNavigate={onNavigate}
+              />
+            </nav>
+          )}
+
+          <Card>
+            <CardHeader
+              title="版本历史"
+              description={
+                page.versions.length === 0
+                  ? '暂无历史版本 —— 每次保存正文变化都会在此留档'
+                  : `当前为 v${page.version}（上方正文）；以下是 ${page.versions.length} 个历史快照，查看快照不会改动当前内容`
+              }
+              actions={<History className="size-4 text-muted" aria-hidden="true" />}
+            />
+            {page.versions.length === 0 ? null : (
+              <div className="overflow-x-auto">
+                <table
+                  tabIndex={0}
+                  aria-label="版本历史"
+                  className="w-full border-collapse text-sm"
+                >
+                  <thead>
+                    <tr>
+                      {['版本', '保存时间', '操作'].map((h) => (
+                        <th
+                          key={h}
+                          scope="col"
+                          className="border-b border-line px-4 py-2 text-left text-xs font-semibold whitespace-nowrap text-muted"
+                        >
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {page.versions.map((v, i) => {
+                      const label = page.version - i - 1
+                      const selected = versionContent?.id === v.id
+                      return (
+                        <tr key={v.id} className={cn('transition-colors', selected && 'bg-accent-soft')}>
+                          <td className="border-b border-line px-4 py-2.5 align-top font-medium">
+                            v{label}
+                          </td>
+                          <td className="border-b border-line px-4 py-2.5 align-top text-muted">
+                            {fmtTime(v.saved_at)}
+                          </td>
+                          <td className="border-b border-line px-4 py-2.5 align-top">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => showVersion(v.id, v.saved_at, label)}
+                                aria-expanded={selected}
+                              >
+                                {selected ? '收起内容' : '查看内容'}
+                              </Button>
+                              {selected && (
+                                <Button
+                                  size="sm"
+                                  loading={restoring}
+                                  icon={<RotateCcw className="size-3.5" />}
+                                  onClick={restore}
+                                >
+                                  恢复此版本
+                                </Button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {versionContent && (
+              <CardBody className="border-t border-line bg-sunken">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <p className="m-0 text-[13px] font-medium text-ink">
+                    v{versionContent.label} 快照预览
+                    <span className="ml-2 font-normal text-muted">{fmtTime(versionContent.saved_at)}</span>
+                  </p>
+                  <Button size="sm" variant="ghost" onClick={() => setVersionContent(null)}>
+                    关闭预览
+                  </Button>
+                </div>
+                <div className="max-h-[360px] overflow-auto rounded-md border border-line bg-surface px-5 py-4">
+                  <MarkdownBody html={versionHtml} className="md-body" />
+                </div>
+              </CardBody>
+            )}
+          </Card>
+        </div>
+
+        <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
+      </div>
     </div>
+  )
+}
+
+/** 历史快照预览：只要 HTML，不要复制按钮（只读小窗里按钮是噪声） */
+function renderMarkdownBodyForPreview(markdown: string): string {
+  return renderMarkdownBody(markdown, { withCopyButtons: false }).html
+}
+
+function SiblingLink({
+  kind,
+  page,
+  onNavigate,
+}: {
+  kind: 'prev' | 'next'
+  page: PageSummary | undefined
+  onNavigate: (path: string) => void
+}): ReactNode {
+  const isPrev = kind === 'prev'
+  // 空位也渲染占位，保持两列对齐（只有一个相邻页时不会一边塌陷）
+  if (page === undefined) return <span aria-hidden="true" />
+  return (
+    <a
+      href={`#/wiki/${encodeURIComponent(page.slug)}`}
+      onClick={() => onNavigate(page.slug)}
+      className={cn(
+        'gw-focus-ring group flex flex-col gap-0.5 rounded-lg border border-line bg-surface px-4 py-3 transition-colors hover:border-line-strong hover:bg-hover',
+        !isPrev && 'sm:text-right',
+      )}
+    >
+      <span className="flex items-center gap-1 text-xs text-muted">
+        {isPrev ? (
+          <>
+            <ChevronLeft className="size-3.5" aria-hidden="true" />
+            上一篇
+          </>
+        ) : (
+          <>
+            下一篇
+            <ChevronRight className="size-3.5" aria-hidden="true" />
+          </>
+        )}
+      </span>
+      <span className="truncate text-sm font-medium text-accent group-hover:underline">
+        {page.title}
+      </span>
+    </a>
   )
 }
 
 /* ============================ 编辑 / 新建 ============================ */
 
-function WikiEdit(props: { slug: string; onDone: (slug: string) => void; onCancel: () => void }): ReactNode {
+/**
+ * 草稿的 localStorage 读写（薄封装）。
+ *
+ * 与 `draftPlan.ts` 分开：那里是**纯逻辑**（可在 node 里单测），这里碰浏览器 API。
+ * 全部 try/catch：隐私模式下 localStorage 会**抛异常**，草稿功能不能因此让编辑页打不开。
+ */
+function readDraft(slug: string): DraftRecord | null {
+  try {
+    return parseDraft(window.localStorage.getItem(draftKey(slug)))
+  } catch {
+    return null
+  }
+}
+
+function writeDraft(slug: string, draft: DraftRecord): void {
+  try {
+    window.localStorage.setItem(draftKey(slug), serializeDraft(draft))
+  } catch {
+    /* 配额满/被禁用：放弃这次草稿，不影响编辑 */
+  }
+}
+
+function removeDraft(slug: string): void {
+  try {
+    window.localStorage.removeItem(draftKey(slug))
+  } catch {
+    /* 同上 */
+  }
+}
+
+function WikiEdit(props: {
+  slug: string
+  onDone: (slug: string) => void
+  onCancel: () => void
+}): ReactNode {
   const { slug, onDone, onCancel } = props
   const isNew = slug === ''
+  /** 本编辑页自身的 hash（未保存离开后要退回它） */
+  const selfHash = isNew ? '#/wiki/new' : `#/wiki/${slug}/edit`
+  const route = isNew ? 'wiki/new' : `wiki/${slug}/edit`
+
   const [slugInput, setSlugInput] = useState(slug)
   const [title, setTitle] = useState('')
   const [content, setContent] = useState('')
-  const [tab, setTab] = useState<'edit' | 'preview'>('edit')
+  const [pane, setPane] = useState<'edit' | 'preview'>('edit')
   const [loading, setLoading] = useState(!isNew)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<PageFormErrors>({})
+  /** 待用户决定的草稿（进入编辑页时读到的） */
+  const [pendingDraft, setPendingDraft] = useState<DraftRecord | null>(null)
+  /** 草稿最近一次落盘时间（0 = 尚未写过），给用户"到底存没存"的确定性 */
+  const [draftSavedAt, setDraftSavedAt] = useState(0)
+  /** 保存冲突：服务端的 updated_at 与本页加载时不同 */
+  const [conflictAt, setConflictAt] = useState<string | null>(null)
   const [origSlug, setOrigSlug] = useState('')
 
-  useEffect(() => {
+  /** 加载时的基线（脏值比较用 state 而非 ref：比较结果要参与渲染） */
+  const [original, setOriginal] = useState<PageDraft>({ title: '', content: '', slugInput: slug })
+  /** 本页加载时服务端的 updated_at；保存前用它检测"别人改过了" */
+  const serverUpdatedAt = useRef<string | null>(null)
+
+  const dirty = isDirty(original, { title, content, slugInput })
+
+  const load = useCallback((): void => {
+    setErr('')
+    setFieldErrors({})
     if (isNew) {
+      const base: PageDraft = { title: '', content: '', slugInput: '' }
+      setOriginal(base)
       setLoading(false)
+      const d = readDraft('')
+      if (d !== null && !isDraftExpired(d, Date.now())) setPendingDraft(d)
       return
     }
-    setErr('')
     api
       .page(slug)
       .then((p) => {
         setTitle(p.title)
         setContent(p.content)
         setOrigSlug(p.slug)
+        serverUpdatedAt.current = p.updated_at
+        setOriginal({ title: p.title, content: p.content, slugInput: slug })
         setLoading(false)
+        // 草稿：只有"确实有改动"或"服务端已变"时才打扰用户，内容一致的残留草稿直接清掉
+        const d = readDraft(slug)
+        if (d === null || isDraftExpired(d, Date.now())) {
+          if (d !== null) removeDraft(slug)
+          return
+        }
+        const decision = decideDraftRestore(d, {
+          title: p.title,
+          content: p.content,
+          updatedAt: p.updated_at,
+        })
+        if (decision === 'restore' || decision === 'restore-stale') setPendingDraft(d)
+        else if (decision === 'discard') removeDraft(slug)
       })
       .catch((e: unknown) => {
         setErr(e instanceof Error ? e.message : String(e))
@@ -518,81 +884,361 @@ function WikiEdit(props: { slug: string; onDone: (slug: string) => void; onCance
       })
   }, [slug, isNew])
 
-  const save = (): void => {
-    const target = isNew ? slugInput.trim() : slug
-    if (isNew && !slugOk(target)) {
-      setErr('页面标识需以字母或数字开头，仅含 a-z 0-9 . _ -，≤80 字符')
-      return
-    }
-    if (!title.trim()) {
-      setErr('标题不能为空')
-      return
-    }
-    setSaving(true)
-    setErr('')
-    api
-      .savePage(target, { title: title.trim(), content })
-      .then((r) => {
-        // 新建时 slug 可能规范化，统一跳转到服务端确认的 slug
-        onDone(isNew ? r.slug : slug)
+  useEffect(load, [load])
+
+  /*
+   * 草稿自动保存（防抖 900ms）。
+   *
+   * 为什么比预览防抖（200ms）长得多：预览是"跟手"的体验，草稿是"防丢失"，两者目标不同。
+   * 900ms 的取值依据：连续打字时每秒可能产生多次改动，若每次都写 localStorage，
+   * 大文档下会与输入竞争主线程（localStorage 是同步 API，会阻塞渲染）；
+   * 900ms 足够让"打一个词/一句话"合并成一次写盘，同时用户几乎不可能在 900ms 内
+   * 关掉页面还指望草稿生效（真那样也还有 beforeunload 拦截兜底）。
+   */
+  useEffect(() => {
+    if (loading || !dirty) return
+    const t = window.setTimeout(() => {
+      writeDraft(isNew ? '' : slug, {
+        title,
+        content,
+        savedAt: Date.now(),
+        baseUpdatedAt: serverUpdatedAt.current,
       })
-      .catch((e: unknown) => {
+      setDraftSavedAt(Date.now())
+    }, DRAFT_DEBOUNCE_MS)
+    return () => window.clearTimeout(t)
+  }, [title, content, slugInput, dirty, loading, isNew, slug])
+
+  /**
+   * 预览防抖。
+   *
+   * 为什么必须防抖：预览每次都要跑 `marked` + `DOMPurify`（一次完整消毒）。
+   * 若跟随每次按键，用户每敲一个字符就消毒一遍全文——在几千字的文档上是可感的卡顿。
+   * 200ms 的取值依据：低于 ~100ms 对"连续输入"几乎没有合并效果（打字间隔常在 80–150ms），
+   * 高于 ~300ms 用户会明显觉得"预览落后于输入"。200ms 落在两者之间。
+   * （实测成本见汇报：一次完整消毒在本仓库的真实文档上约数毫秒，因此 200ms 足够宽裕。）
+   */
+  const [previewSource, setPreviewSource] = useState('')
+  useEffect(() => {
+    const t = window.setTimeout(() => setPreviewSource(content), PREVIEW_DEBOUNCE_MS)
+    return () => window.clearTimeout(t)
+  }, [content])
+  const previewRendered = useRenderedMarkdown(previewSource, { withCopyButtons: false, route })
+
+  const save = useCallback(
+    async (opts: { force?: boolean } = {}): Promise<void> => {
+      const target = isNew ? slugInput.trim() : slug
+      const errors = validatePageForm({ isNew, slugInput, title })
+      setFieldErrors(errors)
+      if (hasErrors(errors)) {
+        // 顶部给一句汇总（屏幕阅读器/长页面用户可能看不到字段旁的红字），字段旁给具体原因
+        setErr('请先修正下面标出的问题')
+        return
+      }
+      setErr('')
+
+      /*
+       * 冲突检测（仅编辑既有页面）：保存前取一次服务端状态，比对 `updated_at`。
+       *
+       * 目的：**不静默覆盖别人更新的内容**。若期间有人（或另一个标签页）保存过，
+       * 就先让用户知道，由他决定是否覆盖——而不是无声地把对方的工作顶掉。
+       * 代价是每次保存多一次 GET；对本应用的数据规模（单页几百 KB 以内）可接受，
+       * 换来的是"丢内容"这种不可逆事故的避免。
+       */
+      if (!isNew && opts.force !== true) {
+        try {
+          const fresh = await api.page(slug)
+          if (serverUpdatedAt.current !== null && fresh.updated_at !== serverUpdatedAt.current) {
+            setConflictAt(fresh.updated_at)
+            return
+          }
+        } catch (e) {
+          // 拿不到最新状态时**不阻塞保存**：网络抖动不该让用户存不了东西
+          console.debug('[geewiki-wiki] 保存前冲突检测跳过：', e instanceof Error ? e.message : e)
+        }
+      }
+
+      setSaving(true)
+      try {
+        const r = await api.savePage(target, { title: title.trim(), content })
+        // 保存成功 ⇒ 草稿使命结束（连同新建页的哨兵键一起清）
+        removeDraft(slug)
+        if (isNew) removeDraft('')
+        onDone(isNew ? r.slug : slug)
+      } catch (e) {
         setErr(e instanceof Error ? e.message : String(e))
         setSaving(false)
-      })
+      }
+    },
+    [content, isNew, slug, slugInput, title, onDone],
+  )
+
+  /** ⌘/Ctrl+S 全局保存：焦点可能在标题输入框，不能只靠编辑器的 keymap */
+  const saveRef = useRef(save)
+  saveRef.current = save
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault()
+        void saveRef.current()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const { confirmLeave } = useUnsavedGuard({
+    dirty,
+    message: '有未保存的改动，确定离开吗？未保存的内容可在下次进入编辑页时恢复。',
+    selfHash,
+  })
+
+  const applyDraft = (): void => {
+    if (pendingDraft === null) return
+    setTitle(pendingDraft.title)
+    setContent(pendingDraft.content)
+    setPendingDraft(null)
   }
 
-  if (loading) return <div className="page"><div className="empty">加载中…</div></div>
+  const discardDraft = (): void => {
+    removeDraft(isNew ? '' : slug)
+    setPendingDraft(null)
+  }
 
-  const previewHtml = mdToHtml(content)
+  if (loading) {
+    return (
+      <div className="flex flex-col gap-4" aria-busy="true">
+        <Skeleton className="h-4 w-48" />
+        <Skeleton className="h-8 w-1/3" />
+        <Skeleton className="h-[420px] w-full" />
+        <Spinner label="正在加载页面" />
+      </div>
+    )
+  }
+
+  const slugError = fieldErrors.slug
+  const titleError = fieldErrors.title
+  const previewEmpty = previewSource.trim() === ''
 
   return (
-    <div className="page page-edit">
-      <div className="detail-top">
-        <button className="btn small ghost" onClick={onCancel} disabled={saving}>← 取消</button>
-        {err && <span className="notice err">{err}</span>}
-        <div className="spacer" />
-        <button className="btn small" disabled={saving} onClick={() => setTab(tab === 'edit' ? 'preview' : 'edit')}>
-          {tab === 'edit' ? '👁 预览' : '✎ 继续编辑'}
-        </button>
-        <button className="btn small primary" disabled={saving || loading} onClick={save}>
-          {saving ? '保存中…' : '💾 保存'}
-        </button>
+    <div className="flex flex-col gap-4">
+      <Breadcrumb title={isNew ? '新建页面' : origSlug !== '' ? origSlug : slug} />
+
+      {/* 操作条 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <h1 className="m-0 text-xl font-semibold">{isNew ? '新建页面' : '编辑页面'}</h1>
+        {dirty && (
+          <span className="text-xs text-muted" role="status">
+            {draftSavedAt > 0
+              ? `草稿已自动保存（${new Date(draftSavedAt).toLocaleTimeString('zh-CN', { hour12: false })}）`
+              : '有未保存的改动'}
+          </span>
+        )}
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {err !== '' && (
+            <span
+              role="alert"
+              className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink"
+            >
+              {err}
+            </span>
+          )}
+          <Button
+            disabled={saving}
+            onClick={() => {
+              if (confirmLeave()) onCancel()
+            }}
+          >
+            取消
+          </Button>
+          <Button
+            variant="primary"
+            loading={saving}
+            icon={<Save className="size-3.5" />}
+            onClick={() => void save()}
+          >
+            保存
+          </Button>
+        </div>
       </div>
 
-      <div className="edit-form">
-        {isNew && (
-          <label className="field">
-            <span>页面标识（URL 中的路径，如 getting-started）</span>
-            <input value={slugInput} onChange={(e) => setSlugInput(e.target.value.trim())} placeholder="my-page" spellCheck={false} />
-          </label>
-        )}
-        <label className="field">
-          <span>标题</span>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="页面标题" />
-        </label>
-        {tab === 'edit' ? (
-          <label className="field grow">
-            <span>正文（Markdown）</span>
-            <textarea
-              className="md-editor"
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              placeholder={'支持 Markdown：标题、列表、代码块、链接…\n\n# 示例\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
-              spellCheck={false}
-            />
-          </label>
-        ) : (
-          <div className="field grow">
-            <span>预览（保存前本地渲染）</span>
-            <div className="md-body preview-box">
-              {content.trim() === '' ? <p className="empty">（空白）</p> : <div dangerouslySetInnerHTML={{ __html: previewHtml }} />}
+      {/* 字段：错误就地显示（`aria-describedby` 把错误与控件关联，屏幕阅读器才能读到） */}
+      <div className="rounded-lg border border-line bg-surface px-5 py-4 shadow-sm">
+        <div className="flex flex-col gap-4">
+          {isNew && (
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="gw-page-slug" className="text-xs font-semibold text-ink-soft">
+                页面标识（URL 里的路径，如 getting-started）
+              </label>
+              <Input
+                id="gw-page-slug"
+                value={slugInput}
+                onChange={(e) => setSlugInput(e.target.value.trim())}
+                placeholder="my-page"
+                spellCheck={false}
+                invalid={slugError !== undefined}
+                aria-describedby={slugError !== undefined ? 'gw-page-slug-error' : undefined}
+                className="font-mono sm:max-w-md"
+              />
+              {slugError !== undefined ? (
+                <p id="gw-page-slug-error" className="m-0 text-xs text-danger-ink">
+                  {slugError}
+                </p>
+              ) : (
+                <p className="m-0 text-xs text-muted">仅小写字母、数字与 . _ -（≤80 字符）</p>
+              )}
             </div>
+          )}
+
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="gw-page-title" className="text-xs font-semibold text-ink-soft">
+              标题
+            </label>
+            <Input
+              id="gw-page-title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="页面标题"
+              invalid={titleError !== undefined}
+              aria-describedby={titleError !== undefined ? 'gw-page-title-error' : undefined}
+            />
+            {titleError !== undefined && (
+              <p id="gw-page-title-error" className="m-0 text-xs text-danger-ink">
+                {titleError}
+              </p>
+            )}
           </div>
-        )}
+        </div>
       </div>
-      {origSlug && origSlug !== slug && <p className="muted small">提示：原标识 {origSlug} 的内容已迁移到新标识</p>}
-      <div className="edit-footer muted">保存会把当前正文快照进版本历史（内容未变化则不产生新版本）。</div>
+
+      {/* 编辑 / 预览：宽屏分屏，窄屏 Tab 切换（同一份状态，两种呈现） */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1 rounded-md border border-line bg-surface p-0.5 xl:hidden">
+          <Button
+            size="sm"
+            variant={pane === 'edit' ? 'primary' : 'ghost'}
+            onClick={() => setPane('edit')}
+            aria-pressed={pane === 'edit'}
+          >
+            编辑
+          </Button>
+          <Button
+            size="sm"
+            variant={pane === 'preview' ? 'primary' : 'ghost'}
+            onClick={() => setPane('preview')}
+            aria-pressed={pane === 'preview'}
+          >
+            预览
+          </Button>
+        </div>
+        <span className="text-xs text-muted">
+          {charCount(content)} 字符 · 支持 Markdown
+          <span className="hidden xl:inline"> · ⌘/Ctrl+S 保存 · ⌘/Ctrl+B 加粗 · Tab 缩进</span>
+          <span className="xl:hidden"> · ⌘/Ctrl+S 保存</span>
+        </span>
+      </div>
+
+      <div className="grid items-start gap-4 xl:grid-cols-2">
+        <div className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'preview' && 'hidden xl:flex')}>
+          <span className="text-xs font-semibold text-ink-soft">正文（Markdown）</span>
+          <MarkdownEditorLazy
+            value={content}
+            onChange={setContent}
+            onSave={() => void save()}
+            disabled={saving}
+            ariaLabel="Markdown 正文编辑器"
+            minHeight="480px"
+            placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
+          />
+        </div>
+
+        <div className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'edit' && 'hidden xl:flex')}>
+          <span className="text-xs font-semibold text-ink-soft">预览（本地实时渲染，非最终发布稿）</span>
+          <div className="min-h-[480px] overflow-auto rounded-md border border-line bg-surface px-5 py-4">
+            {previewEmpty ? (
+              <p className="m-0 text-sm text-muted">（空白）</p>
+            ) : (
+              <MarkdownBody html={previewRendered.html} className="md-body" />
+            )}
+          </div>
+        </div>
+      </div>
+
+      <p className="m-0 text-xs text-muted">
+        保存会把当前正文快照进版本历史（内容未变化则不产生新版本）。
+        {origSlug !== '' && origSlug !== slug && ` 提示：原标识 ${origSlug} 的内容已迁移到新标识。`}
+      </p>
+
+      {/* 草稿恢复：用 Dialog 而不是 confirm —— 需要呈现"多久以前""服务端已更新"等信息 */}
+      <Dialog open={pendingDraft !== null} onOpenChange={(open) => !open && discardDraft()}>
+        <DialogContent
+          title="发现未保存的草稿"
+          description={
+            pendingDraft === null
+              ? undefined
+              : `保存于 ${formatDraftAge(pendingDraft.savedAt, Date.now())}${
+                  draftIsStale(pendingDraft, serverUpdatedAt.current) ? '；期间服务端内容已被更新' : ''
+                }。`
+          }
+          footer={
+            <>
+              <DialogClose asChild>
+                <Button onClick={discardDraft}>丢弃草稿</Button>
+              </DialogClose>
+              <Button variant="primary" onClick={applyDraft}>
+                恢复草稿
+              </Button>
+            </>
+          }
+        >
+          {draftIsStale(pendingDraft, serverUpdatedAt.current) ? (
+            <p className="m-0">
+              服务端版本比这份草稿新。恢复并保存后，你的内容会覆盖服务端最新的改动
+              （保存时会再确认一次）；若不确定，建议先「丢弃草稿」查看当前线上内容，
+              再从版本历史对照。
+            </p>
+          ) : (
+            <p className="m-0">恢复后可以继续编辑；不恢复则丢弃这份草稿。</p>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 保存冲突：服务端已更新 */}
+      <Dialog open={conflictAt !== null} onOpenChange={(open) => !open && setConflictAt(null)}>
+        <DialogContent
+          title="服务端内容已被更新"
+          description={conflictAt === null ? undefined : `服务端最近更新于 ${fmtTime(conflictAt)}。`}
+          footer={
+            <>
+              <DialogClose asChild>
+                <Button>先不保存</Button>
+              </DialogClose>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setConflictAt(null)
+                  // 用户明确选择覆盖：跳过冲突检测再存一次
+                  void save({ force: true })
+                }}
+              >
+                仍然覆盖保存
+              </Button>
+            </>
+          }
+        >
+          <p className="m-0">
+            你打开这一页之后，服务端的内容被改过（可能是另一个标签页或其他人）。
+            继续保存会覆盖那些改动；被你覆盖掉的那一版会作为历史快照保留在版本历史里，
+            因此事后仍可从历史里找回。
+          </p>
+        </DialogContent>
+      </Dialog>
     </div>
   )
+}
+
+/** 草稿是否基于较旧的服务端版本（用于提示语气） */
+function draftIsStale(draft: DraftRecord | null, serverUpdatedAt: string | null): boolean {
+  if (draft === null || serverUpdatedAt === null) return false
+  return draft.baseUpdatedAt !== null && draft.baseUpdatedAt !== serverUpdatedAt
 }

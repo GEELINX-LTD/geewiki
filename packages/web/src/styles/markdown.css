@@ -1,0 +1,146 @@
+/*
+ * 正文阅读体验的组件样式（锚点、代码块复制按钮）—— 放进 `components` 层。
+ *
+ * 为什么不写进 `styles.css`（legacy 层）：那份文件是"待迁移的旧样式"，
+ * 新组件不该往里加东西，否则 legacy 层永远清不掉。层序见 `styles/index.css`：
+ *   theme < base < components < legacy < utilities
+ * 放 components 层意味着：**工具类仍可覆盖它**（utilities 在更后），与既有约定一致。
+ *
+ * 这些类名带 `gw-` 前缀且由 `lib/markdownRender.ts` 注入，不是 Tailwind 工具类
+ * （因为它们是**运行时注入进 HTML 字符串**的，无法参与构建期的类名收集）。
+ */
+
+@layer components {
+  /* ---------- 标题锚点 ---------- */
+
+  /*
+   * 锚点跳转不被顶栏遮挡（WCAG 2.4.11 Focus Not Obscured）。
+   * 顶栏是 sticky 且高 `--spacing-header`，故给所有正文标题留出它的高度 + 余量。
+   */
+  .md-body :is(h1, h2, h3, h4, h5, h6) {
+    scroll-margin-top: calc(var(--spacing-header) + 12px);
+  }
+
+  /*
+   * 锚点链接：平时不可见，悬停/聚焦标题时淡入。
+   *
+   * 为什么是"淡入"而不是 `display: none`：`display: none` 的元素**不可聚焦**，
+   * 键盘用户就永远拿不到它（Tab 跳过）。这里用 opacity + 始终占据布局（零宽字符内容），
+   * 因此键盘可达；`focus-visible` 时强制可见，Tab 到时用户能看见焦点在哪。
+   */
+  .gw-heading-anchor {
+    margin-left: 0.35em;
+    color: var(--gw-ink-muted);
+    text-decoration: none;
+    opacity: 0;
+    transition: opacity 150ms var(--ease-standard);
+    /* 让点击区域够大（WCAG 2.5.8 ≥24px），同时不撑高标题行 */
+    display: inline-block;
+    min-width: 1em;
+    text-align: center;
+  }
+
+  .gw-heading-anchor::before {
+    /* 用 CSS 画一个"链接"符号，避免依赖图标字体/额外 DOM */
+    content: '#';
+    font-weight: 400;
+  }
+
+  .md-body :is(h1, h2, h3, h4, h5, h6):hover .gw-heading-anchor,
+  .gw-heading-anchor:focus-visible {
+    opacity: 1;
+  }
+
+  .gw-heading-anchor:hover {
+    color: var(--gw-accent);
+  }
+
+  /* 触屏设备没有 hover：直接把锚点显示出来，否则永远够不到 */
+  @media (hover: none) {
+    .gw-heading-anchor {
+      opacity: 0.55;
+    }
+  }
+
+  /* ---------- 代码块复制按钮 ---------- */
+
+  .gw-code {
+    position: relative;
+  }
+
+  /* 复制按钮浮在代码块右上角，不占正文流（否则每个代码块都多一行高度） */
+  .gw-copy-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 1;
+    height: 26px;
+    padding: 0 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgb(255 255 255 / 18%);
+    background: rgb(255 255 255 / 10%);
+    color: var(--gw-header-ink);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 150ms var(--ease-standard),
+      background-color 150ms var(--ease-standard);
+  }
+
+  /* 代码块底色是深色（`--gw-header-bg`），故按钮用浅色前景，两种主题下都够对比度 */
+  .gw-code:hover .gw-copy-btn,
+  .gw-copy-btn:focus-visible,
+  .gw-copy-btn.is-copied,
+  .gw-copy-btn.is-manual {
+    opacity: 1;
+  }
+
+  .gw-copy-btn:hover {
+    background: rgb(255 255 255 / 20%);
+  }
+
+  .gw-copy-btn:focus-visible {
+    outline: 2px solid var(--gw-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .gw-copy-btn.is-copied {
+    background: var(--gw-ok);
+    border-color: var(--gw-ok);
+    color: #fff;
+  }
+
+  /* 复制失败的兜底提示：用警示色，明确区别于"已复制" */
+  .gw-copy-btn.is-manual {
+    background: var(--gw-warn);
+    border-color: var(--gw-warn);
+    color: #1a1204;
+  }
+
+  /* 触屏：直接显示按钮（没有 hover 可依赖） */
+  @media (hover: none) {
+    .gw-copy-btn {
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .gw-heading-anchor,
+    .gw-copy-btn {
+      transition: none;
+    }
+  }
+
+  /* ---------- 分屏编辑 ---------- */
+
+  /*
+   * 预览面板与编辑面板等高：两边各自独立滚动，避免"左边滚到底、右边还在顶上"。
+   * 用 `min-height: 0` 让 grid 子项可以真正收缩（否则内容会把它撑开，滚动条跑到整页上）。
+   */
+  .gw-split-pane {
+    min-width: 0;
+    min-height: 0;
+  }
+}

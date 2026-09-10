@@ -23,6 +23,7 @@
  *   - `tokens.css`       —— 设计 token（`@theme` + 深浅两套语义色）
  *   - `styles.css`       —— 旧样式，整体收进 `@layer legacy`（未迁移页面仍依赖它）
  *   - `legacy-bridge.css` —— 无层的旧变量→新 token 桥接，让旧页面白得深色模式
+ *   - `markdown.css`     —— 正文阅读体验（标题锚点、代码块复制按钮、分屏），components 层
  */
 
 @layer theme, base, components, legacy, utilities;
@@ -33,3 +34,4 @@
 @import '../styles.css' layer(legacy);
 @import './legacy-bridge.css';
 @import './focus.css';
+@import './markdown.css';
