@@ -137,10 +137,16 @@ export function AdminPage(): ReactNode {
   /**
    * 依赖方闭包（前端预览，与后端 collectDependentsClosure 同语义）：
    * 冲突组替换会把旧插件的依赖方一起卸载再接回，确认框需先如实告知用户。
+   *
+   * **只返回当前活跃的依赖方**，与后端口径一致：后端的卸载/接回集合是
+   * `collectDependentsClosure(...).filter(active)`，未激活的依赖方根本不在替换范围内。
+   * 若不过滤，确认框会把"未启用"的插件也列为将被重启，夸大影响面、与事实不符。
+   * 遍历本身仍走完整依赖图（不过滤中间节点）——被顶替插件的下游可能隔着未激活节点。
    */
   const dependentsOf = useCallback(
     (root: string): string[] => {
       const list = plugins ?? []
+      const stateOf = new Map(list.map((p) => [p.name, p.state]))
       const seen = new Set([root])
       const out: string[] = []
       const queue = [root]
@@ -155,7 +161,7 @@ export function AdminPage(): ReactNode {
           }
         }
       }
-      return out.sort()
+      return out.filter((n) => stateOf.get(n) === 'active').sort()
     },
     [plugins],
   )
@@ -212,8 +218,13 @@ export function AdminPage(): ReactNode {
       setNotice(null)
       try {
         const res = await api.replace(prompt.target.name, prompt.config)
+        // 冲突可能在用户确认前被别处解除（例如另一处停用了冲突方）：此时后端走
+        // "无冲突降级"路径、响应 replaced === null，若仍写"已用 X 替换 Y"就与事实不符。
+        const replacedName = res.replaced?.name
         const text = [
-          `已用 ${prompt.target.name} 替换 ${res.replaced?.name ?? prompt.conflict}`,
+          replacedName
+            ? `已用 ${prompt.target.name} 替换 ${replacedName}`
+            : `冲突已解除，已直接启用 ${prompt.target.name}（未发生替换）`,
           res.restarted.length > 0 ? `接回依赖方: ${res.restarted.join('、')}` : '',
         ]
           .filter(Boolean)
@@ -318,7 +329,11 @@ export function AdminPage(): ReactNode {
             同组内只能激活一个。确认后：先卸载 {replacePrompt.conflict}
             {replacePrompt.dependents.length > 0 && <>（连同它的依赖方 {replacePrompt.dependents.join('、')}）</>}
             ，再激活 {replacePrompt.target.name}
-            {replacePrompt.dependents.length > 0 && <>，并将依赖方接回新提供者</>}。全部为热操作，无需重启。
+            {replacePrompt.dependents.length > 0 && <>，并把依赖方接回新提供者</>}。
+          </p>
+          <p className="small">
+            替换期间被卸载的插件会<strong>短暂不可用</strong>（约几秒，需等待在途请求排空），完成后自动恢复。
+            全程为热操作，无需重启进程。
           </p>
           <div className="page-actions">
             <button className="btn" onClick={() => setReplacePrompt(null)} disabled={busy !== ''}>
