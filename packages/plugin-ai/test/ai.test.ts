@@ -745,3 +745,48 @@ test('真实 cordis：ai-service 对兄弟插件可见，卸载后注销', async
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+/* ================= 问句检索（mode:'terms'）——RAG 检索地基的回归 ================= */
+
+test('问句检索：自然语言问句能召回资料（修前恒为 0 命中）', async () => {
+  const h = makeHarness()
+  try {
+    // 正文照抄真实语料形态：问句的词元都在正文里，但整句**不**连续出现
+    h.putPage('kb-1', '检索设计', '本系统的检索增强问答先从知识库检索相关资料，再做抽取式摘要。')
+
+    const body = await askOk(h.post({ q: '检索增强怎么做' }))
+    assert.ok(body.retrieval.total >= 1, `问句应召回资料，实际 total=${body.retrieval.total}`)
+    assert.equal(body.retrieval.mode, 'fts', '问句 ≥3 字符，词元非空 → 走 FTS')
+    assert.ok(body.sources.length >= 1, `sources 应非空，实际 ${body.sources.length}`)
+    assert.equal(body.sources[0]?.slug, 'kb-1')
+    // 无密钥时走抽取式摘要：answer 不应为 null（有命中且有内容）
+    assert.equal(body.mode, 'retrieval-only')
+    assert.ok(body.answer !== null, '有命中时应给出抽取式摘要')
+    assert.ok((body.answer ?? '').includes('检索'), `摘要应围绕命中位置，实际：${String(body.answer)}`)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('问句检索：检索条数与降级结构保持契约（后缀无关词不破坏召回）', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('kb-1', '甲', '检索增强问答先从知识库检索相关资料。')
+    h.putPage('kb-2', '乙', '完全不相关的另一篇内容。')
+
+    // 问句里混入正文没有的词（「怎么」「做」）：只要还有词元命中，就应召回 kb-1
+    const body = await askOk(h.post({ q: '知识库怎么检索资料' }))
+    assert.ok(body.retrieval.total >= 1, `应召回 kb-1，实际 total=${body.retrieval.total}`)
+    assert.ok(
+      body.sources.some((s) => s.slug === 'kb-1'),
+      `sources 应含 kb-1，实际 ${JSON.stringify(body.sources.map((s) => s.slug))}`,
+    )
+    // 与正文毫无交集的问句仍是 0 命中（不能因为词元化就"什么都命中"）
+    const miss = await askOk(h.post({ q: '量子纠缠退相干实验' }))
+    assert.equal(miss.retrieval.total, 0, '无交集问句必须 0 命中')
+    assert.deepEqual(miss.sources, [])
+    assert.equal(miss.answer, null, '无命中时 answer 为 null（与既有契约一致）')
+  } finally {
+    h.dispose()
+  }
+})

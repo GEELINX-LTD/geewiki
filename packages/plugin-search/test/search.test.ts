@@ -21,9 +21,11 @@ import { Context as CordisContext } from 'cordis'
 import { SqliteDatabase } from '@geewiki/db-sqlite'
 import type { HttpRouterService, RouteHandler, RouteHandlerContext } from '@geewiki/core'
 import {
+  MIN_TRIGRAM_LENGTH,
   SEARCH_MIGRATIONS_DIR,
   SearchPlugin,
   buildSnippet,
+  buildTermQuery,
   escapeHtml,
   escapeLike,
   toFtsPhrase,
@@ -749,4 +751,175 @@ test('纯函数：转义与短语构造', () => {
   // 命中词在文本中不存在时返回 null（调用方据此退回标题）
   assert.equal(buildSnippet('无关内容', '缺席词', 10), null)
   assert.equal(buildSnippet('', 'x', 10), null)
+})
+
+/* ================= 词元检索（mode:'terms'）——RAG 问句的检索路 ================= */
+
+/*
+ * 背景（本组用例钉住的缺陷）：`toFtsPhrase` 把**整个查询串**包成一个 FTS5 短语，
+ * 于是自然语言问句（「检索增强怎么做」）要求正文里**连续出现该整串**才命中——
+ * 而问句几乎不可能逐字出现在正文里，于是 /api/ai/ask 的检索地基恒为 0 命中。
+ * 防注入（整体当字面短语）是对的，错的是"把整句当一个短语"。
+ * 修法：新增 mode:'terms'，把查询切成可检索词元后各自加引号（仍字面、仍防注入）以 OR 连接。
+ */
+
+test('词元检索：问句能召回（短语路 0 命中，词元路 ≥1）——核心回归', async () => {
+  const h = makeHarness()
+  try {
+    // 正文照抄真实语料形态：问句的每个词元都在正文里，但整句**不**连续出现
+    h.putPage('kb-1', '检索设计', '本系统的检索增强问答先从知识库检索相关资料，再做抽取式摘要。')
+    const q = '检索增强怎么做'
+
+    // 对照：短语语义下 0 命中——这正是缺陷现场
+    const phrase = await searchAs(h, `q=${encodeURIComponent(q)}`, 'fts')
+    assert.equal(phrase.total, 0, '整句作为一个短语时必然 0 命中（本用例的前置事实）')
+
+    // 修好后：词元语义下必须召回
+    const terms = await searchAs(h, `q=${encodeURIComponent(q)}&mode=terms`, 'fts')
+    assert.ok(terms.total >= 1, `词元检索应召回该页，实际 total=${terms.total}`)
+    assert.deepEqual(slugs(terms), ['kb-1'])
+    assert.equal((terms.hits[0]?.score ?? 0) > 0, true, 'FTS 路的 score 应 > 0（BM25 取负）')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('词元检索：total 是 distinct 行数（一行命中多个词元不重复计数）', async () => {
+  const h = makeHarness()
+  try {
+    // p1 同时命中「检索增」「索增强」「知识库」等词元；p2 只命中「知识库」
+    h.putPage('p1', '甲', '检索增强知识库')
+    h.putPage('p2', '乙', '知识库')
+    const body = await searchAs(h, `q=${encodeURIComponent('检索增强知识库')}&mode=terms`, 'fts')
+    assert.equal(body.total, 2, `应为 distinct 行数 2（若按词元命中次数累加会得到 >2），实际 ${body.total}`)
+    assert.equal(body.hits.length, 2)
+    // 命中词元更多的行 BM25 更相关 → 排在前（OR + ORDER BY rank 的天然效果）
+    assert.deepEqual(slugs(body), ['p1', 'p2'], '多词元命中者应排在前面')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('词元检索：词元全空时回退 LIKE（短查询/纯标点不构造空 MATCH）', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('kb-1', '检索设计', '全文检索是知识库的地基。')
+    // 2 字中文：切不出 3-gram → 词元为空 → 必须回退 LIKE（与 <3 字符的短语路径一致）
+    const short = await searchAs(h, `q=${encodeURIComponent('检索')}&mode=terms`, 'like')
+    assert.equal(short.total, 1)
+    assert.deepEqual(slugs(short), ['kb-1'])
+    // 纯标点：同样回退且不抛（若构造出 `MATCH ''` 会抛 fts5: syntax error）
+    const punct = await searchAs(h, `q=${encodeURIComponent('。。')}&mode=terms`, 'like')
+    assert.equal(punct.total, 0)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('词元检索：注入安全——敌意输入仍按字面词元处理，不改变语义', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('p1', '标题', '正文里字面含有 a OR b 这个串，也含有星号*与引号"。')
+    const hostile = [
+      '"',
+      '*',
+      '***',
+      'a OR b',
+      'a AND b',
+      'NOT x',
+      'NEAR(',
+      'NEAR(a b, 2)',
+      '^x',
+      'x:y',
+      '{a}',
+      '(a)',
+      '中文"引号',
+      '\\',
+      'a-b_c',
+      'OR',
+      '知识库" OR "x',
+      '检索"*)',
+    ]
+    for (const q of hostile) {
+      const res = await h.search(`q=${encodeURIComponent(q)}&mode=terms`)
+      assert.equal(res.status, 200, `q=${JSON.stringify(q)} 不应报错: ${JSON.stringify(res.body)}`)
+      assert.equal(res.body['ok'], true)
+    }
+
+    // 语义：`a OR b` 的 ASCII 词元都短于 3 字符被剔除 → 词元为空 → 回退 LIKE → 字面匹配
+    const literal = await searchAs(h, `q=${encodeURIComponent('a OR b')}&mode=terms`, 'like')
+    assert.equal(literal.total, 1, 'ASCII 短词元被剔除后走 LIKE，仍是字面匹配')
+    assert.deepEqual(slugs(literal), ['p1'])
+
+    // 长 ASCII 词元：OR 必须是连接符，不得被当布尔语法（否则"缺席词贝塔"会去匹配别的行）
+    h.putPage('p2', '标题2', '正文含有唯一词阿尔法。')
+    const longAscii = await searchAs(h, `q=${encodeURIComponent('唯一词阿尔法 OR 缺席词贝塔')}&mode=terms`, 'fts')
+    assert.deepEqual(slugs(longAscii), ['p2'], 'OR 只作连接符；缺席词元不应命中任何行')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('词元检索：与短语路语义确实不同（同一查询两条路可同时成立）', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('p1', '甲', '检索增强问答先从知识库检索相关资料。')
+    // 既含整串（短语命中）又含各词元（词元命中）
+    const phrase = await searchAs(h, `q=${encodeURIComponent('检索增强问答')}`, 'fts')
+    const terms = await searchAs(h, `q=${encodeURIComponent('检索增强问答')}&mode=terms`, 'fts')
+    assert.equal(phrase.total, 1, '整串连续出现 → 短语路命中')
+    assert.ok(terms.total >= 1, '词元路同样命中')
+    assert.deepEqual(slugs(phrase), slugs(terms))
+  } finally {
+    h.dispose()
+  }
+})
+
+test('词元检索：REST 端点的 mode 参数校验与默认值', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('kb-1', '甲', '检索增强问答先从知识库检索相关资料。')
+    // 默认（不传 mode）= phrase：整句不连续出现 → 0
+    const dflt = await searchAs(h, `q=${encodeURIComponent('检索增强怎么做')}`, 'fts')
+    assert.equal(dflt.total, 0, '不传 mode 时保持既有短语语义（向后兼容）')
+    // 显式 mode=phrase 与默认一致
+    const explicit = await searchAs(h, `q=${encodeURIComponent('检索增强怎么做')}&mode=phrase`, 'fts')
+    assert.equal(explicit.total, 0)
+    // 非法 mode → 400（不静默降级成某个模式）
+    const bad = await h.search(`q=${encodeURIComponent('检索增强')}&mode=nope`)
+    assert.equal(bad.status, 400, `非法 mode 应 400，实际 ${bad.status}`)
+    assert.equal(bad.body['error'], 'invalid_mode')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('纯函数：buildTermQuery（CJK 3-gram / ASCII 切词 / 去重 / 空输入）', () => {
+  // CJK：长度 ≥3 的滑窗 3-gram，保持出现顺序
+  assert.deepEqual(buildTermQuery('检索增强怎么做'), ['检索增', '索增强', '增强怎', '强怎么', '怎么做'])
+  // 恰好 3 字 → 单个词元
+  assert.deepEqual(buildTermQuery('知识库'), ['知识库'])
+  // 2 字中文切不出 3-gram → 空（交由调用方回退 LIKE）
+  assert.deepEqual(buildTermQuery('检索'), [])
+  // ASCII：按空白与常见标点切词，只保留长度 ≥3
+  assert.deepEqual(buildTermQuery('full text search'), ['full', 'text', 'search'])
+  assert.deepEqual(buildTermQuery('a, ab, abc, abcd'), ['abc', 'abcd'])
+  // 数字按字面保留（≥3 字符才可能在 trigram 下命中；2 位数字如 "42" 在 MATCH 下恒为空）
+  assert.deepEqual(buildTermQuery('2024 报表'), ['2024'], '2 字 CJK 片段切不出 3-gram')
+  assert.deepEqual(buildTermQuery('2024 报表系统'), ['2024', '报表系', '表系统'])
+  // 去重：重复词元只留一次
+  assert.deepEqual(buildTermQuery('知识库 知识库'), ['知识库'])
+  // 中英混排：各自切分且顺序不乱
+  assert.deepEqual(buildTermQuery('知识库 FTS5 index'), ['知识库', 'FTS5', 'index'])
+  // 空/纯标点/纯空白 → 空数组
+  assert.deepEqual(buildTermQuery(''), [])
+  assert.deepEqual(buildTermQuery('。。！？'), [])
+  assert.deepEqual(buildTermQuery('   '), [])
+  assert.deepEqual(buildTermQuery('a b c'), [], '全部短于 3 字符 → 空')
+  // 边界：MIN_TRIGRAM_LENGTH 是切分依据（<3 的词元在 MATCH 下恒为空）
+  assert.equal(MIN_TRIGRAM_LENGTH, 3)
+  // 每个词元都能被 toFtsPhrase 安全转义（含引号）
+  for (const t of buildTermQuery('知识库"OR"x')) {
+    assert.match(toFtsPhrase(t), /^".*"$/, `词元应被包成字面短语: ${t}`)
+  }
 })

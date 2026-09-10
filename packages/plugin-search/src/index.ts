@@ -117,9 +117,11 @@ export interface SearchService {
    * 故两者在同 q 同 limit 下结果逐字段一致。
    *
    * @param q    查询串（调用方无需 trim，内部会 trim；trim 后为空则返回空结果）
-   * @param opts limit 为本次返回条数上限（1..100，非法值抛错——与端点的 400 语义对应）
+   * @param opts limit 为本次返回条数上限（1..100，非法值抛错——与端点的 400 语义对应）；
+   *             mode 为查询语义：`'phrase'`（默认）= 整串字面短语（搜索框语义），
+   *             `'terms'` = 切成词元后 OR（**问句检索**语义，RAG 用）。
    */
-  search(q: string, opts?: { limit?: number }): SearchResult
+  search(q: string, opts?: { limit?: number; mode?: SearchMode }): SearchResult
 
   /**
    * 按 slug 批量取整页正文，供 RAG 拼上下文。
@@ -166,6 +168,59 @@ export function escapeLike(text: string): string {
 export function toFtsPhrase(query: string): string {
   return `"${query.replace(/"/g, '""')}"`
 }
+
+/**
+ * 把查询切成**可检索词元**（`mode:'terms'` 用），每段分别加引号后以 OR 连接。
+ *
+ * 为什么需要它：`toFtsPhrase` 把**整串**当一个短语，于是自然语言问句
+ * （「检索增强怎么做」）要求正文里连续出现该整串——问句几乎不可能逐字出现在正文里，
+ * 结果恒为 0 命中（`/api/ai/ask` 的检索地基因此不可用）。防注入的正确姿势是
+ * "每个输入单元都当字面量"，而不是"把整句当一个单元"。
+ *
+ * 切分规则（由 trigram 分词器的硬约束决定：**短于 3 字符的 token 在 MATCH 下恒为空**，
+ * 因为索引用的是 3 字符片段）：
+ * - **CJK 连续片段**：取长度 3 的滑窗 3-gram（「检索增强怎么做」→ 检索增/索增强/…）。
+ *   取窗口而非整段，是为了让"词元在正文里出现"这一条件退化成"该 3-gram 在正文里出现"，
+ *   从而绕过 trigram 无法按词匹配的限制；长度 <3 的片段切不出词元，交由调用方回退 LIKE。
+ * - **ASCII/数字片段**：按空白与常见标点切词，只保留**长度 ≥3** 的词元（<3 在 MATCH 下
+ *   恒为空——实测 `MATCH '"42"'` 命中 0，即使正文含「42」）。
+ * - 去重且保持出现顺序（顺序稳定便于测试与排障）。
+ *
+ * **返回值不是 SQL**：调用方必须对每个词元调用 {@link toFtsPhrase} 再拼 OR——
+ * 本函数只负责"切词"，绝不负责"转义"，两者分开才能保证注入防护只有一处实现。
+ */
+export function buildTermQuery(q: string): string[] {
+  const terms: string[] = []
+  const push = (t: string): void => {
+    if (t.length >= MIN_TRIGRAM_LENGTH && !terms.includes(t)) terms.push(t)
+  }
+
+  // CJK 统一表意文字（含扩展 A 区与兼容区）：按"连续片段"取 3-gram。
+  // 用码点范围而非 \p{Script=Han}：后者依赖 Unicode 属性转义，且会把日文汉字等一并算入
+  // （本仓库语料以中文为主，码点范围更可控、无正则引擎差异）。
+  const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
+  const segments = q.split(/([\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+)/)
+
+  for (const seg of segments) {
+    if (seg === '') continue
+    if (CJK.test(seg)) {
+      // CJK 连续片段：滑窗 3-gram
+      const chars = [...seg]
+      for (let i = 0; i + MIN_TRIGRAM_LENGTH <= chars.length; i += 1) {
+        push(chars.slice(i, i + MIN_TRIGRAM_LENGTH).join(''))
+      }
+      continue
+    }
+    // 非 CJK 片段：按空白与常见标点切词，逐词判断长度
+    for (const word of seg.split(/[^\p{L}\p{N}_]+/u)) {
+      if (word !== '') push(word)
+    }
+  }
+  return terms
+}
+
+/** 一次检索的查询语义：`phrase` = 整串字面短语（默认，向后兼容）；`terms` = 词元 OR（问句检索） */
+export type SearchMode = 'phrase' | 'terms'
 
 /**
  * 自实现高亮片段（不用 FTS5 的 `snippet()`：trigram 下它上限约 64 token ≈ 中文 64 字，
@@ -236,7 +291,7 @@ export const SearchPlugin = {
      * 端点只负责把 HTTP 参数解析成 `(q, limit)` 并把结果包成响应体——
      * 若两处各写一份 SQL，迟早会出现"REST 与插件内检索结果不一致"的漂移。
      */
-    const search = (rawQuery: string, opts?: { limit?: number }): SearchResult => {
+    const search = (rawQuery: string, opts?: { limit?: number; mode?: SearchMode }): SearchResult => {
       assertLive()
       const q = (rawQuery ?? '').trim()
       // 空查询在这里返回空结果：空串传给 MATCH 会抛
@@ -252,30 +307,44 @@ export const SearchPlugin = {
         limit = opts.limit
       }
 
-      const useFts = q.length >= MIN_TRIGRAM_LENGTH
+      // 查询语义：phrase（默认，搜索框）与 terms（问句）**不改变返回结构**，
+      // 只决定"喂给 MATCH 的表达式"；两条路最终都落到同一个 FTS 查询与同一段排序逻辑。
+      const queryMode: SearchMode = opts?.mode ?? 'phrase'
+      // terms 模式先把查询切成词元；切不出词元（<3 字符、纯标点）时**回退 LIKE**——
+      // 不能构造空 MATCH（`MATCH ''` 抛 fts5 syntax error），也不该静默返回空结果：
+      // 短查询的正确答案由 LIKE 给出（与 <3 字符的短语路径完全一致）。
+      const terms = queryMode === 'terms' ? buildTermQuery(q) : []
+      const useFts = queryMode === 'terms' ? terms.length > 0 : q.length >= MIN_TRIGRAM_LENGTH
+
       let total: number
       let rows: SearchHitRow[]
       let mode: 'fts' | 'like'
       let scoreOf: (row: SearchHitRow) => number
 
       if (useFts) {
-        const phrase = toFtsPhrase(q)
+        // phrase：整串一个短语。terms：每个词元各自 toFtsPhrase（**仍字面、仍防注入**）后 OR 连接。
+        const matchExpr =
+          queryMode === 'terms' ? terms.map((t) => toFtsPhrase(t)).join(' OR ') : toFtsPhrase(q)
+        // total 必须是 **distinct 行数**：OR 会让同一行被多个词元各自命中，
+        // COUNT(*) 会把行数按命中次数重复计入（实测一行命中 2 个词元时 COUNT(*)=该行计 2 次），
+        // 而契约里 total 是"全量命中数"（与 hits 的行语义一致）。
         total = countOf(
           db.query<{ n: number }>(
-            `SELECT COUNT(*) AS n FROM pages_fts f JOIN pages p ON p.id = f.rowid WHERE f.pages_fts MATCH ?`,
-            [phrase],
+            `SELECT COUNT(DISTINCT p.id) AS n FROM pages_fts f JOIN pages p ON p.id = f.rowid WHERE f.pages_fts MATCH ?`,
+            [matchExpr],
           ),
         )
         rows = db.query<SearchHitRow>(
           `SELECT ${SELECT_COLUMNS}, f.rank AS score
              FROM pages_fts f JOIN pages p ON p.id = f.rowid
             WHERE f.pages_fts MATCH ? ORDER BY f.rank LIMIT ?`,
-          [phrase, limit],
+          [matchExpr, limit],
         )
         mode = 'fts'
         // BM25（FTS5 的 `rank`）原始值是**负的**，越小越相关；这里**取负**换成
         // "越大越相关"再对外。**这不是归一化**：值域没有界、量级随语料规模与查询词
         // 变化，故**只在同一次查询的结果内部可比**，跨查询（乃至跨库）比大小无意义。
+        // terms 模式下 BM25 天然让"命中词元更多"的行排前（OR 的相关度是各词元得分之和）。
         scoreOf = (row) => -(row.score ?? 0)
       } else {
         const pattern = `%${escapeLike(q)}%`
@@ -311,8 +380,11 @@ export const SearchPlugin = {
         hits: rows.map((row) => ({
           slug: row.slug,
           title: row.title,
-          // 片段优先取正文；正文没出现（例如只命中标题）时退回标题
-          snippet: buildSnippet(row.content, q, snippetRadius) ?? buildSnippet(row.title, q, snippetRadius) ?? '',
+          // 片段优先取正文；正文没出现（例如只命中标题）时退回标题。
+          // terms 模式下**不能用整句去定位**：问句本身不在正文里，那样每条命中都会
+          // snippet 为空、高亮消失（命中却看不到"为什么命中"）。故逐个词元试，取第一个
+          // 能在正文里定位到的词元作为锚点；都定位不到时退回整句（结果为 ''）。
+          snippet: snippetFor(row, terms, q, snippetRadius),
           score: scoreOf(row),
           updated_at: row.updated_at,
         })),
@@ -371,9 +443,33 @@ export const SearchPlugin = {
           limit = parsed
         }
 
+        // mode：不传 = phrase（搜索框语义，向后兼容）；非法值显式 400，
+        // 不静默降级——把 'term'/'keywords' 这类拼错当 phrase 会表现为"问了却没结果"，
+        // 正是最难定位的症状。
+        const modeRaw = h.url.searchParams.get('mode')
+        let queryMode: SearchMode = 'phrase'
+        if (modeRaw !== null && modeRaw !== '') {
+          if (modeRaw !== 'phrase' && modeRaw !== 'terms') {
+            h.json(400, {
+              ok: false,
+              error: 'invalid_mode',
+              message: `mode 须为 phrase 或 terms，实际 ${modeRaw}`,
+            })
+            return
+          }
+          queryMode = modeRaw
+        }
+
         // 查询本体完全交给 search()（单一实现）；端点只管 HTTP 层
-        const result = search(q, limit === undefined ? undefined : { limit })
-        h.json(200, { ok: true, query: q, mode: result.mode, total: result.total, hits: result.hits })
+        const result = search(q, { ...(limit === undefined ? {} : { limit }), mode: queryMode })
+        h.json(200, {
+          ok: true,
+          query: q,
+          mode: result.mode,
+          queryMode,
+          total: result.total,
+          hits: result.hits,
+        })
       }),
     )
 
@@ -397,4 +493,25 @@ export const SearchPlugin = {
 /** COUNT(*) 结果取值（SqliteDatabase 返回的行里字段名与别名一致） */
 function countOf(rows: { n: number }[]): number {
   return Number(rows[0]?.n ?? 0)
+}
+
+/**
+ * 取一条命中的高亮片段。
+ *
+ * phrase 模式：整串即锚点（行为与既有实现逐字一致）。
+ * terms 模式：整句通常不在正文里，故**按词元顺序**试锚点，取第一个能定位到的；
+ * 正文与标题都定位不到时退回整句（buildSnippet 返回 null，最终得到空串）——
+ * 与既有"只命中标题时退回标题片段"的降级链保持一致。
+ */
+function snippetFor(row: SearchHitRow, terms: readonly string[], q: string, radius: number): string {
+  const anchors = terms.length > 0 ? terms : [q]
+  for (const anchor of anchors) {
+    const content = buildSnippet(row.content, anchor, radius)
+    if (content !== null) return content
+  }
+  for (const anchor of anchors) {
+    const title = buildSnippet(row.title, anchor, radius)
+    if (title !== null) return title
+  }
+  return ''
 }

@@ -354,7 +354,11 @@ export const AiPlugin = {
       let total: number
       let contents: ReadonlyMap<string, string>
       try {
-        const result = search.search(query, { limit })
+        // **问句走 mode:'terms'**（词元 OR），而非搜索框的默认 'phrase'（整串短语）。
+        // 理由：本插件的入口就是**自然语言问句**（「检索增强怎么做」），而问句几乎不可能
+        // 逐字连续出现在正文里——按短语检索会恒为 0 命中，RAG 的检索地基等于不可用。
+        // 词元切分是 search 插件的单一实现（buildTermQuery），本插件不重复实现分词。
+        const result = search.search(query, { limit, mode: 'terms' })
         hits = result.hits
         retrievalMode = result.mode
         total = result.total
