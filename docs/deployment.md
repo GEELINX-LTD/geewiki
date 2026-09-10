@@ -79,6 +79,8 @@ GEEWIKI_PLUGINS_DIR=/app/plugins
 GEEWIKI_WEB_DIST=/app/packages/web/dist
 ```
 
+> **`GEEWIKI_PLUGIN_UI_DIST` 镜像内刻意不设**（已只读核实 `Dockerfile:96-103` 与 `docker-compose.yml:45-52`，两处都只固化 `GEEWIKI_WEB_DIST`）：该变量**缺省即回落 `GEEWIKI_WEB_DIST`**（`packages/server/src/index.ts:723-734`），因此镜像里"前端产物根"与"内置插件 UI 资产根"**指向同一个目录** `/app/packages/web/dist`（内置插件 UI 位于其下的 `plugins-ui/<插件名>/`，由镜像内 `vite build` 从 `packages/web/public/` 拷贝而来，见 `.dockerignore` **未排除** `packages/web/public/plugins-ui/` 与 `Dockerfile:111` 的 `COPY --from=builder /src/packages/web/dist /app/packages/web/dist`；**前提**是构建上下文里已有 `packages/web/public/plugins-ui/**`，即宿主机先跑过 `pnpm --filter @geewiki/web run build:fixtures`——该目录被 `.gitignore` 排除、不入版本库。**本次未实跑镜像构建，本段为只读核实 + 推断**）。**镜像行为与拆分前完全一致，无需显式设置**；只有当你想让插件 UI 走独立目录（如 dev 形态的 `packages/web/public`）时，才需要额外覆盖该变量。启动日志会同时打印两个根，相同的那一份带"（同静态产物根）"注记，便于核对。
+
 镜像自带 `HEALTHCHECK`（每 30s 请求 `/api/health`），判据是 **`ok:true` 且 `db.present:true`**（即服务在跑、SQLite 已连接），满足时 `docker compose ps` 显示 `healthy`；数据目录不可写等导致数据库插件激活失败的情况会如实显示 `unhealthy`（详见第 9 节）。
 
 ### 外部插件：镜像内不打包，只来自挂载
@@ -160,7 +162,8 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `GEEWIKI_DATA_DIR` | `/app/data` | SQLite 数据库与 `crash.marker` 所在目录 |
 | `GEEWIKI_CONFIG_DIR` | `/app/config` | 基础层/会话层插件清单目录 |
 | `GEEWIKI_PLUGINS_DIR` | `/app/plugins` | 外部插件发现根。**必须是绝对路径**：部署树里没有 `pnpm-workspace.yaml`，相对路径会回退到 `process.cwd()`，一旦覆盖工作目录就会**静默发现 0 个插件且不报错**（已实测：`-w /tmp` + `GEEWIKI_PLUGINS_DIR=plugins` 时发现根变为 `/tmp/plugins`、0 个插件、无任何告警） |
-| `GEEWIKI_WEB_DIST` | `/app/packages/web/dist` | 前端静态产物目录（后端托管 + SPA fallback） |
+| `GEEWIKI_WEB_DIST` | `/app/packages/web/dist` | **前端静态产物根**（app shell 的 `index.html`、`/assets/*`、SPA fallback；`null` = 不启用静态服务）。镜像内为绝对路径，与工作目录无关 |
+| `GEEWIKI_PLUGIN_UI_DIST` | **未设置**（= 回落 `GEEWIKI_WEB_DIST`） | **内置插件 UI 资产根**（含 `plugins-ui/<插件名>/` 的目录），是插件 UI 产物的**第二候选根**（第一候选根是插件自带的 `<插件目录>/dist`）。**缺省 = `GEEWIKI_WEB_DIST`**，故镜像内与静态产物根同值、无需设置。注意它与 `GEEWIKI_WEB_DIST` 的 **`null` 语义不同**（`pluginUiDist: null` = 不用内置根、只看插件自带产物；`webDist: null` = 不启用静态服务）——该区分只存在于 `ServerOptions`，环境变量层面留空即等同"未设置 = 回落" |
 
 ---
 

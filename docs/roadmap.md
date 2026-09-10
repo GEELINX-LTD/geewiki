@@ -41,13 +41,13 @@
   - `#/graph` 依赖图：React Flow 渲染插件 DAG（内置分层布局：被依赖方居左，无 dagre 依赖），状态着色节点 + 图例 + 缩放控件。
 - `packages/plugin-wiki`（`@geewiki/wiki` 核心业务插件，requires http+db，热授权）：
   - `GET/PUT/DELETE /api/pages(/:slug)` + `GET /api/pages/:slug/versions/:id`；upsert 幂等（内容未变不产生版本）；每次保存先快照旧正文至 `page_versions`；删除显式事务级联清历史；body 大小/形状校验。
-- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。**后续批次补充**：`/plugins-ui/**` 走**独立分支**（按名查根、不复用 `webDist` 根、**绝不 SPA fallback**，缺失即 404 `application/json`），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
+- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。**后续批次补充**：`/plugins-ui/**` 走**独立分支**（按名查根、**绝不 SPA fallback**，缺失即 404 `application/json`；其"内置根"由 `GEEWIKI_PLUGIN_UI_DIST` 指定、**缺省 = `webDist`**——app shell 产物根与内置插件 UI 资产根已拆为两个独立配置项，见 architecture §6 与 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 9 节），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
 
 **验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 15/15（`packages/manager/test/deps.test.ts` 8 例 + `manager.test.ts` 7 例）、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
 
 > 后续治理批次（同一实现期）在 `manager.test.ts` 增补崩溃自愈、persist 跳过失败条目、enable 事务性、看门狗决策、卸载排空与缓存清理等用例，并新增 `repo-paths.test.ts`（3 例，路径解析与进程工作目录解耦）与 `packages/server/test/router.test.ts`（11 例，覆盖 HTTP 路由排空/413/端口选项）；该批累计单测 **35/35**（deps 8 + manager 13 + repo-paths 3 + server 11）。
 >
-> **当前口径（插件 UI 入口表后端下发 + 缓存寿命修复后实跑）**：单测 **132/132 全绿** = `packages/web` **19**（`pluginUiPlan` 19）+ `packages/manager` **91**（`deps` 10 + `manager` 14 + `config` 36 + `discovery` 13 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/server` **22**（`registry` 3 + `router` 11 + `plugin-ui-static` 8），`pnpm typecheck` 7 个包 0 错误。**`packages/web` 自本轮起首次拥有单测**，入口是 `node --import tsx --test test/*.test.ts`（`packages/web/package.json` 的 `test` 脚本）。因此上文 Phase 2 验收里的 15/15 与本段的 35/35、以及此前的 72/72、81/81、87/87 均为**历史时点口径**，不代表当前工作树；契约迁移（`layer` = 持久化层、无 schema 插件接受原始 JSON）已完成、两条旧断言已随新契约更新，逐条记录见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 6 节与第 9 节。
+> **当前口径（插件 UI 入口表后端下发 + 缓存寿命修复 + 资产根配置拆分后实跑）**：单测 **134/134 全绿** = `packages/web` **19**（`pluginUiPlan` 19）+ `packages/manager` **91**（`deps` 10 + `manager` 14 + `config` 36 + `discovery` 13 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/server` **24**（`registry` 3 + `router` 11 + `plugin-ui-static` 10），`pnpm typecheck` 7 个包 0 错误。**`packages/web` 自本轮起首次拥有单测**，入口是 `node --import tsx --test test/*.test.ts`（`packages/web/package.json` 的 `test` 脚本）。因此上文 Phase 2 验收里的 15/15 与本段的 35/35、以及此前的 72/72、81/81、87/87、132/132 均为**历史时点口径**，不代表当前工作树；契约迁移（`layer` = 持久化层、无 schema 插件接受原始 JSON）已完成、两条旧断言已随新契约更新，逐条记录见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 6 节与第 9 节。
 
 ## Phase 3（候选）：AI 原生能力
 
@@ -57,7 +57,7 @@
 - [x] 插件 UI 入口表由后端下发 + 跟随插件生命周期自动同步（**已完成**）：入口表不再是静态 JSON（`/plugins-ui/registry.json` **已停用**），改由 `GET /api/plugins/ui` 从**活状态**现算（注册表 × 激活集合 × 产物 stat → `{ ok, version: 1, revision, plugins: { <name>: { entry, css?, rev } }, skipped }`；`skipped` 记 `inactive` / `no_client` / `entry_missing` / `invalid_name`），响应带 `cache-control: no-store` + `ETag`，`If-None-Match` 命中即 **304**（**空表仍 200**，永不 404）；前端 `syncPluginUi()`（幂等 + 单飞）按整表 `revision` 与逐插件 `rev` 的差集**先卸后装**，`startPluginUiSync({ intervalMs: 15000 })` 立即同步一次 + `visibilitychange` + 可见期轮询 → **UI 随插件启停自动出现/消失**（管理台动作即时，外部变更收敛上界 ≤15s）。**仍成立的边界**：**ESM 模块实例不回收**——`rev` 变化走 unload → load，同 URL 命中模块缓存，故**产物更新需整页刷新才生效**（见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 5 节 L-6）
 - [ ] LLM 组插件（OpenAI/Anthropic 示例，configSchema 含密码字段）+ RAG 检索管线
 - [ ] 编辑器组插件（Milkdown / TipTap 示例）替换 textarea
-- [ ] 插件级静态资源注入（每插件可携带前端资源目录，随激活挂载）——**部分落地**：插件 UI 已有"自带产物根"（`<插件目录>/dist` 优先于 `<webDist>/plugins-ui/<名>`，见 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`），但**只覆盖 UI 入口与样式两个单段文件名**（`entry` / `css`），**不支持任意资源目录、也不支持子目录资源**（字体/图片需内联进 bundle）
+- [ ] 插件级静态资源注入（每插件可携带前端资源目录，随激活挂载）——**部分落地**：插件 UI 已有"自带产物根"（`<插件目录>/dist` 优先于内置根 `<GEEWIKI_PLUGIN_UI_DIST>/plugins-ui/<名>`，见 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`；该内置根**缺省 = `GEEWIKI_WEB_DIST`**，两者已拆为独立配置项，见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 9 节），但**只覆盖 UI 入口与样式两个单段文件名**（`entry` / `css`），**不支持任意资源目录、也不支持子目录资源**（字体/图片需内联进 bundle）
 
 ## Phase 4（候选）：稳定性加固与生产化
 
