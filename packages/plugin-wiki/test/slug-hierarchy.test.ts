@@ -1,0 +1,429 @@
+/**
+ * 层级 slug（`guide/intro`）+ 列表排序稳定性 + 0002 迁移的测试。
+ *
+ * **本批要钉住的三件事**：
+ *
+ * 1. **路径式 slug 可用**。改造前 `SLUG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/`
+ *    不允许 `/`，因此无法表达层级（侧边栏页面树的前置条件）。本次先**实测**确认了
+ *    路由层会把 `%2F` 解码回 `/` 并作为**单个**路径参数交给处理器
+ *    （证据：`GET /api/pages/guide%2Fintro` 返回的是"路由已匹配"形态的 404
+ *    `{"error":"not_found","message":"页面不存在: guide/intro"}`，而路由**未**匹配时
+ *    返回的是 `{"error":"not_found","path":"/api/pages/guide/intro"}`），
+ *    故只需放开服务端的校验规则。
+ *
+ * 2. **列表排序必须有次级键**。`updated_at` 是 ISO 秒级字符串，并列很常见。
+ *    实测：同一份并列数据，无索引时单键排序得 `alpha,beta,gamma,delta,epsilon`，
+ *    加上 `(updated_at DESC, id DESC)` 索引后单键排序**完全反转**为
+ *    `epsilon,delta,gamma,beta,alpha` —— 也就是说"看起来稳定"的顺序会随查询计划
+ *    悄悄翻转。因此 `ORDER BY` 必须显式带 `p.id DESC`（本文件用"同一并列集合
+ *    连续多次读取结果一致 + 与 id 倒序一致"来钉住它）。
+ *
+ * 3. **0002 迁移幂等**：索引用 `IF NOT EXISTS`，且由 `db.migrate()` 包在单事务里执行。
+ *
+ * 测试策略沿用 `service.test.ts`：真实 SQLite（`node:sqlite`）+ 真实迁移文件 + 路由替身。
+ * 只读**真实**的 SQL 文件而不抄一份 DDL，避免与生产漂移。
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Readable } from 'node:stream'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { DatabaseSync } from 'node:sqlite'
+import type { Context } from 'cordis'
+import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
+import {
+  SLUG_HINT,
+  SLUG_MAX_DEPTH,
+  SLUG_MAX_LENGTH,
+  WikiPlugin,
+  isValidSlug,
+  type WikiService,
+} from '../src/index.js'
+
+/* ------------------------------ 夹具 ------------------------------ */
+
+/** db-sqlite 的真实迁移目录（0001 建表、0002 建排序索引） */
+const MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
+
+/** 按文件名序读出全部真实迁移 SQL（与 `db.migrate()` 的 `readdirSync().sort()` 同序） */
+function readAllMigrations(): { name: string; sql: string }[] {
+  return readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith('.sql'))
+    .sort()
+    .map((name) => ({ name, sql: readFileSync(join(MIGRATIONS_DIR, name), 'utf8') }))
+}
+
+/** `node:sqlite` 上的 DatabaseAdapter：只做同步转发，不含业务逻辑 */
+class NodeSqliteAdapter implements DatabaseAdapter {
+  readonly db: DatabaseSync
+
+  constructor(filename: string, schemaSql: string) {
+    this.db = new DatabaseSync(filename)
+    this.db.exec(schemaSql)
+  }
+
+  query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
+    return this.db.prepare(sql).all(...(params as never[])) as T[]
+  }
+
+  run(sql: string, params: unknown[] = []): RunResult {
+    const r = this.db.prepare(sql).run(...(params as never[]))
+    return { changes: Number(r.changes), lastInsertRowid: r.lastInsertRowid as number | bigint }
+  }
+
+  migrate(): void {
+    throw new Error('本夹具不实现 migrate（@geewiki/wiki 不调用它）')
+  }
+
+  listTables(): string[] {
+    return this.query<{ name: string }>(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
+    ).map((r) => r.name)
+  }
+
+  appliedMigrations(): string[] {
+    return []
+  }
+
+  transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN')
+    try {
+      const value = fn()
+      this.db.exec('COMMIT')
+      return value
+    } catch (err) {
+      this.db.exec('ROLLBACK')
+      throw err
+    }
+  }
+
+  close(): void {
+    this.db.close()
+  }
+}
+
+interface Harness {
+  adapter: NodeSqliteAdapter
+  ctx: Context
+  call(
+    method: string,
+    path: string,
+    params?: Record<string, string>,
+    body?: unknown,
+  ): Promise<{ status: number; body: Record<string, unknown> }>
+  svc(): WikiService
+  dispose(): void
+}
+
+function makeHarness(): Harness {
+  const dir = mkdtempSync(join(tmpdir(), 'gw-wiki-slug-'))
+  const adapter = new NodeSqliteAdapter(
+    join(dir, 'test.db'),
+    readAllMigrations()
+      .map((m) => m.sql)
+      .join('\n'),
+  )
+
+  const routes = new Map<string, RouteHandler>()
+  const routerService: HttpRouterService = {
+    register: (method, path, handler) => {
+      routes.set(`${method} ${path}`, handler)
+      return () => routes.delete(`${method} ${path}`)
+    },
+    stats: () => ({ total: 0, ok: 0, fail: 0, consecutiveFailures: 0, lastMs: 0, avgMs: 0 }),
+    inflight: () => 0,
+    pending: () => 0,
+    drain: () => Promise.resolve(true),
+  }
+  const services = new Map<string, unknown>([
+    ['db', adapter],
+    ['http', routerService],
+  ])
+  const ctx = {
+    get: (name: string) => services.get(name),
+    provide: (name: string, value: unknown) => {
+      services.set(name, value)
+      return () => {
+        if (services.get(name) === value) services.delete(name)
+      }
+    },
+  } as unknown as Context
+  const dispose = WikiPlugin.apply(ctx, { recentVersions: 10 }) as () => void
+
+  const call = (
+    method: string,
+    path: string,
+    params: Record<string, string> = {},
+    body?: unknown,
+  ): Promise<{ status: number; body: Record<string, unknown> }> => {
+    const handler = routes.get(`${method} ${path}`)
+    assert.ok(handler, `应已注册路由 ${method} ${path}`)
+    const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
+    const req = Readable.from(chunks) as unknown as IncomingMessage
+    ;(req as unknown as { headers: Record<string, string> }).headers =
+      body === undefined ? {} : { 'content-length': String(chunks[0]?.length ?? 0) }
+    return new Promise((resolve, reject) => {
+      const h: RouteHandlerContext = {
+        req,
+        res: { once: () => {} } as unknown as ServerResponse,
+        url: new URL(`http://localhost${path}`),
+        params,
+        json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
+      }
+      void Promise.resolve(handler(h)).catch(reject)
+    })
+  }
+
+  return {
+    adapter,
+    ctx,
+    call,
+    svc: () => {
+      const svc = ctx.get('wiki-service') as WikiService | undefined
+      assert.ok(svc, 'wiki-service 必须被 provide')
+      return svc
+    },
+    dispose: () => {
+      try {
+        dispose()
+      } finally {
+        adapter.close()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  }
+}
+
+/** 便捷：保存一篇页面（走真实端点） */
+const save = (h: Harness, slug: string, title = slug, content = 'x'): ReturnType<Harness['call']> =>
+  h.call('PUT', '/api/pages/:slug', { slug }, { title, content })
+
+/* ------------------ 1. 层级 slug：合法与非法（纯函数层） ------------------ */
+
+test('isValidSlug：扁平 slug 的判定与改造前逐字一致（回归保护）', () => {
+  for (const ok of ['a', '9', 'getting-started', 'a.b_c-d', `a${'b'.repeat(79)}`]) {
+    assert.equal(isValidSlug(ok), true, `${ok} 应当合法`)
+  }
+  for (const bad of ['', '.a', '-a', '_a', 'a b', 'a/b/'.slice(0, 2) + ' ', 'a!b', '中文']) {
+    assert.equal(isValidSlug(bad), false, `${bad} 应当非法`)
+  }
+  // 长度边界：≤80 合法、81 非法（既有预算不变）
+  assert.equal(`a${'b'.repeat(79)}`.length, SLUG_MAX_LENGTH)
+  assert.equal(isValidSlug(`a${'b'.repeat(80)}`), false)
+})
+
+test('isValidSlug：层级路径合法，且拒绝空段/前后斜杠/父目录段', () => {
+  for (const ok of ['guide/intro', 'a/b/c', 'guide/intro.v2', 'docs/api/rest_v1']) {
+    assert.equal(isValidSlug(ok), true, `${ok} 应当合法`)
+  }
+  for (const bad of [
+    '/guide', // 以 / 开头 → 首段为空
+    'guide/', // 以 / 结尾 → 末段为空
+    'a//b', // 空段
+    'guide/../etc', // `..` 段（首字符必须字母数字 ⇒ 被逐段字符集拒绝）
+    '..',
+    '.',
+    'guide/.hidden', // 段以点开头
+    'guide/-x',
+  ]) {
+    assert.equal(isValidSlug(bad), false, `${bad} 应当非法（路径逃逸/空段防护）`)
+  }
+  // 深度上限
+  assert.equal(isValidSlug(Array.from({ length: SLUG_MAX_DEPTH }, () => 'a').join('/')), true)
+  assert.equal(isValidSlug(Array.from({ length: SLUG_MAX_DEPTH + 1 }, () => 'a').join('/')), false)
+})
+
+test('isValidSlug：保留段被拒——首段 search/ask/new/list、第二段 edit', () => {
+  // 首段保留：这些会被前端 hash 路由吃掉，建得出来也打不开
+  for (const first of ['search', 'ask', 'new', 'list']) {
+    assert.equal(isValidSlug(first), false, `${first} 作为首段应当非法`)
+    assert.equal(isValidSlug(`${first}/child`), false, `${first}/child 应当非法`)
+  }
+  // 第二段保留：`<slug>/edit` 是编辑路由
+  assert.equal(isValidSlug('guide/edit'), false)
+  // `edit` 出现在**第二段**一律拒绝——包括更深的 `guide/edit/intro`：
+  // 前端把"第二段是 edit"整体解释为编辑路由，故这种路径无法被无歧义地打开。
+  assert.equal(isValidSlug('guide/edit/intro'), false, 'edit 在第二段时，无论后面还有几段都拒绝')
+  // 但同名字符串出现在**其它位置**时不受限（避免过度拒绝）
+  assert.equal(isValidSlug('guide/search'), true, 'search 只在首段保留')
+  assert.equal(isValidSlug('edit'), true, 'edit 作为首段（单段）合法')
+  assert.equal(isValidSlug('edit/intro'), true, 'edit 在首段、intro 在第二段 ⇒ 合法')
+  assert.equal(isValidSlug('guide/intro/edit'), true, 'edit 在第三段不受限')
+})
+
+/* ------------------ 2. 层级 slug：端点往返（集成层） ------------------ */
+
+test('层级 slug 的完整 CRUD 往返：PUT → GET → 列表 → 版本 → DELETE', async () => {
+  const h = makeHarness()
+  try {
+    // PUT 新建
+    const put = await save(h, 'guide/intro', '入门', '第一版正文')
+    assert.equal(put.status, 200)
+    assert.equal(put.body['slug'], 'guide/intro', 'slug 必须原样往返（不被解码/截断）')
+    assert.equal(put.body['outcome'], 'created')
+
+    // GET 详情
+    const got = await h.call('GET', '/api/pages/:slug', { slug: 'guide/intro' })
+    assert.equal(got.status, 200)
+    assert.equal(got.body['slug'], 'guide/intro')
+    assert.equal(got.body['title'], '入门')
+    assert.equal(got.body['content'], '第一版正文')
+
+    // 列表里出现，且 slug 带斜杠
+    const list = await h.call('GET', '/api/pages')
+    const slugs = (list.body['pages'] as { slug: string }[]).map((p) => p.slug)
+    assert.ok(slugs.includes('guide/intro'), `列表应含 guide/intro，实际 ${JSON.stringify(slugs)}`)
+
+    // 更新（产生历史快照）
+    const put2 = await save(h, 'guide/intro', '入门', '第二版正文')
+    assert.equal(put2.body['outcome'], 'updated')
+    assert.equal(put2.body['version'], 2)
+
+    // 版本端点可用（该端点路径段更多，是 %2F 解码的额外验证点）
+    // 注意：要**重新读取**详情才有更新后的历史（第一次的 got 取自更新之前）
+    const afterUpdate = await h.call('GET', '/api/pages/:slug', { slug: 'guide/intro' })
+    const versions = (afterUpdate.body['versions'] as { id: number }[]) ?? []
+    assert.ok(versions.length >= 1, `更新后应至少有 1 条历史版本，实际 ${JSON.stringify(versions)}`)
+    const vid = versions[0]!.id
+    const ver = await h.call('GET', '/api/pages/:slug/versions/:id', { slug: 'guide/intro', id: String(vid) })
+    assert.equal(ver.status, 200)
+    assert.equal(ver.body['content'], '第一版正文')
+
+    // DELETE
+    const del = await h.call('DELETE', '/api/pages/:slug', { slug: 'guide/intro' })
+    assert.equal(del.status, 200)
+    assert.equal(del.body['deleted'], 'guide/intro')
+    const after = await h.call('GET', '/api/pages/:slug', { slug: 'guide/intro' })
+    assert.equal(after.status, 404)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('多级 slug（a/b/c）同样往返一致，且与扁平 slug 互不干扰', async () => {
+  const h = makeHarness()
+  try {
+    await save(h, 'a', '顶层')
+    await save(h, 'a/b', '二级')
+    await save(h, 'a/b/c', '三级')
+
+    for (const slug of ['a', 'a/b', 'a/b/c']) {
+      const got = await h.call('GET', '/api/pages/:slug', { slug })
+      assert.equal(got.status, 200, `${slug} 应可读取`)
+      assert.equal(got.body['slug'], slug)
+    }
+    // 不是前缀匹配语义：删 a/b 不应影响 a 与 a/b/c
+    await h.call('DELETE', '/api/pages/:slug', { slug: 'a/b' })
+    assert.equal((await h.call('GET', '/api/pages/:slug', { slug: 'a' })).status, 200)
+    assert.equal((await h.call('GET', '/api/pages/:slug', { slug: 'a/b/c' })).status, 200)
+    assert.equal((await h.call('GET', '/api/pages/:slug', { slug: 'a/b' })).status, 404)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('非法 slug 经端点仍返回 400 invalid_slug（错误语义不变）', async () => {
+  const h = makeHarness()
+  try {
+    for (const bad of ['search/x', 'guide/edit', 'a//b', 'guide/', 'guide/../x', 'x'.repeat(81) + '/y']) {
+      const res = await save(h, bad)
+      assert.equal(res.status, 400, `${bad} 应 400`)
+      assert.equal(res.body['error'], 'invalid_slug', `${bad} 错误码应为 invalid_slug`)
+      assert.equal(res.body['message'], SLUG_HINT, '错误文案应来自同一份 SLUG_HINT')
+    }
+    // 服务层同口径（消息前缀即错误码）
+    assert.throws(() => h.svc().save('search/x', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
+    assert.throws(() => h.svc().save('guide/../etc', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------ 3. 排序稳定性（并列 updated_at） ------------------ */
+
+test('列表排序稳定：updated_at 全部并列时，顺序由 id DESC 决定且可重复', async () => {
+  const h = makeHarness()
+  try {
+    const slugs = ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
+    for (const s of slugs) await save(h, s)
+
+    // 制造并列：把所有 updated_at 改成同一个值（模拟批量导入）
+    h.adapter.db.prepare('UPDATE pages SET updated_at = ?').run('2026-01-01T00:00:00.000Z')
+
+    const order = async (): Promise<string[]> =>
+      ((await h.call('GET', '/api/pages')).body['pages'] as { slug: string }[]).map((p) => p.slug)
+
+    const first = await order()
+    // 次级键为 id DESC ⇒ 后插入的（id 更大）排前面，与插入顺序**相反**
+    assert.deepEqual(first, ['epsilon', 'delta', 'gamma', 'beta', 'alpha'])
+
+    // 连续多次读取必须完全一致（否则分页/侧边栏会漏项或重项）
+    for (let i = 0; i < 5; i++) {
+      assert.deepEqual(await order(), first, `第 ${i + 2} 次读取顺序应与首次一致`)
+    }
+
+    // 打破并列后仍按 updated_at 优先
+    h.adapter.db.prepare('UPDATE pages SET updated_at = ? WHERE slug = ?').run('2030-01-01T00:00:00.000Z', 'alpha')
+    assert.deepEqual((await order())[0], 'alpha', 'updated_at 更新者应排最前')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('列表排序：分页切片不重不漏（同一并列集合）', async () => {
+  const h = makeHarness()
+  try {
+    for (const s of ['p1', 'p2', 'p3', 'p4', 'p5']) await save(h, s)
+    h.adapter.db.prepare('UPDATE pages SET updated_at = ?').run('2026-01-01T00:00:00.000Z')
+
+    const all = ((await h.call('GET', '/api/pages')).body['pages'] as { slug: string }[]).map((p) => p.slug)
+    // 模拟"每页 2 条"的两页拼接：顺序确定 ⇒ 拼接结果必须等于整表顺序，且无重复
+    const page1 = all.slice(0, 2)
+    const page2 = all.slice(2, 4)
+    const merged = [...page1, ...page2]
+    assert.equal(new Set(merged).size, merged.length, '分页拼接不得出现重复项')
+    assert.deepEqual(merged, all.slice(0, 4), '分页拼接应等于整表的前 4 条')
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------ 4. 0002 迁移 ------------------ */
+
+test('0002 迁移：建出排序索引、可重复执行（幂等）、且与查询计划相符', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gw-mig-'))
+  const db = new DatabaseSync(join(dir, 'm.db'))
+  try {
+    const migrations = readAllMigrations()
+    assert.ok(
+      migrations.some((m) => m.name === '0002_pages_updated_at_index.sql'),
+      `迁移目录应含 0002，实际 ${JSON.stringify(migrations.map((m) => m.name))}`,
+    )
+
+    // 逐文件执行（与 db.migrate() 同序）；0002 的 IF NOT EXISTS 允许重放
+    for (const m of migrations) db.exec(m.sql)
+    for (const m of migrations) db.exec(m.sql) // 重放：不得抛错
+
+    const indexes = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pages'`)
+      .all() as { name: string }[]
+    const names = indexes.map((i) => i.name)
+    assert.ok(names.includes('idx_pages_updated_at'), `应建出 idx_pages_updated_at，实际 ${JSON.stringify(names)}`)
+
+    // 查询计划应使用该索引（而不是临时 B 树）——这正是加索引的目的
+    const plan = (
+      db.prepare('EXPLAIN QUERY PLAN SELECT slug FROM pages ORDER BY updated_at DESC, id DESC').all() as {
+        detail: string
+      }[]
+    )
+      .map((r) => r.detail)
+      .join(' | ')
+    assert.match(plan, /idx_pages_updated_at/, `计划应走新索引，实际：${plan}`)
+    assert.doesNotMatch(plan, /TEMP B-TREE/, `不应再需要临时 B 树，实际：${plan}`)
+  } finally {
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

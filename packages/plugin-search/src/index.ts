@@ -61,6 +61,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/search',
   version: '0.1.0',
   geewiki: {
+    displayName: '全文检索',
+    description: '为页面标题与正文建立全文索引，支持中文与英文关键词检索',
     provides: 'search-service',
     // 依赖以服务标识声明（非具体插件名）：数据库切换（SQLite→PG）对业务插件透明，
     // 依赖边由管理器按 provides 解析（deps.ts resolveDependency）

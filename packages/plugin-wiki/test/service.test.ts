@@ -29,7 +29,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
-import { WikiPlugin, manifest, type WikiService } from '../src/index.js'
+import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
 /* ------------------------------ 夹具 ------------------------------ */
 
@@ -384,7 +384,9 @@ test('端点既有错误语义未被本次重构改变（invalid_slug 400 / 未�
     const badSlug = await h.call('PUT', '/api/pages/:slug', { slug: '../etc/passwd' }, { title: 't', content: 'c' })
     assert.equal(badSlug.status, 400)
     assert.equal(badSlug.body['error'], 'invalid_slug')
-    assert.equal(badSlug.body['message'], '页面标识非法：须以字母或数字开头，仅含 a-z 0-9 . _ -，≤80 字符')
+    // 断言与端点共用同一份 SLUG_HINT（不再硬编码文案：规则升级文案必然变化，
+    // 硬编码会让"文案改了"被误报成"语义坏了"。本用例要守的是状态码+错误码+文案同源）
+    assert.equal(badSlug.body['message'], SLUG_HINT)
 
     const unknownField = await h.call('PUT', '/api/pages/:slug', { slug: 'ok' }, { title: 't', content: 'c', nope: 1 })
     assert.equal(unknownField.status, 400)

@@ -11,7 +11,7 @@
     "dev:web": "pnpm --filter @geewiki/web run dev",
     "build": "pnpm -r --if-present run build",
     "start": "tsx packages/server/src/index.ts",
-    "typecheck": "pnpm -r --if-present run typecheck",
+    "typecheck": "pnpm -r --no-bail --if-present run typecheck",
     "test": "pnpm -r --no-bail --if-present run test"
   },
   "engines": {

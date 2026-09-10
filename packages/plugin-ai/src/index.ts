@@ -152,6 +152,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/ai',
   version: '0.1.0',
   geewiki: {
+    displayName: '智能问答',
+    description: '先检索相关资料再交给大模型作答；未配置模型时退回检索结果与摘要',
     provides: 'ai-service',
     // 一律按**服务标识**依赖（非插件名）：数据库/检索/模型都可整体替换而对本插件透明。
     // 四个依赖也正好是"没有 key 也完整可用"的最小闭环：http + db + search 已足够出结果。

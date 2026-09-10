@@ -387,3 +387,48 @@ test('scanPluginDirs：插件根不是目录 → 返回空并记 issue（旧实�
     cleanup()
   }
 })
+
+/* ---------------- 展示字段必须能穿过外部清单解析（无白名单裁剪） ---------------- */
+
+test('外部清单：displayName/description 被完整解析（证明 manifest 无字段白名单裁剪）', async () => {
+  const { root, cleanup } = makeRoot()
+  try {
+    // ① 纯函数层：package.json#geewiki 与独立清单都要保留这两个字段
+    const fromPkg = parsePluginManifest(
+      {
+        name: '@x/named',
+        version: '1.0.0',
+        geewiki: { displayName: '外部插件示例', description: '演示从 plugins/ 目录加载插件', provides: 'x' },
+      },
+      undefined,
+    )
+    assert.equal(fromPkg.geewiki.displayName, '外部插件示例')
+    assert.equal(fromPkg.geewiki.description, '演示从 plugins/ 目录加载插件')
+
+    const fromStandalone = parsePluginManifest(undefined, {
+      name: '@x/standalone',
+      version: '1.0.0',
+      geewiki: { displayName: '独立清单', description: '走 geewiki.manifest.json' },
+    })
+    assert.equal(fromStandalone.geewiki.displayName, '独立清单')
+    assert.equal(fromStandalone.geewiki.description, '走 geewiki.manifest.json')
+
+    // ② 端到端：真实目录发现后，字段仍在注册表条目里（供 /api/plugins 快照透传）
+    writePlugin(root, 'named-plugin', {
+      pkg: {
+        name: '@ext/named',
+        version: '1.0.0',
+        geewiki: { displayName: '命名插件', description: '一句话说明', entry: 'index.js' },
+      },
+      entryFile: 'index.js',
+      entryContent: 'export default { name: "@ext/named", apply() { return () => {} } }\n',
+    })
+    const result = await loadExternalPlugins({ root, log: () => {} })
+    const found = result.plugins.find((p) => p.name === '@ext/named')
+    assert.ok(found, '应发现该外部插件')
+    assert.equal(found.manifest.geewiki.displayName, '命名插件', '展示字段不得在发现期被丢弃')
+    assert.equal(found.manifest.geewiki.description, '一句话说明')
+  } finally {
+    cleanup()
+  }
+})

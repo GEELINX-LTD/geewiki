@@ -105,6 +105,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/wiki',
   version: '0.1.0',
   geewiki: {
+    displayName: '知识库页面',
+    description: '创建、编辑与删除页面，并保留每次保存的历史版本',
     provides: 'wiki-service',
     // 依赖以服务标识声明（非具体插件名）：数据库切换（SQLite→PG）对业务插件透明，
     // 依赖边由管理器按 provides 解析（deps.ts resolveDependency）
@@ -174,18 +176,69 @@ function readBody(h: RouteHandlerContext, limit = 1_000_000): Promise<unknown> {
   })
 }
 
-/** slug 服务端校验正则（与前端 WikiPage 一致）：字母/数字开头，仅 a-z 0-9 . _ -，≤80 字符 */
-const SLUG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
+/**
+ * 单个 slug 段的字符集：字母或数字开头，仅含 a-z A-Z 0-9 . _ -。
+ *
+ * 与改造前的整串正则**逐字相同**，只是现在应用到**每一段**而不是整串——
+ * 因此既有扁平 slug（`getting-started`）的判定结果一字未变。
+ * 该正则天然拒绝：空段、以 `.`/`-`/`_` 开头的段、含 `/` 以外的特殊字符、以及 `..`。
+ */
+const SLUG_SEGMENT_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/
+
+/** slug 总长上限（沿用既有 ≤80 的预算；层级路径的各段共享这一预算） */
+export const SLUG_MAX_LENGTH = 80
+
+/** 层级深度上限：超过即拒绝（避免无意义的极深嵌套） */
+export const SLUG_MAX_DEPTH = 8
+
+/**
+ * 会被**前端路由吃掉**的保留首段：这些路径永远进不了详情页。
+ * 与服务端无关，但若允许创建，用户会得到一个"建得出来却打不开"的页面。
+ *   来源：`packages/web/src/pages/WikiPage.tsx` 的 hash 路由分发
+ *
+ * 导出是刻意的：**这里是单一事实来源**，前端的镜像规则应当消费它而不是各写一份
+ * （前端目前仍是自己的副本，待其批次对齐）。
+ */
+export const RESERVED_FIRST_SEGMENTS: ReadonlySet<string> = new Set(['search', 'ask', 'new', 'list'])
+
+/** 第二段为该值时是"编辑"路由（`<slug>/edit`），故不能作为页面路径的第二段 */
+export const RESERVED_SECOND_SEGMENT = 'edit'
+
+/**
+ * slug 是否合法（**端点与服务共用的唯一判定**）。
+ *
+ * 规则（自本批起支持 `/` 分层）：
+ *   - 非空，总长 ≤ {@link SLUG_MAX_LENGTH}，段数 ≤ {@link SLUG_MAX_DEPTH}
+ *   - 每段都满足 {@link SLUG_SEGMENT_RE}（⇒ 拒绝空段、首尾斜杠、`.`/`..`、非法字符）
+ *   - 首段不在 {@link RESERVED_FIRST_SEGMENTS}，第二段不是 {@link RESERVED_SECOND_SEGMENT}
+ *
+ * 为什么不用单个正则：保留段判定依赖"第几段"的位置语义，正则表达力用尽也难读；
+ * 拆成"逐段字符集 + 位置规则"两件事后，每条规则都能单独测试。
+ */
+export function isValidSlug(slug: unknown): slug is string {
+  if (typeof slug !== 'string') return false
+  if (slug.length === 0 || slug.length > SLUG_MAX_LENGTH) return false
+  const segs = slug.split('/')
+  if (segs.length > SLUG_MAX_DEPTH) return false
+  // 逐段校验同时覆盖了：空段（`a//b`、首尾斜杠）、`.`/`..`（首字符必须字母数字）
+  for (const seg of segs) {
+    if (!SLUG_SEGMENT_RE.test(seg)) return false
+  }
+  if (RESERVED_FIRST_SEGMENTS.has(segs[0] as string)) return false
+  if (segs.length >= 2 && segs[1] === RESERVED_SECOND_SEGMENT) return false
+  return true
+}
 
 /** slug 非法时的提示文案（端点与服务共用同一份文案） */
-export const SLUG_HINT = '页面标识非法：须以字母或数字开头，仅含 a-z 0-9 . _ -，≤80 字符'
+export const SLUG_HINT =
+  '页面标识非法：每段须以字母或数字开头，仅含 a-z 0-9 . _ -；可用 / 分层；总长 ≤80 字符；首段不能是 search/ask/new/list，第二段不能是 edit'
 
 /**
  * slug 校验（服务层入口）：非法即抛错。消息以 `invalid_slug: ` 开头——
  * 沿用本插件"消息前缀即错误码"的既有约定（端点据前缀/码分流 400/413）。
  */
 function assertValidSlug(slug: string): void {
-  if (!SLUG_RE.test(slug)) throw new Error(`invalid_slug: ${SLUG_HINT}`)
+  if (!isValidSlug(slug)) throw new Error(`invalid_slug: ${SLUG_HINT}`)
 }
 
 /**
@@ -234,13 +287,23 @@ export const WikiPlugin = {
      * 服务方法只负责入参校验后转发——两条路径因此不可能行为漂移。
      * ------------------------------------------------------------------- */
 
-    /** 页面摘要列表（按 updated_at 倒序；version = 历史快照数 + 1） */
+    /**
+     * 页面摘要列表（按 updated_at 倒序；version = 历史快照数 + 1）。
+     *
+     * **次级键 `p.id DESC` 不是装饰，是正确性要求**：`updated_at` 是秒级 ISO 字符串，
+     * 批量导入/脚本创建时极易出现完全相同的时间戳，此时单键排序的结果**取决于查询计划**。
+     * 实测（同一份并列数据）：
+     *   - 无索引（`SCAN pages` + 临时 B 树）→ `alpha,beta,gamma,delta,epsilon`
+     *   - 加上 `(updated_at DESC, id DESC)` 索引（`SCAN pages USING INDEX …`）→ **完全反转**
+     * 即"看起来稳定"的顺序会在加索引那一刻悄悄翻转——分页/侧边栏会因此漏项或重项。
+     * 显式 tiebreaker 让顺序由 SQL 决定，而非由计划决定。
+     */
     const listPages = (): WikiPageSummary[] =>
       db
         .query<PageRow>(
           `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at,
                   (SELECT COUNT(*) FROM page_versions v WHERE v.page_id = p.id) AS version_count
-             FROM pages p ORDER BY p.updated_at DESC`,
+             FROM pages p ORDER BY p.updated_at DESC, p.id DESC`,
         )
         .map((r) => ({
           slug: r.slug,
@@ -398,7 +461,7 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('PUT', '/api/pages/:slug', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!SLUG_RE.test(slug)) {
+        if (!isValidSlug(slug)) {
           h.json(400, {
             ok: false,
             error: 'invalid_slug',

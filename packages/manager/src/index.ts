@@ -173,6 +173,13 @@ export interface ManagerConfig {
 export interface PluginSnapshot {
   name: string
   version: string
+  /**
+   * **面向人的短名称**（manifest `geewiki.displayName`）。缺失时管理台回退到 `name`（包名）。
+   * 纯展示字段，不参与任何运行时判定。
+   */
+  displayName?: string
+  /** **一句话说明**（manifest `geewiki.description`）；缺失时界面隐藏说明区域，勿用包名冒充 */
+  description?: string
   state: 'active' | 'inactive' | 'error'
   layer: Layer | null
   hotReloadable: boolean
@@ -343,6 +350,9 @@ export class GeeWikiManager {
     return {
       name,
       version: m.version,
+      // 面向人的展示字段：直接透传，缺失即 undefined（管理台自行回退到包名/隐藏说明）
+      displayName: m.geewiki.displayName,
+      description: m.geewiki.description,
       state: p?.active ? 'active' : p?.error ? 'error' : 'inactive',
       layer: p?.layer ?? null,
       hotReloadable: m.geewiki.runtime?.supportsHotReload === true,

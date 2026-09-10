@@ -5,6 +5,8 @@
   "type": "module",
   "description": "GeeWiki 示例插件：演示「插件自带前端 UI 产物」这条链路（计数器 + 错误边界演示件），不属于内置产品功能",
   "geewiki": {
+    "displayName": "插件界面示例",
+    "description": "演示插件如何向管理界面贡献自己的 UI（计数器与错误隔离演示件）",
     "provides": "ui-demo-service",
     "requires": ["http-service"],
     "runtime": {

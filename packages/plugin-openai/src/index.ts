@@ -78,6 +78,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/openai',
   version: '0.1.0',
   geewiki: {
+    displayName: 'OpenAI 兼容模型',
+    description: '接入 OpenAI 兼容的模型服务（如 DeepSeek），支持流式回答',
     // 无 provides：它只往 llm-service 注册路由，不对外提供新服务
     provides: undefined,
     // 按**服务 token**依赖（不是插件名）：换成别的注册表实现也无需改这里

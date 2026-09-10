@@ -5,6 +5,8 @@
   "type": "module",
   "description": "GeeWiki 外部插件示例：零依赖，演示 plugins/ 目录发现 + 会话层热插拔 + 自带前端 UI 产物",
   "geewiki": {
+    "displayName": "外部插件示例",
+    "description": "演示如何从 plugins/ 目录加载插件：注册一个接口，并自带前端界面",
     "provides": "hello-service",
     "requires": ["http-service"],
     "runtime": {

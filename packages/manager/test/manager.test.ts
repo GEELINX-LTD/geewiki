@@ -109,6 +109,9 @@ function plugin(
     cold?: boolean
     drainTimeout?: number
     cachePurge?: boolean
+    /** 面向人的展示字段（可选；缺失即 undefined，用于验证向后兼容） */
+    displayName?: string
+    description?: string
   } = {},
 ): RegisteredPlugin {
   return {
@@ -117,6 +120,8 @@ function plugin(
       name,
       version: '1.0.0',
       geewiki: {
+        displayName: opts.displayName,
+        description: opts.description,
         requires: opts.requires ?? [],
         conflictGroup: opts.conflictGroup,
         runtime: {
@@ -591,6 +596,48 @@ test('requiresCachePurge：单个监听器抛错不影响其余监听器（emit 
     await m.disposeAll()
     assert.deepEqual(called, ['first', 'second:@t/cache'], '抛错的监听器不得阻断后续监听器')
     assert.equal(snapshotOf(m, '@t/cache').state, 'inactive', '缓存清理失败不影响卸载结果')
+  } finally {
+    env.cleanup()
+  }
+})
+
+/* --------------- 面向人的展示字段（displayName / description） --------------- */
+
+test('快照：透传 manifest 的 displayName/description，供管理台替代包名展示', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    const m = makeManager(env, [
+      plugin('@t/named', log, { displayName: '知识库页面', description: '创建、编辑与删除页面，并保留历史版本' }),
+    ])
+    await m.boot()
+
+    const s = snapshotOf(m, '@t/named')
+    assert.equal(s.displayName, '知识库页面')
+    assert.equal(s.description, '创建、编辑与删除页面，并保留历史版本')
+    // 展示字段是纯元数据：不得影响既有运行时判定
+    assert.equal(s.state, 'inactive', '未激活状态不受展示字段影响')
+    assert.equal(s.source, 'builtin')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('快照：未声明 displayName/description 时为 undefined 且不报错（向后兼容）', async () => {
+  const env = makeEnv()
+  try {
+    const log: string[] = []
+    // 老插件（manifest 只有 requires/runtime）必须照常工作：界面回退到包名
+    const m = makeManager(env, [plugin('@t/legacy', log, { requires: [] })])
+    await m.boot()
+
+    const s = snapshotOf(m, '@t/legacy')
+    assert.equal(s.displayName, undefined, '未声明 → undefined（界面据此回退到包名）')
+    assert.equal(s.description, undefined, '未声明 → undefined（界面据此隐藏说明区域）')
+    // 关键：字段必须是「存在且为 undefined」，而不是抛错或缺字段导致 JSON 序列化异常
+    const json = JSON.parse(JSON.stringify(s)) as Record<string, unknown>
+    assert.ok('displayName' in s, '属性应存在（值为 undefined）')
+    assert.equal(json['name'], '@t/legacy', '快照仍可正常序列化')
   } finally {
     env.cleanup()
   }

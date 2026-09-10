@@ -62,6 +62,22 @@ export interface GeeWikiClient {
 
 /** `geewiki` 命名空间：插件元数据 */
 export interface GeeWikiMeta {
+  /**
+   * **面向人的短名称**（如「SQLite 数据库」「全文检索」）。
+   *
+   * 用途：管理台等界面用它替代 npm 包名展示，让非开发者也能看懂这是什么插件。
+   * **缺失时的回退语义**：界面必须回退到 `name`（包名）。该字段是纯展示用的可选元数据，
+   * 不参与依赖解析、冲突组或任何运行时判定，缺失不得导致报错或功能缺失。
+   */
+  displayName?: string
+  /**
+   * **一句话说明这个插件做什么**（面向用户，非开发者；如「创建、编辑与删除页面，并保留历史版本」）。
+   *
+   * 用途：管理台的插件说明、配置面板的引导文案。
+   * **缺失时的回退语义**：界面应隐藏说明区域（或留空），**不要**拿包名或技术字段
+   * （`provides` / `conflictGroup` / `layer` 等）冒充说明——那些是机器标识，对用户无意义。
+   */
+  description?: string
   /** 对外提供的服务/能力标识（如 "database-provider"、"ai-service"），供其他插件 requires 引用 */
   provides?: string
   /** 依赖的插件/服务标识列表（如 ["@geewiki/core"]）；加载时自动递归加载未激活的依赖项 */

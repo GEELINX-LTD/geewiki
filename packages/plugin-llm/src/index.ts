@@ -98,6 +98,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/llm',
   version: '0.1.0',
   geewiki: {
+    displayName: '模型接入',
+    description: '为大模型服务商提供统一的接入契约；本身不含任何模型实现',
     provides: 'llm-service',
     requires: [],
     conflictGroup: undefined,

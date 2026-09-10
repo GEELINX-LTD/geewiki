@@ -30,6 +30,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/echo',
   version: '0.1.0',
   geewiki: {
+    displayName: '回显示例',
+    description: '演示用插件：原样回显请求内容，可用于连通性检查',
     // 这里**刻意不声明 `provides`**（曾写 `provides: 'echo-service'`，已撤销）。
     // 原因：manifest 的 provides 只是**依赖图谱 token**，不会创建任何 cordis 服务。
     // 本插件从未 `ctx.provide('echo-service', …)`，所以那是一个**谎报的 token**——

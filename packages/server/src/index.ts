@@ -64,6 +64,8 @@ export const httpManifest: GeeWikiManifest = {
   name: '@geewiki/http',
   version: '0.1.0',
   geewiki: {
+    displayName: 'Web 服务',
+    description: '提供网页访问与 REST 接口，并托管前端静态资源',
     provides: 'http-service',
     requires: [],
     runtime: {
