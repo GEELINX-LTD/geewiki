@@ -41,22 +41,23 @@
   - `#/graph` 依赖图：React Flow 渲染插件 DAG（内置分层布局：被依赖方居左，无 dagre 依赖），状态着色节点 + 图例 + 缩放控件。
 - `packages/plugin-wiki`（`@geewiki/wiki` 核心业务插件，requires http+db，热授权）：
   - `GET/PUT/DELETE /api/pages(/:slug)` + `GET /api/pages/:slug/versions/:id`；upsert 幂等（内容未变不产生版本）；每次保存先快照旧正文至 `page_versions`；删除显式事务级联清历史；body 大小/形状校验。
-- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
+- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。**后续批次补充**：`/plugins-ui/**` 走**独立分支**（按名查根、不复用 `webDist` 根、**绝不 SPA fallback**，缺失即 404 `application/json`），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
 
 **验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 15/15（`packages/manager/test/deps.test.ts` 8 例 + `manager.test.ts` 7 例）、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
 
 > 后续治理批次（同一实现期）在 `manager.test.ts` 增补崩溃自愈、persist 跳过失败条目、enable 事务性、看门狗决策、卸载排空与缓存清理等用例，并新增 `repo-paths.test.ts`（3 例，路径解析与进程工作目录解耦）与 `packages/server/test/router.test.ts`（11 例，覆盖 HTTP 路由排空/413/端口选项）；该批累计单测 **35/35**（deps 8 + manager 13 + repo-paths 3 + server 11）。
 >
-> **当前口径（冲突组替换前置校验收紧后实跑）**：单测 **87/87 全绿** = `packages/manager` **73**（`deps` 10 + `manager` 14 + `config` 33 + `discovery` 13 + `repo-paths` 3）+ `packages/server` **14**（`registry` 3 + `router` 11），`pnpm typecheck` 7 个包 0 错误。因此上文 Phase 2 验收里的 15/15 与本段的 35/35、以及此前的 72/72、81/81 均为**历史时点口径**，不代表当前工作树；契约迁移（`layer` = 持久化层、无 schema 插件接受原始 JSON）已完成、两条旧断言已随新契约更新，逐条记录见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 6 节与第 9 节。
+> **当前口径（插件 UI 入口表后端下发 + 缓存寿命修复后实跑）**：单测 **132/132 全绿** = `packages/web` **19**（`pluginUiPlan` 19）+ `packages/manager` **91**（`deps` 10 + `manager` 14 + `config` 36 + `discovery` 13 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/server` **22**（`registry` 3 + `router` 11 + `plugin-ui-static` 8），`pnpm typecheck` 7 个包 0 错误。**`packages/web` 自本轮起首次拥有单测**，入口是 `node --import tsx --test test/*.test.ts`（`packages/web/package.json` 的 `test` 脚本）。因此上文 Phase 2 验收里的 15/15 与本段的 35/35、以及此前的 72/72、81/81、87/87 均为**历史时点口径**，不代表当前工作树；契约迁移（`layer` = 持久化层、无 schema 插件接受原始 JSON）已完成、两条旧断言已随新契约更新，逐条记录见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 6 节与第 9 节。
 
 ## Phase 3（候选）：AI 原生能力
 
-- [x] Slots 插槽机制（**宿主侧**已落地）：宿主经 `window.__GEEWIKI_HOST__` 暴露 `registerSlot(name, component)` / `unregisterSlot`（`packages/web/src/lib/slots.tsx`、`packages/web/src/lib/hostSdk.ts`，SDK 版本 `0.1.0`）；插件 UI bundle 从 `/plugins-ui/<name>/client.js` 动态加载后调用 `register(host)` 注册。**插槽名是白名单，当前仅 `app-header` 与 `app-footer` 两个**，未知插槽名告警并忽略；`SlotOutlet` 外层包 ErrorBoundary——插件组件抛错只丢该插槽内容，主界面不白屏
+- [x] Slots 插槽机制（**宿主侧**已落地）：宿主经 `window.__GEEWIKI_HOST__` 暴露 `registerSlot(name, component)` / `unregisterSlot`（`packages/web/src/lib/slots.tsx`、`packages/web/src/lib/hostSdk.ts`，SDK 版本 `0.1.0`）；插件 UI bundle 由加载器（`packages/web/src/lib/pluginUi.ts`）按**后端下发的入口表**（`GET /api/plugins/ui`）动态加载后调用 `register(host)` 注册。**插槽名是白名单，当前仅 `app-header` 与 `app-footer` 两个**，未知插槽名告警并忽略；`SlotOutlet` 外层包 ErrorBoundary——插件组件抛错只丢该插槽内容，主界面不白屏
 - [ ] 后端注册链路与更多扩展点：`ctx.slot(name, component)`、`editor-toolbar-slots`、`admin-page-slots`（**尚未提供**）
-- [ ] Suspense + use Hook 懒加载远端插件 JS Bundle —— 当前为**入口表静态 JSON**（`/plugins-ui/registry.json`）+ 显式 `import()`：加载时机是手动刷新（`window.__GEEWIKI_PLUGIN_UI__.refresh()`），**未绑定 fork 生命周期**（插件停用不会自动撤销其 UI）；热卸载只撤销插槽注册与移除插件 CSS，**ESM 模块实例不回收**
+- [ ] Suspense + use Hook 懒加载远端插件 JS Bundle —— 远端 bundle 目前仍由加载器显式 `import()`（"不白屏"靠 ErrorBoundary 而非 Suspense Fallback）；**加载时机已不再是问题**（见下一项：入口表由后端下发 + 生命周期自动同步），本项剩下的只是"改用 Suspense / use Hook 的加载表现"这一件事
+- [x] 插件 UI 入口表由后端下发 + 跟随插件生命周期自动同步（**已完成**）：入口表不再是静态 JSON（`/plugins-ui/registry.json` **已停用**），改由 `GET /api/plugins/ui` 从**活状态**现算（注册表 × 激活集合 × 产物 stat → `{ ok, version: 1, revision, plugins: { <name>: { entry, css?, rev } }, skipped }`；`skipped` 记 `inactive` / `no_client` / `entry_missing` / `invalid_name`），响应带 `cache-control: no-store` + `ETag`，`If-None-Match` 命中即 **304**（**空表仍 200**，永不 404）；前端 `syncPluginUi()`（幂等 + 单飞）按整表 `revision` 与逐插件 `rev` 的差集**先卸后装**，`startPluginUiSync({ intervalMs: 15000 })` 立即同步一次 + `visibilitychange` + 可见期轮询 → **UI 随插件启停自动出现/消失**（管理台动作即时，外部变更收敛上界 ≤15s）。**仍成立的边界**：**ESM 模块实例不回收**——`rev` 变化走 unload → load，同 URL 命中模块缓存，故**产物更新需整页刷新才生效**（见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 5 节 L-6）
 - [ ] LLM 组插件（OpenAI/Anthropic 示例，configSchema 含密码字段）+ RAG 检索管线
 - [ ] 编辑器组插件（Milkdown / TipTap 示例）替换 textarea
-- [ ] 插件级静态资源注入（每插件可携带前端资源目录，随激活挂载）
+- [ ] 插件级静态资源注入（每插件可携带前端资源目录，随激活挂载）——**部分落地**：插件 UI 已有"自带产物根"（`<插件目录>/dist` 优先于 `<webDist>/plugins-ui/<名>`，见 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`），但**只覆盖 UI 入口与样式两个单段文件名**（`entry` / `css`），**不支持任意资源目录、也不支持子目录资源**（字体/图片需内联进 bundle）
 
 ## Phase 4（候选）：稳定性加固与生产化
 
