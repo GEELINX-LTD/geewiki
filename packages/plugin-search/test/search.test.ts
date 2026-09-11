@@ -19,7 +19,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import { SqliteDatabase } from '@geewiki/db-sqlite'
-import type { HttpRouterService, RouteHandler, RouteHandlerContext } from '@geewiki/core'
+import type { HttpRouterService, Principal, RouteHandler, RouteHandlerContext } from '@geewiki/core'
 import {
   MAX_QUERY_LENGTH,
   MIN_TRIGRAM_LENGTH,
@@ -53,6 +53,13 @@ interface Harness {
   search(queryString: string): Promise<{ status: number; body: Record<string, unknown> }>
   /** 直接写 pages 表（触发器会把变更同步进 FTS 索引） */
   putPage(slug: string, title: string, content: string, updatedAt?: string): void
+  /** 调用 `GET /api/search` 时挂在 `h.principal` 上的主体（默认匿名） */
+  principal: Principal
+  /**
+   * 覆写策略层返回的可见集合（P2）。
+   * `null` = 回到默认行为「库里所有页面都可见」—— 既有用例因此语义不变。
+   */
+  setVisible(slugs: readonly string[] | null): void
   /** 仅卸载插件（保留 db 与 ctx，便于断言卸载后的服务状态） */
   unload(): void
   dispose(): void
@@ -86,9 +93,29 @@ function makeHarness(): Harness {
   // provide→get 立即可见、注销后回到 undefined），故 harness 能忠实断言
   // `ctx.get('search-service')`；真实 cordis 下的**跨插件**可见性另由
   // "真实 cordis：search-service 对兄弟插件可见"一例覆盖。
+  /*
+   * ★ P2：策略层替身。
+   *
+   * 默认返回「库里所有页面」（`setVisible(null)`）—— 这样既有用例的行为与 P2 之前
+   * 完全一致（它们本来就不涉及可见性），不会因为引入策略层而整批改语义。
+   * 需要验证裁剪的用例调用 `setVisible([...])` 覆写成指定集合。
+   *
+   * 用真实 SQL 读 pages 而不是硬编码列表：让"可见集合"与库内容保持一致，
+   * 避免夹具自己成为第二个真源。
+   */
+  let visibleOverride: readonly string[] | null = null
+  const policyService = {
+    visibleSlugs: (_principal: Principal, _q?: { levels?: readonly string[] }): Promise<string[]> => {
+      if (visibleOverride !== null) return Promise.resolve([...visibleOverride])
+      return Promise.resolve(
+        db.query<{ slug: string }>('SELECT slug FROM pages ORDER BY slug').map((r) => r.slug),
+      )
+    },
+  }
   const services = new Map<string, unknown>([
     ['db', db],
     ['http', routerService],
+    ['policy-service', policyService],
   ])
   const ctx = {
     get: (name: string) => services.get(name),
@@ -102,6 +129,19 @@ function makeHarness(): Harness {
   } as unknown as Context
   const dispose = SearchPlugin.apply(ctx, { limit: 20, snippetRadius: 48 }) as () => void
 
+  /*
+   * ★ P2：请求主体。默认匿名 —— 检索结果是否含某条完全由策略层决定，
+   * 与主体本身的具体字段无关（本插件的用例只验证"策略层说不给就不给"）。
+   */
+  const principal: Principal = {
+    kind: 'anonymous',
+    userId: null,
+    orgId: null,
+    orgRole: null,
+    groupIds: [],
+    sessionId: null,
+  }
+
   const search = (queryString: string) => {
     const handler = routes.get('GET /api/search')
     assert.ok(handler, '应已注册路由 GET /api/search')
@@ -114,6 +154,7 @@ function makeHarness(): Harness {
         res: { once: () => {} } as unknown as ServerResponse,
         url,
         params: {},
+        principal,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)
@@ -148,6 +189,10 @@ function makeHarness(): Harness {
     services,
     search,
     putPage,
+    principal,
+    setVisible: (slugs) => {
+      visibleOverride = slugs === null ? null : [...slugs]
+    },
     unload,
     dispose: () => {
       unload()
@@ -557,7 +602,7 @@ test('search-service：apply 后 ctx.get 拿得到，且 search/contents 都是�
     // 探针反证：manifest 声明的 provides 不会自己变成 cordis 服务——
     // 若插件里漏掉 ctx.provide，这里拿到的是 undefined（这正是本批要修的症状）
     assert.ok(h.services.has('search-service'), 'provide 应把服务登记进 ctx')
-    assert.equal(svc.search('插件化').total, 0, '空库检索应为 0 命中而非抛错')
+    assert.equal((await svc.search(h.principal, '插件化')).total, 0, '空库检索应为 0 命中而非抛错')
   } finally {
     h.dispose()
   }
@@ -571,14 +616,14 @@ test('search-service：svc.search 与 REST 端点结果逐字段一致（单一�
 
     // FTS 路（≥3 字符）
     const ftsRes = await h.search('q=共同词奥米克戎&limit=2')
-    const ftsSvc = svc.search('共同词奥米克戎', { limit: 2 })
+    const ftsSvc = await svc.search(h.principal, '共同词奥米克戎', { limit: 2 })
     assert.equal(ftsRes.body['mode'], ftsSvc.mode)
     assert.equal(ftsRes.body['total'], ftsSvc.total)
     assert.deepEqual(ftsRes.body['hits'], [...ftsSvc.hits], 'FTS 路：端点与服务的 hits 必须逐字段一致')
 
     // LIKE 路（<3 字符）
     const likeRes = await h.search('q=共同&limit=1')
-    const likeSvc = svc.search('共同', { limit: 1 })
+    const likeSvc = await svc.search(h.principal, '共同', { limit: 1 })
     assert.equal(likeRes.body['mode'], 'like')
     assert.equal(likeRes.body['mode'], likeSvc.mode)
     assert.equal(likeRes.body['total'], likeSvc.total)
@@ -586,15 +631,18 @@ test('search-service：svc.search 与 REST 端点结果逐字段一致（单一�
 
     // 默认 limit 也必须一致（端点不传 limit ↔ 服务不传 opts）
     const defRes = await h.search('q=共同词奥米克戎')
-    const defSvc = svc.search('共同词奥米克戎')
+    const defSvc = await svc.search(h.principal, '共同词奥米克戎')
     assert.deepEqual(defRes.body['hits'], [...defSvc.hits])
     assert.equal(defSvc.hits.length, 4, '默认 limit 20 应返回全部 4 条')
 
     // 空查询：服务层返回空结果（端点层另用 400 invalid_query 表达 HTTP 语义）
-    assert.deepEqual(svc.search('   '), { mode: 'like', total: 0, hits: [] })
-    // 非法 limit：服务层抛错（与端点的 400 对应）
-    assert.throws(() => svc.search('共同', { limit: 0 }), RangeError)
-    assert.throws(() => svc.search('共同', { limit: 101 }), RangeError)
+    assert.deepEqual(await svc.search(h.principal, '   '), { mode: 'like', total: 0, hits: [] })
+    // 非法 limit：服务层抛错（与端点的 400 对应）。
+    // ★ P2：`search` 改为异步后，同步抛错变成**拒绝的 Promise**，故必须用 `assert.rejects`
+    // 而不是 `assert.throws` —— 用错会让这条断言恒真（`assert.throws` 对返回 Promise 的
+    // 函数不会捕获其中的异步抛出，于是"没抛"也通过），等于悄悄丢掉这个保护。
+    await assert.rejects(() => svc.search(h.principal, '共同', { limit: 0 }), RangeError)
+    await assert.rejects(() => svc.search(h.principal, '共同', { limit: 101 }), RangeError)
   } finally {
     h.dispose()
   }
@@ -607,18 +655,18 @@ test('search-service.contents：批量取正文，只含存在的 slug（供 RAG
     h.putPage('a', '甲', '甲的完整正文，含独特词阿尔法。')
     h.putPage('b', '乙', '乙的完整正文，含独特词贝塔。')
 
-    assert.equal(svc.contents([]).size, 0, '空数组直接返回空 Map')
+    assert.equal((await svc.contents(h.principal, [])).size, 0, '空数组直接返回空 Map')
 
-    const single = svc.contents(['a'])
+    const single = await svc.contents(h.principal, ['a'])
     assert.equal(single.size, 1)
     assert.equal(single.get('a'), '甲的完整正文，含独特词阿尔法。', 'value 必须是该页完整正文（逐字一致）')
 
-    const both = svc.contents(['a', 'b'])
+    const both = await svc.contents(h.principal, ['a', 'b'])
     assert.equal(both.size, 2)
     assert.equal(both.get('b'), '乙的完整正文，含独特词贝塔。')
 
     // 查不到的 slug 不进 Map（消费方据此区分"页面不存在"与"正文为空串"）
-    const mixed = svc.contents(['a', '不存在的slug', 'b'])
+    const mixed = await svc.contents(h.principal, ['a', '不存在的slug', 'b'])
     assert.equal(mixed.size, 2)
     assert.equal(mixed.has('不存在的slug'), false)
     assert.deepEqual([...mixed.keys()].sort(), ['a', 'b'])
@@ -626,10 +674,23 @@ test('search-service.contents：批量取正文，只含存在的 slug（供 RAG
     // 一次 IN 查询能跨越多个 slug（多于 1 个占位符时的正确性）
     const many = ['a', 'b', 'c', 'd', 'e', 'f'].map((s) => s)
     for (const s of ['c', 'd', 'e', 'f']) h.putPage(s, s, `正文-${s}`)
-    assert.equal(svc.contents(many).size, 6)
+    assert.equal((await svc.contents(h.principal, many)).size, 6)
 
     // 顺序无关
-    assert.deepEqual([...svc.contents(['b', 'a']).keys()].sort(), ['a', 'b'])
+    assert.deepEqual([...(await svc.contents(h.principal, ['b', 'a'])).keys()].sort(), ['a', 'b'])
+
+    /*
+     * ★ P2：**策略层说不给就不给**。
+     * 这一条是 P2 引入的核心不变式：`contents` 是 RAG 的正文入口，原先它对任意 slug
+     * 都原样返回正文（"给什么吐什么"的裸接口）。现在所有返回都必须先过策略层。
+     * 注意断言的是"正文取不到"，不是"报错"——不可见与不存在在**这一层**同构，
+     * 存在性差异由 HTTP 层统一翻成 404（见 wiki 的读端点）。
+     */
+    h.setVisible(['a'])
+    const gated = await svc.contents(h.principal, ['a', 'b'])
+    assert.equal(gated.size, 1, '只有策略层放行的 slug 才应取到正文')
+    assert.equal(gated.has('b'), false, '被策略层挡下的 slug 绝不能出现在结果里')
+    h.setVisible(null)
   } finally {
     h.dispose()
   }
@@ -644,15 +705,13 @@ test('search-service.contents：SQL 注入防护——slug 走参数绑定，绝
     // 敌意输入：若实现把 slug 字符串拼进 SQL，这些会让 IN 条件恒真 → 返回全表
     const hostile = ["' OR 1=1 --", "p1' OR '1'='1", "x'); DROP TABLE pages; --", '%', '_', '"', '\\']
     for (const slug of hostile) {
-      let result: ReadonlyMap<string, string>
-      assert.doesNotThrow(() => {
-        result = svc.contents([slug])
-      }, `slug=${JSON.stringify(slug)} 不应抛错`)
-      assert.equal(result!.size, 0, `slug=${JSON.stringify(slug)} 必须按字面匹配（注入成功会返回全表）`)
+      // 敌意输入不得抛错（抛错说明 slug 进了 SQL 语法位置），也不得返回任何行
+      const result = await svc.contents(h.principal, [slug])
+      assert.equal(result.size, 0, `slug=${JSON.stringify(slug)} 必须按字面匹配（注入成功会返回全表）`)
     }
 
     // 混合敌意输入与真实 slug：只应返回真实那个，且表完好
-    const mixed = svc.contents(["' OR 1=1 --", 'p1'])
+    const mixed = await svc.contents(h.principal, ["' OR 1=1 --", 'p1'])
     assert.equal(mixed.size, 1)
     assert.deepEqual([...mixed.keys()], ['p1'])
 
@@ -663,12 +722,65 @@ test('search-service.contents：SQL 注入防护——slug 走参数绑定，绝
   }
 })
 
+test('★ P2 权限：不可见条目既不进 hits 也不进 total —— FTS 路与短查询 LIKE 路分别验证', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('公开页', '公开标题', '正文含公开词阿尔法。')
+    h.putPage('私有页', '私有标题', '正文含机密词奥米克戎。')
+
+    // 前置：默认（全部可见）时两条都能搜到 —— 证明下面的 0 是**过滤**造成的，不是本来就搜不到
+    assert.equal((await h.search('q=机密词奥米克戎')).body['total'], 1, '前置：默认可见时应有 1 条命中')
+
+    h.setVisible(['公开页'])
+
+    // ① FTS 路（查询串 ≥3 字符，走 pages_fts MATCH）
+    const fts = await h.search('q=机密词奥米克戎')
+    assert.equal(fts.status, 200)
+    assert.equal(fts.body['total'], 0, 'FTS 路：不可见条目的命中数必须为 0')
+    assert.deepEqual(fts.body['hits'], [], 'FTS 路：不可见条目不得出现在 hits 里')
+
+    // ② 短查询 LIKE 路 —— **另一条 SQL**，最容易被漏改。
+    //    2 字元中文低于 trigram 的 3 字元门槛，必然走这里。
+    const like = await h.search('q=机密')
+    assert.equal(like.body['mode'], 'like', '前置：2 字元查询应走 LIKE 路（否则本用例没测到想测的东西）')
+    assert.equal(like.body['total'], 0, 'LIKE 路：不可见条目的命中数必须为 0（括号没加会让过滤只作用于一半条件）')
+    assert.deepEqual(like.body['hits'], [], 'LIKE 路：不可见条目不得出现在 hits 里')
+
+    // ③ 反向：可见条目仍然搜得到 —— 证明过滤没有把整条路一起堵死
+    assert.equal((await h.search('q=公开词阿尔法')).body['total'], 1, 'FTS 路：可见条目必须照常命中')
+    assert.equal((await h.search('q=公开')).body['total'], 1, 'LIKE 路：可见条目必须照常命中')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('★ P2 权限：一条都看不见时直接返回空结果（不查库、也不暴露"有没有内容"）', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('p1', '标题', '正文含独特词伽马。')
+    h.setVisible([])
+
+    const fts = await h.search('q=独特词伽马')
+    assert.equal(fts.status, 200)
+    assert.equal(fts.body['total'], 0)
+    assert.deepEqual(fts.body['hits'], [])
+
+    const like = await h.search('q=独特')
+    assert.equal(like.body['total'], 0)
+    // mode 仍按"本来会走哪条路"报告：不能让调用方据 mode 反推出"这个人有没有可见内容"
+    assert.equal(like.body['mode'], 'like')
+    assert.equal(fts.body['mode'], 'fts')
+  } finally {
+    h.dispose()
+  }
+})
+
 test('search-service：卸载后服务注销、路由摘除（不留"仍可调用但已失效"的语义）', async () => {
   const h = makeHarness()
   try {
     const svc = serviceOf(h)
     h.putPage('p1', '标题', '正文含独特词伽马。')
-    assert.equal(svc.search('独特词伽马').total, 1, '前置：卸载前服务可用')
+    assert.equal((await svc.search(h.principal, '独特词伽马')).total, 1, '前置：卸载前服务可用')
 
     h.unload()
 
@@ -680,8 +792,16 @@ test('search-service：卸载后服务注销、路由摘除（不留"仍可调�
 
     // **已持有 svc 引用**的消费方再调用：必须显式报错，而不是静默返回空结果
     // （静默空结果会被误读成"库里没有匹配内容"，是本批要消灭的那类难定位症状）
-    assert.throws(() => svc.search('独特词伽马'), /已卸载/, '卸载后 svc.search 必须显式报错')
-    assert.throws(() => svc.contents(['p1']), /已卸载/, '卸载后 svc.contents 必须显式报错')
+    await assert.rejects(
+      () => svc.search(h.principal, '独特词伽马'),
+      /已卸载/,
+      '卸载后 svc.search 必须显式报错',
+    )
+    await assert.rejects(
+      () => svc.contents(h.principal, ['p1']),
+      /已卸载/,
+      '卸载后 svc.contents 必须显式报错',
+    )
   } finally {
     h.dispose()
   }
@@ -994,13 +1114,15 @@ test('search-service：超长查询抛错而不是静默截断（消费方不受
   try {
     const svc = h.ctx.get('search-service') as SearchService
     const long = '检'.repeat(MAX_QUERY_LENGTH + 1)
-    assert.throws(
-      () => svc.search(long),
+    // ★ P2：`search` 改为异步 ⇒ 必须用 `assert.rejects`。用 `assert.throws` 会是**恒真**断言
+    // （它对返回 Promise 的函数捕获不到其中的异步抛出），等于把这条保护悄悄丢掉。
+    await assert.rejects(
+      () => svc.search(h.principal, long),
       /过长/,
       '超长查询必须显式报错（截断会给出"看起来正常但只搜了一部分"的结果）',
     )
     // 边界内应放行
-    assert.doesNotThrow(() => svc.search('检'.repeat(MAX_QUERY_LENGTH)))
+    await assert.doesNotReject(() => svc.search(h.principal, '检'.repeat(MAX_QUERY_LENGTH)))
   } finally {
     h.dispose()
   }

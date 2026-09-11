@@ -26,7 +26,7 @@ import type { Context } from 'cordis'
 import { SqliteDatabase } from '@geewiki/db-sqlite'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin } from '@geewiki/search'
 import { createLlmService, type LlmChunk, type LlmProvider, type LlmService } from '@geewiki/llm'
-import type { HttpRouterService, RouteHandler, RouteHandlerContext } from '@geewiki/core'
+import type { HttpRouterService, Principal, RouteHandler, RouteHandlerContext } from '@geewiki/core'
 import {
   AiPlugin,
   MAX_CONCURRENT_STREAMS,
@@ -44,6 +44,22 @@ import {
 } from '../src/index.js'
 
 /* ============================ 测试内路由 ============================ */
+
+/**
+ * ★ P2：请求主体（匿名）。
+ *
+ * `handleStream` 在**写任何 SSE 帧之前**先取 `h.principal`，取不到就返 401 —— 因为
+ * 一旦写了 SSE 头，状态码就定型为 200，调用方再也无法从协议层看出这次是被拒的。
+ * 故本文件的测试内路由必须像生产路由那样挂上主体，否则所有流式用例都会拿到 401。
+ */
+const TEST_PRINCIPAL: Principal = {
+  kind: 'anonymous',
+  userId: null,
+  orgId: null,
+  orgRole: null,
+  groupIds: [],
+  sessionId: null,
+}
 
 interface TestRouter {
   service: HttpRouterService
@@ -135,7 +151,16 @@ function makeTestRouter(opts: { drainTimeoutMs?: number } = {}): TestRouter {
     for (const route of routes) {
       if (route.method !== req.method || route.segments.length !== segments.length) continue
       if (route.segments.some((seg, i) => seg !== segments[i])) continue
-      const h: RouteHandlerContext = { req, res, url, params: {}, json, noteStatus }
+      const h: RouteHandlerContext = {
+        req,
+        res,
+        url,
+        params: {},
+        json,
+        noteStatus,
+        // ★ P2：主体必须挂上（见文件头 TEST_PRINCIPAL 的说明）
+        principal: TEST_PRINCIPAL,
+      }
       inFlight++
       try {
         const result: unknown = route.handler(h)
@@ -289,10 +314,21 @@ async function makeHarness(
   const llm: LlmService = createLlmService()
   if (opts.provider) llm.register(opts.provider)
 
+  /*
+   * ★ P2：策略层替身。本夹具用**真实** `SearchPlugin`，它现在依赖 `policy-service`；
+   * 缺席时它会显式抛错（拒绝返回结果），于是检索全部降级、流式用例会以
+   * "看起来像功能坏了"的方式红掉。默认"库里所有页面可见"，与 P2 之前语义一致。
+   */
+  const policyService = {
+    visibleSlugs: (_principal: Principal, _q?: { levels?: readonly string[] }): Promise<string[]> =>
+      Promise.resolve(db.query<{ slug: string }>('SELECT slug FROM pages ORDER BY slug').map((r) => r.slug)),
+  }
+
   const services = new Map<string, unknown>([
     ['db', db],
     ['http', router.service],
     ['llm-service', llm],
+    ['policy-service', policyService],
   ])
   const ctx = {
     get: (name: string) => services.get(name),

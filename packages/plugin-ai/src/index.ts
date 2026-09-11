@@ -25,6 +25,7 @@ import {
   closeAfterResponse,
   type GeeWikiManifest,
   type HttpRouterService,
+  type Principal,
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { redact, type LlmErrorCode, type LlmMessage, type LlmService, type LlmUsage } from '@geewiki/llm'
@@ -194,8 +195,10 @@ export interface AiService {
    *   走完检索并返回 200 + 空结果——调用方应先自行 trim 并判空；
    * - `opts.limit` 非法时抛错（与端点的 400 `invalid_limit` 对应）；
    * - 插件卸载后再调用**显式抛错**（见 `apply` 里的 `assertLive`），绝不返回空结果。
+   * ★ P2：`principal` 是**必填首参**（设计文档 §9 R2）。漏传在编译期即报错，运行期
+   * 还会在 `retrieve` 里经 search-service 的守卫再兜一道 —— 绝不"当作匿名继续"。
    */
-  ask(q: string, opts?: { limit?: number; extractive?: boolean }): Promise<AskResponse>
+  ask(principal: Principal, q: string, opts?: { limit?: number; extractive?: boolean }): Promise<AskResponse>
 
   /**
    * 能力查询：模型是否可用、为何不可用。与 `GET /api/ai/capabilities` **同一份返回值**
@@ -415,7 +418,7 @@ export const AiPlugin = {
         }
       | { ok: false; degraded: Degraded }
 
-    const retrieve = (query: string, limit: number): RetrievalStage => {
+    const retrieve = async (principal: Principal, query: string, limit: number): Promise<RetrievalStage> => {
       const search = ctx.get('search-service') as SearchService | undefined
       // 检索不可用：仍然走"200 + 同一结构"（前端只有一套渲染路径）
       if (!search) {
@@ -429,13 +432,22 @@ export const AiPlugin = {
         // 理由：本插件的入口就是**自然语言问句**（「检索增强怎么做」），而问句几乎不可能
         // 逐字连续出现在正文里——按短语检索会恒为 0 命中，RAG 的检索地基等于不可用。
         // 词元切分是 search 插件的单一实现（buildTermQuery），本插件不重复实现分词。
-        const result = search.search(query, { limit, mode: 'terms' })
+        //
+        // ★ P2：主体**必须**透传。RAG 是"把正文喂给模型"的路径，漏传主体等于让模型
+        // 读到无权正文并原样说给用户听 —— 这是 §5.7 点名的泄漏面。
+        const result = await search.search(principal, query, { limit, mode: 'terms' })
         return {
           ok: true,
           hits: result.hits,
           retrievalMode: result.mode,
           total: result.total,
-          contents: search.contents(result.hits.map((h) => h.slug)),
+          // ★ P2：`contents` 是 RAG 的正文入口（§5.6 的第三条旁路），同样必须带主体。
+          // 两层过滤（search 已按主体裁剪 hits，contents 再按主体裁剪正文）是刻意的：
+          // 即便将来有人改了 hits 的来源，正文这一层仍不会吐无权内容。
+          contents: await search.contents(
+            principal,
+            result.hits.map((h) => h.slug),
+          ),
         }
       } catch (err) {
         // 服务已被卸载（search 的 assertLive 会显式抛错）或库出问题：同样降级而非 500
@@ -479,6 +491,7 @@ export const AiPlugin = {
      * 端点只负责把 HTTP 参数解析成 `(q, opts)` 并把结果包成响应体。
      */
     const ask = async (
+      principal: Principal,
       rawQuery: string,
       // `opts` 必须有默认值：AiService 的契约里它是可选的，`svc.ask(q)` 是合法调用。
       // 缺了 `= {}` 会让省略第二参的调用在 `opts.limit` 处抛 TypeError（实测过），
@@ -491,7 +504,7 @@ export const AiPlugin = {
       const limit = opts.limit ?? cfg.retrievalLimit
       const useExtractive = opts.extractive ?? cfg.extractive
 
-      const stage = retrieve(query, limit)
+      const stage = await retrieve(principal, query, limit)
 
       // 检索不可用：仍然返回 200 + 同一结构（前端只有一套渲染路径）
       if (!stage.ok) {
@@ -604,6 +617,22 @@ export const AiPlugin = {
      */
     const handleStream = (h: RouteHandlerContext): void => {
       void (async () => {
+        /*
+         * ★ P2：**主体在建立连接时定下**（设计文档 §5.7）。
+         *
+         * SSE 是一条长连接。若把主体解析推迟到流中途，"连接建立后权限被撤销"就会
+         * 出现"流仍在按旧权限继续推送"的窗口。这里取一次、整个流沿用。
+         *
+         * 取不到主体时**必须在写任何 SSE 帧之前**以普通 JSON 返回 401 —— 一旦写了
+         * SSE 头，状态码就定型为 200，调用方再也无法从协议层看出这次是被拒的。
+         * ⚠️ 注意 `trackStream(res, owner)` 的 `owner` 是**插件名**（在途排空用），
+         * 它不是鉴权，不要把它当成"这条流已经有主了"。
+         */
+        const principal = h.principal
+        if (!principal) {
+          h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息，无法判定可见范围' })
+          return
+        }
         /* ---- 阶段 1：读体 + 校验（失败一律普通 JSON，且未写 SSE 头）---- */
         let q = ''
         let limit = cfg.retrievalLimit
@@ -684,7 +713,7 @@ export const AiPlugin = {
           h.res.on('close', () => {
             if (!h.res.writableEnded) ac.abort()
           })
-          await runStream({ writer, watchdog, ac, q, limit, extractive })
+          await runStream({ writer, watchdog, ac, principal, q, limit, extractive })
         } catch (err) {
           // 自身代码炸了：仍要以终止帧收尾（协议要求 done/error 恰一帧），message 必须脱敏
           console.error('[@geewiki/ai] 流式问答异常:', err)
@@ -712,13 +741,15 @@ export const AiPlugin = {
       writer: FrameWriter
       watchdog: Watchdog
       ac: AbortController
+      /** ★ P2：SSE 的主体在**建立连接时**定下（§5.7），此后整个流沿用同一个主体 */
+      principal: Principal
       q: string
       limit: number
       extractive: boolean
     }): Promise<void> => {
-      const { writer, watchdog, ac, q, limit, extractive } = ctxStream
+      const { writer, watchdog, ac, principal, q, limit, extractive } = ctxStream
       const started = Date.now()
-      const stage = retrieve(q, limit)
+      const stage = await retrieve(principal, q, limit)
 
       let sources: readonly AskSource[] = []
       let retrieval: { mode: 'fts' | 'like'; total: number; limit: number } = { mode: 'like', total: 0, limit }
@@ -865,11 +896,21 @@ export const AiPlugin = {
         })
         return
       }
+      /*
+       * ★ P2：主体由 P0 的闸门在 dispatch 里解析并挂在 `h.principal` 上。
+       * 这里判空后**拒绝**而不是"当作匿名继续"：当作匿名会静默少给内容（可发现），
+       * 而放行会静默多给（不可发现，且是安全事故）。见设计文档 §9 R2。
+       */
+      const principal = h.principal
+      if (!principal) {
+        h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息，无法判定可见范围' })
+        return
+      }
       try {
         const limit = parseLimit(params.limit, cfg.retrievalLimit)
         const extractive = parseExtractive(params.extractive, cfg.extractive)
         // 查询本体完全交给 svc.ask()（单一实现）；端点只管 HTTP 层
-        h.json(200, await svc.ask(q, { limit, extractive }))
+        h.json(200, await svc.ask(principal, q, { limit, extractive }))
       } catch (err) {
         failFromError(h, err)
       }
