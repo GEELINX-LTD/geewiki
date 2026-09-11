@@ -767,6 +767,68 @@ export const WikiPlugin = {
     if (justAppliedMigration) await backfillLinks()
 
     /**
+     * ★ P3a：**存量 `pages.content` → `blocks` 回填**。
+     *
+     * ## 为什么必须做
+     *
+     * `blocks` 是**解析产物**：P3a 之前保存的页面只有 `pages.content`，没有块行。
+     * 不回填的后果有两条，都不是"体验差一点"而是**功能失效**：
+     *   1. **检索搜不到存量内容** —— `blocks_fts` 只索引块，而 `pages_fts` 已废弃；
+     *   2. **块级遮蔽对存量内容不生效** —— 详情路径在没有块行时会现场解析（那是最低限度的
+     *      兜底），但检索、AI 两条路都以 `blocks` 为准。
+     *
+     * ## 触发条件为什么是"扫描没有块的行"，而不是"迁移刚应用过"
+     *
+     * `justAppliedMigration` 只覆盖"这一次激活恰好跑了迁移"这一个窗口。而回填没跑成的
+     * 可能有多种：迁移由别的进程跑掉、上一次激活中途失败、页面由导入脚本或第三方插件插入。
+     * 判据落在**数据现状**（`NOT EXISTS (SELECT 1 FROM blocks …)`）上，上述情况全部覆盖，
+     * 且天然幂等 —— 已回填过的页面不会被重复处理。
+     *
+     * ## 分批 + 失败不阻断
+     *
+     * 启动路径上的大规模写会拖长激活、甚至卡死大库，故**分批**（每批一个事务）。
+     * 失败一律**尽力而为**：告警后返回，不阻断激活 —— 块随时可以从 `pages.content` 重建，
+     * 而"插件激活不了"会让整个 wiki 不可用，两者代价不对等。
+     */
+    const backfillBlocks = async (): Promise<void> => {
+      const BATCH = 200
+      let done = 0
+      try {
+        for (;;) {
+          const rows = await adb.query<{ id: number; slug: string; content: string }>(
+            `SELECT p.id, p.slug, p.content FROM pages p
+              WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.page_id = p.id)
+              ORDER BY p.id LIMIT ?`,
+            [BATCH],
+          )
+          if (rows.length === 0) break
+          for (const r of rows) {
+            const now = new Date().toISOString()
+            // 逐条一个事务：单条失败不影响同批其它条目，中断后重启能从"还没有块的行"续上
+            const pageLevel = await pageLevelOf(r.slug)
+            await adb.transaction(async (tx) => {
+              await syncBlocksForPage(tx, { pageId: r.id, content: r.content, pageLevel, now })
+              // `content_hash` 由调用方一并维护（syncBlocksForPage 只管块与索引）——
+              // 它是一致性探针 `/api/admin/blocks/verify` 的比对基准，不回填会让存量页面恒报不一致
+              await tx.run('UPDATE pages SET content_hash = ? WHERE id = ?', [sha256Hex(r.content), r.id])
+            })
+          }
+          done += rows.length
+          if (rows.length < BATCH) break
+        }
+        if (done > 0) console.log(`[@geewiki/wiki] 存量条目已回填块: ${done} 条`)
+      } catch (err) {
+        console.warn(
+          `[@geewiki/wiki] 存量条目的块回填失败（已回填 ${done} 条后中断）—— 不回填只影响存量内容的` +
+            '检索与块级遮蔽，不影响新写入；重启可续（判据是"还没有块的行"，天然幂等）。原因:',
+          err,
+        )
+      }
+    }
+    // 无条件跑：没有待回填的行时那条查询是空的，代价可忽略；有则必须补上（见上方理由）
+    await backfillBlocks()
+
+    /**
      * upsert：保存前把旧正文快照进 page_versions（版本即历史）。
      * 幂等：标题与正文均未变化时既不更新 updated_at、也不写历史。
      * 入参须已由 normalizeSaveFields 校验（服务与端点都走该校验）。

@@ -851,6 +851,64 @@ export const SearchPlugin = {
     // 表现为"AI 永远只回空结果"这类极难定位的症状。
     const unprovide = ctx.provide('search-service', svc)
 
+    /*
+     * ★ P3a：**从 `blocks` 重建 `blocks_fts`**（§4.3）。
+     *
+     * ## 为什么必须在激活时做
+     *
+     * `blocks_fts` 是 contentless 表，**没有触发器** —— tier 重算是业务逻辑（依赖页面有效
+     * 档位，含祖先交集与发布闸门），不是触发器能表达的 SQL，所以同步责任在应用层。
+     * 而 `@geewiki/wiki` 的**存量块回填发生在它自己激活时**，那一刻本插件可能尚未激活、
+     * `blocks_fts` 这张表**根本不存在** ⇒ `syncBlocksForPage` 会跳过索引写入
+     * （它刻意不因索引缺席而让"保存页面"失败）。结果是"**块有、索引空**"⇒ 检索恒为空。
+     * 本函数补的就是这个窗口。
+     *
+     * ## 为什么是"全量清空 + 逐块插入"而不是增量
+     *
+     * contentless 表上裸 `DELETE FROM` 可用（已实测：清空后 `count(*)=0`，之后可正常插入
+     * 与 MATCH），所以清空重建能连**索引孤儿行**（块已删、索引行还在）一并清掉 ——
+     * 那正是按 rowid 增量删清不干净的东西，也是 `GET /api/admin/search/verify` 的
+     * `extra` 计数会报出来的东西。整体幂等，重启重跑无副作用。
+     *
+     * ## 为什么是同步的
+     *
+     * 本插件在 `apply()` 顶部就有**方言守卫**：非 `sqlite` 一律同步抛错（FTS5 是 SQLite
+     * 专有）。所以走到这里 `db` **必然是同步适配器**，用它的 `transaction(fn)` / `run`
+     * 即可，`apply` 保持同步 ⇒ 守卫那句 `throw` 仍然同步，既有 `assert.throws` 用例不受影响。
+     *
+     * 失败**不阻断激活**：索引随时可以从 `blocks`（真源）重建，而"插件激活不了"等于检索
+     * 功能整体不可用 —— 两者代价不对等。差异由 verify 探针显式报出，不靠静默。
+     */
+    const rebuildBlocksIndex = (): void => {
+      try {
+        const rows = db.query<{ id: number; text: string }>('SELECT id, text FROM blocks ORDER BY id')
+        db.transaction(() => {
+          db.run('DELETE FROM blocks_fts')
+          for (const r of rows) {
+            db.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [r.id, r.text])
+          }
+        })
+        if (rows.length === 0) {
+          /*
+           * `0 块` 不是故障，但**很容易被误读成"索引被清空了"**，故显式解释：
+           * 本插件与 `@geewiki/wiki` 之间**没有依赖边**，激活顺序不保证。若本插件先激活，
+           * 此刻 wiki 的存量块回填还没跑（`blocks` 尚为空）；等它跑完，`syncBlocksForPage`
+           * 会因为 `blocks_fts` 已存在而**一并写入索引** —— 两条顺序最终都收敛到"索引与
+           * `blocks` 一致"。真出问题由 `GET /api/admin/search/verify` 报，不靠这行日志判断。
+           */
+          console.log('[@geewiki/search] 块索引已从 blocks 重建: 0 块（blocks 当前为空；若 wiki 稍后回填存量块，它会一并写入索引）')
+        } else {
+          console.log(`[@geewiki/search] 块索引已从 blocks 重建: ${rows.length} 块`)
+        }
+      } catch (err) {
+        console.warn(
+          '[@geewiki/search] 块索引重建失败（检索可能不完整；`blocks` 是真源，重启可重建）。原因:',
+          err,
+        )
+      }
+    }
+    rebuildBlocksIndex()
+
     console.log('[@geewiki/search] 已激活: GET /api/search 与 search-service 服务')
     return () => {
       // 先立"已卸载"标志：此后任何仍持有 svc 引用的调用都会显式报错而非返回空结果
