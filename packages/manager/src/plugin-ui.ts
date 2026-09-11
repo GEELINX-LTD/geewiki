@@ -26,8 +26,9 @@
 import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { PLUGIN_UI_FILE_SEGMENT, type GeeWikiManifest } from '@geewiki/core'
+import { PLUGIN_UI_FILE_SEGMENT, type GeeWikiManifest, type SlotName } from '@geewiki/core'
 import type { RegisteredPlugin } from './deps.js'
+import { conflictsOf, effectiveSlotsByOwner, type SlotAssignment, type SlotConflict } from './slots.js'
 
 /** 文件指纹（只 stat，不读内容）：入口/样式的 mtime 与大小 */
 export interface UiFileStat {
@@ -57,6 +58,15 @@ export interface PluginUiTableEntry {
   css?: string
   /** 该插件产物的指纹（entry 与 css 的 mtime-大小拼接入 sha1 的前 8 位） */
   rev: string
+  /**
+   * 该插件**实际生效**的插槽（见 `@geewiki/core` 的 `SlotName`）。
+   *
+   * **为空时整个键被省略**，理由有两条：
+   * ① 绝大多数插件不贡献插槽，塞一个空数组只会让下发体积与 diff 噪声变大；
+   * ② 更实际的是——`revision` 是对 `{version, plugins}` 求 sha1，省略空值意味着
+   *    **本次新增该字段不会改变任何既有部署的 revision**，不会平白触发一次全量重取。
+   */
+  slots?: SlotName[]
 }
 
 /** 未能进入入口表的原因（`GET /api/plugins/ui` 的 `skipped`） */
@@ -75,6 +85,14 @@ export interface PluginUiTable {
   plugins: Record<string, PluginUiTableEntry>
   /** 为什么某些插件没出现（按 name 排序）；`entry_missing` 是"产物缺失"的唯一可见出口 */
   skipped: PluginUiSkipped[]
+  /**
+   * 单占用插槽被多个 active 插件声明时的**冲突诊断**（为空时省略该键，见 `slots` 字段的同款理由）。
+   *
+   * 为什么要把"冲突"下发给前端而不是只写服务端日志：冲突的后果是**用户可见**的
+   * （"我启用的编辑器没生效"），只留在日志里就等于让用户去猜。
+   * 裁决本身是确定性的（见 `resolveSlots`），这里是把结果**可见化**。
+   */
+  slotConflicts?: SlotConflict[]
 }
 
 /**
@@ -209,6 +227,8 @@ export interface BuildPluginUiTableOptions {
   statFile: UiStatFile
   /** 注入的目录存在性判定（缺省 existsSync；纯函数测试可传 `() => true`） */
   dirExists?: UiDirExists
+  /** 插槽裁决结果（`resolveSlots` 的产物）。缺省视为"无人贡献插槽"，行为与改动前完全一致。 */
+  slotAssignments?: readonly SlotAssignment[]
 }
 
 /**
@@ -220,10 +240,25 @@ export interface BuildPluginUiTableOptions {
  * `skipped` 的判定顺序：名字非法 > 未激活 > 未声明 client > 入口缺失（互斥，每插件至多一条）。
  * `revision` 只对 `{version, plugins}` 求 sha1（`skipped` 不参与），且 `plugins` 按键排序，
  * 因此同一份表格内容必定得到同一个 revision（与注册表顺序无关）。
+ *
+ * ## 插槽字段与 revision 的关系（必须理解，否则会踩"改了却不刷新"的坑）
+ * `slots` 是 `plugins[name]` 的**内容**，因此**天然计入 revision**——这是刻意的：
+ * 若插槽归属变了而 revision 不变，前端的 `If-None-Match` 会拿到 304，
+ * 于是"某个编辑器插件被停用、editor 换人"这类变化会被**静默隐藏**，
+ * 用户看到的是旧编辑器继续渲染、且没有任何报错。本仓库此前在别处踩过同类坑
+ * （`skipped` 不参与 revision 导致变更被 304 掩盖），故这里明确纳入。
+ * 对既有部署的兼容性由"空值省略"保证：没人贡献插槽时 `slots` 根本不出现，
+ * revision 与改动前逐字节相同，不会平白触发一次全量重取。
+ *
+ * `slotConflicts` **刻意不计入 revision**：它是诊断信息，不是"该加载什么"的指令；
+ * 把它算进去会让"仅仅多了一条告警"也触发前端重取 bundle。代价是冲突的**新增**
+ * 可能被 304 掩盖——接受这一点的理由是：冲突一旦存在就会稳定存在（不是瞬时状态），
+ * 且用户下次真正改动插件启停时 revision 必然变化、届时冲突随之可见。
  */
 export function buildPluginUiTable(opts: BuildPluginUiTableOptions): PluginUiTable {
   const found: Record<string, PluginUiTableEntry> = {}
   const skipped: PluginUiSkipped[] = []
+  const slotsByOwner = effectiveSlotsByOwner(opts.slotAssignments ?? [])
   for (const entry of opts.registry) {
     const name = entry.name
     if (!isPluginUiName(name)) {
@@ -244,16 +279,28 @@ export function buildPluginUiTable(opts: BuildPluginUiTableOptions): PluginUiTab
       skipped.push({ name, reason: 'entry_missing' })
       continue
     }
-    found[name] = declared.css === undefined
-      ? { entry: declared.entry, rev: revOf(hit) }
-      : { entry: declared.entry, css: declared.css, rev: revOf(hit) }
+    const slots = slotsByOwner.get(name)
+    found[name] = {
+      entry: declared.entry,
+      ...(declared.css === undefined ? {} : { css: declared.css }),
+      rev: revOf(hit),
+      // 空数组时省略键：见 PluginUiTableEntry.slots 的说明（保持既有部署 revision 不变）
+      ...(slots === undefined || slots.length === 0 ? {} : { slots }),
+    }
   }
   // 按键排序后再序列化：revision 只反映内容，不反映注册表顺序
   const plugins: Record<string, PluginUiTableEntry> = {}
   for (const name of Object.keys(found).sort()) plugins[name] = found[name] as PluginUiTableEntry
   skipped.sort((a, b) => a.name.localeCompare(b.name))
   const revision = createHash('sha1').update(JSON.stringify({ version: 1, plugins })).digest('hex').slice(0, 12)
-  return { version: 1, revision, plugins, skipped }
+  const conflicts = conflictsOf(opts.slotAssignments ?? [])
+  return {
+    version: 1,
+    revision,
+    plugins,
+    skipped,
+    ...(conflicts.length === 0 ? {} : { slotConflicts: conflicts }),
+  }
 }
 
 /**

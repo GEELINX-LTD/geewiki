@@ -37,6 +37,7 @@ import {
   type FiberLike,
   type HttpRouterService,
   type RouteHandlerContext,
+  type SlotService,
 } from '@geewiki/core'
 export type { RegisteredPlugin } from './deps.js'
 export {
@@ -68,6 +69,12 @@ import {
   type RegisteredPlugin,
 } from './deps.js'
 import { decideWatchdog } from './watchdog.js'
+import { SlotRegistry, resolveSlots, type SlotAssignment } from './slots.js'
+import { SLOT_SERVICE_NAME } from './slot-plugin.js'
+
+export { SlotRegistry, resolveSlots, SLOT_SERVICE_NAME }
+export type { SlotAssignment }
+export { slotPlugin, type SlotPluginConfig } from './slot-plugin.js'
 import { buildPluginUiTable, statFileSync, type PluginUiTable } from './plugin-ui.js'
 export {
   buildPluginUiTable,
@@ -286,6 +293,17 @@ export class GeeWikiManager {
   private readonly plugins = new Map<string, ManagedPlugin>()
   /** 激活顺序（dispose 时逆序卸载） */
   private readonly activationOrder: string[] = []
+  /**
+   * 插槽贡献注册表。
+   *
+   * **正常路径**下这是 `@geewiki/slot` 插件经 `ctx.provide('slot', …)` 暴露的实例
+   * （见 `slot-plugin.ts` 的文件头：为什么提供者必须是独立且排在管理器之前的插件）。
+   * 构造时若服务不可见，则**自建一份**并仅供管理器自用——这是为"管理器被单独使用"
+   * （单测、嵌入其它宿主）留的兜底。代价是**此时运行期 `contribute()` 对子插件不可见**
+   * （同一可见性规则），只有 manifest 声明式贡献有效；服务器组合根走的是正常路径，
+   * 端到端已覆盖。兜底的存在是为了不把"没装 slot 插件"变成管理器无法启动。
+   */
+  private readonly slots: SlotRegistry
   private base: PluginListFile = { enabled: [] }
   private session: PluginListFile = { enabled: [] }
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
@@ -317,6 +335,10 @@ export class GeeWikiManager {
       // 内置插件 UI 根：缺省回落 webDist（与拆分前行为一致）
       pluginUiDist: config.pluginUiDist ?? config.webDist ?? null,
     }
+    // 插槽注册表：优先用 `@geewiki/slot` 已暴露的那一份（唯一真源）；
+    // 拿不到则自建兜底（见字段注释——此时只有 manifest 声明式贡献可用）。
+    const provided = ctx.get(SLOT_SERVICE_NAME) as SlotRegistry | undefined
+    this.slots = provided ?? new SlotRegistry()
   }
 
   /* ------------------------- 查询（供 REST） ------------------------- */
@@ -343,7 +365,30 @@ export class GeeWikiManager {
       // 纯函数里那个形参仍叫 webDist 是历史命名，语义就是"第二候选根的内置根"。
       webDist: this.config.pluginUiDist,
       statFile: statFileSync,
+      slotAssignments: this.slotAssignments(),
     })
+  }
+
+  /**
+   * 插槽裁决结果（`resolveSlots` 的产物）。
+   *
+   * 公开它是为了让它成为**唯一**的裁决入口：入口表、未来的前端、REST 诊断
+   * （`GET /api/plugins/slots`）都必须读同一份结果。
+   * 若各处各自按 `list()` 重新判一遍基数，就会出现"表里说 A 生效、界面渲染 B"这种
+   * 极难排查的分裂——与 `resolvePluginUiHit` 的"唯一判定"是同一条教训。
+   */
+  slotAssignments(): SlotAssignment[] {
+    return resolveSlots(this.slots.list(), this.activationOrder)
+  }
+
+  /**
+   * 插槽注册表实例（诊断与测试用）。
+   *
+   * 注意它**不负责 provide**：服务的提供者是 `@geewiki/slot` 插件
+   * （见 `slot-plugin.ts` 的文件头，那里记录了"管理器自己 provide 会失效"的实测结论）。
+   */
+  slotService(): SlotService {
+    return this.slots
   }
 
   private snapshotOf(name: string): PluginSnapshot {
@@ -1167,6 +1212,21 @@ export class GeeWikiManager {
     managed.error = null
     managed.config = effectiveConfig
     this.activationOrder.push(name)
+    // 插槽声明登记：**放在激活成功之后**（apply 抛错时不该留下归属记录，
+    // 否则插件起来了才算数这条不变式会被破坏）。声明式来源标记为 'manifest'。
+    this.registerManifestSlots(name, entry)
+  }
+
+  /**
+   * 把 manifest 的 `geewiki.slots` 声明登记为插槽贡献。
+   *
+   * 为什么在激活后才登记：与激活失败的处理保持一致——失败的插件不应占着插槽。
+   * 未知插槽名由 `SlotRegistry` 忽略并告警（不阻断激活），与前端"忽略未知插槽名"一致。
+   */
+  private registerManifestSlots(name: string, entry: RegisteredPlugin): void {
+    const declared = entry.manifest.geewiki.slots
+    if (!declared || declared.length === 0) return
+    for (const slot of declared) this.slots.contributeFromManifest(name, slot)
   }
 
   /**
@@ -1252,6 +1312,10 @@ export class GeeWikiManager {
     // 客户端会**静默悬空**——历史上这被记为"把噪声故障换成了沉默故障"。
     // 收流本身不改变排空语义与告警文案：真实在途请求该等还是要等、该告警还是要告警。
     this.closeOwnStreams(name)
+    // 插槽贡献同步回收：与收流同层、同理由——卸载统一出口上做一次，
+    // 所有卸载路径（disable / 启停回滚 / disposeAll）自动覆盖。
+    // 放在 drain 之前：贡献已经"不该再生效"了，没必要等排空完才撤。
+    this.slots.release(name)
     await this.drainBeforeUnload(name, managed)
     let error: Error | null = null
     if (managed.fiber) {
@@ -1500,6 +1564,18 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() }),
   )
   router.register('GET', '/api/plugins/graph', (h) => ok(h, { graph: manager.graph() }))
+  // 插槽裁决结果与冲突诊断。
+  //
+  // 为什么单独开一个只读端点而不是只塞进入口表：入口表是**给前端驱动加载**的，
+  // 而冲突是**运维/排障**问题（"我启用的编辑器为什么没生效"）。两者受众与缓存策略不同
+  // （入口表走 revision + 304，这里必须每次现算），混在一起会让排障必须绕过缓存。
+  router.register('GET', '/api/plugins/slots', (h) => {
+    const assignments = manager.slotAssignments()
+    ok(h, {
+      slots: assignments,
+      conflicts: assignments.filter((a) => a.suppressed.length > 0),
+    })
+  })
   // 插件 UI 入口表（前端插槽用）：由注册表 × 激活集合 × 产物 stat 现算。
   // 注册位置说明：本路由是 3 段（/api/plugins/ui），与既有 GET /api/plugins/graph 同形；
   // 4 段路由（如 /api/plugins/:name/config）不受影响——某插件恰好叫 "ui" 时仅裸 3 段路径被占用。

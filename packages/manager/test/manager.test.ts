@@ -17,7 +17,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from 'cordis'
-import { CACHE_PURGE_EVENT, type HttpRouterService } from '@geewiki/core'
+import { CACHE_PURGE_EVENT, type HttpRouterService, type SlotName } from '@geewiki/core'
 import { GeeWikiManager, ManagerError, writeCrashMarker } from '../src/index.js'
 import { decideWatchdog } from '../src/watchdog.js'
 import type { RegisteredPlugin } from '../src/deps.js'
@@ -112,6 +112,8 @@ function plugin(
     /** 面向人的展示字段（可选；缺失即 undefined，用于验证向后兼容） */
     displayName?: string
     description?: string
+    /** manifest 声明的插槽（用于验证"激活时登记、卸载时回收"） */
+    slots?: SlotName[]
   } = {},
 ): RegisteredPlugin {
   return {
@@ -122,6 +124,7 @@ function plugin(
       geewiki: {
         displayName: opts.displayName,
         description: opts.description,
+        slots: opts.slots,
         requires: opts.requires ?? [],
         conflictGroup: opts.conflictGroup,
         runtime: {
@@ -638,6 +641,86 @@ test('快照：未声明 displayName/description 时为 undefined 且不报错�
     const json = JSON.parse(JSON.stringify(s)) as Record<string, unknown>
     assert.ok('displayName' in s, '属性应存在（值为 undefined）')
     assert.equal(json['name'], '@t/legacy', '快照仍可正常序列化')
+  } finally {
+    env.cleanup()
+  }
+})
+
+/* ---------------------- 插槽：激活登记 / 卸载回收（端到端，走真实 GeeWikiManager） ---------------------- */
+
+test('插槽：manifest 声明的贡献在激活时自动登记，卸载后消失（走真实卸载路径）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.sessionFile, [{ name: '@t/editor-a' }, { name: '@t/editor-b' }])
+    const log: string[] = []
+    const registry = [
+      plugin('@t/editor-a', log, { slots: ['editor'] }),
+      plugin('@t/editor-b', log, { slots: ['editor', 'app-footer'] }),
+    ]
+    const m = makeManager(env, registry)
+    await m.boot()
+
+    // 激活即登记：两个插件都声明了 editor
+    assert.deepEqual(m.slotService().ownersOf('editor'), ['@t/editor-a', '@t/editor-b'])
+    assert.deepEqual(m.slotService().ownersOf('app-footer'), ['@t/editor-b'])
+
+    // 单占用裁决：激活顺序最早者生效，其余被抑制且**可见**
+    const first = m.slotAssignments().find((a) => a.slot === 'editor')
+    assert.deepEqual([...first!.effective], ['@t/editor-a'], '按激活顺序最早者胜出')
+    assert.deepEqual([...first!.suppressed], ['@t/editor-b'])
+
+    // 卸载 a：贡献被回收，b 自动接位、冲突消失
+    await m.disable('@t/editor-a')
+    assert.deepEqual(m.slotService().ownersOf('editor'), ['@t/editor-b'], '卸载后其插槽贡献必须消失')
+    const after = m.slotAssignments().find((a) => a.slot === 'editor')
+    assert.deepEqual([...after!.effective], ['@t/editor-b'])
+    assert.deepEqual([...after!.suppressed], [], '竞品卸载后不应再报冲突')
+    // 未受影响的贡献保持原样（不误伤）
+    assert.deepEqual(m.slotService().ownersOf('app-footer'), ['@t/editor-b'])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('插槽：激活失败不留下归属记录（失败的插件不该占着插槽）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.sessionFile, [{ name: '@t/boom' }])
+    const log: string[] = []
+    const m = makeManager(env, [plugin('@t/boom', log, { fail: true, slots: ['editor'] })])
+    await m.boot()
+    assert.equal(snapshotOf(m, '@t/boom').state, 'error', '夹具前提：该插件确实激活失败')
+    assert.deepEqual(m.slotService().ownersOf('editor'), [], 'apply 抛错时不得留下插槽归属')
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('插槽：manifest 未声明 slots 的插件不产生任何贡献（向后兼容）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.sessionFile, [{ name: '@t/plain' }])
+    const log: string[] = []
+    const m = makeManager(env, [plugin('@t/plain', log)])
+    await m.boot()
+    assert.equal(snapshotOf(m, '@t/plain').state, 'active', '夹具前提：插件正常激活')
+    assert.deepEqual(m.slotService().list(), [], '未声明 slots 不应有任何贡献')
+    assert.deepEqual(m.slotAssignments(), [])
+  } finally {
+    env.cleanup()
+  }
+})
+
+test('插槽：disposeAll 回收全部贡献（关停路径不残留）', async () => {
+  const env = makeEnv()
+  try {
+    writeList(env.sessionFile, [{ name: '@t/editor-a' }])
+    const log: string[] = []
+    const m = makeManager(env, [plugin('@t/editor-a', log, { slots: ['editor'] })])
+    await m.boot()
+    assert.equal(m.slotService().list().length, 1)
+    await m.disposeAll()
+    assert.equal(m.slotService().list().length, 0, 'disposeAll 后不得残留贡献')
   } finally {
     env.cleanup()
   }

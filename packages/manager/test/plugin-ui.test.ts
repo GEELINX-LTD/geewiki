@@ -350,3 +350,86 @@ test('不变式：入口表命中的根 === 静态层根表里该插件的根（
   assert.equal(hit?.root, roots['@t/a'], '静态层与入口表必须得到同一个根')
   assert.equal(table.plugins['@t/a']?.entry, 'client.js')
 })
+
+/* ---------------------- 插槽字段（slots / slotConflicts） ---------------------- */
+
+test('slots：无贡献时整个键被省略 —— 保证既有部署的 revision 逐字节不变', () => {
+  const stat = fakeStat({ '/p/a/dist/client.js': [1, 2] })
+  const registry = [pluginOf('@t/a', { dir: '/p/a', client: {} })]
+  const base = { registry, activeNames: new Set(['@t/a']), webDist: '/w', statFile: stat, dirExists: anyDirExists }
+
+  const withoutSlots = buildPluginUiTable(base)
+  // 显式传入"空裁决结果"，必须与完全不传得到**完全相同**的表（含 revision）
+  const withEmptyAssignments = buildPluginUiTable({ ...base, slotAssignments: [] })
+
+  assert.equal('slots' in (withoutSlots.plugins['@t/a'] as object), false, '无贡献时不应出现 slots 键')
+  assert.equal(withoutSlots.revision, withEmptyAssignments.revision, '空裁决结果不得改变 revision')
+})
+
+test('slots：贡献者的 slots 字段计入 revision（否则 304 会隐藏"编辑器换人"）', () => {
+  const stat = fakeStat({ '/p/a/dist/client.js': [1, 2], '/p/b/dist/client.js': [1, 2] })
+  const registry = [pluginOf('@t/a', { dir: '/p/a', client: {} }), pluginOf('@t/b', { dir: '/p/b', client: {} })]
+  const base = {
+    registry,
+    activeNames: new Set(['@t/a', '@t/b']),
+    webDist: '/w',
+    statFile: stat,
+    dirExists: anyDirExists,
+  }
+
+  // 场景一：只有 a 声明 editor
+  const onlyA = buildPluginUiTable({
+    ...base,
+    slotAssignments: [{ slot: 'editor', cardinality: 'single', owners: ['@t/a'], effective: ['@t/a'], suppressed: [] }],
+  })
+  // 场景二：a 被停用（不再有贡献），editor 归 b
+  const onlyB = buildPluginUiTable({
+    ...base,
+    slotAssignments: [{ slot: 'editor', cardinality: 'single', owners: ['@t/b'], effective: ['@t/b'], suppressed: [] }],
+  })
+
+  assert.deepEqual(onlyA.plugins['@t/a']?.slots, ['editor'])
+  assert.equal(onlyA.plugins['@t/b']?.slots, undefined, '未生效者不应带 slots')
+  assert.deepEqual(onlyB.plugins['@t/b']?.slots, ['editor'])
+  assert.notEqual(
+    onlyA.revision,
+    onlyB.revision,
+    '插槽归属变化必须改变 revision，否则前端 If-None-Match 会拿到 304 而静默沿用旧编辑器',
+  )
+})
+
+test('slotConflicts：只在真有多方声明时出现，且**不计入** revision（诊断信息不触发重取）', () => {
+  const stat = fakeStat({ '/p/a/dist/client.js': [1, 2], '/p/b/dist/client.js': [1, 2] })
+  const registry = [pluginOf('@t/a', { dir: '/p/a', client: {} }), pluginOf('@t/b', { dir: '/p/b', client: {} })]
+  const base = {
+    registry,
+    activeNames: new Set(['@t/a', '@t/b']),
+    webDist: '/w',
+    statFile: stat,
+    dirExists: anyDirExists,
+  }
+
+  const noConflict = buildPluginUiTable({
+    ...base,
+    slotAssignments: [{ slot: 'app-header', cardinality: 'multi', owners: ['@t/a', '@t/b'], effective: ['@t/a', '@t/b'], suppressed: [] }],
+  })
+  assert.equal('slotConflicts' in noConflict, false, 'multi 插槽多人贡献不是冲突')
+
+  const conflicted = buildPluginUiTable({
+    ...base,
+    slotAssignments: [{ slot: 'editor', cardinality: 'single', owners: ['@t/a', '@t/b'], effective: ['@t/a'], suppressed: ['@t/b'] }],
+  })
+  assert.deepEqual(conflicted.slotConflicts, [
+    { slot: 'editor', winner: '@t/a', suppressed: ['@t/b'], owners: ['@t/a', '@t/b'] },
+  ])
+  // 冲突是诊断信息：与"该加载什么"无关，故刻意不计入 revision
+  const sameWithoutConflictFlag = buildPluginUiTable({
+    ...base,
+    slotAssignments: [{ slot: 'editor', cardinality: 'single', owners: ['@t/a'], effective: ['@t/a'], suppressed: [] }],
+  })
+  assert.equal(
+    conflicted.revision,
+    sameWithoutConflictFlag.revision,
+    'slotConflicts 不应计入 revision（否则仅多一条告警也会触发前端重取 bundle）',
+  )
+})

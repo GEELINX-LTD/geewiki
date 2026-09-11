@@ -114,6 +114,21 @@ export interface GeeWikiMeta {
    */
   client?: GeeWikiClient
   /**
+   * **声明本插件向哪些宿主插槽贡献界面**（见 {@link SlotName}）。
+   *
+   * 与 `client` 的关系：`client` 声明"我有 UI 产物"，`slots` 声明"我要占用哪些位置"。
+   * 声明后管理器在**激活时自动登记**为插槽贡献（`via: 'manifest'`），
+   * 于是入口表能带上"哪个插件占了哪个插槽"，宿主据此决定要加载哪些 bundle
+   * （配合 `ctx.get('slot').contribute(..., { lazy: true })` 可把编辑器一类大产物推迟到需要时）。
+   *
+   * 未在白名单内的名字会被**忽略并告警**，不阻断激活（与前端"忽略未知插槽名"的既有行为一致）：
+   * 一个笔误不该让整个插件起不来，但必须在日志里可见。
+   *
+   * 声明式优先：能用本字段表达的就不要用运行期 `contribute()`——
+   * 前者可被静态检查、能在插件代码跑起来之前就进入入口表。
+   */
+  slots?: SlotName[]
+  /**
    * 插件配置 Schema（schemastery 实例，如 Schema.object({ port: Schema.number().default(3000) })）。
    *
    * 驱动三件事：REST 层把配置下发/校验、管理台自动生成配置表单、配置热更新前的校验。
@@ -605,4 +620,137 @@ export interface HttpRouterService {
    * 可选（`?`）以保持向后兼容。
    */
   noteStreamRejected?(): void
+}
+
+/* ======================= 插槽（slot）契约与编辑器数据通道 ======================= */
+
+/**
+ * 宿主暴露给插件的**具名插槽**。
+ *
+ * 与前端 `@geewiki/web` 的 `lib/slots.tsx` 是**同一份白名单的两处镜像**（web 不能 import 本包：
+ * core 顶层 `import 'node:fs'`，进不了浏览器 bundle）。两处必须一致——
+ * manager 侧有源码级守卫测试钉住这一点（同 `PLUGIN_UI_FILE_SEGMENT` 的既有做法）。
+ *
+ * - `app-header` / `app-footer`：**零属性**插槽，可多方贡献（多）。
+ * - `editor`：**带数据的单占用**插槽（见 {@link EditorSlotProps}）。
+ */
+export type SlotName = 'app-header' | 'app-footer' | 'editor'
+
+/** 插槽白名单（顺序即文档顺序）。插件传未知名会被忽略并告警，不阻断激活。 */
+export const SLOT_NAMES: readonly SlotName[] = ['app-header', 'app-footer', 'editor']
+
+/**
+ * 插槽的**占用基数**：`multi` 允许多个插件同时贡献，`single` 全局同一时刻只生效一个。
+ *
+ * 为什么需要它：`editor` 是"同一时刻只能有一个"的资源（两个编辑器同时渲染没有意义），
+ * 而 `app-header`/`app-footer` 天然可叠加（多个插件各挂一个小部件）。
+ * 光靠插件级 `conflictGroup` **不足以**表达这件事：
+ * - `conflictGroup` 是**整个插件**级互斥，而某插件可能只是"顺便"贡献了 editor
+ *   （主体功能是别的）——此时要求它跟别的编辑器插件互斥，会连带禁掉它的主体功能；
+ * - 若两个 active 插件都不在同组却都贡献 `editor`，宿主必须能**确定性地**裁决并**可见地**
+ *   报告冲突，而不是静默随便挑一个。
+ * 故：`conflictGroup` 是**声明式**推荐做法（把互斥意图写进 manifest），
+ * 基数裁决是**兜底**（作者忘了声明时的确定性行为 + 显式诊断）。
+ */
+export const SLOT_CARDINALITY: Readonly<Record<SlotName, 'single' | 'multi'>> = Object.freeze({
+  'app-header': 'multi',
+  'app-footer': 'multi',
+  editor: 'single',
+})
+
+/**
+ * `editor` 插槽的 props：**宿主唯一向插件传数据的通道**。
+ *
+ * ## 与"宿主不向插件传数据"的隔离裁决并存
+ * 零属性插槽（`app-header`/`app-footer`）刻意不传任何数据，避免跨版本契约耦合，
+ * 这条裁决**未被推翻**、也不应被推翻。但编辑器场景**本质上需要数据**——
+ * 没有正文与保存回调，插件无法做编辑器。
+ * 因此这里采取**显式窄契约**：类型在 core 里具名声明、字段逐个人工审定，
+ * 插件只能拿到下面这几个字段，**拿不到任意宿主状态**。
+ *
+ * ## 为什么没有 `[k: string]: unknown` 逃生口
+ * 索引签名会让"加字段"绕过类型审查，契约就会在无声明的情况下悄悄漂移；
+ * 未来要加字段**必须显式改这个类型**，从而必然经过一次评审与版本考量。
+ *
+ * ## 演进约束
+ * 加字段只允许**可选**（`?`）语义，以保证既有编辑器插件不被破坏。
+ */
+export interface EditorSlotProps {
+  /** 当前正文 Markdown 源文（受控值：由宿主持有，插件只读 + 通过 onChange 回传） */
+  readonly value: string
+  /** `create` = 新建页面的空编辑器；`edit` = 编辑既有页面 */
+  readonly mode: 'create' | 'edit'
+  /**
+   * 目标页面标识。`mode === 'create'` 时可能是**空串或尚未确定**的输入值
+   * （新建态允许用户先写正文再定标识），插件不得假定它一定合法或非空。
+   */
+  readonly slug: string
+  /** 只读预览（如查看历史快照、无编辑权限）：为 true 时插件应禁用编辑并隐藏保存入口 */
+  readonly readOnly?: boolean
+  /** 正文变更回传（宿主据此维护草稿/脏值判定） */
+  onChange(next: string): void
+  /** 请求保存（宿主负责校验、冲突检测与落库；插件不直接写数据库） */
+  onSave(): void
+  /** 请求取消编辑（宿主负责未保存确认） */
+  onCancel(): void
+}
+
+/** 贡献插槽时的可选元信息 */
+export interface SlotContributionMeta {
+  /**
+   * 标记为**懒加载贡献**：宿主首屏不必加载该插件的 UI 产物，
+   * 直到真的要渲染该插槽时才去取 {@link SlotContribution.importPath}。
+   *
+   * 价值：编辑器插件往往体积不小（例如 CodeMirror 一类），而绝大多数访问
+   * 只看文档、不进编辑态——懒加载把这份成本推迟到真正需要时。
+   */
+  lazy?: boolean
+  /**
+   * 懒加载时要请求的模块路径（相对**插件产物根**，如 `editor.js` 或 `chunks/editor.js`）。
+   * 规则与静态资源层一致（`PLUGIN_UI_ASSET_PATH`：逐段 `[A-Za-z0-9][A-Za-z0-9._-]*`，≤16 段）。
+   * `lazy: true` 而未给 `importPath` 时回退到该插件的 `client.entry`。
+   */
+  importPath?: string
+}
+
+/** 一条插槽贡献（注册表里的记录） */
+export interface SlotContribution {
+  readonly slot: SlotName
+  /** 贡献者（插件名）。管理器在卸载该 owner 时定向注销（见 {@link SlotService.release}） */
+  readonly owner: string
+  /** 来源：manifest 声明（声明式，激活时自动登记）还是运行期 `contribute()`（命令式） */
+  readonly via: 'manifest' | 'runtime'
+  readonly lazy: boolean
+  readonly importPath?: string
+}
+
+/**
+ * 插槽服务（`ctx.get('slot')`）：插件声明与查询"我贡献了哪个插槽"。
+ *
+ * 为什么由**管理器**提供而不是单独一个插件：插槽贡献的归属与回收必须挂在
+ * **插件生命周期**上（激活时登记、卸载时注销），而管理器正是生命周期与
+ * 卸载统一出口（`unloadPlugin`）的持有者；另起一个插件反而要在两者间来回同步。
+ *
+ * 与 `HttpRouterService.trackStream(res, owner)` 的 owner 契约**同源**：
+ * owner 由调用方显式传入、管理器据此定向回收。插件平台内的插件本就能执行任意代码，
+ * 故 owner 不是安全边界，而是**归属与回收的记账依据**；
+ * 冒用他人 owner 只会污染自己的记账（并可被 `list()` 立刻看出来）。
+ */
+export interface SlotService {
+  /**
+   * 登记一条插槽贡献。返回**幂等的注销函数**（重复调用安全）。
+   *
+   * 同一 `(owner, slot)` 重复登记视为**同一条**（后者可覆盖 `lazy`/`importPath`），
+   * 不会产生重复项。
+   *
+   * @param owner 贡献者（插件名）。管理器按此在卸载时定向注销。
+   * @param slot 插槽名；未在白名单内则忽略并告警（返回一个空操作的注销函数）
+   */
+  contribute(owner: string, slot: SlotName, meta?: SlotContributionMeta): () => void
+  /** 列出贡献；不传 `slot` 列出全部（顺序稳定：先插槽白名单顺序，再 owner 字典序） */
+  list(slot?: SlotName): readonly SlotContribution[]
+  /** 某插槽的全部声明者（未按基数裁决，即"谁声明了"，用于诊断） */
+  ownersOf(slot: SlotName): readonly string[]
+  /** 注销某 owner 的**全部**贡献（管理器卸载统一出口调用，与 `closeStreams(owner)` 同风格） */
+  release(owner: string): void
 }

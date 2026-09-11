@@ -49,6 +49,7 @@ import {
   pluginUiRootsFor,
   removeCrashMarker,
   resolveMigrationsDirs,
+  slotPlugin,
   writeCrashMarker,
   type DiscoveryIssue,
   type RegisteredPlugin,
@@ -1081,6 +1082,15 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
     ? { registry: options.registry, issues: [] }
     : await buildRegistry(webDist, { port, host }, pluginsRoot, pluginUiRoots)
   builtRef = built
+
+  // 插槽服务插件**必须先于管理器装载**。
+  //
+  // 理由是实测出来的：最初把 `provide('slot', …)` 放在管理器的 apply 开头、再 boot()，
+  // 结果插件 apply 里 `ctx.get('slot')` 是 **undefined**，它的运行期贡献被静默跳过
+  // ——**在一个插件 apply 尚未结算时 provide 的服务，对它在此期间创建的子插件不可见**，
+  // 而 boot() 恰恰是在管理器的 apply 内部激活插件。前移为独立插件后它的 apply 先结算，
+  // 服务即对管理器及其 boot 出来的插件可见（与 db-sqlite / http 作为兄弟插件同理）。
+  await app.plugin(slotPlugin)
 
   const managerFiber = await app.plugin(PluginManagerPlugin, {
     registry: built.registry,
