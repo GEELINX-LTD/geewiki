@@ -7,7 +7,13 @@
  */
 export { cn } from './cn'
 export { focusRing, touchTarget } from './a11y'
-export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from './Button'
+export {
+  Button,
+  buttonClassName,
+  type ButtonProps,
+  type ButtonSize,
+  type ButtonVariant,
+} from './Button'
 export { Spinner } from './Spinner'
 export { Input, Textarea, type InputProps } from './Input'
 export { Card, CardHeader, CardBody } from './Card'

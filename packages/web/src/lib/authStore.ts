@@ -15,15 +15,28 @@
  * 而 401 会被统一出口当成"会话失效"处理 ⇒ 每个匿名访客冷启动都会触发一次无谓跳转。
  */
 import { useCallback, useEffect, useSyncExternalStore } from 'react'
-import { api, setAuthFailureHandler, type AuthCapabilities, type AuthUser } from '../api'
+import {
+  api,
+  setAuthFailureHandler,
+  type AuthCapabilities,
+  type AuthOidcCapability,
+  type AuthUser,
+} from '../api'
 import { errorLine } from './errorText'
 import { invalidatePages } from './pagesStore'
 
-export type { AuthCapabilities, AuthUser }
+export type { AuthCapabilities, AuthOidcCapability, AuthUser }
 
 export interface AuthState {
   user: AuthUser | null
   capabilities: AuthCapabilities | null
+  /**
+   * SSO 通道能力（P1.5）。`null` = 尚未知。
+   *
+   * **与身份无关，是环境事实**：它由"是否装并启用了 `@geewiki/oidc`、IdP 是否可达"决定，
+   * 所以登出后**不清零**（同 `setupRequired`），否则登录页的 SSO 按钮会闪一下再出现。
+   */
+  oidc: AuthOidcCapability | null
   /** `null` = 尚未知（首帧）；`true` = 库里还没有任何可登录账号，应去 #/setup */
   setupRequired: boolean | null
   authenticated: boolean
@@ -37,6 +50,7 @@ export interface AuthState {
 const EMPTY: AuthState = {
   user: null,
   capabilities: null,
+  oidc: null,
   setupRequired: null,
   authenticated: false,
   loading: true,
@@ -62,6 +76,7 @@ function resetToAnonymous(keepSetupFlag = true): void {
   setState({
     ...EMPTY,
     setupRequired: keepSetupFlag ? state.setupRequired : null,
+    oidc: state.oidc,
     loading: false,
   })
 }
@@ -120,6 +135,7 @@ export function loadAuth(options: { force?: boolean } = {}): Promise<void> {
       setState({
         user: r.user,
         capabilities: r.capabilities,
+        oidc: r.oidc,
         setupRequired: r.setupRequired,
         authenticated: r.authenticated,
         loading: false,
