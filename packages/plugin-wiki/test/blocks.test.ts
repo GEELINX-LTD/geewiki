@@ -31,8 +31,16 @@ function freshDb(): DatabaseSync {
     for (const f of readdirSync(join(REPO, d)).filter((x) => x.endsWith('.sql')).sort()) {
       try {
         db.exec(readFileSync(join(REPO, d, f), 'utf8'))
-      } catch {
-        /* 与本次无关的单条语句失败不阻断（例如 FTS 相关的边界） */
+      } catch (err) {
+        /*
+         * **只吞幂等性错误**（同一文件被重复应用时的 "already exists" / "duplicate column name"）。
+         *
+         * 这里原先是个**空 `catch {}`**，会把真正的语法错误一并吞掉 —— 后果很具体：
+         * 若 `0002_blocks_fts.sql` 语法坏掉，夹具会**静默地没有 `blocks_fts`**，
+         * 而依赖它的断言照绿。那比不测更糟（假绿），所以改为"认识幂等错误、其余重抛"。
+         */
+        const message = err instanceof Error ? err.message : String(err)
+        if (!/already exists|duplicate column name/i.test(message)) throw err
       }
     }
   }
@@ -213,4 +221,105 @@ test('syncBlocksForPage：删页后块与索引都被清（回归：contentless 
   // 外键级联只带走 blocks 行，blocks_fts 必须由写入方显式清（见 deletePage）
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks_fts').get() as { n: number }).n, 1)
+})
+
+/* --------------------- 源码级守卫：块与索引的写入必须成对 --------------------- */
+
+/**
+ * `packages/plugin-wiki/src/blocks.ts` 的头部声称"有源码级守卫测试钉住这一点" ——
+ * **这个测试就是它**（此前并不存在；P3a 审查指出该声称是空的）。
+ *
+ * 钉的不变量（**不是**"只能在 blocks.ts"，那会被合法例外打破）：
+ *
+ * 1. **`INSERT INTO blocks` 只能出现在 `blocks.ts`** —— 最关键的一条：新增一个块行必须
+ *    **同时**往 `blocks_fts` 插一行，而只有 `syncBlocksForPage` 同时做这两件事。
+ *    绕过它直接插入 ⇒ 块在库里却搜不到（或索引里留着已删块的正文）。
+ * 2. **`DELETE FROM blocks` 同理**（删块也要清索引，contentless 表没有级联）。
+ * 3. **`INSERT INTO blocks_fts` 只允许两处**：`blocks.ts` 的逐页同步，以及
+ *    `packages/plugin-search/src/index.ts` 的**全量重建** —— 后者从 `blocks` 派生
+ *    （`SELECT id, text FROM blocks`），派生不出 `blocks` 里没有的内容。
+ *
+ * **刻意不限制**：`DELETE FROM blocks_fts`（单独清索引）与 `UPDATE blocks SET tier`。
+ * 二者的失败方向都是"**少给**"（搜不到 / 档位偏保守），不会泄漏；锁死它们会让
+ * "删除页面时清索引"这类必需的清理无处安放。
+ *
+ * ⚠️ 测试夹具（`test/` 目录）**排除在外** —— 它们本来就在裸写以构造状态。
+ */
+test('源码级守卫：块与索引的写入必须成对（不得绕过唯一写入路径）', () => {
+  const pkgRoot = join(REPO, 'packages')
+  const files: string[] = []
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name)
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name === 'test') continue
+        walk(p)
+      } else if (e.name.endsWith('.ts')) {
+        files.push(p)
+      }
+    }
+  }
+  for (const p of readdirSync(pkgRoot)) {
+    try {
+      walk(join(pkgRoot, p, 'src'))
+    } catch {
+      /* 该包没有 src（例如纯 fixtures）——不是错误 */
+    }
+  }
+
+  const WRITE_PATH = join('plugin-wiki', 'src', 'blocks.ts')
+  const REBUILD = join('plugin-search', 'src', 'index.ts')
+
+  /** 返回**不在允许清单里**却命中该模式的位置 */
+  const offenders = (pattern: RegExp, allowed: readonly string[]): string[] => {
+    const hits: string[] = []
+    for (const f of files) {
+      if (allowed.some((a) => f.endsWith(a))) continue
+      readFileSync(f, 'utf8')
+        .split('\n')
+        .forEach((line, i) => {
+          /*
+           * 跳过注释行：本守卫是**按行匹配文本**的，注释里提到 SQL（`blocks.ts` 头部就写着
+           * "绕过它直接 `INSERT INTO blocks` 会让索引漂移"）会被误判成违规。
+           * 真实语句行不会以 `*` 或 `//` 开头（它们以 `tx.run(`、反引号或引号开头）。
+           */
+          const t = line.trimStart()
+          if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) return
+          if (pattern.test(line)) hits.push(`${f}:${i + 1}: ${line.trim()}`)
+        })
+    }
+    return hits
+  }
+
+  /*
+   * 反空洞：先确认扫描**真的扫到了生产源文件**，以及唯一写入路径里**真的**有那两条语句。
+   * 没有这一段，上面三条"0 处违规"在"扫描范围写错/文件没被读到"时同样会全绿。
+   */
+  assert.ok(files.length > 20, `应当扫到生产源文件，实际只扫到 ${files.length} 个`)
+  const writePathText = readFileSync(
+    files.find((f) => f.endsWith(WRITE_PATH)) ?? '',
+    'utf8',
+  )
+  assert.ok(/INSERT INTO blocks \(/i.test(writePathText), '唯一写入路径里应当确实有 INSERT INTO blocks')
+  assert.ok(/DELETE FROM blocks\b/i.test(writePathText), '唯一写入路径里应当确实有 DELETE FROM blocks')
+  assert.ok(
+    /INSERT INTO blocks_fts/i.test(readFileSync(files.find((f) => f.endsWith(REBUILD)) ?? '', 'utf8')),
+    'search 的全量重建里应当确实有 INSERT INTO blocks_fts',
+  )
+
+  assert.deepEqual(
+    offenders(/INSERT INTO blocks \(/i, [WRITE_PATH]),
+    [],
+    '新增块行必须经 blocks.ts 的 syncBlocksForPage，否则块与索引漂移',
+  )
+  assert.deepEqual(
+    offenders(/DELETE FROM blocks\b/i, [WRITE_PATH]),
+    [],
+    '删除块行必须经 blocks.ts，否则 contentless 索引里留下孤儿',
+  )
+  assert.deepEqual(
+    offenders(/INSERT INTO blocks_fts/i, [WRITE_PATH, REBUILD]),
+    [],
+    '索引插入只允许 blocks.ts 的逐页同步与 search 的全量重建（后者从 blocks 派生）',
+  )
 })

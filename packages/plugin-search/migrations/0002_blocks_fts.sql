@@ -53,14 +53,20 @@ DROP TRIGGER IF EXISTS pages_fts_au;
 -- ④ ★★ 为什么不给 blocks 建触发器 —— 后人看到没有触发器时**不要以为这里忘了写**：
 --
 --    0001 的同步是纯 SQL 能表达的（pages 的三个字段直接抄进索引）。块级**不是**：
---    要写进 `blocks_fts` 之前，得先算出该块的 `tier = min(页面有效档位, 块档位)`，
+--    要写进 `blocks_fts` 之前，得先算出该块的 `tier` = **页面有效档位与块档位中更窄的那个**，
 --    而页面有效档位取决于**祖先链的可见性交集与发布闸门**（§2.3 的规则）——
 --    那是 `policy-service` 的业务逻辑，不是触发器能表达的 SQL。
+--
+--    ⚠️ 用 `tier` 的刻度写就是 **`max`**（`tier` 是**限制等级**：越小越公开，故"更窄"= 更大）。
+--       设计文档 §2.3 规则 B1 把这一条写成 `min(block, page)` —— 那句话的刻度是"**宽松度**"
+--       （越大越宽松），与 `tier` 列**方向相反**。照文档写成 `min` 会让"页面 org + 块 public"
+--       的块拿到 `tier = 0` ⇒ **匿名在搜索里就能搜到它**。以代码的 `effectiveIndexLevel` 为准。
 --
 --    ⇒ **块级索引的同步由应用层在同一事务内维护**：
 --        DELETE FROM blocks_fts WHERE rowid IN (该页所有块 id);
 --        逐块 INSERT INTO blocks_fts(rowid, text) VALUES (块 id, 块文本);
---    全部块写入收敛到单一模块（packages/plugin-wiki 的 blocksWriters），
+--    全部块写入收敛到**单一模块** `packages/plugin-wiki/src/blocks.ts` 的 `syncBlocksForPage()`
+--    （并由源码级守卫测试断言"再无第二处 `INSERT INTO blocks`/`INTO blocks_fts`"），
 --    并由 `GET /api/admin/search/verify` 比对 `blocks` 与 `blocks_fts` 的行数差与抽样命中
 --    —— **这条一致性探针是 P3a 的强制验收项**，因为它替代了触发器的自动同步保证。
 --
