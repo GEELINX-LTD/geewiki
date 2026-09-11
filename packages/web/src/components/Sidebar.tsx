@@ -101,7 +101,16 @@ function NodeRow(props: {
             onClick={() => onOpen(node.page?.slug ?? '')}
             className={cn(
               'gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-note',
-              isActive ? 'font-semibold text-accent-ink' : inPath ? 'text-ink' : 'text-ink-soft',
+              /*
+                当前项底色是 `bg-accent-soft`（见上方 isActive），故前景必须用**它的配套** ink
+                `text-accent-soft-ink`，而不是 `text-accent-ink`。
+                `--gw-accent-ink` 是"**实心** accent 底上的字色"（白/近黑），配 `bg-accent` 才对
+                （见 ui/Button.tsx 的 primary）；用在浅色柔底上会得到 **1.09:1**（深色 1.14:1）
+                ——几乎不可读，axe 记为 serious。仓库里其它三处柔底（CommandPalette、
+                DropdownMenu、Badge）都已经是 `text-accent-soft-ink`，只有侧栏这一处错配。
+                实测对比度：浅色 #1e40af on #eff6ff = **8.01**；深色 #93c5fd on #10203a = **9.03**。
+              */
+              isActive ? 'font-semibold text-accent-soft-ink' : inPath ? 'text-ink' : 'text-ink-soft',
               'hover:underline',
             )}
             title={node.page.slug}

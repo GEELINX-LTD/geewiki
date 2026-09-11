@@ -7,6 +7,15 @@
  *
  * 边界：插件**不**假定 token 一定存在，故每个 `var()` 都给了回退值——
  * 独立调试插件产物（不经宿主页面）时也不会变成无色。
+ *
+ * ⚠️ **回退值会掩盖"token 名写错"**（本文件踩过，务必记住）：
+ * 原先这里写的是 `var(--gw-muted, #6b7a8c)`，而宿主**根本没有** `--gw-muted` 这个变量
+ * （原名是 `--gw-ink-muted`）⇒ **回退值一直在生效**，且它恰好是旧调色板的 gray-500，
+ * 于是浅色 4.09:1 / 深色 4.26:1 双双低于 4.5:1，被 axe 记为 serious（4 个节点：
+ * 字符数、行数、快捷键提示、取消按钮——后两者靠 `color: inherit` 继承本行）。
+ * 写法本身没错（回退是有意的），**错的是名字**。改任一回退值前请先确认 token 名在
+ * `packages/web/src/styles/tokens.css` 里真实存在；`packages/web/test/fixtureTokens.test.ts`
+ * 就是为此加的守卫。
  */
 
 .gw-plain-editor {
@@ -48,7 +57,12 @@
   gap: 10px;
   font-family: var(--gw-font-sans, system-ui, sans-serif);
   font-size: 0.6875rem; /* 与宿主 --text-2xs 同档 */
-  color: var(--gw-muted, #6b7a8c);
+  /*
+    `--gw-ink-muted`：浅色 gray-600 `#55637a`（实测 5.67:1 on 页面底色）、
+    深色 gray-400 `#94a3b8`（实测 7.28:1）——两者都过 4.5:1。
+    回退值取**浅色**下的同名取值，故独立调试时也是合格的前景色（6.08:1 on 白底）。
+  */
+  color: var(--gw-ink-muted, #55637a);
 }
 
 .gw-plain-editor-hint {
