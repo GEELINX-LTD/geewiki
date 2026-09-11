@@ -37,7 +37,7 @@ GeeWiki 是面向团队内部的 **AI 原生 Wiki 知识库**。核心哲学为 
 ## 3. 分层架构
 
 ```
-React 19 前端（宿主侧 Slot：`app-header` / `app-footer` 两个插槽，插件 UI 经 `window.__GEEWIKI_HOST__` 注册 / 依赖图可视化）
+React 19 前端（宿主侧 Slot：`app-header` / `app-footer` 零属性插槽 + 后端声明的 `editor` 数据插槽，详见第 6 章 / 依赖图可视化）
         │
         │  REST API（HTTP）
         ▼
@@ -53,7 +53,7 @@ AI 能力层（**不进任何冲突组**，可自由组合）：@geewiki/search�
 
 各层职责（对应上图中原稿的完整描述）：
 
-1. **React 19 前端**：管理界面与 Wiki 界面。宿主侧 Slot 插槽机制——插件 UI bundle 加载后把组件注册进宿主的 `app-header` / `app-footer` 插槽（无后端 `ctx.slot()` 链路，见第 6 章）；以 React Flow 渲染依赖图可视化。前端通过 **REST API（HTTP）**与 Plugin Manager 通信——**当前没有 WebSocket / 推送通道**，界面数据靠请求-响应获取。
+1. **React 19 前端**：管理界面与 Wiki 界面。宿主侧 Slot 插槽机制——插件 UI bundle 加载后把组件注册进宿主的插槽（`app-header` / `app-footer` 是**零属性**插槽；后端另有 `ctx.slot` 链路与一个具名的 `editor` 数据插槽，见第 6 章）；以 React Flow 渲染依赖图可视化。前端通过 **REST API（HTTP）**与 Plugin Manager 通信——**当前没有 WebSocket / 推送通道**，界面数据靠请求-响应获取。
 2. **Plugin Manager（核心大脑）**：位于服务抽象层（DI，由 Cordis 提供）之上，包含热加载引擎、依赖图/冲突组管理、会话层沙箱机制、迁移控制器、看门狗探针与配置热管理中心。详见第 5 章。
 3. **插件生态**：全部业务能力以插件形式存在。**按冲突组划分**的是真正互斥的同类实现，例如数据库组（SQLite / PG）、编辑器组（Milkdown / TipTap）；而**检索（`@geewiki/search`）、问答（`@geewiki/ai`）、LLM 契约层（`@geewiki/llm`）三类插件刻意不进任何冲突组**——它们提供的是可被多方复用的服务，互斥应留给各厂商 adapter 自己声明（详见第 9 节）。
 
@@ -242,7 +242,7 @@ unprovide()                      // ① 先摘掉服务，后续 get('http') 拿
 
 - **宿主 SDK**：`@geewiki/web` 在 `window.__GEEWIKI_HOST__` 上暴露 React 单例与插槽 API（`packages/web/src/lib/hostSdk.ts`，`HOST_SDK_VERSION = '0.1.0'`）：`{ React, jsxRuntime: { jsx, jsxs, Fragment }, registerSlot(name, component), unregisterSlot(name, token?), version }`。初始化必须是宿主入口的**第一个导入**（`packages/web/src/main.tsx:1-3`），因为 import map 指向的 shim 在模块求值期就要读这个全局。
 - **React 单例共享（D-8）**：`packages/web/index.html` 的 `<script type="importmap">` 必须位于 head 首位，把裸标识符 `react` 映射到 `/host-sdk/react.js`、`react/jsx-runtime` 映射到 `/host-sdk/jsx-runtime.js`——两者是从 `window.__GEEWIKI_HOST__` 取宿主实例再 re-export 的**薄 shim**（`packages/web/public/host-sdk/`）。插件 bundle 以 external 形式构建，因此与宿主共用同一个 React 实例，不会出现双实例 `Invalid hook call`。**刻意不映射 `react-dom` / `react-dom/client`**——插件不得自带框架。注意这与"用 import map 分发宿主产物"的方案不同：此处 import map 只做**标识符到 shim 的转接**，react 实例仍由宿主 bundle 持有（D-4 / D-8 / S-19）。
-- **插槽名是白名单**：当前仅 **`app-header`** 与 **`app-footer`**（`packages/web/src/lib/slots.tsx:12` 的 `export type SlotName = 'app-header' | 'app-footer'`，白名单常量 `SLOT_NAMES` 在 `:15`）。未在名单内的名字只打印 `[geewiki-slot] 未知插槽名 "…"，已忽略（可用：app-header, app-footer）` 并忽略，不抛错。
+- **插槽名是白名单（两处镜像，后端为权威）**：后端 `packages/core/src/index.ts:637` 的 `export type SlotName` / `:640` 的 `export const SLOT_NAMES` 是**权威**；前端 `packages/web/src/lib/slots.tsx` 里是**手抄镜像**（web 不能 import core：core 顶层 `import 'node:fs'`，进浏览器会炸）。**两侧必须逐元素相等，由 `packages/manager/test/slots.test.ts` 守卫**（源码级比对，照本仓既有先例）。该守卫经历过一次**真实的收敛过程**，值得记录：后端先加了具名数据插槽 `editor`，而前端批次尚未跟上，中间状态由源码里的显式记账常量 `PENDING_WEB_SYNC` 钉住（**该清单只允许变短**——web 一旦补上，守卫会因"清单里还有它"而变红并提示移除）；前端补上后守卫转而要求**清空该清单**，从而**不允许"已同步"的陈述长期滞留**。这正是守卫存在的意义：两个方向都受检，且不允许退化成"两边都空"的空洞相等。未在名单内的名字只打印 `[geewiki-slot] 未知插槽名 "…"，已忽略（可用：…）` 并忽略，不抛错。
 - **渲染与容错**：`SlotOutlet({ name })` 用 `useSyncExternalStore` 订阅插槽注册表，外层包 `SlotErrorBoundary`（`packages/web/src/lib/slots.tsx:102`）——插件组件渲染抛错时只丢弃该插槽的内容、保留兜底 UI，**主界面不白屏**。`registerSlot(name, component, source = 'host')` 返回**幂等的撤销函数**。
 - **插件 UI 的加载**：加载器在 `packages/web/src/lib/pluginUi.ts`，不接触 DOM 的纯逻辑部分在 `packages/web/src/lib/pluginUiPlan.ts`（顶层不写 `window`，故可直接用 `node --test` 单测）。**入口表由后端下发**：`GET /api/plugins/ui` → `{ ok, version: 1, revision, plugins: { "<name>": { entry, css?, rev } }, skipped }`，其中 `plugins` **只含**"当前已激活 ∩ 声明了 `geewiki.client` ∩ 入口产物确实存在（只 stat 不读内容）"的插件，`skipped` 逐条记未入表原因（`inactive` / `no_client` / `entry_missing` / `invalid_name`）。前端带 `If-None-Match: "<revision>"`，命中 **304 即零动作**（不触碰已加载 UI）；响应不可信时（请求抛错 / 非 2xx / JSON 解析失败 / 格式不符契约）**既不加载也不卸载**，只 `console.debug`——避免网络抖动清空已加载的界面。`planUiSync(entries, loaded)` 算出"该装载 / 该卸载"的差集：表中新增 → load，已加载但表中消失 → unload，`rev` 变化 → **先卸后装**（产物换了必须重跑 `register`），两个数组均按插件名排序以保证确定性。装载即 `await import(pluginUiBase(name) + '/' + entry)`（**同源绝对 URL，不带任何 query**），要求模块导出 `register(host)`（或 default），收集其返回的清理函数；卸载时执行 disposers、移除 `<link data-plugin-ui=…>`，并以 `epoch` 使在途 import 作废（防"卸载后又被在途 import 复活"）。插件 CSS 由宿主**集中注入** `<link data-plugin-ui=…>`（lib 模式不会自动注入样式，集中注入可避免重复与卸载残留）。`pluginUiBase(name)` 先做路径段校验（1 段非 scope 名，或 2 段且首段为 `@` 开头的 scope 名；段内拒绝 `.` / `..` / 分隔符 / 空白与控制字符）再映射为 `/plugins-ui/<name>`；非法名返回 `undefined` 而不抛错。
 - **入口表为什么由后端下发、而不是"拼约定 URL + 试探"**（`packages/web/src/lib/pluginUi.ts:22-26` 记录的三条实测结论）：① dev 下非绝对 URL 的动态 import 会被 Vite 追加 `?import` 并返回 **500**；② dev 下缺失入口返回 **200 + text/html**，浏览器报 MIME 错（`Failed to load module script … MIME type of text/html`，JS 捕获不掉）；③ prod 下缺失入口直接 **404**，而 Chrome 把任何 404 记为控制台 `log:error`。故"先探测再 import"必然产生噪声或误判。现在"产物缺失"由后端归入 `skipped: entry_missing`，前端根本不会去 import 那些插件——三种噪声**结构性消失**。表本身也不再是构建生成物（旧形态 `/plugins-ui/registry.json` **已停用**），而是由活状态（注册表 × 激活集合 × 产物 stat）**每请求现算**（`GeeWikiManager.uiTable()` → `buildPluginUiTable`），因此"装了插件就有 UI、停用就消失"不需要任何重新构建、也不需要重新生成任何 JSON。
@@ -258,7 +258,7 @@ unprovide()                      // ① 先摘掉服务，后续 get('http') 拿
 
 **已知边界（不要按"完整的插件前端扩展"理解）**：
 
-1. **没有后端注册链路**：不存在 `ctx.slot(name, component)`，插槽注册只发生在浏览器侧；`editor-toolbar-slots`、`admin-page-slots` 等扩展点**尚未提供**（早期设计的目标态，见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 4 节批次 D）。
+1. **后端 `ctx.slot` 链路已建立，前端镜像与消费者尚在收敛中**（提交 `084dab4`）：后端已有 `SlotService`（`ctx.get('slot')` 可取，提供 `contribute(owner, slot, meta?)` / `list(slot?)` / `ownersOf(slot)` / `release(owner)`，且**插件卸载时按 owner 自动回收**），插槽基数由 `SLOT_CARDINALITY` 声明（`app-header`/`app-footer` 为 `multi`，`editor` 为 **`single`**），`GeeWikiMeta.slots?: SlotName[]` 让插件可在 manifest 里声明占用，`GET /api/plugins/slots` 与入口表新增的 `slots` 字段对外可见（**`slots` 计入 `revision`**——否则"编辑器换人"会被 304 静默隐藏）。`app-header` / `app-footer` 的**零属性**语义**未变**；`editor` 是**新增的具名数据插槽**（`EditorSlotProps`：`value` / `mode` / `slug` / `readOnly?` / `onChange` / `onSave` / `onCancel`），**刻意不留 `[k: string]: unknown` 逃生口**——加字段必须显式改类型。**仍在收敛中的部分**：前端 `slots.tsx` 的镜像与 `PENDING_WEB_SYNC` 记账（见上一条）、以及**尚无消费 `editor` 的编辑器插件**；`editor-toolbar-slots`、`admin-page-slots` 等扩展点仍未提供（早期设计的目标态见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 4 节批次 D）。同基数插槽（`single`）同时被多个 active 插件占用时，裁决规则是**激活顺序最早者胜出**、其余进 `slotConflicts`——选"最早"而非"最新"是因为最新胜出会让后启用的插件**静默顶掉**用户正在用的编辑器；但正解仍是作者用 **`conflictGroup`** 声明互斥（插件级互斥会在**启用时**就明确拒绝，而不是留到运行期裁决）。
 2. **没有 Suspense + use Hook 懒加载**：远端 bundle 由加载器显式 `import()`；"不白屏"靠上面的 ErrorBoundary，而不是 Suspense Fallback。
 3. **ESM 模块实例不回收**（`packages/web/src/lib/pluginUi.ts:36-41` 明列为"决策，不是待办"）：`unloadPluginUi` 只做"注销插槽注册 + 移除插件 CSS"，已 import 的模块留在模块图中。因此 `rev` 变化走的是 unload → load，**同一 URL 命中模块缓存**——产物更新后**需整页刷新**才能拿到新代码（未更新时重新 enable 会复用同一实例，`register` 重跑、不累积实例）。与第 5 节的 L-6 同源。
 4. **样式无隔离**：插件 CSS 以 `<link data-plugin-ui=…>` 全局注入文档，v1 **不做任何样式隔离**（无 Shadow DOM、无样式前缀改写）。示例夹具以 `.gw-fixture-*` 前缀命名类名（`packages/web/fixtures/src/style.css`）作为**约定示范**，宿主侧无强制手段。
@@ -364,6 +364,12 @@ unprovide()                      // ① 先摘掉服务，后续 get('http') 拿
 
 > 判断规则（写新插件时照此执行）：`provides` 是**依赖图谱 token**，它**不会创建任何 cordis 服务**；要对外提供能力，必须显式 `ctx.provide(<服务名>, svc)` 并在 dispose 时注销，同时导出服务契约类型供消费方使用。
 
+**并列的第二类认知陷阱：`provide` 的可见性受 `apply` 结算时机约束。** 在一个插件 `apply` **尚未结算**时 `provide` 的服务，对它**在此期间创建的子插件不可见**（`ctx.get` 返回 `undefined`）。它与上面那条是**两类不同的陷阱**，但症状同形：**不报错，只是拿不到服务**，因而同样表现为"功能静默不可用"。
+
+具体到本仓：管理器在 `apply` **内部**调用 `boot()` 激活插件，因此"管理器自己 `provide('slot', …)` 再 `boot()`"这个组合**天然自相矛盾**——被激活的插件里 `ctx.get('slot')` 恒为 `undefined`，插件的运行期插槽贡献被 `if (!slot) return` 静默跳过，**与"这个插件本来就没贡献"完全无法区分**。（提交 `084dab4` 实测踩到：夹具的 3 条插槽贡献只登记了 2 条，**零报错**；诊断日志为 `[slot-demo] ctx.get('slot') → undefined`。）
+
+**正确做法**：把服务提供者做成**独立的兄弟插件**，在组合根里**先于**消费者装载（如 `@geewiki/slot` 之于 `@geewiki/manager`，与 `@geewiki/db-sqlite` / `@geewiki/http` 同理），而不是让消费者在自己的 `apply` 里提供、又在自己内部激活别人。
+
 ### 9.3 `@geewiki/search`：FTS5 + `trigram` 的中文检索事实
 
 **索引形态**（`packages/plugin-search/migrations/0001_search.sql`）：FTS5 **external content** 虚表 `pages_fts(title, content, content='pages', content_rowid='id', tokenize='trigram')`，配三条触发器（`pages_fts_ai` / `pages_fts_ad` / `pages_fts_au`）与末尾的 `rebuild` 回填；迁移脚本**不写 `BEGIN`/`COMMIT`**（`db.migrate()` 已把每个迁移文件包在单个事务里，脚本内再开事务会嵌套报错）。
@@ -454,7 +460,7 @@ unprovide()                      // ① 先摘掉服务，后续 get('http') 拿
 
 ### 9.6 前端接入（**宿主原生 UI，不改 Slot 机制**）
 
-检索与问答界面是**宿主原生 UI**，走 hash 子路由 `#/wiki/search/<q>` 与 `#/wiki/ask/<q>`（可分享、刷新不丢）。**Slot 机制一行未改**——`packages/web/src/lib/slots.tsx` 在本阶段零改动，"宿主不向插件传数据"的冻结裁决保持。
+检索与问答界面是**宿主原生 UI**，走 hash 子路由 `#/wiki/search/<q>` 与 `#/wiki/ask/<q>`（可分享、刷新不丢）。**本阶段未改 `packages/web/src/lib/slots.tsx` 的渲染与注册逻辑**——`app-header` / `app-footer` 仍是**零属性**插槽，"宿主不向插件传数据"的冻结裁决**对这两个插槽依然成立**。注意不要与后端 `ctx.slot` 链路混淆：后端另有一个**具名数据插槽** `editor`（`EditorSlotProps`，见第 6 章已知边界第 1 条），那是**显式开出的窄通道**，与零属性插槽并存。
 
 - **插件未启用时静默降级**：入口探测用两路——`GET /api/plugins`（恒可用）判插件是否 `active`，这是权威判据、**不产生 404**；`GET /api/ai/capabilities`（按契约要求调用）拿"模型是否就绪"的说明，插件未启用时它会 404，前端**静默降级**（只 `console.debug`，**绝不产生 console error**）。插件未启用时搜索框 disabled + 给出提示。
 - **降级提示条是信息性的**，不是错误样式：`no_provider` / `missing_credential` → `level: 'info'`，文案"未配置模型密钥，以下为检索结果与摘要"（`packages/web/src/lib/searchPlan.ts:77-86`）；未知 `reason` 回退到通用文案并带上 `message`，**绝不 throw**（降级提示本身不该成为新的故障点）。
