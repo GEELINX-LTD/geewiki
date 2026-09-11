@@ -596,6 +596,16 @@ export const AuthzPlugin = {
      * 忽略了 `no-store`，`Vary` 也保证不会把匿名渲染结果喂给登录用户
      * （web cache deception —— 这是唯一防线，不是可选项）。
      */
+    /**
+     * 门户类响应的缓存串 —— **提成常量**，供下面的运维端点如实复述。
+     * 若在运维端点里再硬编码一份副本，两份必然漂移，而漂移的后果是
+     * "运维按提示清了一个并不存在的缓存、真正共享缓存的那条却没清"。
+     */
+    const CACHE_PORTAL_ANON = 'public, max-age=60, s-maxage=300'
+    const CACHE_PORTAL_PRIVATE = 'private, no-store'
+    /** sitemap 刻意 `no-store`：它现在是运维的泄漏核对工具，不该被任何中间缓存留存 */
+    const CACHE_SITEMAP = 'no-store, private'
+
     const setPortalHeaders = (h: RouteHandlerContext, contentType: string): void => {
       const setHeader = h.res?.setHeader
       // 测试替身可能没有 setHeader：那是夹具的能力问题，不该让请求失败
@@ -604,7 +614,7 @@ export const AuthzPlugin = {
       setHeader.call(
         h.res,
         'cache-control',
-        hasSessionCookie(h) ? 'private, no-store' : 'public, max-age=60, s-maxage=300',
+        hasSessionCookie(h) ? CACHE_PORTAL_PRIVATE : CACHE_PORTAL_ANON,
       )
       setHeader.call(h.res, 'vary', 'Cookie')
       setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
@@ -643,9 +653,17 @@ export const AuthzPlugin = {
         const setHeader = h.res?.setHeader
         if (typeof setHeader === 'function') {
           setHeader.call(h.res, 'content-type', 'application/xml; charset=utf-8')
-          setHeader.call(h.res, 'cache-control', 'no-store, private')
+          setHeader.call(h.res, 'cache-control', CACHE_SITEMAP)
           setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
         }
+        /*
+         * ⚠️ `/p/<slug>` 这个前缀**只是本端点的数据形态，不保证可解析**：全仓没有注册任何
+         * `/p/...` 路由（真实读路径是 `/api/pages/:slug`；门户链接用 `/#/wiki/<slug>`）。
+         * 本端点在 D4 下**不给爬虫、只给运维做集合差核对**（见上方注释），`<loc>` 的唯一消费者
+         * 是运维脚本 —— 而**核对请走真实读路径** `/api/pages/:slug`（见
+         * `packages/plugin-authz/test/e2e-p4.sh` 阶段 I 的 I1），不要照 `<loc>` 去请求：
+         * 那会落进 serveStatic 的 SPA fallback、拿到 index.html + 200，看起来"可访问"。
+         */
         const urls = slugs.map((s) => `  <url><loc>/p/${esc(s)}</loc></url>`).join('\n')
         h.res.end(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset>\n${urls}\n</urlset>\n`)
       })
@@ -711,12 +729,16 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'admin.verify_search',
         'admin.session_revoke',
         'admin.grants_purge',
+        'admin.access_explain',
+        'admin.verify_sitemap',
+        'admin.cache_plan',
         'org.group.add_member',
         'org.group.create',
         'org.group.delete',
         'org.group.remove_member',
         'org.invitation.accept',
         'org.invitation.create',
+        'org.invitation.purge',
         'org.invitation.redeem',
         'org.invitation.revoke',
         'org.member.remove',
@@ -890,6 +912,350 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
             }).catch((e: unknown) => console.error('[@geewiki/authz] 回收审计写入失败:', e))
           }
           h.json(200, { ok: true, expired, remaining, at: now })
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- GET /api/admin/access-explain：反向展开「谁能看这条」（★ P4b） ----------
+       *
+       * §8.1 P4 的原始要求：**不做递归实现**，只如实展示**三条来源**，并标注每一条是
+       * "正在起作用"还是"可能相关"。设计意图是让人**一眼看出"为什么这个人看得到"**，
+       * 而不是丢回一个还需要二次推导的中间结果。
+       *
+       * 三条来源的**真实强度不同**，这个区分就是本端点的全部价值：
+       *   1. 直接授予（`page_grants` / `block_grants`）—— **确定生效**：`decideNormally`
+       *      里授予分支排在档位之前，授予是"明确指名的例外"（§2.3 优先级表）。
+       *   2. 祖先链 —— 逐级复述 `effectiveRank` 在这个 slug 上的**真实遍历过程**：
+       *      哪一级**真的收紧了**、哪一级因 `inherit=false` **截断了链条**（其以上不再下传，
+       *      故标 `not_consulted`）、哪些祖先**根本不存在**（红链/未建页 —— **不构成收紧、
+       *      也不截断**，见 `effectiveRank` 里那个 `continue`）。
+       *   3. 组织角色 / owner-admin 应急覆盖（D14）—— **与主体有关**，故只标相关、不标生效。
+       *
+       * ⚠️ **复用 `loadVisibilityIndex` / `effectiveRank` / `ancestorsOf` / `decideNormally`，
+       * 绝不重写判定**：第二份实现必然与判定单点漂移，而漂移的后果是
+       * "解释是对的、实际判定却是另一个" —— 那比没有解释更糟。
+       *
+       * ⚠️ 响应**不含正文、不含任何块文本**：本端点是排障与治理工具，不是读取通道。
+       */
+      interface ExplainGrantRow {
+        subject_kind: string
+        subject_id: string
+        role: string
+        granted_at: string | null
+        expires_at: string | null
+      }
+
+      router.register(
+        'GET',
+        '/api/admin/access-explain',
+        async (h: RouteHandlerContext) => {
+          const slug = (h.url.searchParams.get('slug') ?? '').trim()
+          if (slug === '') {
+            h.json(400, { ok: false, error: 'missing_slug', message: '需要 slug 查询参数' })
+            return
+          }
+          const index = await loadVisibilityIndex()
+          const self = index.get(slug)
+          if (self === undefined) {
+            // 不编造：页面不存在就如实说，**不推测**"可能是红链"——那需要调用方自己判断
+            h.json(404, { ok: false, error: 'page_not_found', message: `页面不存在: ${slug}` })
+            return
+          }
+
+          const rank = effectiveRank(slug, index)
+          const publishedAt = self.published_at ?? null
+
+          // ---- 来源 2：祖先链（逐级、如实） ----
+          /*
+           * ⚠️ `tightens` 必须拿**累计档位**（runningRank）做基准，而不是拿**本条页面的档位**：
+           * 后者会把"本来就已经被更近的祖先收到同一档、删掉它也不改变结果"的祖先也标成收紧了。
+           * 反例：`c`=public、`a/b`=org、`a`=org —— 两条祖先的档位都高于 `c`，但真正起作用的是
+           * 更近的 `a/b`，`a` 只是重复。与 `effectiveRank` 里那句 `rank = Math.max(rank, …)`
+           * 逐级累积是同一个口径。
+           */
+          let runningRank = rankOf(self.visibility)
+          const ancestors: Record<string, unknown>[] = []
+          let broken = false
+          for (const anc of ancestorsOf(slug)) {
+            if (broken) {
+              ancestors.push({ slug: anc, effect: 'not_consulted', reason: 'chain_break_above' })
+              continue
+            }
+            const row = index.get(anc)
+            if (row === undefined) {
+              ancestors.push({
+                slug: anc,
+                effect: 'not_present',
+                reason: 'missing_ancestor_does_not_tighten',
+              })
+              continue
+            }
+            if (row.inherit !== 1) {
+              broken = true
+              ancestors.push({
+                slug: anc,
+                visibility: row.visibility,
+                inherit: false,
+                effect: 'chain_break',
+                reason: 'inherit=false ⇒ 本级及其以上都不再下传',
+              })
+              continue
+            }
+            const ancRank = rankOf(row.visibility)
+            const tightens = ancRank > runningRank
+            if (tightens) runningRank = ancRank
+            ancestors.push({
+              slug: anc,
+              visibility: row.visibility,
+              inherit: true,
+              effect: tightens ? 'tightens' : 'no_effect',
+            })
+          }
+
+          // ---- 来源 1：直接授予（页级 + 块级），含过期状态 ----
+          const now = new Date().toISOString()
+          const grantView = (r: ExplainGrantRow): Record<string, unknown> => ({
+            subjectKind: r.subject_kind,
+            subjectId: r.subject_id,
+            role: r.role,
+            grantedAt: r.granted_at,
+            expiresAt: r.expires_at,
+            // 过期判定与 `loadGrants` 逐字同款：`expires_at <= now` ⇒ 视同没有
+            status: r.expires_at !== null && r.expires_at <= now ? 'expired' : 'active',
+          })
+          const pageGrantRows = await db.query<ExplainGrantRow>(
+            `SELECT subject_kind, subject_id, role, granted_at, expires_at
+               FROM page_grants WHERE page_slug = ? ORDER BY granted_at, subject_kind, subject_id`,
+            [slug],
+          )
+          // 块级授予用冗余的 `page_slug` 列查 —— 它存在的理由正是"治理查询与排障"，
+          // 因此**不需要**读 @geewiki/wiki 拥有的 `blocks` 表：判定插件不跨界读别人的表。
+          // （代价：这里给不出块序号 ordinal，调用方需要时配合 wiki 的页面端点自行映射。）
+          //
+          // ⚠️ **表可能不存在**（`block_grants` 是 0016 迁移建的，而 P3b 之前没有它）⇒
+          // 这里**显式区分"没有块级授予"与"查不到块级授予表"**：前者是正常情形（`available: true`
+          // 且列表为空），后者必须如实上报 `available: false`，**不能静默当成空集** ——
+          // 那会让排障的人以为"没人有块级授权"，而真相是"这张表根本没建起来"。
+          // 与 `grantedBlockIds()` 的激活期自检同一条纪律。
+          let blockGrants: Record<string, unknown>[] = []
+          let blockGrantsAvailable = true
+          try {
+            const rows = await db.query<ExplainGrantRow>(
+              `SELECT subject_kind, subject_id, role, granted_at, expires_at
+                 FROM block_grants WHERE page_slug = ? ORDER BY granted_at, subject_kind, subject_id`,
+              [slug],
+            )
+            blockGrants = rows.map(grantView)
+          } catch (err) {
+            blockGrantsAvailable = false
+            console.warn(
+              '[@geewiki/authz] access-explain: 读取 block_grants 失败（该表可能未建）——' +
+                '本次如实上报 available:false，不把它伪装成"空集"。原因:',
+              err,
+            )
+          }
+          const pageGrants = pageGrantRows.map(grantView)
+          const anyActive = (rows: Record<string, unknown>[]): boolean =>
+            rows.some((g) => g['status'] === 'active')
+
+          // ---- 与实际判定同源的可达性 ----
+          // 匿名：直接调 `decideNormally` + 真实的 `anonymousPrincipal()`，逐字同源。
+          const anon = decideNormally(rank, publishedAt, undefined, anonymousPrincipal())
+          // 组织成员：`decideNormally` 需要 `kind === 'user' && orgRole !== null`。
+          // **刻意不构造"假 Principal"** —— 假主体一旦与真实 Principal 形状漂移，
+          // 解释就会开始撒谎。这里如实复述它的两条分支（出处：本文件的 decideNormally）。
+          const orgMemberCanSee = (rank === RANK_PUBLIC && publishedAt !== null) || rank === RANK_ORG
+
+          h.json(200, {
+            ok: true,
+            slug,
+            self: { visibility: self.visibility, inherit: self.inherit === 1, publishedAt },
+            positionalRank: rank,
+            reach: {
+              // "本来会怎样"——**不含** D14 应急覆盖；特权路径见 sources.adminOverride
+              anonymous: anon.level === 'full' ? 'full' : 'none',
+              anonymousReason: anon.reason,
+              orgMember: orgMemberCanSee ? 'full' : 'none',
+            },
+            sources: {
+              ancestors,
+              grants: {
+                pages: pageGrants,
+                blocks: blockGrants,
+                // `available: false` = 查不到块级授予表（区别于"没有块级授予"）
+                blockGrantsAvailable,
+                effective: anyActive(pageGrants) || (blockGrantsAvailable && anyActive(blockGrants)),
+              },
+              orgRole: {
+                // 与主体有关 ⇒ 只标"相关"，不标"生效"（生效与否取决于看的人是不是成员）
+                effective: false,
+                relevant: true,
+                rule:
+                  "rank === org 时，kind === 'user' 且 orgRole !== null 的成员可见" +
+                  '（D8：组织内可见不要求发布）',
+              },
+              adminOverride: {
+                effective: false,
+                relevant: true,
+                rule: 'owner/admin 可应急可见，每次覆盖式访问写 access.admin_override 审计（D14）',
+              },
+            },
+          })
+
+          void writeAuditLog(db, {
+            action: 'admin.access_explain',
+            targetKind: 'page',
+            targetId: slug,
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: { positionalRank: rank, anonymous: anon.level, orgMember: orgMemberCanSee },
+          }).catch((e: unknown) => console.error('[@geewiki/authz] 反向展开的审计写入失败:', e))
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- GET /api/admin/sitemap-audit：sitemap 与「匿名可读」的交叉核对（★ P4b） ----------
+       *
+       * §5.12 把 `sitemap.xml` 的定位从"给爬虫"改成"**给运维做泄漏核对**"：与匿名可见集合
+       * 做集合差必须为空。但这里有一个**必须如实说明**的事实：
+       *
+       * ⚠️ **关于本端点的实际信息量，必须说实话**（我第一版把它写大了，这里纠正）：
+       * `sitemap.xml` 由 `anonymousVisible()` 生成，而 `anonymousVisible()` 走
+       * `svc.visibleSlugs()` → `buildAccess()` → `decideNormally()`；本端点复算用的也是
+       * `decideNormally()`。**对匿名主体这两条是同一套规则，所以今天 `unreadable` 与
+       * `omitted` 都恒为空** —— 它不是"两条独立来源的差集"，而是：
+       *   - `page_missing`：列表里有、`pages` 里已经没有这一行（真实可发生的漂移）；
+       *   - **规则漂移哨兵**：若将来 `buildAccess()` 为匿名加了新规则而没同步
+       *     `decideNormally()`，这里会立刻不一致 —— 这是本端点唯一的结构性价值。
+       *
+       * **真正独立的口径在端到端层面**：`packages/plugin-authz/test/e2e-p4.sh`
+       * 的阶段 I 会取自 `/sitemap.xml` 的每个 `<loc>`，再**逐条真去匿名读一次**并断言
+       * 全部拿得到 —— 那才是 §5.12 想要的"集合差为空"，因为读是**另一条 HTTP 路径**。
+       * 进程内没法做这件事（要自打 HTTP），所以两处各司其职。
+       */
+      router.register(
+        'GET',
+        '/api/admin/sitemap-audit',
+        async (h: RouteHandlerContext) => {
+          const index = await loadVisibilityIndex()
+          const advertised = await anonymousVisible()
+          const advertisedSet = new Set(advertised)
+          const anonCanRead = (slug: string): { level: string; reason: string } => {
+            const self = index.get(slug)
+            if (self === undefined) return { level: 'missing', reason: 'page_missing' }
+            const d = decideNormally(
+              effectiveRank(slug, index),
+              self.published_at ?? null,
+              undefined,
+              anonymousPrincipal(),
+            )
+            return { level: d.level, reason: d.reason }
+          }
+
+          const unreadable: Record<string, unknown>[] = []
+          for (const slug of advertised) {
+            const r = anonCanRead(slug)
+            if (r.level !== 'full') unreadable.push({ slug, reason: r.reason })
+          }
+
+          const omitted: string[] = []
+          for (const slug of index.keys()) {
+            if (advertisedSet.has(slug)) continue
+            if (anonCanRead(slug).level === 'full') omitted.push(slug)
+          }
+
+          h.json(200, {
+            ok: true,
+            // ⚠️ 恒为 true，且**今天两个方向都恒为空**（理由见上方注释）：本端点不是
+            // "两条独立来源的差集"，它的价值是 page_missing 与规则漂移哨兵。
+            // 真正独立的口径在 e2e（取自 /sitemap.xml 再逐条匿名读）。
+            sameSource: true,
+            advertisedCount: advertised.length,
+            unreadable,
+            omitted,
+            consistent: unreadable.length === 0,
+          })
+
+          void writeAuditLog(db, {
+            action: 'admin.verify_sitemap',
+            targetKind: 'sitemap',
+            targetId: 'sitemap.xml',
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: {
+              advertisedCount: advertised.length,
+              unreadable: unreadable.length,
+              omitted: omitted.length,
+            },
+          }).catch((e: unknown) => console.error('[@geewiki/authz] sitemap 核对的审计写入失败:', e))
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- GET /api/admin/cache-plan：权限收紧后的清缓存指引（★ P4b，§5.10） ----------
+       *
+       * 为什么需要它：门户 `/portal` 对**匿名**响应允许共享缓存（`s-maxage=300`），所以
+       * "收紧某条可见性"之后，CDN 上可能还留着**旧的匿名渲染结果**。那不是判定错误
+       * （判定每请求现查库、收紧立即生效），而是**缓存里的陈旧副本**。
+       *
+       * 本端点如实复述**实际的缓存串**（取自与设置响应头**同一个常量**，不是另抄一份），
+       * 并报出自 `since` 以来的 ACL 变更类审计条数 —— 让"要不要清、清哪一条"有依据。
+       *
+       * ⚠️ 它**不**自己去清缓存：本进程看不见 CDN。这里给的是**依据与目标**。
+       */
+      router.register(
+        'GET',
+        '/api/admin/cache-plan',
+        async (h: RouteHandlerContext) => {
+          const sinceRaw = h.url.searchParams.get('since')
+          const since =
+            sinceRaw !== null && sinceRaw !== ''
+              ? sinceRaw
+              : new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+          const rows = await db.query<{ action: string; n: number | string }>(
+            `SELECT action, COUNT(*) AS n FROM audit_log
+              WHERE at >= ?
+                AND action IN ('acl.change','page.publish','rollback','admin.resync_tiers')
+              GROUP BY action ORDER BY n DESC`,
+            [since],
+          )
+          const events = rows.map((r) => ({ action: r.action, count: Number(r.n) }))
+          const eventCount = events.reduce((a, e) => a + e.count, 0)
+          h.json(200, {
+            ok: true,
+            since,
+            events,
+            eventCount,
+            purgeRecommended: eventCount > 0,
+            sharedCacheable: [
+              {
+                path: '/portal',
+                cacheControl: CACHE_PORTAL_ANON,
+                vary: 'Cookie',
+                note: '仅**匿名**响应可被共享缓存；带任何 cookie 时走 private, no-store',
+              },
+            ],
+            notSharedCacheable: [
+              { path: '/sitemap.xml', cacheControl: CACHE_SITEMAP },
+              { path: '/api/*', cacheControl: '（未设共享缓存头，默认不可共享缓存）' },
+            ],
+            targets: ['/portal'],
+            note:
+              '判定每请求现查库，收紧**立即生效**；需要处理的是共享缓存里的旧匿名渲染。' +
+              'sitemap 是 no-store，无需清理。',
+          })
+
+          void writeAuditLog(db, {
+            action: 'admin.cache_plan',
+            targetKind: 'cache',
+            targetId: 'portal',
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: { since, eventCount },
+          }).catch((e: unknown) => console.error('[@geewiki/authz] 清缓存指引的审计写入失败:', e))
         },
         { access: 'admin' },
       )

@@ -925,6 +925,69 @@ export const OrgPlugin = {
       ),
     )
 
+    /* ==================== POST /api/org/invitations/purge（admin） ====================
+     *
+     * ⚠️ **这不是"让过期邀请失效"的手段** —— 失效在**兑换判定时**就已经发生：
+     * 兑换路径那句 `invite.expires_at > now`（见下方兑换端点的 `invite !== undefined &&
+     * invite.accepted_at === null && invite.expires_at > now`）。本条只做**空间回收**，
+     * 与 `@geewiki/authz` 的 `POST /api/admin/grants/purge` 是同一条口径
+     * （§8.2 P4 第 3 条原话："无需人工清理即生效；清理任务只是回收"）。
+     *
+     * **为什么非要把这层区分写进注释与响应**：一旦它被当成"失效开关"，就会派生出
+     * "清理任务没跑 ⇒ 过期邀请仍然可用"这种最糟的误解 —— 而那是**失败开放**方向。
+     *
+     * **只回收"未接受 且 已过期"的邀请**：已接受的（`accepted_at IS NOT NULL`）即便早已过期
+     * 也要留着 —— 那是**入伙记录**，清了就丢掉了"谁在什么时候通过哪条邀请进来的"这条溯源链。
+     * 所以删除条件是两者**同时**成立，不是单看 `expires_at`。
+     *
+     * **只在真的回收了东西时才写审计**：与 grants/purge 同款 —— 维护动作的空跑没有副作用，
+     * 每 N 分钟记一条"回收了 0 条"只会把审计淹掉。有副作用才留痕。
+     */
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/org/invitations/purge',
+        async (h) => {
+          if (!requireAdmin(h)) return
+          const now = new Date().toISOString()
+          const countExpired = async (): Promise<number> => {
+            const rows = await db.query<{ n: number | string }>(
+              `SELECT COUNT(*) AS n FROM invitations
+                WHERE org_id = ? AND accepted_at IS NULL AND expires_at <= ?`,
+              [DEFAULT_ORG_ID, now],
+            )
+            // PG 的 COUNT(*) 返回字符串，必须强转（否则 "1" + 1 → "11"）
+            return Number(rows[0]?.n ?? 0)
+          }
+          const expired = await countExpired()
+          if (expired > 0) {
+            await db.run(
+              `DELETE FROM invitations
+                WHERE org_id = ? AND accepted_at IS NULL AND expires_at <= ?`,
+              [DEFAULT_ORG_ID, now],
+            )
+          }
+          const remainRows = await db.query<{ n: number | string }>(
+            'SELECT COUNT(*) AS n FROM invitations WHERE org_id = ?',
+            [DEFAULT_ORG_ID],
+          )
+          const remaining = Number(remainRows[0]?.n ?? 0)
+          if (expired > 0) {
+            audit({
+              action: 'org.invitation.purge',
+              targetKind: 'invitation',
+              targetId: 'invitations',
+              actorId: h.principal?.userId ?? null,
+              actorIpHash: auditIpHash(clientIp(h.req)),
+              after: { expired, remaining, at: now },
+            })
+          }
+          h.json(200, { ok: true, expired, remaining, at: now })
+        },
+        { access: 'admin' },
+      ),
+    )
+
     /* ---------- 邀请：共用的读取与入伙逻辑 ---------- */
 
     interface InvitationRow {

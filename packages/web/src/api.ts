@@ -670,6 +670,173 @@ export const api = {
 
   /* 服务健康：「系统状态」面板用产品化方式呈现，不再把裸 JSON 端点做成头部链接 */
   health: () => request<HealthResponse>('GET', '/api/health'),
+
+  /* ---------------- 审计与运维（P4） ---------------- */
+  /**
+   * 审计查询。`view` 把**两类记录分开**：`security` 是安全事件（要告警），
+   * `acl` 是权限变更（要留存），`all` 是两者的并集。
+   *
+   * ⚠️ 调用方必须**分开呈现**这两类 —— 混在一张表里，"有人在探测权限边界"会被
+   * "某人改了可见性"稀释掉，而两者的处置完全不同。服务端的分法（显式白名单
+   * SECURITY_ACTIONS / ACL_ACTIONS）就是这个判据，前端不要自行改判。
+   */
+  auditLog: (opts?: {
+    view?: 'all' | 'acl' | 'security'
+    action?: string
+    targetKind?: string
+    targetId?: string
+    since?: string
+    until?: string
+    limit?: number
+    offset?: number
+  }) => {
+    const q = new URLSearchParams()
+    if (opts?.view !== undefined) q.set('view', opts.view)
+    for (const k of ['action', 'targetKind', 'targetId', 'since', 'until'] as const) {
+      const v = opts?.[k]
+      if (v !== undefined && v !== '') q.set(k, v)
+    }
+    if (opts?.limit !== undefined) q.set('limit', String(opts.limit))
+    if (opts?.offset !== undefined) q.set('offset', String(opts.offset))
+    const qs = q.toString()
+    return request<AuditResponse>('GET', `/api/admin/audit${qs === '' ? '' : `?${qs}`}`)
+  },
+  /**
+   * 全部会话（含已吊销与已过期）。
+   * ⚠️ `ipHash` 是**哈希不是原文** —— 界面不得把它显示成 IP。
+   */
+  sessions: () => request<SessionsResponse>('GET', '/api/admin/sessions'),
+  /** 定点吊销一条会话：**服务端**写 `revoked_at`，原 cookie 立即失效。 */
+  revokeSession: (id: string) =>
+    request<{ ok: true; revoked: boolean }>(
+      'POST',
+      `/api/admin/sessions/${encodeURIComponent(id)}/revoke`,
+    ),
+  /**
+   * 回收已过期的条目授权。
+   * ⚠️ **不是"让过期授权失效"的手段** —— 失效在**判定时**就已经发生
+   * （判定层比较 `expires_at`）。本条只做空间回收，界面文案也应按此措辞。
+   */
+  purgeGrants: () =>
+    request<{ ok: true; expired: number; remaining: number; at: string }>(
+      'POST',
+      '/api/admin/grants/purge',
+    ),
+  /** 回收已过期的邀请。只回收"**未接受** 且 已过期"的：已接受的是入伙记录，要留。 */
+  purgeInvitations: () =>
+    request<{ ok: true; expired: number; remaining: number; at: string }>(
+      'POST',
+      '/api/org/invitations/purge',
+    ),
+  /** 反向展开「谁能看这条」：三条来源，并标注哪条**真的在起作用**。 */
+  accessExplain: (slug: string) =>
+    request<AccessExplainResponse>(
+      'GET',
+      `/api/admin/access-explain?slug=${encodeURIComponent(slug)}`,
+    ),
+  /**
+   * sitemap 与"匿名可读"的交叉核对。
+   * ⚠️ `sameSource: true` 意味着 sitemap 与匿名可见集合**同源**，两者的集合差恒空、
+   * 无信息量；有信息量的是 `unreadable`（被广告却读不到 —— 泄漏方向）与
+   * `omitted`（读得到却没被广告）。界面不要把它渲染成"发现 N 处泄漏"。
+   */
+  sitemapAudit: () => request<SitemapAuditResponse>('GET', '/api/admin/sitemap-audit'),
+  /** 权限收紧后的清缓存指引（给依据与目标；本进程看不见 CDN，不会自己去清）。 */
+  cachePlan: (since?: string) =>
+    request<CachePlanResponse>(
+      'GET',
+      `/api/admin/cache-plan${since === undefined || since === '' ? '' : `?since=${encodeURIComponent(since)}`}`,
+    ),
+}
+
+export interface AuditEntry {
+  id: number
+  at: string
+  actorId: number | null
+  actorIpHash: string | null
+  action: string
+  targetKind: string
+  targetId: string
+  before?: unknown
+  after?: unknown
+  requestId?: string | null
+}
+
+export interface AuditResponse {
+  ok: true
+  view: 'all' | 'acl' | 'security'
+  total: number
+  limit: number
+  offset: number
+  entries: AuditEntry[]
+}
+
+export interface SessionEntry {
+  id: string
+  userId: number | null
+  createdAt: string
+  lastUsedAt: string | null
+  expiresAt: string
+  idleExpiresAt: string | null
+  revokedAt: string | null
+  userAgent: string | null
+  /** **哈希**，不是 IP 原文 */
+  ipHash: string | null
+  status: string
+}
+
+export interface SessionsResponse {
+  ok: true
+  total: number
+  limit: number
+  entries: SessionEntry[]
+}
+
+export interface AccessExplainResponse {
+  ok: true
+  slug: string
+  self: { visibility: string; inherit: boolean; publishedAt: string | null }
+  positionalRank: number
+  reach: { anonymous: 'full' | 'none'; anonymousReason: string; orgMember: 'full' | 'none' }
+  sources: {
+    ancestors: {
+      slug: string
+      visibility?: string
+      inherit?: boolean
+      effect: string
+      reason?: string
+    }[]
+    grants: {
+      pages: Record<string, unknown>[]
+      blocks: Record<string, unknown>[]
+      blockGrantsAvailable: boolean
+      effective: boolean
+    }
+    orgRole: { effective: boolean; relevant: boolean; rule: string }
+    adminOverride: { effective: boolean; relevant: boolean; rule: string }
+  }
+}
+
+export interface SitemapAuditResponse {
+  ok: true
+  /** 恒为 true：广告集合与匿名可见集合同源 ⇒ 它们的集合差没有信息量 */
+  sameSource: true
+  advertisedCount: number
+  unreadable: { slug: string; reason: string }[]
+  omitted: string[]
+  consistent: boolean
+}
+
+export interface CachePlanResponse {
+  ok: true
+  since: string
+  events: { action: string; count: number }[]
+  eventCount: number
+  purgeRecommended: boolean
+  sharedCacheable: { path: string; cacheControl: string; vary?: string; note?: string }[]
+  notSharedCacheable: { path: string; cacheControl: string }[]
+  targets: string[]
+  note: string
 }
 
 /**

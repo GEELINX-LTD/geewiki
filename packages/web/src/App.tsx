@@ -6,6 +6,7 @@ import {
   Menu as MenuIcon,
   MonitorSmartphone,
   Puzzle,
+  ScrollText,
   Search,
   UserRound,
 } from 'lucide-react'
@@ -31,6 +32,7 @@ import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AdminPage } from './pages/AdminPage'
+import { OpsPage } from './pages/OpsPage'
 import { AccountPage } from './pages/AccountPage'
 import { DeniedPage } from './pages/DeniedPage'
 import { NotFoundPage } from './pages/NotFoundPage'
@@ -131,6 +133,15 @@ const WIKI_ITEM: NavItem = { id: 'wiki', label: '知识库', icon: <BookText cla
 const ADMIN_NAV: NavItem[] = [
   { id: 'plugins', label: '插件管理', icon: <Puzzle className="size-4" />, requires: 'administer' },
   { id: 'graph', label: '依赖图', icon: <GitBranch className="size-4" />, requires: 'administer' },
+  /*
+   * 审计与运维（P4）。能力键用既有的 `administer`（`AuthCapabilities` 只有
+   * editContent / administer / manageVisibility 三个），不新开字段 —— 它对应的
+   * 后端端点全部标了 `access: 'admin'`，判据与其余运维入口一致。
+   *
+   * ⚠️ 本注释刻意**不写出那个键的完整字面量**：`packages/web/test/navPlan.test.ts`
+   * 用文本正则统计"声明了几个能力"，注释里出现同样的字面量会让它多数出一个。
+   */
+  { id: 'audit', label: '审计与运维', icon: <ScrollText className="size-4" />, requires: 'administer' },
 ]
 /**
  * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
@@ -239,6 +250,7 @@ export function App(): ReactNode {
       />
     )
   else if (active === 'plugins') body = <AdminPage />
+  else if (active === 'audit') body = <OpsPage />
   else if (active === 'login') body = <LoginPage />
   else if (active === 'setup') body = <SetupPage />
   else if (active === 'denied') body = <DeniedPage />
