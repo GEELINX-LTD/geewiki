@@ -1,7 +1,8 @@
 # GeeWiki 访问控制、组织管理与公开门户 —— 设计构想
 
-> **状态**：**v5 定稿版**（设计评审已完成 —— **本文档已无待决项**）。由两轮架构设计（v1 完整设计 + v2 修订版）合并而成，并经五轮评审纳入**十二项**已拍板决定（v2 的 D1–D4；v5 新锁定的 D7–D10；v3 的 D11 / D13 / D14；v4 的 D15 —— 另有 D5 / D6 由 §10.2 说明）。五轮修订依次是：① 把"**角色**"从**授权对象**里彻底摘掉（D13）；② 把 `owner`/`admin` 的**应急可见权**写成显式规则 + 审计（D14）；③ **D11 权限版本永久保留**；④ **块级第三档由"仅编辑者"改为"仅授权"**（D15）；⑤ **锁定 D7/D8/D9/D10 的默认值并定稿**。核心在 §2.0 与 §4.3，修订记录见 **§13.1（v3）/ §13.2（v4）/ §13.3（v5 定稿）**。
-> **⚠️ 定稿 ≠ 已实现**：这是一份**设计稿** —— 代码尚未落地，且文中若干结论**未经验证（未实测 / 未跑代码）**。§12 保留的条目是**已知的"未验证 / 实现前需复核"项，不是待决项**；实现前须按 §12 与各章的「原文如此，实现前需复核」逐条复核（完整声明见 §13.3）。
+> **状态**：**v6 修订版**（= v5 定稿版 **+ 实现反馈驱动的修订** —— **本文档已无待决项**）。由两轮架构设计（v1 完整设计 + v2 修订版）合并而成，并经五轮评审纳入**十二项**已拍板决定（v2 的 D1–D4；v5 新锁定的 D7–D10；v3 的 D11 / D13 / D14；v4 的 D15 —— 另有 D5 / D6 由 §10.2 说明）。五轮修订依次是：① 把"**角色**"从**授权对象**里彻底摘掉（D13）；② 把 `owner`/`admin` 的**应急可见权**写成显式规则 + 审计（D14）；③ **D11 权限版本永久保留**；④ **块级第三档由"仅编辑者"改为"仅授权"**（D15）；⑤ **锁定 D7/D8/D9/D10 的默认值并定稿**。
+> **★ 第六轮（v6）不是新的设计决策**：它由 **P0 阶段的落地实现 + 一轮独立代码审查**驱动（**不是**用户拍板），只做三类事 —— ① 把"**实现过程中自行定义、文档里从未写过**"的六项 API 形状（`RouteAccess` / `RequestVerdict` / `use?()` / `dispatch` 返回值 / `register()` 第 4 参 / `judgeAccess` 判定顺序）**回写为正式章节 §2.5**；② 订正 §8.2 里两条**按字面执行不通或自相矛盾**的 P0 验收（P0-1 命令的 URL 编码、P0-6 与 §8.1 的建表归属冲突）；③ 把审查**实测到**的 `config` 回显通道记入 **P2 交付项（第 14 条）** 与 **§12 第 19 条**。核心在 §2.0 与 §4.3，修订记录见 **§13.1（v3）/ §13.2（v4）/ §13.3（v5 定稿）/ §13.4（v6 实现反馈）**。
+> **⚠️ 定稿 ≠ 已实现（★ v6 解冻一部分）**：这是一份**设计稿**。**P0 阶段已落地**（worktree 分支 `feat/p0-route-auth-guard`，基线提交 `bb43fc2`，另含一轮修复改动；实际 API 形状见 **§2.5**），**P1 及其后各阶段仍未实现**；文中其余结论**未经验证（未实测 / 未跑代码）**。§12 保留的条目是**已知的"未验证 / 实现前需复核"项，不是待决项**；实现前须按 §12 与各章的「原文如此，实现前需复核」逐条复核（完整声明见 §13.3，v6 的声明见 §13.4）。
 > **读者**：项目所有者（非权限系统专家）。所有专业术语首次出现时都会用一句白话解释。
 > **素材来源**：① GeeWiki 后端/数据层现状调查；② 前端现状调查；③ 业界权限模型与游客首页调研（外部来源链接见第 11 节）；④ 两轮架构设计。
 > **标注约定**：文中标 **「实测」** 的结论来自对仓库实际执行过的 SQLite 探测（用的是 `:memory:` 库，未触碰 `data/geewiki.db`）；标 **「原文如此，实现前需复核」** 的地方表示来源本身存在不确定或矛盾，**不要照着猜**。
@@ -24,6 +25,8 @@
 - `RouteHandlerContext { req, res, url, params, json, noteStatus? }`（`packages/core/src/index.ts:477-503`）没有 principal（身份主体）字段。
 - 唯一的分发器 `HttpRouter.dispatch()`（`packages/server/src/index.ts:321-459`）是线性路由匹配，**没有任何前置钩子**；`HttpRouterService`（`packages/core/src/index.ts:558-623`）只有 `register/stats/inflight/pending/drain/trackStream/closeStreams/noteStreamRejected`，**没有 `use()` / `before()`**。
 - 唯一可复用的请求级作用域是 `AsyncLocalStorage<RequestState>`（`packages/server/src/index.ts:131`），目前只用于在途排空。
+
+> **★ v6 就地订正（P0 已落地；本节其余内容描述的仍是 P0 之前的状态）**：上面三处在 P0 已经改变 —— ① `RouteHandlerContext` 新增**可选**字段 `principal?: Principal`；② `HttpRouterService` 新增**可选**方法 `use?(hook: RequestHook): () => void`，且 `register()` 新增**可选第 4 参** `opts.access`（默认 `public`）；③ `dispatch()` 的返回类型放宽为 `boolean | Promise<boolean>`（变化的是"是否交给静态层"的**时机**，**语义不变**）。**这三处的确切形状、默认值与判定顺序见 §2.5** —— 它们是 P0 实现过程中**自行定义**的，v1–v5 的文档里**都没有写过**（丢失原因见 §12 第 19 条）。另：`AsyncLocalStorage<RequestState>` 依旧只用于在途排空，它**不是** principal 的载体（principal 走 `RouteHandlerContext.principal`）。
 
 **③ 数据模型里也没有"人"**
 
@@ -337,6 +340,165 @@ function assertCanManage(p: Principal): void  // 组织级管理动作
 2. **`level='none'` 由调用方翻译成 404**（匿名）或 404/403（已登录）。策略层不认识 HTTP，保持可测。
 3. **`reason` 必须回传**：它是审计与"为什么我看不到"产品文案的唯一数据源，也是排查越权/误拒的一手线索。
 4. **★ v3：应急覆盖的审计信号只能来自 `reason`**，但**判据不是 `reason` 本身**。`reason='owner'|'admin'` 表示"这次判定用了规则 O1"；**写审计的判据是"覆盖救回了一次本来会被拒的访问"**，不是"访问者恰好是 owner/admin"（§2.3 规则 O1 的边界 1）。实现里若按 `reason` 无条件写审计，就等于把管理员的所有读操作都记成越权 —— **这是必须避免的误读**。
+
+### 2.5 服务端路由鉴权：P0 已落地的 API 形状（**★ v6 新增，实现回写**）
+
+> **这一节为什么存在**：P0 阶段**已经按本设计落地**（worktree 分支 `feat/p0-route-auth-guard`；基线提交 `bb43fc2`，另含一轮修复改动）。§8.1 的 P0 行、§0.1、§8.2 的 P0-5 / P0-6、§2.4 的 `Principal` 接口，实现都与文档**逐字段一致**；但**这套 API 的具体形状**（枚举取值、可选参数、返回值放宽、判定顺序）**文档里从来没有写过** —— 它是在实现过程中**自行定义**的。独立代码审查的结论与警告是：**"建议把这 6 项设计补进设计文档，否则 P1 会拿『文档没写』当理由改掉它们。"**
+>
+> 所以本节是**回写（write-back）**，**不是新决策** —— 它与 §13.1 / §13.2 / §13.3 那种"**用户拍板驱动**"的修订**性质不同**（见 §13.4）。本节所有形状都能从 §0.1 的缺口 + §2.4 的判定单点推出来；本节只是把**已经落地的形状固定下来**。
+>
+> **先讲清这是一层什么闸门（否则最容易误用）**：`access` 只回答"**这条路由至少需要什么身份**"，它挡的是"**整类端点被匿名调用**"（插件启停、条目写入）。它**不做**逐对象判定 —— "这个用户能不能看**这一条**数据"永远归 `policy-service`（§2.4）。**两者是纵深防御的两层，不是二选一**：注册了 `access:'user'` **不等于**这条路由的数据就安全了。实现内的原话是"它**不能替代**逐对象判定：两者是纵深防御的两层，不是二选一"。
+>
+> **行号约定**：本节 `文件:行号` 以 worktree `feat/p0-route-auth-guard` 的**工作区当前状态**为准（= 提交 `bb43fc2` + 一轮修复改动）。该 worktree 仍在演进 ⇒ **行号可能小幅漂移，定位请以函数 / 类型名为准**。
+
+#### 2.5.1 六项 API 形状（逐条，附理由）
+
+##### ① `RouteAccess` —— 粗粒度准入等级（三档枚举）
+
+```ts
+// packages/core/src/index.ts:487
+export type RouteAccess = 'public' | 'user' | 'admin'
+```
+
+| 档 | 语义：**至少**需要什么身份 | 实现判据（`judgeAccess`） |
+|---|---|---|
+| `public` | 任何主体（**含匿名**） | 直接放行。**默认值** |
+| `user` | 已登录用户，**或**应急通道 | `principal.kind === 'user'`（**已认证即可，不看角色**）**或** `'break-glass'` |
+| `admin` | 管理员，**或**应急通道 | `principal.orgRole ∈ {owner, admin}` **或** `'break-glass'` |
+
+- **三档刻意保持"粗"**：它够用就好，细粒度判定全在 §2.4 的单点函数里。**写细了会变成第二个真源**（与 §9 R2 是同一类风险：两处判定必然漂移）。
+- **`user` 档不看角色是刻意的**：`viewer`（只读成员）也能通过 `user` 档 —— 它只保证"**不是匿名**"。"**谁能改哪一条**"必须由处理器另判（P0 对 `PUT /api/pages/:slug` 就是这么处理的：闸门挡匿名，逐条归属留待 P2 的 `policy-service`）。
+
+##### ② `RequestVerdict` —— 钩子的裁决返回值
+
+```ts
+// packages/core/src/index.ts:598-600
+export type RequestVerdict =
+  | { ok: true }
+  | { ok: false; status: 401 | 403 | 503; code: string; message: string }
+```
+
+- **为什么把 HTTP 状态码写进类型、而不是让钩子自己写响应**：钩子是**集中单点**，让它们只做"判定"、由路由服务**统一写响应**，才能保证错误信封一致（`{ ok:false, error, message, details }`）与 `stats()` 指标记账不被绕过 —— **这正是"只堵了详情页、旁路却还开着"这类事故的来源**（§0.2）。
+- **状态码只开放三个语义明确的值**：`401` = 未认证（缺凭据或凭据无效）；`403` = 已认证但无权限；`503` = **系统尚未就绪**（如引导期没有任何凭据来源），**不是**"未认证"。
+- **失败关闭**：只有显式 `{ ok: true }` 才放行。返回值**形态不合法**（非对象、缺 `ok`、状态码不在白名单内）一律**按拒绝处理**，机器码固定为 `hook_invalid_verdict`（`verdictDenial()`，`packages/server/src/index.ts:241-249`）。**不合法形态返回 403 而不是 500**：500 会被看门狗计入"服务连续失败"并可能在阈值处熔断，而这只是**某个插件的编程错误、不是服务不可用**。
+
+##### ③ 可选 `use?(hook: RequestHook): () => void` —— 前置钩子链
+
+```ts
+// packages/core/src/index.ts:619
+export type RequestHook = (h: RouteHandlerContext) => RequestVerdict | Promise<RequestVerdict>
+
+// packages/core/src/index.ts:698 —— HttpRouterService 上的可选方法
+use?(hook: RequestHook): () => void
+```
+
+**契约（逐条，与实现内注释同源，见 `packages/core/src/index.ts:602-620`）**：
+
+1. 执行位置：**路由匹配成功之后、处理器执行之前**。按注册顺序**串行**执行。
+2. 任一钩子返回 `ok:false` 即**短路** —— 后续钩子与处理器**都不再执行**。
+3. 钩子**可以读取、也可以替换** `h.principal`。**这是 P1 会话解析的挂载点**：给匿名主体换上真实用户，再由 `access` 闸门统一裁决。
+4. 钩子**不得自行结束响应**（不要调 `h.json` / `res.end`）：**只返回裁决**。否则错误信封与 `stats()` 记账会被绕过。
+5. **钩子抛错视同 500**（由路由服务统一处理）—— **不要**用抛错表达"拒绝"，那是**静默失败面**。
+6. 只用 `{ ok: true }` 表示"放行"；形态不合法按**拒绝**处理（见 ②）。
+
+- **为什么签名带 `?`（可选实现）**：既有**测试替身**与第三方 `HttpRouterService` 实现无需立刻提供它，**不破坏向后兼容**（与 `noteStatus?` 同理）。⇒ 调用方必须写成 `router.use?.(...)` 或先判空。
+- **注销函数幂等**：重复调用安全（`packages/server/src/index.ts:315-323`）。
+- **没有钩子时走全同步快路径**：`dispatch` 内部按 `hooks.length === 0` 分流（`packages/server/src/index.ts:259` 的 `private readonly hooks: RequestHook[] = []`；分支在 `:603-609`）⇒ **默认（无钩子）时既有的"同步返回 `boolean`"语义逐字不变**。
+- ⚠️ **它不是"全局中间件"** —— 适用边界见下面 **2.5.2 边界一**。
+
+##### ④ `dispatch` 的返回类型放宽为 `boolean | Promise<boolean>`
+
+```ts
+// packages/server/src/index.ts:490
+dispatch(req: IncomingMessage, res: ServerResponse): boolean | Promise<boolean>
+```
+
+- **为什么放宽（这就是 B1 方案）**：钩子**可以是异步的**（P1 的会话解析要查库拿会话），此时**无法在当拍给出**"是否已接管响应"的结论。而 `dispatch` 的 `boolean` 返回值正是"**要不要交给静态资源层**"的信号 —— 而 **PG 适配器本质异步**（`resolvePrincipal` 接会话后必须 `await` 查库）⇒ **同步解析 principal 根本不可行**，只能把返回值放宽、让调用方 `await` 结算后再决定。
+- **语义不变**：`true` = 已接管响应（含 API 404）；`false` = 无匹配路由且非 `/api` 前缀（静态资源层可尝试兜底）。调用方（`packages/server/src/index.ts:1053` 的 `createServer` 回调）用 `isThenable()` 分流 ⇒ **未注册钩子时仍是同步返回**，既有调用路径与测试行为**逐字不变**。
+- **给 P1 的提醒（实现里已留 `TODO(p1)`，见 `packages/server/src/index.ts:637`）**：`resolvePrincipal` 目前是**同步**的（凭据来源只有环境变量 + 常量时间比较，没有任何跨 IO 查询），**接入会话查询后必须改为异步**、签名对齐 §2.4 的 `principalFromRequest(req): Promise<Principal>`。改造时有**两处连带影响**（不要只加个 `async` 就以为完事）：
+  1. 该方法在 `dispatch` 里是**无条件调用**的（在 `hooks.length === 0` 分支**之外**）⇒ 一旦异步化，**默认（无钩子）路径也会变成异步**，那条"全同步、语义逐字不变"的快路径承诺需要**一并重做**；
+  2. 异步接缝**已经留好**：`runHooks` 是 async 通路、`dispatch` 返回值已放宽、调用点已适配。
+
+##### ⑤ `register()` 的可选第 4 参 `opts.access` —— **默认 `public`**（向后兼容）
+
+```ts
+// packages/core/src/index.ts:679-684
+register(
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
+  path: string,
+  handler: RouteHandler,
+  opts?: RouteAccessOptions,   // = { access?: RouteAccess }（:490-492），省略等价于 { access: 'public' }
+): () => void
+```
+
+- **默认 `public` 是向后兼容的核心设计**：既有调用点只传 3 个实参，**行为完全不变**（这正是 §8.2 P0-3"`GET /api/pages` 行为完全不变"能够成立的前提）。**默认值若取 `user`，全仓所有读端点会在升级瞬间集体 401。**
+- **等级绑在"路由"上，不是绑在"插件"上**：同一次 `registerRoutes()` 里可以逐端点声明不同等级（见下表）。
+
+**P0 实际落地的等级分配（可直接作为 P1 的基线）**
+
+| 端点 | 等级 | 位置（worktree） |
+|---|---|---|
+| `PUT /api/pages/:slug`、`DELETE /api/pages/:slug` | `user` | `packages/plugin-wiki/src/index.ts:680` / `:692` |
+| 条目读端点（列表 / 详情 / 版本 / 反链 / 出链） | `public`（**未声明 = 默认**） | `packages/plugin-wiki/src/index.ts` |
+| `GET /api/plugins`、`/api/plugins/graph`、`/api/plugins/slots`、`/api/plugins/ui` | `public`（**未声明**） | `packages/manager/src/index.ts:1574` / `:1578` / `:1584` / `:1594` |
+| `GET /api/session` | `public`（**显式写出**，理由见下） | `packages/manager/src/index.ts:1619` |
+| `POST /api/plugins/:name/enable` | `admin` | `packages/manager/src/index.ts:1620`（opts 在 `:1633`） |
+| `GET` / `PUT /api/plugins/:name/config` | `admin` | `packages/manager/src/index.ts:1634` / `:1643` |
+| `POST /api/plugins/:name/replace`、`/disable` | `admin` | `packages/manager/src/index.ts:1655` / `:1669` |
+| `POST /api/session/persist` | `admin` | `packages/manager/src/index.ts:1679` |
+
+- **读端点为什么保持 `public`（P0 的刻意选择，不是漏改）**：① 前端**插件探测**（`packages/web/src/pages/WikiPage.tsx` 据 `/api/plugins` 的 `state` 决定搜索 / AI 入口是否可用）与**插件 UI 加载**（`/api/plugins/ui`）都依赖它们，收紧会让**内容浏览**这一核心路径回归 —— 那不属于 P0 要堵的"整类端点被匿名调用"；② 读路径的裁剪需要**逐对象判定**（`policy-service`），属 P2 的范围。
+- **`GET /api/session` 为什么是 `public` 而不是 `admin`**（这条最容易被后人"顺手修掉"）：管理台首屏 `AdminPage` 用 `Promise.all([api.plugins(), api.session(), api.slots().catch(() => null)])` 取数，**三个里只有 `api.session()` 没有 `.catch()`** —— 它一旦 401/503 就整体 reject ⇒ **插件列表根本不渲染**。而 P0 **不许改 `packages/web`**，且前端测试**全部 mock 掉了 `api` 模块**（⇒ **这个回归不会有测试变红**，属于极易漏掉的坑）。所以 P0 的契约是"**读端点行为与改动前逐字一致**"，收紧留给 P2、与读路径裁剪一起做。（就地留痕见 `packages/manager/src/index.ts:1614-1618`。）
+- **代价（如实记录，已列入 P2）**：`GET /api/plugins` 与 `GET /api/session` 的响应里**含各插件的 `config`**，P0 **未裁剪** ⇒ 匿名可达的 `config` 回显通道。**交付项与真实向量见 §8.2 P2 第 14 条**（含"密钥值本身因 `apiKeyEnv`/`passwordEnv` 纪律不会泄漏，但 `baseUrl` 里内嵌的凭据会被逐字吐出"）。
+
+##### ⑥ `judgeAccess` 的判定顺序与状态码选择（401 / 403 / 503 各自何时出现）
+
+```ts
+// packages/server/src/index.ts:213-229 —— 纯函数，便于单测
+function judgeAccess(access: RouteAccess, principal: Principal, credentialSourceAvailable: boolean): AccessDenial | null
+```
+
+**判定顺序即优先级（每一步都是失败关闭，"不满足就拒"）：**
+
+| 步 | 条件 | 结果 |
+|---|---|---|
+| 1 | `access === 'public'` | **放行**（与 P0 之前的行为完全一致） |
+| 2 | `principal.kind === 'break-glass'` | **放行**（旁路整个权限体系；留痕在解析 principal 时已完成） |
+| 3 | **没有任何凭据来源**（`GEEWIKI_ADMIN_TOKEN` 未配置） | **503** `bootstrap_required` |
+| 4 | `principal.kind === 'anonymous'` | **401** `unauthorized`（"需要登录"） |
+| 5 | `access === 'user'` | **放行**（已认证即可） |
+| 6 | `principal.orgRole` 为 `owner` / `admin` | **放行** |
+| 7 | 其余 | **403** `forbidden`（"需要管理员权限"） |
+
+- **`credentialSourceAvailable` 的语义（P0 恒为"`GEEWIKI_ADMIN_TOKEN` 是否已配置"）**：第 3 步**必须排在第 4 步之前** —— 未配置令牌时，带着**任意**令牌头发请求必须得到 503，**绝不能因为"没配令牌"而滑进某个放行分支**（这是 §8.2 P0-5 的验收点）。
+- **为什么"引导期"是 503 而不是 401**：401 的语义是"**你去登录**"，但引导期**根本没有可登录的东西**（P0 无用户表；P1 起是"库里没有任何 owner/admin"）。把两者混为一谈，会让前端把**运维问题**显示成"请重新登录"，并在登录页里**死循环**。
+- **`403` 什么时候出现**：只可能在"**已认证 + 需要 `admin` + 角色不是 owner/admin**"这一种组合上。⇒ **P0 阶段 `403` 分支在生产里不可达**（`resolvePrincipal` 只会产出匿名或 break-glass，用户会话属 P1），实现的测试用例因此**用 `use()` 钩子注入一个 `kind:'user'`、`orgRole:'viewer'` 的主体**把这个分支钉成断言（`packages/server/test/route-auth.test.ts` 的用例"use()：kind:'user' 但角色不足 ⇒ 403 forbidden"），给 P1 留下回归保护。
+- **拒绝时的错误信封统一为** `{ ok:false, error:<机器码>, message:<人读文案>, details:{ access:<被拒的等级> } }`（闸门处见 `packages/server/src/index.ts:693-694`；钩子拒绝处同形）。**§8.2 P0 的测试把 `details.access` 钉成了断言** —— 前端文案与告警匹配规则依赖它。
+- **应急通道的留痕点**：`resolvePrincipal()`（`packages/server/src/index.ts:637`）在令牌校验通过时**立刻**调 `auditBreakGlassUse()`（`:180-186`），**不区分端点等级** —— 令牌本身的"使用"就要可追责。P0 的留痕**形态**（stdout 结构化行）与它的**取舍**见 §8.2 的 P0-6。
+
+#### 2.5.2 两条必须写明的边界（P1 最容易踩）
+
+**边界一：钩子链只对"匹配到的路由"生效。**
+
+- `/api/*` **未匹配**的路径、**静态资源**、**SPA fallback** 全部**不过钩子**。原因在分发顺序上（`packages/server/src/index.ts:490-618`）：① 健康检查在**路由匹配之前**就 early-return；② 未匹配的 `/api/*` 直接走路由自己的 **API 404**（`json(404, { ok:false, error:'not_found', path })`，`:613-616`）；③ 其余 `return false` 交给静态资源层（`:617`）。**这三条路都不进入钩子链。**
+- **P0 这样是对的**（与 §9 R6 一致：静态层不该被身份系统拖住），但**必须在文档里写明**，否则 P1 会误以为"**注册了会话钩子就等于全局已鉴权**"。正确的心智模型是：`use()` 是"**路由级**准入链"，**不是**"**全局**中间件"；真要覆盖静态资源与 SPA fallback，得另找挂载点，且必须先解决"静态层不该被拖住"这个前提。
+- 已由测试钉住：`packages/server/test/route-auth.test.ts:382-398`（用例名"**注册钩子后：路由匹配与静态层交接的行为逐字不变**"）—— 断言注册钩子前后，非 `/api` 路径的静态层交接与未匹配 `/api/*` 的 404 **逐字一致**。
+- 实现内的就地说明：`RequestHook` 契约**第 6 条**（`packages/core/src/index.ts:611-615`）与 `use?()` 的 ⚠️ 注释（`:688-691`）都已写明这条边界。
+
+**边界二：健康检查 `/api/health` 刻意留在闸门之外。**
+
+- `HEALTH_PATH = '/api/health'`（`packages/core/src/index.ts:367`）在 `dispatch` 里**早于路由匹配**就被处理并 `return true`（`packages/server/src/index.ts:538-568`）⇒ **它既不过钩子、也不受 `access` 闸门约束**（P0 之前就是这样，P0 未改）。
+- **理由**：把健康检查纳入鉴权，会让"**权限没配好**"表现为"**服务不可用**" —— Docker `HEALTHCHECK` 与看门狗会因此误判，去重启 / 熔断一个其实完全正常的服务，**反而更难排障**。健康检查的语义是"**进程还活着**"，不是"**权限配好了**"；后者该由专门的就绪 / 运维端点表达（P1 起可考虑）。
+- **代价（如实写在文档里）**：`/api/health` 是**匿名可探测**的，会回显 `ok` / `uptime` / `timestamp` / `db` 等**非敏感**运维信息。**不要**往它的响应里加任何身份相关或配置相关字段 —— 否则这个"闸门外"的端点会变成新的泄漏面（与 §5.9 的清单同源）。
+- **P0 之前的文档完全没提这条** ⇒ 本条是 v6 补写的**边界说明**，不是新决策（§8.1 的 P0 行从未要求把健康检查纳入闸门）。
+
+#### 2.5.3 本节与其它章节的关系
+
+- **§0.1 ②**（"请求上下文里没有『人』"）已被 P0 部分推翻 ⇒ 该节已加**就地订正**。
+- **§8.1 的 P0 行**列出本节的落地范围与涉及文件；**§8.2 的 P0 六条**是它的可测验收标准。
+- **§9 R2**（权限判定必须逐调用传 `principal`）与本节**不冲突、且互补**：`access` 闸门是**粗粒度**的，R2 要求的"逐对象判定 + 服务层二次校验"**一条都不能少**。
+- **§9 R6**（静态资源 / SSE 路径的鉴权覆盖）是"边界一"的另一面：钩子覆盖不到静态层，门户渲染分支因此**必须**放在 `serveStatic` 之前。
+- **本节不引入新决策**：三档枚举、钩子、状态码语义都能从 §0.1 的缺口 + §2.4 的判定单点推出；本节只是把**已经落地的形状**固定下来。**若 P1 确有必要改动它们，请按 v6 的方式再留一次记录（§13.4 式），而不是静默改掉** —— 那正是本节存在的理由。
 
 ---
 
@@ -1130,7 +1292,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 | 阶段 | 范围 | 涉及文件:行号 / 新增插件 | 量级 | 测试影响 |
 |---|---|---|---|---|
-| **P0** | 钩子表 + 路由 `access` 声明 + break-glass + `bootstrap_required`。**★ v5（D7）落地方式**：break-glass 令牌取 `GEEWIKI_ADMIN_TOKEN`，**环境变量未设置即整个通道禁用**（不是"默认令牌"）；**每次使用写审计**，`actor` 记为 **break-glass 来源**（`principal.kind='break-glass'`，§2.4） | `packages/core/src/index.ts:477-503,558-623`；`packages/server/src/index.ts:321-459,768-771`；`packages/manager/src/index.ts:1562-1673`；`packages/plugin-wiki/src/index.ts:643-687` | **S** | 管理端点测试需补 token |
+| **P0** | 钩子表 + 路由 `access` 声明 + break-glass + `bootstrap_required`。**★ v5（D7）落地方式**：break-glass 令牌取 `GEEWIKI_ADMIN_TOKEN`，**环境变量未设置即整个通道禁用**（不是"默认令牌"）；**每次使用留痕**，`actor` 记为 **break-glass 来源**（`principal.kind='break-glass'`，§2.4）。**★ v6（实现反馈）**：P0 **已落地**（worktree `feat/p0-route-auth-guard`，基线提交 `bb43fc2` + 一轮修复改动），实际 API 形状见 **§2.5**。**★ 注意：P0 不新增任何表 / 迁移** ⇒ 留痕在 P0 只有 **stdout 结构化行**（`auditBreakGlassUse()`）；`audit_log` 建表归 **P1**（`0013_audit.sql`）、审计闭环归 **P4** —— 取舍与风险见 §8.2 P0-6 | `packages/core/src/index.ts:487-492,502-518,544-580,598-620,679-698`；`packages/server/src/index.ts:135-249,490-618,637-694`；`packages/manager/src/index.ts:1574-1683`；`packages/plugin-wiki/src/index.ts:649-692` | **S** | 管理端点测试需补 token（**已落地为 `adminHeaders()`**，见 §8.2 P0-4） |
 | **P1** | 身份/会话/本地密码 + **`email_verified` + `user_identities` 建表** + 登录/登出/初始化向导 | 迁移 `0010_identity.sql`、`0013_audit.sql`；新增 `packages/plugin-auth`（`provides:'auth-service'`）；`packages/server/src/index.ts:938-1017` 登记；`config/plugins.base.json`；前端 `lib/authStore.ts`、`packages/web/src/api.ts:27-44`、`lib/errorText.ts:81-105` | **M** | `packages/web/test/errorText.test.ts` 必改 |
 | **P1.5** | **OIDC 通道**：授权码 + PKCE、`(issuer,sub)` 绑定、`provisioning_mode`、手动绑定流 | 新增 `packages/plugin-oidc`（`provides` **无** —— 只往 `auth-service` 注册 provider，**与 `@geewiki/openai` 同形态**：`packages/server/src/index.ts:1000-1017` 的注释明说"只往 llm-service 注册一条路由，故**无 provides**"）；`packages/plugin-auth` 增绑定端点 | **M** | 仅新增 |
 | **P2** | 组织/成员/组/邀请 + **页面级**可见性 + 继承 + `page_grants` + 全量**读路径**加 principal + 门户 `/portal` + 导航 IA + 404/403。**★ v5（D8）新增上线步骤**：**存量条目一次性回填 `visibility='org'`**（见 §8.2 P2 第 13 条） | 迁移 `0011_org_team.sql`、`0012_page_acl.sql`；**新增数据回填**（D8：`UPDATE pages SET visibility='org' WHERE …`，属上线动作、**不是 DDL 默认值**，§3.3）；新增 `packages/plugin-org`、`packages/plugin-authz`（`policy-service`）；`packages/plugin-wiki/src/index.ts:388-425,601-722`；`packages/plugin-search/src/index.ts:478` 与查询层过滤；前端 §6.6 各项 | **L** | 最大（导航/详情按钮/wiki 服务契约） |
@@ -1147,13 +1309,22 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 **P0**
 
-1. 无 token 时：`curl -X PUT /api/pages/x` → 503 `bootstrap_required`；`POST /api/plugins/@geewiki/db-sqlite/disable` → 503。
+1. 无 token 时：`curl -X PUT /api/pages/x` → 503 `bootstrap_required`；`POST /api/plugins/%40geewiki%2Fdb-sqlite/disable` → 503。
+   - **★ v6 订正（原写法按字面跑不通）**：原文写的是 `POST /api/plugins/@geewiki/db-sqlite/disable`。这个路径会被切成 **5 段** —— 插件名里的 `/` 被当成路径分隔符（`api` / `plugins` / `@geewiki` / `db-sqlite` / `disable`），而注册路由 `/api/plugins/:name/disable` 只有 **4 段**；路由匹配要求**段数相等**（`packages/server/src/index.ts:579-593`），于是它**根本不匹配任何路由**，直接落入"未匹配的 `/api/*`"分支 ⇒ 返回的是**路由自己的 API 404**（`{"ok":false,"error":"not_found","path":"…"}`，`:613-616`），**不是 503**。审查已**逐字复现**这一点。
+   - **正确写法是 URL 编码**：`POST /api/plugins/%40geewiki%2Fdb-sqlite/disable` —— 它是 **4 段**，分发时逐段 `decodeURIComponent` 还原出 `:name = '@geewiki/db-sqlite'`（`:570-578`），因此**命中路由** ⇒ **503 `bootstrap_required`**（**审查实测**；本次 v6 修订未亲自复现，见 §13.4 的未验证项）。
+   - **要记住的教训**：**插件名必须 URL 编码**。否则"段数不匹配 → **404**"很容易被误判成"**鉴权失效 / 端点不存在**"，排障时会走偏很远（404 看起来像"路由没了"，实际是"路径切段方式不对"）。
+   - （**同一 P0-1 里的 `PUT /api/pages/x` 命令，审查确认逐字可跑、结论正确，不改。**）
 2. 配 token 后：同样请求带 token → 成功；不带 → 401。
 3. `GET /api/pages`、`GET /api/pages/:slug` **行为完全不变**（现有只读能力零回归）。
 4. 现有测试全绿：`pnpm -r test`（尤其 `packages/server/**/*.test.ts` 的 router 用例、`packages/manager/**` 的 REST 用例需补 token）。
    > 建议在测试工具里提供 `withAdmin()` helper。
+   > **★ v6 实现反馈**：实际落地为 `packages/server/test/helpers.ts` 的 `adminHeaders(extra)` 与 `ADMIN_TOKEN` 常量（**名字与建议的 `withAdmin()` 不同，语义一致**：构造带 `x-gw-admin-token` 的请求头，须与已设置的 `GEEWIKI_ADMIN_TOKEN` 配套使用）。**该 helper 刻意不放进模块顶层自动生效** —— 否则会给所有 import 它的测试**隐式开启应急通道**，让"未配置令牌时必须 503"这类用例静默变成**假通过**。
 5. **（★ v5 新增，D7）未设置 `GEEWIKI_ADMIN_TOKEN` ⇒ 令牌通道完全不可用**：不设该环境变量时，带任意 `Authorization`/令牌头请求管理端点 ⇒ **仍 503 `bootstrap_required`**（或按未初始化处理），**绝不因为"没有配令牌"而放行**；显式设置后才进入"带 token 成功 / 不带 401"两种结果。
-6. **（★ v5 新增，D7）break-glass 使用留痕**：用令牌成功调用一次管理端点 ⇒ `audit_log` 新增一行，`actor` 记为 **break-glass 来源**（`principal.kind='break-glass'`），可事后追责。
+6. **（★ v5 新增，D7；★ v6 下调口径）break-glass 使用留痕**：用令牌成功调用一次管理端点 ⇒ **P0 阶段仅 stdout 留痕** —— 固定前缀的结构化行 `[audit] action=access.break_glass actor=break-glass method=… path=… remote=… at=…`（`auditBreakGlassUse()`，`packages/server/src/index.ts:180-186`），并在源码留 **`TODO(audit-service)`**；`actor` 记为 **break-glass 来源**（`principal.kind='break-glass'`）。
+   - **★ v6 为什么要下调：原文与 §8.1 自相矛盾。** 原文要求"**`audit_log` 新增一行**"，但 §8.1 把 `0013_audit.sql` 划给 **P1**，而 P0 的范围是"**不新增任何表 / 迁移**"（`packages/server/src/index.ts:175-179` 的注释同样这么写）⇒ **P0 里根本没有 `audit_log` 表，这一条在 P0 内不可满足**。v6 把口径改成"**P0 仅 stdout 留痕（+ `TODO(audit-service)`）；持久化审计表在 P1 建立（`0013_audit.sql`），P4 做审计闭环**"，**§8.1 的 P0 行同步改词** ⇒ 两处不再互相矛盾。
+   - **★ 这个取舍的风险（必须写明，别让它悄悄消失）**：stdout 留痕**只活在容器日志里** ⇒ **日志轮转（或容器重建）之后，应急令牌的使用将无迹可查**。也就是说 P0 → P1 之间的这段时间，"谁用应急令牌做了什么"**不可事后追责**，只能靠日志系统的保留 / 采集策略兜住（若运维把日志集中收集并长期保留，风险才降级）。**⇒ 上线 P0 时必须确认日志保留与采集策略，并把这条风险写进发布说明。**
+   - 验收（P0 内可测）：用令牌调用一次受保护端点 ⇒ stdout 出现**恰好一行** `[audit] action=access.break_glass …`（含 `method` / `path` / `remote` / `at`）；**不带令牌或带错令牌的请求不产生该行**（留痕只发生在"认证通过"那一刻）。
+   - 验收（P1 起接续）：`audit_log` 建表后，同一事件改写入审计表（`action='access.break_glass'`），可保留一条 stdout 作为冗余。
 
 **P1**
 
@@ -1168,7 +1339,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 **P1.5** —— 见 §7.4 的七条安全校验，外加：mock IdP 下完成首登 `invite_only` 拒绝（403 `no_invitation`）、email 已存在时 409 `identity_link_required`、解绑最后一个凭据 409 `last_credential`、IdP 不可达时本地密码通道不受影响。
 
-**P2**（v1 十条 + v2 一条 + v3 一条 + v5 一条）
+**P2**（v1 十条 + v2 一条 + v3 一条 + v5 一条 + **v6 一条**）
 
 1. **继承**：`public` 父 + `private` 子 ⇒ 匿名 `GET /api/pages/:child` → **404**；`GET /api/pages` 不含该 slug。
 2. **不可放宽**：`private` 父 + `public,published` 子 ⇒ 匿名仍 404。
@@ -1187,6 +1358,17 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
     - ② **没有任何存量条目被批量设成 `public`**：`SELECT COUNT(*) FROM pages WHERE visibility='public' AND published_at IS NOT NULL` **不因回填而增加**（`public` 只能由管理员显式发布，D8）；
     - ③ **回填是上线动作、不是 DDL 默认值**：只跑 `0012_page_acl.sql`（`ADD COLUMN … DEFAULT 'private'`）而**不跑回填**时，存量条目的 `visibility` 应为 `private`（**这正是 D8 要避免的"全站条目瞬间消失"**）—— 两条命令的先后关系必须写进发布手册；
     - ④ 匿名访问任一回填后的存量条目 ⇒ 按 `org` 规则处理（**匿名 = 404**，因为 `org` 档只对组织成员可见；**不是**"能看"）—— 这一点必须测准，别把 `org` 误当"公开"。
+14. **（★ v6 新增，依据 = P0 独立代码审查的实测）插件 `config` 回显泄漏 —— 路由层 `redactConfig(principal)`**：**非 break-glass 主体**调用相关端点时，响应里**不含**任何插件的 `config` 字段。**两条路径都必须覆盖**（见下）。
+    - **先纠正一处此前的错误认知**：曾怀疑 `GET /api/plugins` 的 `config` 会泄漏 **LLM API key 与数据库密码**。审查用**真实服务实测后推翻**：本项目有成文的**密钥纪律** —— `apiKeyEnv` / `passwordEnv` **只接受环境变量「名」**，填**密钥值本身**会导致插件**激活失败**（`packages/plugin-openai/src/index.ts:116-119` 的 `isEnvVarName` 白名单闸门；`packages/db-postgres/src/index.ts:126` 的 `assertEnvNameLooksLikeName('passwordEnv', …)`；测试 `packages/db-postgres/test/secret-discipline.test.ts`）⇒ **密钥值不会出现在响应里**。
+    - **但存在一个真实的、更窄的通道**：`config` 是**原样回显运维填写的任意字符串字段**。审查实测：真实密钥 `sk-live-…` **未**泄漏，而 `baseUrl` 里内嵌的 `hunter2` **泄漏 1 次** ⇒ `baseUrl` 若写成 `https://user:pass@gateway/v1` 会被**逐字吐出**。附带泄漏：**环境变量名、模型名、内网端点拓扑**。**风险等级 Low–Medium。**
+    - **交付物**：**路由层**的 `redactConfig(principal)` —— 对**非 break-glass 主体**（`principal.kind !== 'break-glass'`）**去掉 `config` 字段**（或替换为公开子集）。**注意：P0 的 `GET /api/session` 是 `public`、`GET /api/plugins` 也仍是 `public`** ⇒ **这个回显通道目前是匿名可达的**（P0 的刻意取舍见 §2.5 ⑤）。
+    - **必须同时覆盖两条路径（只改一条会漏）**：
+      1. `GET /api/plugins`（`packages/manager/src/index.ts:1574`）；
+      2. **`GET /api/session`**（`:1619`）—— 它经 `manager.sessionState()`（`packages/manager/src/index.ts:449-451`）返回 `PluginListFile.enabled[].config`，结构见同文件 `:129-136`。**审查明确警告："只改 `/api/plugins` 会漏掉第二条。"**
+    - **不能改 `snapshotOf()`**（`packages/manager/src/index.ts:394-417`）：它被 `enable` / `replace` 的响应**复用**（`ok(h, { plugin: snapshot })`，`:1629`），在那里裁剪会把**管理台的配置表单一起打瞎**（表单读的正是这个 snapshot 里的 `config`）。**⇒ 裁剪必须做在路由层，不能做在快照函数里。**
+    - **待排查项（标注清楚：不要当成已确认）**：`packages/manager/src/index.ts:413` 的 `error: p?.error ?? undefined` 是**插件激活失败的字符串**，**可能**含运维填入的连接信息。审查**未实测到泄漏** ⇒ 按"**待排查**"处理，先别写进交付范围。
+    - **为什么不能更早做（P0 不做的理由）**：① P0 的契约是"**读端点行为与改动前逐字一致**"（§8.1 P0 行），且 **P0 不许改 `packages/web`** —— 裁剪 `config` 会改变管理台首屏的取数结果（配置表单依赖 snapshot 的 `config`），属**读路径改造**，必须与 §5 的读路径裁剪一起在 P2 做；② 现实约束：`GET /api/session` 在 P0 **刻意保持 `public`**（理由见 §2.5 ⑤ —— `AdminPage` 的 `Promise.all` 里**只有它没有 `.catch()`**）⇒ **收紧它时必须同时处理那个 `Promise.all`**，否则管理台首屏直接白屏。
+    - **运维缓解建议（在修复之前）**：**不要把凭据内嵌进 `baseUrl`（或任何配置值）**，改用环境变量；`config` 里只写**变量名**。已经内嵌过的，按"**已泄漏**"处理（轮换凭据）。
 
 **P3a**
 
@@ -1248,6 +1430,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 `ctx.provide('wiki-service', svc)`（`packages/plugin-wiki/src/index.ts:726`）提供的是**进程级单例**，`WikiService.list()/get()/save()/remove()`（`:141-154`）**均无 principal 入参**。若只在路由层判定而服务方法签名不变，任何新消费者调 `svc.get(slug)` 都拿到**未裁剪**的数据。
 - **缓解（三段式）**：(1) 服务方法**显式加 `principal` 参数**（编译期强制）；(2) 服务实现内部**再次**校验（纵深防御：路由层判一次、服务层判一次）；(3) 在 `AsyncLocalStorage`（`packages/server/src/index.ts:131` 已有 `requestScope`）里放 principal，服务实现发现 `principal === undefined` 时**抛错而非放行**（失败关闭）。
 - **反模式**：`if (principal) { 过滤 }` —— 这会把"忘了传"变成"全量返回"。**必须**是 `if (!principal) throw`。
+- **★ v6 交叉引用**：P0 落地的 `access` 闸门（**§2.5**）是**粗粒度**的 —— 它只保证"**不是匿名**"，**不能替代**本条的逐对象判定与服务层二次校验。闸门 + 逐调用 `principal` 是**两层纵深防御**，别用前者替代后者（实现内的原话："两者是纵深防御的两层，不是二选一"）。
 
 ### R3 —— `packages/core` 不能进浏览器包
 `packages/core/src/index.ts` 顶层 `import 'node:fs'`。因此 `Principal`/`Capability`/`PageVisibility` 等类型若要前后端共用，**必须**在 `packages/web/src/lib/` 持镜像副本（先例：`PLUGIN_UI_PREFIX`、`SLOT_NAMES`，`packages/core/src/index.ts:376-381,630-640`），且**必须有源码级守卫测试**钉住两处一致（参照 `packages/web/test/pluginUiPlan.test.ts`）。
@@ -1270,6 +1453,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - `trackStream(res, owner)` 的 `owner` 是**插件名**（`packages/core/src/index.ts:591-611`），**不是鉴权**。
 - `serveStatic`（`packages/server/src/index.ts:634-680`）在 `dispatch` **返回 false** 时才接手（`:768-771`）→ 静态资源**完全绕过**任何 API 层钩子。若门户渲染分支走错地方（放在 `serveStatic` 之后），会出现"**服务端渲染了受限内容、`Cache-Control` 却是公开缓存**"的致命组合。
 - **缓解**：门户渲染分支必须**在 `serveStatic` 之前**、且 `Cache-Control` 由 principal 决定。
+- **★ v6 交叉引用（这条边界已写成正式契约）**：P0 注册的 `use()` 钩子链**只对"匹配到的路由"生效** ⇒ 静态资源与 SPA fallback **永远不过钩子**，`/api/*` 未匹配路径走路由自己的 **API 404**、也不进钩子链（见 **§2.5.2 边界一**）。⇒ "**注册了会话钩子**"**不等于**"**静态层已被鉴权**"。本节的门户渲染分支仍然**必须**在 `serveStatic` 之前，这一点不因 P0 引入了钩子而有任何放松。
 
 ### R7 —— 路由与 slug 保留段的双重约束
 - 后端 `RESERVED_FIRST_SEGMENTS = search|ask|new|list`（`packages/plugin-wiki/src/index.ts:242-298`）。
@@ -1563,7 +1747,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 ## 12. 整理本文时发现的前后矛盾与不确定处
 
-> 这一节是**刻意保留**的：两轮设计与用户决定之间存在张力，不应被悄悄抹平。**★ v5 定稿时已逐条核对** —— 下表给出每一条的现状。**注意区分两类**：标"**已解决**"的是**曾经的矛盾/张力，已有结论**；标"**需复核**"的是**技术上的未验证项（不是待决项）**，实现前必须实测/复核。
+> 这一节是**刻意保留**的：两轮设计与用户决定之间存在张力，不应被悄悄抹平。**★ v5 定稿时已逐条核对**（**★ v6 追加第 18 / 19 两行**）—— 下表给出每一条的现状。**注意区分两类**：标"**已解决**"的是**曾经的矛盾/张力，已有结论**；标"**需复核**"的是**技术上的未验证项（不是待决项）**，实现前必须实测/复核。
 >
 > | 条目 | 现状 |
 > |---|---|
@@ -1584,8 +1768,10 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 > | 15（块级"仅编辑者可见"让能力定可见性） | **已解决**（v4/D15） |
 > | 16（`minRole` 命名） | **已解决**（v3 改名 `minVisibility`；v4 值域改 `'org'\|'granted'`） |
 > | 17（`invitations.org_role` 命名保留） | **不是矛盾**（说明性留痕，保留不改名） |
+> | 18（`pages.visibility` 两层默认值） | **不是矛盾**（v5 说明性留痕，保留；见本条正文） |
+> | 19（P0 实现自行定义了文档未写的 API 形状） | **已解决**（v6：已回写为 §2.5；过程与根因见本条正文） |
 >
-> 也就是说：**定稿后本节不再含"待拍板"类条目**，只剩第 11 条（可选简化）与第 12 条（需复核）这类**实现期事项**。
+> 也就是说：**定稿后本节不再含"待拍板"类条目**，只剩第 11 条（可选简化）与第 12 条（需复核）这类**实现期事项**，外加 **v6 新增的第 19 条**（**实现回写留痕，已解决，不是待决项**）。
 
 1. **v1 明确否决了块级模型，而用户选择了它。** v1 §6.3 的结论是"**推荐 A 方案**（内联标记 + 服务端投影裁剪），B 方案（blocks 表）列为 P4+ 可选演进"，并给出了理由：B 会**同时炸掉** FTS5 external content 触发器、版本历史、AI RAG 三条链路。用户选择了 B（完整块级模型）⇒ **v2 §6 整节重写**，v1 §6 与 §9-D3 作废。本文档以 v2 为准。**风险没有消失，只是被 v2 的具体方案接住了**（§4.3 的 tier 设计 + §4.4 的版本语义 + §4.5 的 RAG 契约），而 R11–R15 是这套方案**新增**的风险。
 2. **v1 推荐"仅本地密码"，用户要 OIDC** ⇒ v1 D2 作废，v2 新增 P1.5（§7）。
@@ -1628,6 +1814,15 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 17. **★ v3：`invitations.org_role` 这个名字保留（说明，非矛盾）。** §3.2 里除授权表之外还有一处 `org_role` —— `invitations.org_role`（"接受邀请后获得哪个组织角色"）。它描述的是**能力**（入伙后是不是 admin/member），**不是授权对象**，与决定一无关，因此**保留不改名**（已在 §3.2 的 DDL 注释里就地写明）。在此留痕，以免后人 grep `org_role` 时误以为它是残留。
 18. **★ v5：`pages.visibility` 的两层默认值看起来矛盾，其实是刻意的（说明，非矛盾）。** §3.3 的 DDL 写 `DEFAULT 'private'`（**失败关闭**：没人管的写入路径落到最严档），而应用层新建条目的默认是 `'org'`（**本产品的常态**，也是 D8 给存量条目回填的档）。已把这两层的关系写清在 §3.3 的 v5 注里，并在此留痕 —— 因为**只看 DDL 很容易误读成"新建页面默认私有"**，而那是错的。这也是 D8 的派生项（见 §13.3）。
 
+19. **★ v6：P0 实现过程中自行定义了文档未写的 API 形状（"文档缺口 → 实现补齐 → 回写文档"）。** 本条**不是"矛盾"，而是一次缺口记录** —— 沿用本节"**刻意保留张力**"的风格：把**过程与根因**写下来，避免同类丢失再发生。
+    - **事实**：P0 依赖的"**钩子机制**"与"**路由 `access` 声明**"**确实都是文档要求过的**（`§8.1` 的 P0 行、`§0.1`、`§8.2` 的 P0-5 / P0-6、`§2.4` 的 `Principal` 接口，实现与它们**逐字段一致** —— 审查已逐项核对）；**但这套 API 的具体形状文档里没有**：`RouteAccess` 三档枚举、`RequestVerdict`、可选 `use?(hook): () => void`、`dispatch` 返回类型放宽为 `boolean | Promise<boolean>`、`register()` 的可选第 4 参 `opts.access`（默认 `public`）、`judgeAccess` 的判定顺序与 401 / 403 / 503 的选择 ⇒ **全部由实现在过程中自行定义**。
+    - **风险（审查的结论，原话大意）**：*"建议把这 6 项设计补进设计文档，否则 **P1 会拿『文档没写』当理由改掉它们**。"* 这不是纯理论风险：这些形状里有若干条**看起来像实现细节、实际是安全契约** —— `access` 默认 `public` 的**向后兼容前提**、**503 必须早于 401** 的引导期语义、钩子返回值不合法必须**失败关闭**、`dispatch` 返回值放宽是**异步身份解析的唯一可行路径**（B1）。
+    - **v6 的处理**：**新增 §2.5**（六项形状 + 两条边界）把它们补成正式章节；并在 **§8.1 P0 行**、**§0.1 ②** 就地标注"实现已落地"。
+    - **为什么它当初会丢（根因，必须记下来）**：**章节重排**。v1 设计里"**路由鉴权插入**"原本是 **§4**；定稿合并时 **§4 被"块级内容模型"占用**（即现 §4），而那一节的内容**没有被迁移到别处**（也没有被显式声明作废）⇒ 它作为"**没进最终文档的一节**"静默消失，只在 §8.1 / §0.2 的行文里留下"**钩子表 + 路由 `access` 声明**"这样一句**没有形状的短语**。风险因此被延后到**实现期**才暴露（实现者只能自行定义形状）。
+      > **来源说明（诚实标注）**：本条里"v1 的 §4 是路由鉴权插入方案"出自**本轮修订的任务简报与独立代码审查结论**；仓库内**没有 v1 设计稿存档**（`docs/design/` 只有 `access-control.md`，`git log --all -- docs/design/` 只有一条新增提交 `261cea1`）⇒ **该因果无法在仓库内核验**，此处按"审查结论"记录，**不要当成已实测事实**。
+    - **与既有 18 条的关系（已逐条核对，无重复）**：不是第 6 条（那讲的是 **D5–D8 决策**未获同等处理）、不是第 13 条（那讲的是 **v1 附录的三处订正**）；本条讲的是"**章节迁移过程中的内容丢失**"，是**新的一类** —— 特点是"**丢了的东西没进 §12，因为当时没人知道它丢了**"。**故不合并，只在此交叉引用。**
+    - **可复用的一条经验**：**合并 / 重排章节时必须逐节核对"目标编号是否已被占用、原内容是否已迁移"**，并给被并掉的节留一条**显式的作废或迁移指针**。本条就是缺这一步的代价（代价最终落在 P0 的实现者与审查者身上）。
+
 ---
 
 ## 13. 交付确认
@@ -1635,6 +1830,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - 本文档为**唯一产出**：`docs/design/access-control.md`。
 - **未修改任何现有文件、未改动任何代码。**
 - 文中标 **「实测」** 的结论来自对仓库实际执行过的只读 SQLite 探测（使用 `:memory:` 库，未触碰 `data/geewiki.db`）。
+- **★ v6 补充**：上面三条描述的是 **v1–v5 的写作过程**。**v6（本次修订）同样是纯文档改动**（只改本文件、**未动任何代码**）；但 v6 的**依据不再是用户决策**，而是 **P0 阶段的落地实现 + 一轮独立代码审查** —— 详见 §13.4。另需说明：v6 期间仓库里**已经存在 P0 的实现代码**（worktree 分支 `feat/p0-route-auth-guard`），它是本轮**核对的对象**，不是本文档的产出。
 
 ### 13.1 ★ v3 修订记录（本次修订；依据 = 用户的三项决定）
 
@@ -1713,5 +1909,29 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
   3. **实现前必须按 §12 与各章的「原文如此，实现前需复核」逐条复核**；凡本文标"（原文如此，实现前需复核）"处，**不要照着猜**。
   4. 全文既有 `文件:行号` 引用**沿用原始调查与两轮设计、五轮修订均未逐条复核**（仅抽查过 3 处：`packages/plugin-wiki/src/index.ts:274` 的 `isValidSlug`、同文件 `:672` 的 `savePage(...)` 调用、`packages/server/src/index.ts:131` 的 `AsyncLocalStorage<RequestState>`）。
   5. 本次修订事实核对（仅此两项）：① 全仓库 grep 确认 ACL 相关标识在 `*.ts`/`*.tsx`/`*.sql` 中**零命中**（⇒ 未实现，改动不会与代码冲突）；② `ls` 核实双方言迁移目录的现有编号与 §12 第 12 条所述一致。
+
+### 13.4 ★ v6 修订记录（依据 = **P0 实现 + 独立代码审查**，**不是**新的用户决策）
+
+- **本次修订的性质（务必与 §13.1–§13.3 区分）**：**v3 / v4 / v5 都是"用户拍板驱动"的修订**（分别依据用户的第三、四、五项决定）。**v6 不是** —— 它由 **P0 阶段的落地实现 + 一轮独立代码审查**驱动，**没有引入任何新的设计决策**，只做三类事：
+  1. **回写**：把"实现已定义、文档里从未写过"的 API 形状补成正式章节（**§2.5**）；
+  2. **订正**：修掉两条**按字面执行不通 / 自相矛盾**的 P0 验收（**§8.2 P0-1、P0-6**）；
+  3. **记账**：把审查**实测到**的泄漏通道记入 P2 交付项（**§8.2 P2 第 14 条**）与 §12（**第 19 条**）。
+- **改动清单（五项）**：
+
+  | # | 改动 | 落点 |
+  |---|---|---|
+  | 1 | **新增 §2.5「服务端路由鉴权：P0 已落地的 API 形状」** —— 六项形状（`RouteAccess` 三档 / `RequestVerdict` / 可选 `use?()` / `dispatch` 返回类型放宽 / `register()` 第 4 参默认 `public` / `judgeAccess` 判定顺序与 401·403·503）+ **两条边界**（钩子链**只对匹配到的路由**生效；`/api/health` **刻意在闸门之外**）+ P0 各端点的等级分配表 | **新增 §2.5**（§2 末尾，§2.4 之后）；§0.1 ② 就地订正；§8.1 P0 行；§9 R2 / R6 交叉引用 |
+  | 2 | **订正 §8.2 P0-1 的命令**：`POST /api/plugins/@geewiki/db-sqlite/disable` → `POST /api/plugins/%40geewiki%2Fdb-sqlite/disable`（未编码是 **5 段** ⇒ 不匹配 **4 段**路由 ⇒ 得到 **API 404** 而不是 503） | §8.2 P0-1 |
+  | 3 | **解决 P0-6 与 §8.1 的自相矛盾**：`audit_log` 建表在 P1、P0 不建表 ⇒ 原"新增一行"在 P0 **不可满足**。口径下调为"**P0 仅 stdout 留痕 + `TODO(audit-service)`**；P1 建表、P4 闭环"，并写明风险（**日志轮转后应急令牌的使用无迹可查**） | §8.2 P0-6；§8.1 P0 行同步改词 |
+  | 4 | **P2 新增第 14 条**：**路由层** `redactConfig(principal)`，**两条路径都要覆盖**（`GET /api/plugins`、`GET /api/session`），**不能改 `snapshotOf()`**；含审查实测的真实向量（`baseUrl` 内嵌凭据被**逐字回显**；密钥值本身因 `apiKeyEnv` / `passwordEnv` 纪律**不会**泄漏）、风险等级（Low–Medium）、**运维缓解建议**，以及一条**待排查项**（`:413` 的 `error` 字段） | §8.2 P2 第 14 条（并改 P2 小标题计数） |
+  | 5 | **§12 新增第 19 条**：记录"**文档缺口 → 实现补齐 → 回写文档**"的过程与**根因（章节重排：v1 的 §4 是路由鉴权插入方案，定稿时 §4 被块级内容模型占用、内容未迁移 ⇒ 静默丢失）** | §12 第 19 条 + 现状表追加第 18 / 19 行 |
+
+- **本次修订的核对方式（与前几轮不同）**：v6 **读了实现源码（只读，未改动）**来核对，而不是只读旧文档。核对覆盖：`packages/core/src/index.ts`、`packages/server/src/index.ts`、`packages/manager/src/index.ts`、`packages/plugin-wiki/src/index.ts`、`packages/server/test/route-auth.test.ts`、`packages/server/test/helpers.ts`，以及**密钥纪律**的旁证（`packages/plugin-openai/src/index.ts:116-119`、`packages/db-postgres/src/index.ts:126`、`packages/db-postgres/test/secret-discipline.test.ts`）。
+- **★ 未验证项（诚实声明）**：
+  1. 本节与 §2.5 新写的 **worktree 行号**取自核对当时的**工作区状态**（提交 `bb43fc2` **+ 一轮尚未提交的修复改动**）。该 worktree 仍在演进 ⇒ **行号可能小幅漂移**，定位请以**函数 / 类型名**为准。
+  2. P0 的"实测"结论（**URL 未编码 ⇒ API 404**、**编码后 ⇒ 503 `bootstrap_required`**、**`/api/health` 不过闸门**、**`baseUrl` 内嵌凭据会被回显**）来自**本轮独立代码审查的复现记录 + 实现自身的测试**；**本次 v6 修订没有亲自把服务跑起来复现**（本次约束：只改文档）⇒ 凡本节新写的状态码行为，**以 §8.2 的 P0 验收为准，实现前请按 §12 与各章标注复核**。
+  3. §12 第 19 条里"**v1 的 §4 是路由鉴权插入方案**"**无法在仓库内核验**（无 v1 存档），已在该条就地标注来源。
+  4. `packages/manager/src/index.ts:413` 的 `error` 字段是否泄漏连接信息 ⇒ **待排查**（审查未实测到），**不要当成已确认**。
+- **★ 不变的要求（继承 §13.3 第 3 条）**：本文其余仍标「**原文如此，实现前需复核**」的地方，**本次修订一条都没有验证过**，**不要照着猜**。v6 的范围**严格限于上面五项**；§12 的既有 18 条**一条都没有被删除**（只增补与就地标注）。
 
 
