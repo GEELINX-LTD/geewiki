@@ -1269,6 +1269,177 @@ export const AuthPlugin = {
       ),
     )
 
+    /* ---------- ★ P4：会话管理（admin） ---------- */
+    /*
+     * 三条端点的共同约束：
+     *
+     * - **服务端吊销**（写 `revoked_at`），不是"删掉客户端的 cookie" —— 后者对已经拿到
+     *   令牌副本的人零效果。
+     * - `ip_hash` 是**哈希**不是 IP 原文；界面上不要把它渲染成 "IP"。它存在的意义是
+     *   "同一来源的会话能对上"，不是回溯到具体地址。
+     * - 吊销必须**写审计**：把人在线踢下来是有后果的运维动作，要能事后回答"谁踢的、何时"。
+     * - 我们**不提供**"列出会话令牌"这类信息 —— `token_hash` 连哈希都不出接口，
+     *   因为它是可离线爆破的凭据材料（哪怕成本高，也没有任何展示必要）。
+     */
+    const SESSION_LIST_MAX = 200
+
+    interface SessionRow {
+      id: string
+      user_id: number
+      created_at: string
+      last_used_at: string
+      expires_at: string
+      idle_expires_at: string
+      revoked_at: string | null
+      user_agent: string | null
+      ip_hash: string | null
+    }
+
+    const sessionView = (r: SessionRow, now: string) => ({
+      id: r.id,
+      userId: r.user_id,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at,
+      expiresAt: r.expires_at,
+      idleExpiresAt: r.idle_expires_at,
+      revokedAt: r.revoked_at,
+      userAgent: r.user_agent,
+      ipHash: r.ip_hash,
+      /*
+       * 综合状态：`revoked` 优先于过期 —— 一条被显式踢下线的会话，运维想知道的是
+       * "被人踢了"，而不是"它同时恰好也过期了"。时间列都是 ISO8601，字符串比较即时间比较。
+       */
+      status:
+        r.revoked_at !== null
+          ? 'revoked'
+          : r.expires_at <= now || r.idle_expires_at <= now
+            ? 'expired'
+            : 'active',
+    })
+
+    cleanups.push(
+      router.register(
+        'GET',
+        '/api/admin/sessions',
+        async (h) => {
+          const rawUserId = h.url.searchParams.get('userId')
+          const rawLimit = Number(h.url.searchParams.get('limit') ?? SESSION_LIST_MAX)
+          const limit = Number.isFinite(rawLimit)
+            ? Math.min(Math.max(1, Math.trunc(rawLimit)), SESSION_LIST_MAX)
+            : SESSION_LIST_MAX
+          const now = new Date().toISOString()
+
+          const where: string[] = []
+          const params: unknown[] = []
+          if (rawUserId !== null && rawUserId !== '') {
+            const userId = Number(rawUserId)
+            if (!Number.isInteger(userId) || userId <= 0) {
+              h.json(400, { ok: false, error: 'invalid_user_id', message: 'userId 必须是正整数' })
+              return
+            }
+            where.push('user_id = ?')
+            params.push(userId)
+          }
+          const sql = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
+          const countRows = await db.query<{ n: number | string }>(
+            `SELECT COUNT(*) AS n FROM sessions${sql}`,
+            params,
+          )
+          // PG 的 COUNT(*) 返回字符串，必须强转
+          const total = Number(countRows[0]?.n ?? 0)
+          const rows = await db.query<SessionRow>(
+            `SELECT id, user_id, created_at, last_used_at, expires_at, idle_expires_at,
+                    revoked_at, user_agent, ip_hash
+               FROM sessions${sql}
+              ORDER BY last_used_at DESC, id DESC
+              LIMIT ?`,
+            [...params, limit],
+          )
+          h.json(200, { ok: true, total, limit, entries: rows.map((r) => sessionView(r, now)) })
+        },
+        { access: 'admin' },
+      ),
+    )
+
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/admin/sessions/:id/revoke',
+        async (h) => {
+          const id = h.params.id ?? ''
+          const now = new Date().toISOString()
+          const row = (
+            await db.query<{ user_id: number; revoked_at: string | null }>(
+              'SELECT user_id, revoked_at FROM sessions WHERE id = ?',
+              [id],
+            )
+          )[0]
+          if (!row) {
+            h.json(404, { ok: false, error: 'not_found', message: `会话不存在: ${id}` })
+            return
+          }
+          if (row.revoked_at !== null) {
+            /*
+             * **幂等**：对已吊销的会话再吊销一次不算错（运维脚本重跑、界面重复点击都常见）。
+             * 但**不重复写审计** —— 否则同一个事实被记成多次，审计就不再是"发生过什么"的记录。
+             */
+            h.json(200, { ok: true, id, alreadyRevoked: true, revokedAt: row.revoked_at })
+            return
+          }
+          await db.run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [
+            now,
+            id,
+          ])
+          audit({
+            action: 'admin.session_revoke',
+            targetKind: 'session',
+            targetId: id,
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(clientIp(h.req)),
+            before: { revokedAt: null },
+            after: { revokedAt: now, userId: row.user_id },
+          })
+          h.json(200, { ok: true, id, alreadyRevoked: false, revokedAt: now })
+        },
+        { access: 'admin' },
+      ),
+    )
+
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/admin/users/:userId/sessions/revoke',
+        async (h) => {
+          const userId = Number(h.params.userId ?? '')
+          if (!Number.isInteger(userId) || userId <= 0) {
+            h.json(400, { ok: false, error: 'invalid_user_id', message: 'userId 必须是正整数' })
+            return
+          }
+          const now = new Date().toISOString()
+          const before = await db.query<{ n: number | string }>(
+            'SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND revoked_at IS NULL',
+            [userId],
+          )
+          const affected = Number(before[0]?.n ?? 0)
+          await db.run(
+            'UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL',
+            [now, userId],
+          )
+          // 无人可踢时也写审计：这是"某账号被要求下线"的意图记录，不是被踢人数的统计
+          audit({
+            action: 'admin.session_revoke',
+            targetKind: 'user',
+            targetId: String(userId),
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(clientIp(h.req)),
+            after: { revokedAt: now, revokedCount: affected },
+          })
+          h.json(200, { ok: true, userId, revokedCount: affected, revokedAt: now })
+        },
+        { access: 'admin' },
+      ),
+    )
+
     /* ---------- POST /api/auth/password（user） ---------- */
     cleanups.push(
       router.register(

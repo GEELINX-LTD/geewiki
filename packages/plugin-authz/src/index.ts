@@ -664,6 +664,7 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'admin.resync_tiers',
         'admin.verify_blocks',
         'admin.verify_search',
+        'admin.session_revoke',
         'org.group.add_member',
         'org.group.create',
         'org.group.delete',
