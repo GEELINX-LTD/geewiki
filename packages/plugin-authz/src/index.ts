@@ -24,12 +24,15 @@
  */
 import type { Context } from 'cordis'
 import {
+  anonymousPrincipal,
   asAsync,
   writeAuditLog,
   type AnyDatabaseAdapter,
   type DatabaseAdapterAsync,
   type GeeWikiManifest,
+  type HttpRouterService,
   type Principal,
+  type RouteHandlerContext,
 } from '@geewiki/core'
 
 /* ============================== 类型 ============================== */
@@ -141,7 +144,7 @@ export const manifest: GeeWikiManifest = {
     provides: 'policy-service',
     // 只要数据库：主体（含 orgRole / groupIds）由调用方经 Principal 传入，
     // 本插件**不认识** auth 或 org 插件 —— 这正是"策略与身份解耦"的落点。
-    requires: ['database-provider'],
+    requires: ['database-provider', 'http-service'],
     conflictGroup: undefined,
     migrations: undefined,
     runtime: {
@@ -430,6 +433,118 @@ export const AuthzPlugin = {
         }
         return out
       },
+    }
+
+    /* ------------------------- P2：公开门户与收录控制 ------------------------- */
+
+    /*
+     * 门户是**服务端渲染**的：它必须在 `serveStatic` 之前接管 `/portal`，否则会拿到
+     * SPA 的 index.html —— 外壳由 JS 渲染，爬虫与社交分享预览都看不到内容。
+     * 路由注册天然优先于静态层（`dispatch` 先匹配路由，未命中才交给静态层）。
+     *
+     * ★ D4：门户**存在但不许搜索引擎收录**。三件套缺一不可：
+     *   `robots.txt` 的 Disallow（管愿意守规矩的爬虫）+ `X-Robots-Tag` 响应头
+     *   （管非 HTML 响应与"已被收录页面的重新抓取"）+ HTML `<meta name="robots">`（纵深）。
+     * **但它们都不是访问控制** —— 内容本身只由 policy-service 裁剪，本文件不例外。
+     */
+    const SESSION_COOKIE = 'gw_sid'
+    const X_ROBOTS_TAG = 'noindex, nofollow, noarchive'
+
+    const hasSessionCookie = (h: RouteHandlerContext): boolean => {
+      const raw = h.req.headers.cookie
+      if (typeof raw !== 'string' || raw.length === 0) return false
+      return raw.split(';').some((part) => part.trim().startsWith(`${SESSION_COOKIE}=`))
+    }
+
+    /**
+     * 门户类响应的缓存策略（§6.5）。
+     *
+     * 判 **cookie 存在性**而非会话有效性：判有效性要查库（每请求一次 IO），
+     * 而存在性只是 header 解析；安全上后者更保守（拿任意垃圾 cookie 也走 `no-store`）。
+     *
+     * `Vary: Cookie` 是 `public` 与 `private` 之间的**正确性锚点**：即便某中间缓存
+     * 忽略了 `no-store`，`Vary` 也保证不会把匿名渲染结果喂给登录用户
+     * （web cache deception —— 这是唯一防线，不是可选项）。
+     */
+    const setPortalHeaders = (h: RouteHandlerContext, contentType: string): void => {
+      const setHeader = h.res?.setHeader
+      // 测试替身可能没有 setHeader：那是夹具的能力问题，不该让请求失败
+      if (typeof setHeader !== 'function') return
+      setHeader.call(h.res, 'content-type', contentType)
+      setHeader.call(
+        h.res,
+        'cache-control',
+        hasSessionCookie(h) ? 'private, no-store' : 'public, max-age=60, s-maxage=300',
+      )
+      setHeader.call(h.res, 'vary', 'Cookie')
+      setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
+    }
+
+    /** 最小 HTML 转义（门户要渲染 slug/title，两者都来自用户输入） */
+    const esc = (s: string): string =>
+      s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+
+    /** 匿名主体能看见的全部 slug —— 门户与 sitemap **共用**这一个出口（禁止第二份筛选逻辑） */
+    const anonymousVisible = async (): Promise<string[]> => svc.visibleSlugs(anonymousPrincipal(), { levels: ['full'] })
+
+    const router = ctx.get('http') as HttpRouterService | undefined
+    if (router) {
+      router.register('GET', '/robots.txt', (h: RouteHandlerContext) => {
+        const setHeader = h.res?.setHeader
+        if (typeof setHeader === 'function') {
+          setHeader.call(h.res, 'content-type', 'text/plain; charset=utf-8')
+          setHeader.call(h.res, 'cache-control', 'public, max-age=3600')
+        }
+        h.res.end('User-agent: *\nDisallow: /\n')
+      })
+
+      /*
+       * `sitemap.xml` 的定位在 D4 下变了：**不给爬虫，给运维做泄漏核对**
+       * （与匿名可见集合做集合差必须为空 —— 这是一条可自动化的安全回归断言）。
+       * 保留端点而不提交给搜索引擎，正是"安全价值留下、收录副作用去掉"。
+       */
+      router.register('GET', '/sitemap.xml', async (h: RouteHandlerContext) => {
+        const slugs = await anonymousVisible()
+        const setHeader = h.res?.setHeader
+        if (typeof setHeader === 'function') {
+          setHeader.call(h.res, 'content-type', 'application/xml; charset=utf-8')
+          setHeader.call(h.res, 'cache-control', 'no-store, private')
+          setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
+        }
+        const urls = slugs.map((s) => `  <url><loc>/p/${esc(s)}</loc></url>`).join('\n')
+        h.res.end(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset>\n${urls}\n</urlset>\n`)
+      })
+
+      router.register('GET', '/portal', async (h: RouteHandlerContext) => {
+        // 匿名主体：门户展出的必须与"未登录访客看得到的内容"逐字一致
+        const slugs = await anonymousVisible()
+        setPortalHeaders(h, 'text/html; charset=utf-8')
+        const items = slugs.map((s) => `<li><a href="/#/wiki/${esc(s)}">${esc(s)}</a></li>`).join('\n')
+        h.res.end(
+          `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- ★ D4：不收录。这不是访问控制，内容是否可见只由 policy-service 决定。 -->
+<meta name="robots" content="${X_ROBOTS_TAG}">
+<title>知识库</title>
+</head>
+<body>
+<main>
+<h1>知识库</h1>
+${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
+</main>
+</body>
+</html>
+`,
+        )
+      })
     }
 
     const unprovide = ctx.provide('policy-service', svc)

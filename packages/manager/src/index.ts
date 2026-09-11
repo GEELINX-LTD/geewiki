@@ -1557,6 +1557,42 @@ function fail(h: RouteHandlerContext, err: unknown): void {
   send(h, 500, { ok: false, error: 'internal', message: '服务器内部错误（详见服务端日志）' })
 }
 
+/* ------------------------- P2：插件 config 回显脱敏 ------------------------- */
+
+/**
+ * 是否允许在响应里回显插件的 `config`（设计文档 §8.2 P2 第 14 条）。
+ *
+ * **为什么必须在路由层脱敏、而不是改 `snapshotOf()`**：`snapshotOf()` 的返回值同时被
+ * `enable`/`replace` 的响应复用（`ok(h, { plugin: snapshot })`）。在那一层裁剪会把管理台
+ * 的**配置表单**一起打瞎 —— 表单正是靠 `config` 回填当前值。
+ *
+ * **为什么两条路都要覆盖**：`GET /api/plugins` 与 `GET /api/session` 回显的是**同一批
+ * config**（后者经 `PluginListFile.enabled[].config`）。只改前者会留下第二条通道。
+ *
+ * 判据是 break-glass **或** 组织 owner/admin。设计文档原文只写了 break-glass，
+ * 那是因为写下它时（P1 阶段）**还没有真实角色** —— 角色的持久化位置 `org_members`
+ * 是 P2 才建的。现状下若只认 break-glass，登录为 owner 的管理员也会拿不到 config，
+ * 管理台的配置表单将无法回填。放宽到 owner/admin **不重新打开匿名泄漏**
+ * （匿名与普通成员的 `orgRole` 不是这两个值），故这是对原文的**有据收窄**。
+ */
+function mayReadPluginConfig(h: RouteHandlerContext): boolean {
+  const p = h.principal
+  if (!p) return false // 拿不到主体 ⇒ 失败关闭
+  if (p.kind === 'break-glass') return true
+  return p.orgRole === 'owner' || p.orgRole === 'admin'
+}
+
+/** 剥掉单个插件快照里的 `config` 字段（返回新对象，不改原对象） */
+function withoutPluginConfig(snapshot: PluginSnapshot): Omit<PluginSnapshot, 'config'> {
+  const { config: _drop, ...rest } = snapshot
+  return rest
+}
+
+/** 剥掉清单文件里每个条目的 `config` 字段（`PluginListFile.enabled[].config`） */
+function withoutListConfig(file: { enabled: readonly { name: string; config?: unknown }[] }): unknown {
+  return { ...file, enabled: file.enabled.map(({ config: _drop, ...rest }) => rest) }
+}
+
 /** 挂载管理器 REST 路由（导出以便集成测试直接以路由服务替身驱动，无需真实 HTTP） */
 export function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): void {
   /*
@@ -1571,10 +1607,17 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
    *   注意：`GET /api/plugins` 的响应里含各插件的 `config`（可能含上游密钥），
    *   本次**未**裁剪（属读路径改造，留给 P2 的"非 admin 返回公开子集"）。
    */
-  router.register('GET', '/api/plugins', (h) =>
+  router.register('GET', '/api/plugins', (h) => {
+    // ★ P2：非 owner/admin/break-glass 的主体**看不到 `config`**（§8.2 P2 第 14 条）。
+    // 其余字段（state/provides/requires/displayName…）照常返回 —— 前端的插件探测
+    // 与依赖图都依赖它们，收紧它们会让内容浏览主路径回归。
+    const snapshots = manager.snapshot()
     // issues：外部插件目录里被跳过的目录/清单（机器可读 code），前端与 CLI 据此提示"装了但没加载"
-    ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() }),
-  )
+    ok(h, {
+      plugins: mayReadPluginConfig(h) ? snapshots : snapshots.map(withoutPluginConfig),
+      issues: manager.discoveryIssues(),
+    })
+  })
   router.register('GET', '/api/plugins/graph', (h) => ok(h, { graph: manager.graph() }))
   // 插槽裁决结果与冲突诊断。
   //
@@ -1616,7 +1659,21 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
   // AdminPage 用 Promise.all([api.plugins(), api.session(), api.slots().catch(() => null)]) 取数，
   // 三个里只有 api.session() 没有 .catch()，它一旦 401/503 就整体 reject ⇒ 插件列表根本不渲染。
   // （packages/web 在 P0 不得改动，前端测试又全部 mock 掉了 api 模块，故此回归不会有测试变红。）
-  router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()), { access: 'public' })
+  router.register('GET', '/api/session', (h) => {
+    // ★ P2：这里是 config 回显的**第二条通道** —— `sessionState()` 里的
+    // `PluginListFile.enabled[].config` 与 `/api/plugins` 是同一批数据。
+    // 只堵前一条会留下这个旁路（§8.2 P2 第 14 条明确点名）。
+    const state = manager.sessionState()
+    if (mayReadPluginConfig(h)) {
+      ok(h, state)
+      return
+    }
+    ok(h, {
+      ...state,
+      base: withoutListConfig(state.base),
+      session: withoutListConfig(state.session),
+    })
+  }, { access: 'public' })
   router.register('POST', '/api/plugins/:name/enable', async (h) => {
     try {
       const name = h.params['name']
