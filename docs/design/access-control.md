@@ -1,9 +1,11 @@
 # GeeWiki 访问控制、组织管理与公开门户 —— 设计构想
 
-> **状态**：**v7 修订版**（= v6 修订版 **+ 实现反馈驱动的三处订正** —— **本文档已无待决项**）。由两轮架构设计（v1 完整设计 + v2 修订版）合并而成，并经五轮评审纳入**十二项**已拍板决定（v2 的 D1–D4；v5 新锁定的 D7–D10；v3 的 D11 / D13 / D14；v4 的 D15 —— 另有 D5 / D6 由 §10.2 说明）。五轮修订依次是：① 把"**角色**"从**授权对象**里彻底摘掉（D13）；② 把 `owner`/`admin` 的**应急可见权**写成显式规则 + 审计（D14）；③ **D11 权限版本永久保留**；④ **块级第三档由"仅编辑者"改为"仅授权"**（D15）；⑤ **锁定 D7/D8/D9/D10 的默认值并定稿**。
-> **★ 第六轮（v6）不是新的设计决策**：它由 **P0 阶段的落地实现 + 一轮独立代码审查**驱动（**不是**用户拍板），只做三类事 —— ① 把"**实现过程中自行定义、文档里从未写过**"的六项 API 形状（`RouteAccess` / `RequestVerdict` / `use?()` / `dispatch` 返回值 / `register()` 第 4 参 / `judgeAccess` 判定顺序）**回写为正式章节 §2.5**；② 订正 §8.2 里两条**按字面执行不通或自相矛盾**的 P0 验收（P0-1 命令的 URL 编码、P0-6 与 §8.1 的建表归属冲突）；③ 把审查**实测到**的 `config` 回显通道记入 **P2 交付项（第 14 条）** 与 **§12 第 19 条**。核心在 §2.0 与 §4.3，修订记录见 **§13.1（v3）/ §13.2（v4）/ §13.3（v5 定稿）/ §13.4（v6 实现反馈）/ §13.5（v7 实现反馈）**。
+> **状态**：**v8 修订版**（= v7 修订版 **+ 全部阶段实现反馈驱动的订正** —— **本文档已无待决项**）。由两轮架构设计（v1 完整设计 + v2 修订版）合并而成，并经五轮评审纳入**十二项**已拍板决定（v2 的 D1–D4；v5 新锁定的 D7–D10；v3 的 D11 / D13 / D14；v4 的 D15 —— 另有 D5 / D6 由 §10.2 说明）。五轮修订依次是：① 把"**角色**"从**授权对象**里彻底摘掉（D13）；② 把 `owner`/`admin` 的**应急可见权**写成显式规则 + 审计（D14）；③ **D11 权限版本永久保留**；④ **块级第三档由"仅编辑者"改为"仅授权"**（D15）；⑤ **锁定 D7/D8/D9/D10 的默认值并定稿**。
+> **★ 第六轮（v6）不是新的设计决策**：它由 **P0 阶段的落地实现 + 一轮独立代码审查**驱动（**不是**用户拍板），只做三类事 —— ① 把"**实现过程中自行定义、文档里从未写过**"的六项 API 形状（`RouteAccess` / `RequestVerdict` / `use?()` / `dispatch` 返回值 / `register()` 第 4 参 / `judgeAccess` 判定顺序）**回写为正式章节 §2.5**；② 订正 §8.2 里两条**按字面执行不通或自相矛盾**的 P0 验收（P0-1 命令的 URL 编码、P0-6 与 §8.1 的建表归属冲突）；③ 把审查**实测到**的 `config` 回显通道记入 **P2 交付项（第 14 条）** 与 **§12 第 19 条**。核心在 §2.0 与 §4.3，修订记录见 **§13.1（v3）/ §13.2（v4）/ §13.3（v5 定稿）/ §13.4（v6 实现反馈）/ §13.5（v7 实现反馈）/ §13.6（v8 实现反馈）**。
 > **★ 第七轮（v7）同样不是新的设计决策**：它由 **P1 / P1.5 阶段的落地实现 + 一次 PostgreSQL 实机试跑** 驱动（**不是**用户拍板），只做三处**订正** —— ① §7.2 的 `link_ticket` **不落库**（HMAC 自包含票据；原文"存 DB"与 §7.6 的"迁移增量 0"不可兼得，两批实现者各自独立选了同一个解法）；② §4.3 补**明确的方言语义**（该 FTS 形态**仅支持 SQLite**、PG 下检索插件**显式拒绝激活**、PG 等价物是 `tsvector` + `pg_trgm` 且**列为非目标**）；③ 记录**进度事实**（P0 / P1 已合入 `main`，P1.5 / P2 正在 worktree 分支上实现）与一条**方法学事实**。修订记录见 **§13.5**。
-> **⚠️ 定稿 ≠ 已实现（★ v7 更新进度）**：这是一份**设计稿**。**P0 与 P1 均已合入 `main`**（合并提交 `e708814` / `f3990a9`，见 §8.1 两行的 ★ v7 标注）；**P1.5（OIDC）与 P2（组织与条目可见性）正在各自的 worktree 分支上实现**（`.wt-p15` / `feat/p15-oidc`、`.wt-p2` / `feat/p2-org-visibility`）；**P3a 及其后各阶段仍未实现**。文中结论除 **§13.5 明确标为"实现反馈 / 已在实现中核对"** 的三处外，**仍属未验证（未实测 / 未跑代码）**。§12 保留的条目是**已知的"未验证 / 实现前需复核"项，不是待决项**；实现前须按 §12 与各章的「原文如此，实现前需复核」逐条复核（完整声明见 §13.3，v6 的声明见 §13.4，v7 的见 §13.5）。
+> **★ 第八轮（v8）同样不是新的设计决策**：它由 **P2 / P3a / P3b / P3c / P3d / P4 的落地实现 + 多轮独立审查** 驱动（**不是**用户拍板），**不引入任何新的设计决策**，只做**订正与回写** —— ① **§2.3 规则 B1 的方向写反了**（**安全相关，本次最重要的一处**：按 `tier` 刻度必须写成 `max`，见 §2.3 与 §13.6 第 1 条）；② **§4.3 补 P3a 的方言成本** —— 三个**只在真实 PostgreSQL 上暴露**的缺陷（实现已修，但文档此前那句"块模型与读路径裁剪两部分仍可两方言落地"在修掉之前**不成立**，见 §13.6 第 2 条）；③ **新增 §4.6「跨阶段不变量：`blocks.tier` 的扇出」**（这条不变量在实现中**失效过三次**，三次均由审查端到端复现，见 §13.6 第 3 条）；④ 其余十条逐条补正（§3.6 / §4.3 / §6.6 / §8.2 / §9 R9 / §2.3 等，见 §13.6 第 4 条）。修订记录见 **§13.6**。
+
+> **⚠️ 定稿 ≠ 已实现 ≠ 每句都已验证（★ v8 更新进度）**：**全部阶段 P0 / P1 / 文档 v7 / P1.5 / P2（含 M5 前三项）/ P3a / P3b / P3c / P3d / P4 均已实现并合入 `main`**（`main` = **`5536bfa`**，进度与验证基线见 §13.6）。**但"已实现"不等于"本文档的每一句都已被验证"** —— 文中由 **§13.5 / §13.6 明确标为"实现反馈 / 已在实现中核对"** 的条目以外，**其余结论仍属未验证（未实测 / 未跑代码）**；§12 保留的条目是**已知的"未验证 / 实现前需复核"项，不是待决项**。做维护性改动前须按 §12 与各章的「原文如此，实现前需复核」逐条复核（完整声明见 §13.3，v6 的声明见 §13.4，v7 的见 §13.5，v8 的见 §13.6）。
 > **读者**：项目所有者（非权限系统专家）。所有专业术语首次出现时都会用一句白话解释。
 > **素材来源**：① GeeWiki 后端/数据层现状调查；② 前端现状调查；③ 业界权限模型与游客首页调研（外部来源链接见第 11 节）；④ 两轮架构设计。
 > **标注约定**：文中标 **「实测」** 的结论来自对仓库实际执行过的 SQLite 探测（用的是 `:memory:` 库，未触碰 `data/geewiki.db`）；标 **「原文如此，实现前需复核」** 的地方表示来源本身存在不确定或矛盾，**不要照着猜**。
@@ -136,7 +138,9 @@
 
 **角色退回去只管能力**（不参与上面任何一档）：能不能管成员（`owner`/`admin`）、能不能建改内容（`member` 及以上）、能不能改可见性（`admin`，以及内容级授予档 `editor`）、能不能写（`viewer` **不能**写）。
 
-**可见性是一条"由宽到窄"的阶梯（★ v4 补）**：`public`(0) < `org`(1) < `granted`(2) —— **越靠右越窄**，`granted` 是"**默认谁都不能看、靠授权放人**"的那一档（块级三档见 §2.2）。块级的有效可见性取 `min(page, block)`（§2.3 规则 B1）：**页面把上限压住，块只能在页面给定的范围内再收紧**。
+**可见性是一条"由宽到窄"的阶梯（★ v4 补）**：`public`(0) < `org`(1) < `granted`(2) —— **越靠右越窄**，`granted` 是"**默认谁都不能看、靠授权放人**"的那一档（块级三档见 §2.2）。块级的有效可见性取 `max(page, block)`（§2.3 规则 B1）：**页面把上限压住，块只能在页面给定的范围内再收紧**。
+> **★★ v8 订正**：本句原写作 `min(page, block)`，**方向写反了**。因为上面这个档位序是"**越靠右越窄**"（数值越大越窄）⇒ "取更窄的一方"是 **`max`**。
+> 只有把刻度声明成"越大越**宽松**"时才是 `min`。同一语义在两套刻度下的写法为什么相反、以及写反会造出什么泄漏（"页面 org + 块 public" 的块拿到 `tier = 0` ⇒ 匿名搜得到），见 **§2.3 规则 B1 的 ★ v8 小节**。此处保留原文以留痕：`min(page, block)` 是**已作废的旧写法，不要照它实现**。
 
 **唯一的例外，而且是刻意的**：组织 `owner`/`admin` **恒可看一切**（含 `private`），作为应急通道，**每次实际发生的覆盖式访问都写一条审计**（§2.3 规则 O1）。这不叫"角色参与可见性判定"，而是一条**显式的、留痕的、可事后追责的**管理员兜底规则 —— 它是**唯一**一处"有角色的人看到的比别人多"。
 
@@ -239,7 +243,7 @@ block.inherit: boolean = true                     // 子块（列表项/嵌套�
 1. 页面级判定 pageEffectiveRank(slug)      // 位置性，含祖先收紧 + published_at 闸门
    → level='none' ⇒ 整个页面 404（不再往下算）★ 见规则 B3
    （对 owner/admin，这一步**恒不返回 none** —— 应急覆盖在页面级就先生效，第 4 步是它的显式落点）
-2. 块级收紧 effectiveBlockTier = min(block.visibility, page.visibility)
+2. 块级收紧 effectiveBlockTier = max(block.visibility, page.visibility)   // ★ v8 订正：原写 min，方向反了（见规则 B1）
    // ★ v4 档位序（越右越窄）：public(0) < org(1) < granted(2)；页面级 private 与块级 granted 同为"最窄档"
 3. block_grants 显式授予（subject_kind 只有 user|group）   // 只放宽到页面级上限，不能突破第 1 步；在 granted 档里是**唯一入口**
 4. 组织 owner/admin 应急覆盖                // 恒可看；每次实际覆盖写审计（规则 O1）
@@ -248,11 +252,66 @@ block.inherit: boolean = true                     // 子块（列表项/嵌套�
 
 **规则 B1：块只能更窄，不能更宽**（这是块级模型的关键约束）
 
+> **★★ v8 订正（安全相关；本次修订最重要的一处）：下面这个公式原来写反了方向。**
+> 原文只写 `min`，而 **`min` 只在"宽松度"刻度下成立**；"块只能更窄"这同一条语义，在 `tier` 那一列的刻度下**必须写成 `max`**。
+> 更糟的是：**本文自己声明的档位序是"越右越窄"**（即数值越大越窄）—— 在那个刻度上 `min` **本来也该是 `max`**。
+> 也就是说这里有两层错：**公式与它自己声明的刻度不符**，且**两处刻度方向本来就相反**。
+> 这**不是措辞问题** —— 照原文（或照曾经的代码注释）写会**直接造出内容泄漏**，细节与真值表见下方「★ v8：两套刻度，方向相反」。
+
 ```text
-档位序（★ v4，越右越窄）：public = 0  <  org = 1  <  granted = 2
-                                                    （页面级对应档叫 private，同为最窄档）
-effectiveBlockTier(block) = min( block.visibilityRank, pageEffectiveRank(slug) )
+① 窄度 / 限制等级刻度（★ 两处实现都用它："越窄数值越大"）
+   档位序（★ v4，越右越窄）：public = 0  <  org = 1  <  granted = 2
+                                                      （页面级对应档叫 private，同为最窄档）
+   effectiveRank(block) / effectiveBlockTier(block)
+       = max( block 档位, pageEffectiveRank(slug) )        ← 取更窄的一方 = 数值更大
+   （注：另有一套"宽松度"刻度（越大越宽松）。只有在那套刻度下，"取更窄的一方"才表现为 min。）
+② `blocks.tier` 这一列（§3.6）的取值域与①同刻度：0 = 匿名可见 < 1 = 仅组织成员（越小越公开）
+   检索条件是 `b.tier <= :readerTier` ⇒ "更窄"同样是"更大" ⇒ 落列时也是 max
 ```
+
+**为什么两套刻度的写法相反**：只有"取更严的一方"这条**语义**是不变的；
+若把刻度声明成"**越大越宽松**"（宽松度），"更严"就表现为 `min`；若声明成"**越大越窄**"（窄度 / 限制等级），
+就表现为 `max`。**⇒ "取最窄"与 `min` 之间没有任何必然联系 —— 把 `min` 当成这条规则的名字，等于把刻度当成了规则。**
+两套刻度在本项目里**同时存在**（页面级的 `RANK_*` 与块级的 `tier` 都是窄度刻度，故都是 `max`），
+因此**同一句话里出现两个刻度名时必须点明用的是哪一个**。
+
+**★ v8：两套刻度，方向相反（含真值表）**
+
+这一版的表述采用 **`packages/plugin-wiki/src/blocks.ts:220-234`** —— 它是**全仓最完整、也最自解释**的解释
+（该处的小标题就是「为什么这里是 `max` 而不是文档写的 `min`」）：
+
+| 页面 | 块 | `blocks.tier` | 含义 |
+|---|---|---|---|
+| public (0) | public (0) | **0** | 匿名可搜到 |
+| public (0) | org (1) | **1** | 仅组织成员 |
+| org (1) | public (0) | **1** | 页面本身就把匿名挡住了 |
+| 任一侧无等级（`null`） | — | **`null`** | 等级分支永不命中，只能靠授权分支（§4.3） |
+
+> **总结句（原文照抄）**：**"这不是两种规则，是同一条『只能更窄』的两种刻度。"**
+
+**★ 写反的后果（这才是本处订正属"安全相关"的原因）**：把 `max` 写成 `min`，会让"**页面 org + 块 public**"的块
+拿到 **`tier = 0`** ⇒ **匿名在站内搜索里就能搜到它** —— 表现为"**读路径 404、检索却命中**"的错位
+（读路径按 slug 前缀**实时算**有效档位、检索按**物化的** `tier` 过滤；两者一旦不同步就是这个症状 —— 见 **§4.6**）。
+
+**实现落点（权威，照它实现）**：
+
+| 位置 | 内容 | 说明 |
+|---|---|---|
+| `packages/plugin-wiki/src/blocks.ts:235-239` | `tierFor(pageLevel: PageLevel, blockVisibility: BlockVisibility): BlockTier` | 先 `blockLevelOf(...)`；`pageLevel === null \|\| bl === null ⇒ null`；否则 `pageLevel > bl ? pageLevel : bl`（即 **`max`**） |
+| `packages/plugin-wiki/src/blocks.ts:59` / `:209` | `type BlockTier = 0 \| 1 \| null` / `type PageLevel = 0 \| 1 \| null` | 列侧（限制等级）刻度的类型 |
+| `packages/plugin-wiki/src/blocks.ts:212` | `blockLevelOf(visibility: BlockVisibility): BlockTier` | **块侧与读路径必须共用这一个判据**，否则会出现"搜得到但读不到"（检索漏过滤）或"读得到但搜不到"（检索过严） |
+| `packages/plugin-authz/src/index.ts:127-129` | `RANK_PUBLIC = 0` / `RANK_ORG = 1` / `RANK_PRIVATE = 2` | **同为窄度刻度**（越窄数值越大）⇒ 故 `effectiveRank`（`:274-287`）内部用的也是 `Math.max`（源码原话：*"越窄档数值越大 ⇒ max 即『最严格优先』"*）。**不要因为名字叫 `RANK` 就以为它是宽松度刻度。** |
+
+**★ 这条错误的扩散与订正（留痕，防复发）**：该错误**曾扩散到 4 处代码注释**（分布在 **3 个迁移文件**中），
+**已全部订正**（都只改注释、**未动任何 SQL 语句**）：
+- `packages/db-sqlite/src/migrations/0015_blocks.sql`（**两处**：`visibility` 列说明 + `tier` 列说明）与
+  `packages/db-postgres/migrations/0015_blocks.sql`（**一处**）—— 由提交 **`ade59ef`** 订正；
+- `packages/plugin-search/migrations/0002_blocks_fts.sql`（**一处**）—— 由**更早**的提交 **`1d608a6`** 订正
+  （`1d608a6` 是 `ade59ef` 的祖先：先修检索侧那一处，再补齐 db 包的两侧）。
+
+> **⚠️ 复核时不要误判**：这三个文件里**至今仍然出现 `min(`**，但**全部是"解释为什么不是 `min`"的行文**，不是照抄形态。
+> 判读方法与复核命令见 **§13.6 第 1 条**；把那些解释性文字再"改成 `max`"一次，**等于把注释改瞎**。
+> `packages/plugin-wiki/src/blocks.ts:222` 那句 `min(...)` 同理：它是**引用文档旧写法**以说明为什么代码用 `max`，**不是残留**。
 
 **为什么不允许反过来**（形式化依据）：若允许 `page=private` 且 `block=public`，则匿名可见该块 ⇒ 必须能返回该块的标题与附件元数据 ⇒ **页面本身的存在性必然泄漏** ⇒ 与 §2.3"不泄露存在性"的约定直接矛盾。而"页面存在性"是**结构信息**（分类树、面包屑、侧边栏），它**无法在块粒度上被裁剪**。所以：**放宽只能发生在页面级**，全部可见性复杂度集中在页面层级（一套规则），块级只有收紧。
 
@@ -279,10 +338,18 @@ effectiveBlockTier(block) = min( block.visibilityRank, pageEffectiveRank(slug) )
 | 私有父 `secret`(private) + 公开子 `secret/x`(public, published_at≠null) | 子**仍私有** | 交集 = private；要公开得先放宽 `secret` |
 | 同上，但 `secret.inherit = false` | 子**公开** | "继承不可放宽"靠的是继承本身，**断链即断继承** |
 | 匿名访问 `secret/x`（private 父） | **HTTP 404**，非 403 | 不泄露存在性（比 Confluence 更严格；Confluence 官方明说"无法隐藏页面存在性"） |
-| 登录 `viewer` 访问 `guides/draft` | **HTTP 403** + "申请访问"入口 | 登录用户已知组织存在该条目，403 不额外泄露 |
+| 登录 `viewer` 访问 `guides/draft` | ~~**HTTP 403** + "申请访问"入口~~ → **★ v8 订正：实现是 HTTP 404**（见下方就地订正） | 原论证"登录用户已知组织存在该条目，403 不额外泄露"**未成立** |
+
+> **★★ v8 订正（本表最后一行）：实现对**所有**主体一律返回 404，不区分"匿名 404 / 已登录 403"。**
+> 源码原话（`packages/plugin-wiki/src/index.ts:2285-2290`）：*"详情读路径对**所有**主体一律返回 404，而非设计文档 §2.3 写的『匿名 404 / 已登录 403』—— 见 `getPage` 的注释与本文件 `:1268-1269`：**区分 404 与 403 就等于提供了一个存在性探测接口**。这个选择更严……"*
+> - **为什么实现选了更严的一侧**：403 与 404 的字面差异**本身就是一个匿名可用的存在性探测接口**（同一 slug 试两次即可判定"存在但无权"）。原表第二行的论证漏掉了这一点 —— 它假设"登录用户已知组织存在该条目"，但**判据是响应码，攻击者不需要事先知道**。
+> - **★ 代价（必须记下来，因为它影响一个产品流程）**：**"申请访问"失去了自然触发点** —— 用户拿到 404 时分不清"无权"还是"不存在"。
+>   **⇒ 申请入口必须由前端在"已知 slug"的拒绝页 / 受限块占位文案上提供**（§8.2 P3b 第 6 条），**不能指望读路径给出 403**。
+> - **服务端内部分得清两者**（对外压成同一个 404，对内用于审计）：只有"**页存在但无权看**"才算越权尝试并记 `access.denied`（`recordAccessDenied`，`packages/plugin-wiki/src/index.ts:1266-1272`，判据在 `:1272` 的 `pageExists(slug)`）；"请求了不存在的页"只是普通 404（`packages/plugin-wiki/src/index.ts:790-796`）。**把前者也记进来只会把有用信号淹没在噪声里。**
+> - **⇒ §2.4 的"四条关键约束"第 2 条（`level='none'` 由调用方翻译成 404 或 404/403）也据此收窄：实现一律翻成 404。** 该条已在 §2.4 就地标注。
 | `member` 对 `secret`（private，非自己空间） | 无 `page_grants` ⇒ **403** | 组织角色**不自动等于**内容权限 |
 | 移动 `x`（有 3 条 `page_grants`）到别处 | grants **保留**（绑定在 slug 上，不随位置失效） | 这条要显式写进产品文案，否则用户会困惑 |
-| 移动 `a/b`（private）到 `public-space/b` | **立即变 org/public** | 位置性实时计算；`acl_revision++` 保证无 TTL 窗口 |
+| 移动 `a/b`（private）到 `public-space/b` | **立即变 org/public** | 位置性实时计算（★ v8 订正：判定**每请求现查库、本就无缓存** ⇒ "无 TTL 窗口"是**因为根本没有缓存**，不是因为 `acl_revision` 触发了失效；`acl_revision++` 只是变更留痕/观测信号，见 §13.6 第 11 条） |
 
 > **v2 订正**：v1 为层级准备了一个物化列 `ancestor_path`，**v2 已删除该列**（见 §3.3），祖先收紧改为**按 slug 前缀实时计算**。因此上面表格中"`ancestor_path` 重建后判定即刻变化"的说法已过时，正确表述是"按新的 slug 前缀实时重算"。
 
@@ -338,7 +405,7 @@ function assertCanManage(p: Principal): void  // 组织级管理动作
 **四条关键约束（是设计约束，不是实现细节）**
 
 1. **`project()` 是载荷裁剪的唯一出口**。任何端点若自己拼 payload，就是第二个真源，必然漂移。落地方式：让 `WikiPageDetail` / `SearchHit` 的构造走 `access.project(...)`。
-2. **`level='none'` 由调用方翻译成 404**（匿名）或 404/403（已登录）。策略层不认识 HTTP，保持可测。
+2. **`level='none'` 由调用方翻译成 404**（匿名）或 404/403（已登录）—— **★ v8 订正：实现一律翻成 404，不分主体**（区分 404 与 403 等于提供一个存在性探测接口；代价是"申请访问"失去自然触发点 ⇒ 入口改由前端在已知 slug 的拒绝页提供）。详见 §2.3 的 ★ v8 就地订正。策略层不认识 HTTP，保持可测。
 3. **`reason` 必须回传**：它是审计与"为什么我看不到"产品文案的唯一数据源，也是排查越权/误拒的一手线索。
 4. **★ v3：应急覆盖的审计信号只能来自 `reason`**，但**判据不是 `reason` 本身**。`reason='owner'|'admin'` 表示"这次判定用了规则 O1"；**写审计的判据是"覆盖救回了一次本来会被拒的访问"**，不是"访问者恰好是 owner/admin"（§2.3 规则 O1 的边界 1）。实现里若按 `reason` 无条件写审计，就等于把管理员的所有读操作都记成越权 —— **这是必须避免的误读**。
 
@@ -642,7 +709,7 @@ ALTER TABLE pages ADD COLUMN visibility    TEXT    NOT NULL DEFAULT 'private';
 ALTER TABLE pages ADD COLUMN inherit       INTEGER NOT NULL DEFAULT 1;   -- PG: BOOLEAN
 ALTER TABLE pages ADD COLUMN published_at  TEXT;
 ALTER TABLE pages ADD COLUMN created_by    INTEGER;         -- 不加 FK：用户删除后条目留存
-ALTER TABLE pages ADD COLUMN acl_revision  INTEGER NOT NULL DEFAULT 0;   -- 本条 acl 版本，用于缓存失效
+ALTER TABLE pages ADD COLUMN acl_revision  INTEGER NOT NULL DEFAULT 0;   -- 本条 acl 版本（★ v8 订正：原注释写"用于缓存失效"，实情是**全仓没有任何读取方**）
 ALTER TABLE pages ADD COLUMN content_hash  TEXT;            -- ★ v2 新增：与 blocks 的一致性校验
 CREATE INDEX IF NOT EXISTS idx_pages_visibility ON pages(visibility, published_at);
 
@@ -691,6 +758,8 @@ CREATE INDEX IF NOT EXISTS idx_page_grants_subject
 ```sql
 -- 0013_audit.sql
 CREATE TABLE IF NOT EXISTS acl_revision (            -- 全局 ACL 版本（Zanzibar 风格）
+                                                     -- ★ v8 订正：它是**变更留痕 / 观测信号**，
+                                                     -- **不是**失效机制 —— 判定层无缓存，全仓无读取方
   id        INTEGER PRIMARY KEY CHECK (id = 1),
   revision  INTEGER NOT NULL DEFAULT 1
 );
@@ -738,8 +807,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_access_req_pending
 
 ### 3.6 `0015_blocks.sql` —— 内容块（块级模型的核心）
 
+> **★★ v8 订正（两处，都会导致"迁移跑了但表没建"）**：
+>
+> **① 迁移落点是错的（原文如此 → 实情不同）**。本节原写作"属于 `@geewiki/wiki` 的迁移目录 `packages/plugin-wiki/migrations/`"。
+> **照原文写，PostgreSQL 部署下 `blocks` 表根本不会被建出来**：`@geewiki/wiki` 的迁移目录**只声明了 sqlite** ——
+> `packages/plugin-wiki/src/index.ts:112` 的 `WIKI_MIGRATIONS_DIR` 在 `packages/server/src/index.ts:1405` 被注册为
+> `builtinMigrations(wikiManifest, { sqlite: WIKI_MIGRATIONS_DIR })`（**没有 `postgres` 键**）⇒ PG 下取不到目录、走"跳过迁移"分支。
+> **实情**：`blocks` 的迁移落在 **db 包、两侧成对** ——
+> `packages/db-sqlite/src/migrations/0015_blocks.sql` 与 `packages/db-postgres/migrations/0015_blocks.sql`
+> （这也是双方言成对要求的正确落点，与 §3.0 的迁移约定一致）。
+>
+> **② `tier` 必须内联在 `CREATE TABLE` 里**，**不能**另起一条 `ALTER TABLE … ADD COLUMN`
+> —— **SQLite 没有"加列时若已存在则跳过"的语法**，独立 `ALTER` 会让该迁移**无法重放**（第二次跑时
+> `CREATE TABLE IF NOT EXISTS` 会跳过建表，而 `ALTER` 仍会执行并因"列已存在"报错）。
+> 下面的 DDL 已按实情改正（`tier` 内联、且**不给默认值**）。
+
 ```sql
--- 0015_blocks.sql（属于 @geewiki/wiki 的迁移目录 packages/plugin-wiki/migrations/）
+-- 0015_blocks.sql（落在 db 包、两侧成对：packages/db-sqlite/src/migrations/ 与 packages/db-postgres/migrations/）
+--   ★ v8：不要写进 packages/plugin-wiki/migrations/ —— @geewiki/wiki 只声明 sqlite 目录，
+--          PG 部署下会被整段跳过 ⇒ blocks 表不存在。
 CREATE TABLE IF NOT EXISTS blocks (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
@@ -751,19 +837,23 @@ CREATE TABLE IF NOT EXISTS blocks (
   marker        TEXT,                      -- 来源标记原文（如 'org'/'granted'），NULL = 未标记
   content_hash  TEXT    NOT NULL,          -- sha256(text)：检测"文本变了但 ordinal 没变"
   created_at    TEXT    NOT NULL,
-  updated_at    TEXT    NOT NULL
+  updated_at    TEXT    NOT NULL,
+  -- ★ v4 / ★ v8：检索用的密级冗余列（派生列，随页面可见性变化重算）
+  --   取值域收敛为 { 0 = anon, 1 = org }；**`granted` 档的块不进入任何等级索引，此列写 NULL**（理由见 §4.3）
+  --   ★ v8：**必须内联在这里**（不能另起 ALTER，见本节上方订正 ②）；
+  --   且**故意不给默认值** —— `DEFAULT 0` 会让"忘了算 tier"的块以**匿名等级**进索引（若它其实是 org/granted，那就是**泄漏**）。
+  --   无默认（NULL）的失败方向是"该块搜不到"，且由 §4.3 的一致性探针（`tier IS NULL` 计数）兜住。
+  tier          INTEGER
 );
 -- 查询路径：按页取块（渲染/投影/RAG 全走这条）
 CREATE INDEX IF NOT EXISTS idx_blocks_page_ordinal ON blocks(page_id, ordinal);
 -- 治理查询："哪些块被单独收紧过"
 CREATE INDEX IF NOT EXISTS idx_blocks_visibility ON blocks(visibility) WHERE visibility <> 'public';
-
--- ★ v4：检索用的密级冗余列（派生列，随页面可见性变化重算）
---   取值域收敛为 { 0 = anon, 1 = org }；**`granted` 档的块不进入任何等级索引，此列写 NULL**（理由见 §4.3）
-ALTER TABLE blocks ADD COLUMN tier INTEGER;   -- ★ v4：可为 NULL（原为 INTEGER NOT NULL DEFAULT 0）
+-- 检索路径：等级分支 `b.tier <= ?` 走这条（§4.3 的 FTS 查询 JOIN 后用）
 CREATE INDEX IF NOT EXISTS idx_blocks_tier ON blocks(tier);
--- ★ v4：默认值故意**不设 0** —— `DEFAULT 0` 会让"忘了算 tier"的块以**匿名等级**进入索引（若它其实是 org/granted，那就是**泄漏**）。
---   无默认（NULL）的失败方向是"该块搜不到"，且由 §4.3 的一致性探针（tier IS NULL 计数）兜住。
+-- 一致性探针（§4.3）：两个数必须相等，不等即有块被漏算
+--   SELECT COUNT(*) FROM blocks WHERE tier IS NULL;                 -- 必须等于 ↓
+--   SELECT COUNT(*) FROM blocks WHERE visibility = 'granted';
 ```
 
 **`blocks` 与 `pages.content` 的关系（这是 v2 对 v1 思路的关键订正）**
@@ -878,7 +968,7 @@ ALTER TABLE page_versions ADD COLUMN acl_json    TEXT;   -- ★ 该版本的页�
 | `fts5(text, tier UNINDEXED, content='', contentless_delete=1, ...)` 且 `WHERE tier <= ?` **写在 FTS 表上** | ❌ **静默返回 0 行**（contentless 表的 `UNINDEXED` 列不可读，`tier` 为 NULL ⇒ 谓词恒 NULL）。**这是最容易踩的坑：不报错，只是搜不到** |
 | `fts5(..., content='blocks_fts_content', content_rowid='id', tokenize='trigram')` + 额外 `tier UNINDEXED` 列 | ✅ 可建，但需要额外一张内容表 ⇒ **内容存两遍**（页面原文 + 投影），空间翻倍 |
 | tier 过滤**放在 JOIN 后的 `blocks` 表上** | ✅ **正确工作**（见下表） |
-| `snippet()` 对该表 | 返回空（无 stored text）—— 本项目不用（高亮由前端做），**但这是一条须写入文档的约束** |
+| `snippet()` 对该表 | **★ v8 订正：返回 `null`，而且不报错（静默失败）**（原写"返回空"，没有说清它**不抛错**）—— 本项目**不用**它（高亮自实现），**但这是一条须写入文档的约束** |
 
 **实测的 tier 过滤正确性**（3 字元以上的中文查询）：
 
@@ -925,7 +1015,15 @@ SELECT p.slug, p.title, p.updated_at, b.ordinal, f.rank AS score
  ORDER BY f.rank LIMIT ?
 ```
 
-**为什么给 `blocks` 加一个 `tier` 冗余列**：`tier` 是页面有效可见性与块可见性的**组合结果**（`min(page, block)`）。它随祖先可见性变化而变，所以是**派生列**（页面的 `acl_revision` 变化时重算该页所有块）。把它放在 `blocks` 上，FTS 查询就是一条 `AND b.tier <= ?`，**且这条路径已实测正确**。相对把 `tier` 放进 FTS 表（不可行）或建多张 FTS 表（跨表 `rank` 不可比），这是唯一同时满足"正确 + 单表 + 可比排名"的形态。
+**为什么给 `blocks` 加一个 `tier` 冗余列**：`tier` 是页面有效可见性与块可见性的**组合结果**（★ v8 订正：**`max(page, block)`**，不是原文写的 `min(page, block)` —— 理由见 §2.3 规则 B1 的 ★ v8 小节）。它随祖先可见性变化而变，所以是**派生列**（页面的可见性/`inherit`/`published_at` 一变，该页**及其全部子孙**的块都要重算 —— 这条扇出是**跨阶段不变量**，见 §4.6）。把它放在 `blocks` 上，FTS 查询就是一条 `AND b.tier <= ?`，**且这条路径已实测正确**。相对把 `tier` 放进 FTS 表（不可行）或建多张 FTS 表（跨表 `rank` 不可比），这是唯一同时满足"正确 + 单表 + 可比排名"的形态。
+
+> **★ v8 新增：`blocks_fts` 只索引块文本 ⇒ FTS 路不再按标题匹配**（这是上面这条 SQL 形态的**直接后果**，必须写明，否则会被当成 bug）。
+> 索引表定义只有一列 `text`（`packages/plugin-search/migrations/0002_blocks_fts.sql:37-42` 的 `fts5(text, content='', contentless_delete=1, tokenize='trigram')`），
+> 而 FTS 路是 `WHERE f.blocks_fts MATCH ?`（`packages/plugin-search/src/index.ts:579` / `:588`）—— **`p.title` 只出现在 `SELECT` 里（`PAGE_COLUMNS`，`:440`），从不参与匹配**。
+> **⇒ 只出现在标题里、正文块中没有的词，在 FTS 路上搜不到。**
+> **而 LIKE 兜底路（< 3 字符短查询）仍然匹配标题**：`packages/plugin-search/src/index.ts:611` / `:619` 是
+> `WHERE (p.title LIKE ? ESCAPE '\\' OR b.text LIKE ? ESCAPE '\\')` ⇒ **两条路的召回面不同**（这是 P3a 之前没有的差异）。
+> **已被断言钉住**：`packages/plugin-search/test/search.test.ts:558` 的用例名就是「`snippet：截断补省略号；★ P3a 标题不再参与 FTS 匹配（只索引块文本）`」（断言 `:575`：*"块索引不含标题 ⇒ FTS 路搜不到『只出现在标题里』的词"*）。**⇒ 不要"顺手补上标题索引"** —— 那会改变 `rowid ↔ blocks.id` 的对齐前提（本文件 `:44-46`），进而破坏整个 tier 过滤形态。
 
 #### ★ v7：方言语义 —— 这套 FTS 形态**仅支持 SQLite**（PG 下检索插件**显式拒绝激活**，不是静默恒空）
 
@@ -942,6 +1040,10 @@ SELECT p.slug, p.title, p.updated_at, b.ordinal, f.rank AS score
 **PG 侧若将来要实现（等价物与工作量）**：等价物是 **`tsvector` + `pg_trgm`**（`tsvector` 做词元检索、`pg_trgm` 补中文/短串的相似匹配）。但**光换检索引擎不够**：本节整套 **tier 分层可见性**（`blocks.tier` 派生列 + 等级分支 OR 授权分支 + `:grantedBlockIds` + contentless 表的应用层同步 + 一致性探针）都建立在 FTS5 的 `rowid` 与 `rank` 语义上，**必须在 PG 上重做一遍**（可能是 GIN 索引 + `ts_rank` + 不同的过滤计划）⇒ **工作量可能与 P3a 本体相当**。
 
 **⇒ 明确列为非目标（本期不做）**：PG 部署下**没有全文检索**。块模型、逐块可见性、读路径裁剪（P3a 的非 FTS 部分）仍可在 PG 上落地，但"搜索"这一路在 PG 下**不可用**，且必须是**可诊断的拒绝**（现在的行为），不能退化成"能启动但搜不到"。
+> **★★ v8 订正（这是本次修订第 2 重要的更正）：上一句里的"块模型、逐块可见性、读路径裁剪仍可在 PG 上落地"当时是**未经验证的乐观判断**，而且**是不成立的**。**
+> 实情：**有三个缺陷只在真实 PostgreSQL 上暴露**，它们修掉之前，"块模型的非 FTS 部分能在 PG 上跑"这句话**是错的** ——
+> 表现不是"功能缺失"，而是**写块全失败 / 新建保存 500 / 删除页面 500**。三者都由提交 **`96891db`**（前两条）与 **`e941da5`**（第三条）修掉，细节与逐条证据见下方「**★ v8：P3a 的方言成本**」。
+> **★ 更重要的结论**：这三个缺陷**都不是类型系统能拦住的**（它们全是"SQL 文本与方言语义"层面的问题）⇒ **必须有真方言 e2e 兜底**（SQLite-only 的 e2e 会全绿而 PG 全废）。
 
 **★ 诊断体验问题（非正确性问题，列为可选改进项，不阻塞任何阶段）**：迁移控制器**在插件激活之前**就会尝试执行 `packages/plugin-search/migrations/0001_search.sql`，而该脚本是 FTS5 语法（`CREATE VIRTUAL TABLE … USING fts5(…)`，`packages/plugin-search/migrations/0001_search.sql:17-21`）⇒ **在 PG 上必然失败回滚**，并在日志里留下那段 PG 语法错误堆栈。
 
@@ -954,6 +1056,28 @@ SELECT p.slug, p.title, p.updated_at, b.ordinal, f.rank AS score
 - **⚠️ 由此订正本节上方的一句注释**：§4.3 的迁移示例里写着"**PG 侧不执行本文件**" —— 那是**目标行为**（控制器确实支持按方言跳过），但**当前不会自动成立**（见上一条根因）。要让这句话成真，必须先把 manifest 的迁移声明改成按方言的形式。已在该处就地标注。
 
 **⇒ 对验收的影响**：§8.1 的 P3a 行与 §8.2 的 P3a 验收项**凡涉及 FTS / `blocks_fts` / `pages_fts` / `GET /api/search` 的，都已就地标注"仅 SQLite"**（PG 下这些项**不适用**，因为检索插件不会激活）。逐条清单见 §8.2 的 P3a 小标题下说明与 §13.5。
+
+#### ★ v8：P3a 的方言成本 —— **三个只在真实 PostgreSQL 上暴露的缺陷**（**已修，但文档此前低估了这部分成本**）
+
+**结论先行**：**"块模型与读路径裁剪这两部分可以两方言落地"这句话，在下面三个缺陷修掉之前是不成立的。**
+三个缺陷都**不是**"PG 上少个功能"，而是**PG 上直接不可用**（写块恒为 0 条 / 新建保存 500 / 删除页面 500 且删不掉），
+而且**两个方言下类型检查、单元测试、SQLite e2e 全都照样全绿** —— 它们只在**真 PostgreSQL**上暴露。
+
+| # | 缺陷（现象） | 根因（逐条已验证到行） | 修法 | 订正提交 |
+|---|---|---|---|---|
+| 1 | **每次写块都失败，`blocks` 恒为 0 条** | 写块时靠**捕获异常**判断"`blocks_fts` 不存在"，而只匹配 SQLite 的文案 `no such table:`，PG 的文案是 **`relation "blocks_fts" does not exist`** ⇒ 异常没被识别、**每次写块都抛** | **事务外按方言判定**（不能"捕获后继续"：**PG 的事务在任一语句报错后即进入 aborted 状态**，后续语句一律失败）⇒ 必须在进事务**之前**得出布尔值 | `96891db` |
+| 2 | **新建 / 保存页面 500**：PG 报 `insert or update on table "blocks" violates foreign key constraint "blocks_page_id_fkey"` / `Key (page_id)=(0) is not present in table "pages"` | `INSERT INTO blocks` **缺 `RETURNING id`** ⇒ PG 驱动拿不到新 id（退化为 `0`）⇒ 依赖块 id 的后续写入全部以 `page_id = 0` 落地 | SQL 里加 **`RETURNING id`**，并对拿不到 id 的情况**响亮失败**（`blocks_writer_no_rowid`） | `96891db` |
+| 3 | **PostgreSQL 上删除任何页面返回 500，且页面删不掉** | `deletePage` 里的 **`DELETE FROM blocks_fts ...` 没有方言守卫** ⇒ PG 上必然抛 `relation "blocks_fts" does not exist` ⇒ **PG 事务报错即整体回滚** ⇒ 删除失败 | 与其它 `blocks_fts` 语句一样，**每一处**都加方言守卫（用同一个方言判定结果） | `e941da5` |
+
+**★ 缺陷 3 为什么长期没被发现（必须记住这条方法论教训）**：e2e 的**阶段 G/H/I/K 靠直读 SQLite 文件**核对 `tier`（`packages/plugin-wiki/test/e2e-p3a.sh:79` 的 `node_db()`），因此**在 PG 下整体跳过**（跳过点：`:319` G、`:342` H、`:369` I、`:397` K；文件头 `:293` 就写着 *"G/H/I/K 都靠直读 SQLite 文件核对 tier ⇒ 在 PG 下整体跳过"*）⇒ **`deletePage` 在 PG 上从来没有被端到端跑到过**。
+**修法与补测**：新增**方言中立**的 e2e **阶段 L**（`:292`：*"阶段 L：扇出在两种方言下都要跑通（纯 HTTP 断言，不读 SQLite 文件）"*），其中 **L8** 覆盖删除路径、**L9** 断言 `tier_mismatched=0`（`:310` / `:313`）；该阶段由提交 `dee82cd` 补入。
+
+> **★ 结论性提示（建议直接引用这句话）**：
+> *"块模型的 PG 可用性依赖 `RETURNING id`、索引表存在的方言判定、以及每一处 `blocks_fts` 语句的方言守卫 —— **这三点都不由类型系统保证，必须有真方言 e2e 兜底**。"*
+>
+> **★ 由此派生的两条要求（写进后续任何阶段的验收）**：
+> 1. **凡新增一处 `blocks_fts` 语句，都要问一句"它在 PG 上会不会被执行"** —— 守卫是**逐处**的，不是全局的；
+> 2. **凡新增一个"靠直读 SQLite 文件断言"的 e2e 阶段，都要同时给出方言中立（纯 HTTP）的替代断言**，否则该阶段在 PG 下被整体跳过时，**不会有任何信号告诉你它没跑**（这正是缺陷 3 藏了整整一个阶段的原因）。
 
 #### ★ v4：第三档 `granted` 无法用 `tier` 表达 —— 检索改形
 
@@ -1024,7 +1148,7 @@ DROP TRIGGER IF EXISTS pages_fts_au;
 | 登录用户召回 | **受损**（"搜不到受限片段"） | ✅ **无损失**（member 能搜到 org 块；★ v4 起**被授权者也能搜到 `granted` 块**，靠授权分支） |
 | 索引体积 | 1× | **1×**（contentless 不存正文；实测 tiny 语料下 `dbstat` 显示 16KB 全是页开销，**真实倍数需在你自己的语料上量**：`SELECT SUM(pgsize) FROM dbstat WHERE name LIKE 'blocks_fts%'` 对比 `SELECT SUM(length(text)) FROM blocks`。既有的 `0001_search.sql` 注释给出参照："5000 行 / 6.6MB 语料增约 7.9MB" ⇒ trigram 索引约 1.2× 语料） |
 | 新增要求 | 无 | **SQLite ≥ 3.43**（`contentless_delete=1`）→ 必须写进 `packages/db-sqlite/package.json` 的 `better-sqlite3` 版本下限，并加一条启动自检（`sqlite_version()` 解析），否则**老版本会静默建表失败或行为异常** |
-| 新增要求 | 无 | **`snippet()` 不可用**（高亮必须前端做或从 `blocks.text` 取原文后自行标记） |
+| 新增要求 | 无 | **`snippet()` 不可用**（★ v8 订正：**实测是返回 `null` 且不报错 —— 静默失败**；若用了它又没防护，**高亮会静默变空**，而"不专门断言高亮内容"的测试**发现不了**。⇒ 高亮必须自实现，或从 `blocks.text` 取原文后自行标记。本项目的落地见 `packages/plugin-search/src/index.ts:386`、`:1131`，断言见 `packages/plugin-wiki/test/e2e-p3a.sh:213` 的 C6） |
 
 **结论：采纳 tier 方案**（它同时达成 v1 D5 的安全目标并消除召回损失，代价是两条已实测的工程约束）。**若索引体积实测不可接受**，退路是只索引 `tier=0`（匿名）行 —— 即回到 v1 D5 的取舍，但**列为运维开关**（配置项），**不是默认**。
 > **★ v5（D10）在此定稿**：**默认形态 = 全密级收录（`tier ≤ 1`）**；"只索引匿名层（`tier = 0`）"是**非默认的运维开关**，只有在**自有语料上实测索引体积不可接受**时才考虑打开（测量方法见上表）。**不要**把它当成初始配置，也不要在打开它之后仍宣称"登录用户无召回损失"。
@@ -1046,6 +1170,8 @@ restoreVersion(slug, versionId, principal):
                           visibility = ?, published_at = ?, inherit = ?   -- ← 来自 acl_json
        d. INSERT INTO page_versions(...) 快照"恢复前"的状态（可再恢复回来）
        e. acl_revision++  → blocks_fts 重建该页行
+          -- ★ v8 订正：这里的箭头**不是因果链**。`acl_revision++` 只是留痕（无读取方）；
+          --   `blocks_fts` 的重建由**应用层显式调用**触发，且必须在事务**提交之后**（§4.6）
   4. 返回新版本 id 与 outcome
 ```
 
@@ -1097,6 +1223,77 @@ interface ContentView {
 2. **★ 分块（chunking）必须块对齐，绝不跨块合并可见性不同的内容**：`selectSources()` 的 `perSourceChars` 截断（`packages/plugin-ai/src/select.ts:44`，既有约定"放不下就整条丢弃，绝不做尾部裁切"）在块级下要改为：**按块累积**，遇到 `tier` 变化的边界即分新 chunk。原因：若把 public 块与 org 块拼成一个 chunk 再截断，匿名上下文里可能残留 org 文本 —— **这是块级模型下新的泄漏面**。
 3. **`gatedCount` 的正确用法**：它是"**存在但你看不到**"的唯一合法信号。`packages/plugin-ai/src/select.ts` 可据此产生一句**高层提示**："该问题的答案可能位于 3 个需要更高权限的内容块中。" —— **对权限不足的主体，只说"需要更高权限"，绝不透露块的内容、标题或计数以外的任何信息**；对匿名主体，`gatedCount > 0` **也不得出现**（否则等于确认存在受限内容），此时退化为"未在知识库中找到"。
 4. **`SearchHit` 增 `blocks` 字段**（块级命中定位）：`packages/plugin-search/src/index.ts:83-98` 的 `SearchHit { slug, title, content, ... }` 中 `content` 必须**删除**（它就是泄漏源），改为 `blocks: { ordinal, kind, text }[]` + `gatedCount`。**这是一处破坏性契约变更**：需 grep 全部消费方（`packages/web/src/lib/searchPlan.ts`、`packages/web/src/components/SearchView.tsx`、`packages/plugin-ai`）。
+
+### 4.6 ★ v8 新增：跨阶段不变量 —— 写了 `pages` 的档位，就要补齐子孙 `tier`
+
+> **这一节为什么存在**：它与 §4.3 的 tier 方案是**同一件事的两半**，但**它是"跨阶段"的** ——
+> 每个阶段（P3a / P3b / P3c / P4）各自看自己那一段时**都看不出问题**，缺陷**只存在于交界处**。
+> 实情是：**这条不变量在实现中失效过三次，三次都由审查端到端复现**。所以它被提成一条**独立的、显著的不变量**，而不是留在 §9 R13 里当一条"风险提示"。
+
+**不变量（一句话，可直接抄进任何后续阶段的验收）**：
+
+> **`blocks.tier` 是物化派生列。凡写了 `pages.visibility` / `inherit` / `published_at` 的代码路径，
+> 都必须在该事务提交之后，调用子孙 `tier` 重算（"扇出"）。新增一条写档位的路径，就应触发"补扇出"这个动作。**
+
+**★ 为什么"新增一条写档位的路径就应触发补扇出"，是本条最需要记住的一句**：
+漏扇出的后果**不是**"索引陈旧"这种可用性问题，而是 **`blocks.tier` 比实际档位更宽** ⇒
+**读路径 404、检索却命中并吐出正文片段**（内容泄漏）。失效方向上恰好落在"**少限制**"那一侧，**不是失败关闭**。
+
+#### 失效过的三次（三次都由审查端到端复现，不是推测）
+
+| # | 路径 | 场景（审查的复现） | 订正提交 |
+|---|---|---|---|
+| 1 | **P3a `savePage` 的 create 分支**（新建祖先） | 建 `a/b`（public + published）⇒ 匿名读 200、搜 `total=1`；再 `PUT /api/pages/a`（默认 org）⇒ 匿名读 `a/b` **404**，但匿名 `/api/search` 仍 **`total:1`，响应体里出现唯一词 `CHILDUNIQ777`**；同刻 `blocks/verify` 报 `tier_mismatched:1` | `a3d72b7` |
+| 2 | **P3a `deletePage`**（删掉 `inherit = 0` 的断链点） | `a` = private、`a/b` = public + published + **`inherit=false`**（断链点）、`a/b/c` = public + published ⇒ 匿名读 `c` 200 且搜得到；`DELETE /api/pages/a%2Fb` 后 ⇒ 匿名读 404，但匿名搜**仍吐 `DEEPUNIQ999`** | `a3d72b7` |
+| 3 | **P3c 新增的版本恢复路径** | 恢复版本会写回 `pages.visibility` / `published_at` / `inherit`，但未补扇出 ⇒ 同样的"读 404、搜命中" | `9699aa7`（提交信息：*"否则读路径 404 而检索仍吐正文"*；并注明*"是 P3c 实现时就漏的，非 rebase 所致"*） |
+
+**★ 第 2 条的根因（`continue` / `break` 的不对称，是刻意的，不要去改它）**：
+`packages/plugin-authz/src/index.ts:274-287` 的 `effectiveRank`——`ancestorsOf` **由近及远**；
+对**缺失**祖先 `continue`（不构成收紧）、对 `inherit !== 1` 才 `break`（断链）。
+**删掉断链点后，更上层更严的祖先重新开始压制**（rank 0 → 2），而 `blocks.tier` 仍为 `0` ⇒ 错位。
+**⇒ 只能补"档位变了要重算 tier"，不能去动那个不对称。**
+
+#### 为什么扇出必须在**事务提交之后**（这是本节的第二个关键结论）
+
+`pageLevelOf`（`packages/plugin-wiki/src/index.ts:646`，经 `:659` 委派给策略层的 `effectiveIndexLevel`）
+走**策略层**，而策略层用的是**另一条数据库连接**读 `pages`。
+**PostgreSQL 的 MVCC 下，另一条连接看不到本事务未提交的行** ⇒
+
+- 放进同一个事务**不会死锁**，但会**读到旧值** ⇒ **等于没修**（这是最危险的一种"看起来修了"）；
+- 因此实现把扇出放在**提交之后**（自己再开一个事务）。源码原话：*"⚠️ 必须在调用方的事务提交之后跑：`pageLevelOf` 走策略层（另一条连接），PG 下看不到未提交的祖先改动，在事务内算会拿到旧祖先值 —— 那正是本函数要修的东西。故它自己开一个事务。"*
+
+**⇒ 由此得出的必然推论：扇出会失败，而失败必须是一等可观测信号。**
+提交后执行的代价是"**提交成功但扇出失败**"这个窗口客观存在（**且失败方向上就是永久泄漏**，因为它不会自愈），
+所以实现把失败**升级为可观测信号**，而不是 `console.warn` 了事：
+
+| 信号 | 落点 | 作用 |
+|---|---|---|
+| `ResyncReport`（`packages/plugin-wiki/src/index.ts:185`：`{ resynced: number; failed: boolean; error?: string }`） | 扇出函数的返回类型（类型在 `:185`，挂在 `WikiSaveResult.indexTiersResync`，`:201`） | 让调用方拿到结构化的结果 |
+| 审计动作 **`acl.resync_failed`** | 写入于 `packages/plugin-wiki/src/index.ts:1921`；已白名单进审计的 `acl` 视图（`packages/plugin-authz/src/index.ts:699`） | 失败留痕、可告警 |
+| 响应字段 **`index_tiers_resync_failed`** / `index_tiers_resync_error`，与 `index_tiers_resynced` 并列 | `packages/plugin-wiki/src/index.ts:1588-1591`（版本恢复）、`:1681-1685`（`PUT` 保存）、`:2106-2110`（改可见性） | **让"重算了 0 个子孙"与"扇出整个失败"可区分** |
+
+> **★ 为什么"可区分"是必需的**：`index_tiers_resynced: 0` 有**两种完全不同的含义** ——
+> ① 该页本来就没有子孙（正常）；② 扇出整个失败了（异常）。
+> 没有 `index_tiers_resync_failed` 时**这两者不可区分**，于是"永久泄漏"会被读成"没事"。
+
+**扇出的四个调用点（实现，全部在提交之后）**：
+
+| 调用点 | 位置 | 对应上文哪次失效 |
+|---|---|---|
+| `savePage` 的 **create 分支**（仅 `outcome === 'created'`） | `packages/plugin-wiki/src/index.ts:1131`（`savePage` 定义在 `:1015`） | 失效 #1 |
+| `deletePage`（`if (deleted)`） | `packages/plugin-wiki/src/index.ts:1201`（`deletePage` 定义在 `:1170`） | 失效 #2 |
+| **版本恢复** `POST /api/pages/:slug/versions/:id/restore` | `packages/plugin-wiki/src/index.ts:1571`（路由注册于 `:1347`） | 失效 #3 |
+| **改可见性** `PUT /api/pages/:slug/visibility` | `packages/plugin-wiki/src/index.ts:2086`（路由注册于 `:1975`） | 这一条本来就有（e2e 阶段 G 一直测的就是它） |
+
+- 扇出本体：`resyncDescendantTiers`（`packages/plugin-wiki/src/index.ts:1883`）与带报告的包装 `resyncDescendantsReporting`（`:1909`）—— **两者都是 `apply()` 内部的闭包，未导出**；**对外导出的类型是 `ResyncReport`**。定位请以这三个名字为准。
+- **兜底修复入口**：`POST /api/admin/blocks/resync`（注册于 `packages/plugin-wiki/src/index.ts:3176`，实现定义在 `:3218`）—— **探针只负责报警，这个端点负责把它重算回去**（提交 `2b5f13d`：*"让『可重算』从承诺变成事实"*）。
+
+#### ★ 这条不变量的验证方式（**必须能覆盖四条路径，只测一条会假绿**）
+
+- **必须覆盖**：① 改档位（原有）、② 新建祖先、③ 删除断链点（`inherit=false`）、④ 版本恢复。
+- **★ 实证教训**：e2e 阶段 G **只测了"改档位"**一条 ⇒ **它绿着而泄漏仍在**（这正是前两次失效长期未被发现的原因）。
+- **★ 实证证据（红-绿自检，最硬的一种）**：临时禁用两处扇出 ⇒ e2e 的 `K5/K6/K14/K15` 全红，其中 `K6` 报响应体里出现 `KKK777LEAK`、`K15` 报 `DDD999LEAK`（通过 71 / 失败 4）；恢复后全绿。**⇒ 断言确实有判别力，不是"看起来在测"。**
+- **方言中立要求**：阶段 L 用**纯 HTTP 断言**（不读 SQLite 文件），因此**在 PG 下也照样跑** —— 见 §4.3 的「★ v8：P3a 的方言成本」里缺陷 3 的教训（靠直读 SQLite 文件断言的阶段在 PG 下会**整体跳过**，且**不会有任何信号告诉你它没跑**）。
 
 ---
 
@@ -1233,10 +1430,17 @@ Vary: Cookie          ← ★ 新增：让任何中间缓存不把两者混用
 
 | 项 | 改法 |
 |---|---|
-| 块占位渲染 | `MarkdownBody` / `renderMarkdownBody`（`packages/web/src/lib/markdownRender.ts`）新增一种节点：`{ kind:'gated', count:N, minVisibility:'org'|'granted' }`（★ v3：原名 `minRole`，因为它的取值是**可见性档位**、不是角色，故改名，见 §12 第 16 条；★ v4：取值域随块级三档改为 `'org'|'granted'`）→ 渲染为"🔒 此处有 N 段内容需登录查看" + 申请入口；**措辞不得包含块内容/标题/字数以外的信息** |
+| 块占位渲染 | `MarkdownBody` / `renderMarkdownBody`（`packages/web/src/lib/markdownRender.ts`）新增一种节点：`{ kind:'gated', count:N, minVisibility:'org'\|'granted' }`（★ v3：原名 `minRole`，因为它的取值是**可见性档位**、不是角色，故改名，见 §12 第 16 条；★ v4：取值域随块级三档改为 `'org'\|'granted'`）→ 渲染为"🔒 此处有 N 段内容需登录查看" + 申请入口；**措辞不得包含块内容/标题/字数以外的信息** |
 | 预览为匿名视角 | 编辑器预览（`packages/web/src/pages/WikiPage.tsx:1135-1140` 的 `renderMarkdownBodyForPreview`、挂载于 `:1670`）新增"预览为匿名/组织成员视角"开关 —— 否则作者无法自查块级可见性（**这是块级模型唯一的可用性救生圈**，P3d 交付） |
 | 块级共享面板 | 条目详情页新增"内容块"面板：列出被收紧的块（`ordinal` + 摘要 + 可见性 + 单独授予），供 `canManageVisibility` 者治理 |
 | 红链 | v1 的三步态 `exists: false \| true \| 'hidden'` 不变，**新增** `visibleBlocks`（§5.5）用于区分"部分可见" |
+| `系统状态`（服务健康 / DB 方言 / 表清单） | **★ v8 新增：随 `管理 ▾` 下沉为管理员专属** |
+
+> **★ v8：`系统状态` 的归属（规格从未表态，本次裁定并留痕）**
+> - **事实**：`grep -rn "系统状态\|服务健康" docs/` 在**本文档里零命中** —— 该界面**从未被设计文档规定过**（它是既有实现里的一个对话框，见 `packages/web/src/App.tsx:401`、`:548-551`）。因此"它该给谁看"**不是实现偏离文档，而是文档缺口**。
+> - **裁定（编排者）：维持管理员专属**。理由：它的内容是**运维细节**（服务健康、DB 方言、表清单），与所在分组的"**运维台面**"语义一致（实现内的原话见 `packages/web/src/App.tsx:126-128`：*"「系统状态」对话框与这两项同处一个下拉，因此它**也随之下沉为管理员可见**。它是运维台面…"*）。
+> - **★ 一个必须写清的边界**：**`GET /api/health` 本身仍然是公共端点**，看门狗不受影响 —— `HEALTH_PATH = '/api/health'`（`packages/core/src/index.ts:379`）在 `packages/server/src/index.ts:583` **内联处理**，**不经过 `router.register`**，因此**根本不进 §2.5 的 `access` 闸门**（与 §2.5.2 边界二 一致）。**"界面管理员专属"与"端点公共"是两件事，不要混。**
+> - **若将来要让所有人看到服务健康**：改的是**界面门控**，**不要**顺手把 `/api/health` 改窄（那会打断看门狗）。
 
 ---
 
@@ -1372,7 +1576,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 | **P1** | 身份/会话/本地密码 + **`email_verified` + `user_identities` 建表** + 登录/登出/初始化向导。**★ v7：已合入 `main`**（合并提交 `f3990a9`，分支 `feat/p1-identity`，基线 `e708814`，tip `4b19e7b`） | 迁移 `0010_identity.sql`、`0013_audit.sql`；新增 `packages/plugin-auth`（`provides:'auth-service'`）；`packages/server/src/index.ts:938-1017` 登记；`config/plugins.base.json`；前端 `lib/authStore.ts`、`packages/web/src/api.ts:27-44`、`lib/errorText.ts:81-105` | **M** | `packages/web/test/errorText.test.ts` 必改 |
 | **P1.5** | **OIDC 通道**：授权码 + PKCE、`(issuer,sub)` 绑定、`provisioning_mode`、手动绑定流。**★ v7：正在实现中** —— worktree `.wt-p15`、分支 `feat/p15-oidc`（**堆叠在 P1 的 tip `4b19e7b` 上**）⇒ 本行内容以 §7.2 的 ★ v7 小节为准（`link_ticket` 已改为**不落库**） | 新增 `packages/plugin-oidc`（`provides` **无** —— 只往 `auth-service` 注册 provider，**与 `@geewiki/openai` 同形态**：`packages/server/src/index.ts:1000-1017` 的注释明说"只往 llm-service 注册一条路由，故**无 provides**"）；`packages/plugin-auth` 增绑定端点 | **M** | 仅新增 |
 | **P2** | 组织/成员/组/邀请 + **页面级**可见性 + 继承 + `page_grants` + 全量**读路径**加 principal + 门户 `/portal` + 导航 IA + 404/403。**★ v7：正在实现中** —— worktree `.wt-p2`、分支 `feat/p2-org-visibility`（**基线 `f3990a9`**）。**★ v5（D8）新增上线步骤**：**存量条目一次性回填 `visibility='org'`**（见 §8.2 P2 第 13 条） | 迁移 `0011_org_team.sql`、`0012_page_acl.sql`；**新增数据回填**（D8：`UPDATE pages SET visibility='org' WHERE …`，属上线动作、**不是 DDL 默认值**，§3.3）；新增 `packages/plugin-org`、`packages/plugin-authz`（`policy-service`）；`packages/plugin-wiki/src/index.ts:388-425,601-722`；`packages/plugin-search/src/index.ts:478` 与查询层过滤；前端 §6.6 各项 | **L** | 最大（导航/详情按钮/wiki 服务契约） |
-| **P3a** | **块模型落地 + 读路径改造 + FTS tier 切换**（原子 PR）。**★ v7：其中"FTS tier 切换"部分仅 SQLite 适用** —— `blocks_fts` 是 FTS5（SQLite 专有），PG 部署下 `@geewiki/search` **显式拒绝激活**⇒ 检索不可用；块模型与读路径裁剪两部分仍可两方言落地。详见 §4.3 的「★ v7：方言语义」与 §8.2 P3a 的逐条标注 | 迁移 `0015_blocks.sql` + `packages/plugin-search/migrations/0002_blocks_fts.sql`；`packages/plugin-wiki` 的 `parseBlocks` + `savePage` 事务（`:489-531`）；`packages/plugin-search/src/index.ts:290-478`；`packages/plugin-ai/src/index.ts:438`、`packages/plugin-ai/src/select.ts:41-44` | **L** | `packages/plugin-search/test/search.test.ts`（`SearchHit.content` 删除）、`packages/plugin-ai/test/*` |
+| **P3a** | **块模型落地 + 读路径改造 + FTS tier 切换**（原子 PR）。**★ v7：其中"FTS tier 切换"部分仅 SQLite 适用** —— `blocks_fts` 是 FTS5（SQLite 专有），PG 部署下 `@geewiki/search` **显式拒绝激活**⇒ 检索不可用；~~块模型与读路径裁剪两部分仍可两方言落地~~ **★ v8 订正：这句话当时是未经验证的乐观判断，且不成立** —— 有三个**只在真 PostgreSQL 上暴露**的缺陷（写块靠异常判表存在 / 缺 `RETURNING id` / `deletePage` 的 `DELETE FROM blocks_fts` 无方言守卫），修掉之前 PG 上「写块恒 0 条 / 新建保存 500 / 删除页面 500」；现已由 `96891db` / `e941da5` 修掉，但**这三点都不由类型系统保证**，详见 §4.3 的「★ v8：P3a 的方言成本」。另：**块模型与读路径裁剪两部分仍可两方言落地**。详见 §4.3 的「★ v7：方言语义」与 §8.2 P3a 的逐条标注 | 迁移 `0015_blocks.sql`（**★ v8 订正落点：落在 db 包、两侧成对** —— `packages/db-sqlite/src/migrations/` 与 `packages/db-postgres/migrations/`，**不是** `packages/plugin-wiki/migrations/`，见 §3.6 的 ★ v8 订正）+ `packages/plugin-search/migrations/0002_blocks_fts.sql`；`packages/plugin-wiki` 的 `parseBlocks` + `savePage` 事务（`:489-531`）；`packages/plugin-search/src/index.ts:290-478`；`packages/plugin-ai/src/index.ts:438`、`packages/plugin-ai/src/select.ts:41-44` | **L** | `packages/plugin-search/test/search.test.ts`（`SearchHit.content` 删除，另含 ★ v8 的"标题不参与 FTS 匹配"断言 `:558`）、`packages/plugin-ai/test/*` |
 | **P3b** | **块级权限 + `block_grants` + 例外授予 + 申请访问** | 迁移 `0016_block_grants.sql`；`policy-service` 的块级判定；条目详情页"内容块"治理面板 | **M** | 新增为主 |
 | **P3c** | **块级版本与恢复** | 迁移 `0017_version_blocks.sql`；`packages/plugin-wiki/src/index.ts:621-639`（读历史）+ 恢复端点 | **M** | `packages/plugin-wiki/test/service.test.ts` |
 | **P3d** | **块级编辑器体验**：标记语法高亮/自动补全、块级可见性侧栏、"预览为匿名视角" | `packages/web/src/components/MarkdownEditor*.tsx`、`packages/web/src/pages/WikiPage.tsx:1135-1140,1670` | **S–M** | `packages/web/test/designSystem.test.ts`、`contrastPlan.test.ts` |
@@ -1415,12 +1619,12 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 **P1.5** —— 见 §7.4 的七条安全校验，外加：mock IdP 下完成首登 `invite_only` 拒绝（403 `no_invitation`）、email 已存在时 409 `identity_link_required`、解绑最后一个凭据 409 `last_credential`、IdP 不可达时本地密码通道不受影响。
 
-**P2**（v1 十条 + v2 一条 + v3 一条 + v5 一条 + **v6 一条**）
+**P2**（v1 十条 + v2 一条 + v3 一条 + v5 一条 + **v6 一条** + **★ v8 一条**）
 
 1. **继承**：`public` 父 + `private` 子 ⇒ 匿名 `GET /api/pages/:child` → **404**；`GET /api/pages` 不含该 slug。
 2. **不可放宽**：`private` 父 + `public,published` 子 ⇒ 匿名仍 404。
 3. **断链**：父 `inherit=false` ⇒ 子按自身 `visibility` 生效。
-4. **移动**：把私有条目移入公开空间 ⇒ 匿名立即可见（`acl_revision` 缓存已失效，**无 TTL 窗口**）。
+4. **移动**：把私有条目移入公开空间 ⇒ 匿名立即可见（★ v8 订正：原因是**判定层没有决策缓存、每请求现查库**，故天然**无 TTL 窗口**；原写的"`acl_revision` 缓存已失效"**不成立** —— 没有任何代码读 `acl_revision`，见 §13.6 第 11 条）。
 5. **（v2 改写）** 搜索不泄漏：**查询层 `WHERE slug IN visible` 生效**（原第 5 条与 FTS 相关的部分推到 P3a）。
 6. **反链不泄漏**：私有条目引用公开条目 ⇒ 公开条目的 backlinks **不含**私有条目标题。
 7. **版本不泄漏**：匿名 `GET /api/pages/:slug/versions/:id` 对受限条目 → 404。
@@ -1434,10 +1638,22 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
     - ② **没有任何存量条目被批量设成 `public`**：`SELECT COUNT(*) FROM pages WHERE visibility='public' AND published_at IS NOT NULL` **不因回填而增加**（`public` 只能由管理员显式发布，D8）；
     - ③ **回填是上线动作、不是 DDL 默认值**：只跑 `0012_page_acl.sql`（`ADD COLUMN … DEFAULT 'private'`）而**不跑回填**时，存量条目的 `visibility` 应为 `private`（**这正是 D8 要避免的"全站条目瞬间消失"**）—— 两条命令的先后关系必须写进发布手册；
     - ④ 匿名访问任一回填后的存量条目 ⇒ 按 `org` 规则处理（**匿名 = 404**，因为 `org` 档只对组织成员可见；**不是**"能看"）—— 这一点必须测准，别把 `org` 误当"公开"。
-14. **（★ v6 新增，依据 = P0 独立代码审查的实测）插件 `config` 回显泄漏 —— 路由层 `redactConfig(principal)`**：**非 break-glass 主体**调用相关端点时，响应里**不含**任何插件的 `config` 字段。**两条路径都必须覆盖**（见下）。
+14. **（★ v6 新增，依据 = P0 独立代码审查的实测；★ v8 按实现订正判据）插件 `config` 回显泄漏 —— 路由层脱敏**：**无资格的主体**调用相关端点时，响应里**不含**任何插件的 `config` 字段。**两条路径都必须覆盖**（见下）。
+    - **★★ v8 订正：判据被放宽了，而且放宽是有据的**。原文只写"**非 break-glass 主体**"，**实现是 `break-glass` 或 `orgRole ∈ {owner, admin}`** ——
+      `packages/manager/src/index.ts:1574-1579` 的 `mayReadPluginConfig(h: RouteHandlerContext): boolean`：
+      `if (!p) return false`（拿不到主体 ⇒ 失败关闭）→ `if (p.kind === 'break-glass') return true` → `return p.orgRole === 'owner' || p.orgRole === 'admin'`。
+      **为什么必须放宽**（源码注释 `:1564-1573` 的原话大意）：写下文档原文时（P1 阶段）**还没有真实角色** —— 角色的持久化位置 `org_members` 是 P2 才建的；
+      现状下**若只认 break-glass，登录为 owner 的管理员也会拿不到 `config`，管理台的配置表单将无法回填**。
+      **放宽不重新打开匿名泄漏**（匿名与普通成员的 `orgRole` 不是这两个值），故这是对原文的**有据收窄**。
+      **⇒ 判据以 `mayReadPluginConfig` 为准；不要按字面只认 break-glass 去"修"它。**
     - **先纠正一处此前的错误认知**：曾怀疑 `GET /api/plugins` 的 `config` 会泄漏 **LLM API key 与数据库密码**。审查用**真实服务实测后推翻**：本项目有成文的**密钥纪律** —— `apiKeyEnv` / `passwordEnv` **只接受环境变量「名」**，填**密钥值本身**会导致插件**激活失败**（`packages/plugin-openai/src/index.ts:116-119` 的 `isEnvVarName` 白名单闸门；`packages/db-postgres/src/index.ts:126` 的 `assertEnvNameLooksLikeName('passwordEnv', …)`；测试 `packages/db-postgres/test/secret-discipline.test.ts`）⇒ **密钥值不会出现在响应里**。
     - **但存在一个真实的、更窄的通道**：`config` 是**原样回显运维填写的任意字符串字段**。审查实测：真实密钥 `sk-live-…` **未**泄漏，而 `baseUrl` 里内嵌的 `hunter2` **泄漏 1 次** ⇒ `baseUrl` 若写成 `https://user:pass@gateway/v1` 会被**逐字吐出**。附带泄漏：**环境变量名、模型名、内网端点拓扑**。**风险等级 Low–Medium。**
-    - **交付物**：**路由层**的 `redactConfig(principal)` —— 对**非 break-glass 主体**（`principal.kind !== 'break-glass'`）**去掉 `config` 字段**（或替换为公开子集）。**注意：P0 的 `GET /api/session` 是 `public`、`GET /api/plugins` 也仍是 `public`** ⇒ **这个回显通道目前是匿名可达的**（P0 的刻意取舍见 §2.5 ⑤）。
+    - **交付物**：**路由层**的脱敏 —— 对**无资格主体**（判据见上方 ★ v8 订正）**去掉 `config` 字段**（或替换为公开子集）。
+      **★ v8 落地记录**：实现里没有名叫 `redactConfig` 的函数，实际是两个路由层工具函数 ——
+      `withoutPluginConfig(snapshot: PluginSnapshot): Omit<PluginSnapshot, 'config'>`（`packages/manager/src/index.ts:1582`，剥单个插件快照）
+      与 `withoutListConfig(file: { enabled: readonly { name: string; config?: unknown }[] }): unknown`（`:1587`，剥 `enabled[].config`），
+      配合判据函数 `mayReadPluginConfig`（`:1574`）。**⇒ 定位请以这三个名字为准，"`redactConfig`"在仓库里零命中。**
+      **注意：P0 的 `GET /api/session` 是 `public`、`GET /api/plugins` 也仍是 `public`** ⇒ **这个回显通道当时是匿名可达的**（P0 的刻意取舍见 §2.5 ⑤）。
     - **必须同时覆盖两条路径（只改一条会漏）**：
       1. `GET /api/plugins`（`packages/manager/src/index.ts:1574`）；
       2. **`GET /api/session`**（`:1619`）—— 它经 `manager.sessionState()`（`packages/manager/src/index.ts:449-451`）返回 `PluginListFile.enabled[].config`，结构见同文件 `:129-136`。**审查明确警告："只改 `/api/plugins` 会漏掉第二条。"**
@@ -1445,6 +1661,13 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
     - **待排查项（标注清楚：不要当成已确认）**：`packages/manager/src/index.ts:413` 的 `error: p?.error ?? undefined` 是**插件激活失败的字符串**，**可能**含运维填入的连接信息。审查**未实测到泄漏** ⇒ 按"**待排查**"处理，先别写进交付范围。
     - **为什么不能更早做（P0 不做的理由）**：① P0 的契约是"**读端点行为与改动前逐字一致**"（§8.1 P0 行），且 **P0 不许改 `packages/web`** —— 裁剪 `config` 会改变管理台首屏的取数结果（配置表单依赖 snapshot 的 `config`），属**读路径改造**，必须与 §5 的读路径裁剪一起在 P2 做；② 现实约束：`GET /api/session` 在 P0 **刻意保持 `public`**（理由见 §2.5 ⑤ —— `AdminPage` 的 `Promise.all` 里**只有它没有 `.catch()`**）⇒ **收紧它时必须同时处理那个 `Promise.all`**，否则管理台首屏直接白屏。
     - **运维缓解建议（在修复之前）**：**不要把凭据内嵌进 `baseUrl`（或任何配置值）**，改用环境变量；`config` 里只写**变量名**。已经内嵌过的，按"**已泄漏**"处理（轮换凭据）。
+15. **（★ v8 新增：补上"前端 IA"这一整类验收标准 —— 原文 1–14 条全是后端项）**：**这是一个明确的设计文档缺口**。P2 的前端信息架构工作（内部称 **M5**，分支 `feat/p2-m5-frontend-ia`）**在本文档里原本没有任何验收条目**，其规格来源是**实现者留下的 TODO**，而不是设计文档 ⇒ 交付时"做没做完"没有文档层面的判据。v8 把它补成可测条目（依据 = §6.6 的表格 + §2.1 的角色能力 + 本次实现反馈）：
+    - **① 导航与入口由能力驱动，不由"是否登录"驱动**：`capabilities` 决定"新建页面 / 编辑 / 删除 / 版本恢复 / 管理 ▾ / 成员管理"等入口是否渲染；**未登录访客不得看到准管理员界面**（§0.1 ⑤ 的回归断言：`#/wiki` 无"新建页面"主按钮、详情页无"删除/编辑"、顶栏无"管理 ▾"直通）。
+    - **② 降级与提升必须刷新入口**：登录 / 登出 / 角色变更后 `capabilities` 与 `pagesStore` 同步失效（★ **未完成项**：`capabilities` 目前只在 `loadAuth()` 写入，`denied`(403) 分支只跳转不刷新 ⇒ 提升后不重载看不到新入口、降级后旧入口留着；**这是外观层面的失败开放，服务端仍独立判定**）。
+    - **③ `系统状态`（服务健康 / DB 方言 / 表清单）维持管理员专属**（★ v8 裁定，见 §6.6 的 ★ v8 小节）；`GET /api/health` **本身仍是公共端点**，看门狗不受影响。
+    - **④ 红链三步态 `exists: false | true | 'hidden'`**：设计原文（§6.6、§5.5）要求保留三步态以区分"不存在"与"存在但不可见"。**★ 实情：`'hidden'` 这一步态在本批 M5 里仍未实现**（列为本阶段未做项，见 §13.6）。
+    - **⑤ 守卫测试**：新 UI 必须过 `packages/web/test/navGate.test.ts` 与 `packages/web/test/navPlan.test.ts`（顶栏导航的真正守卫），以及 `contrastPlan.test.ts` / `designSystem.test.ts`（复用 `ui/*` 与 tokens、禁 px 字面量与裸色值）。**★ 注意**：原文 §9 R9 曾把 `navOrder.test.ts` 误列为"必然触碰"，**它其实与顶栏导航无关**（见 §9 R9 的 ★ v8 订正）。
+    - **★ 未验证项（诚实标注）**：上述 ①–⑤ 是**回写时按设计与实现反馈整理的判据**，**本条不声称已逐条跑过**；其中 ② 与 ④ 是**已知未完成项**。真实浏览器交互**从未验证**（全部端到端都是 `curl`）。
 
 **P3a**（★ v7：本阶段部分验收项**仅 SQLite 适用**）
 
@@ -1477,7 +1700,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 3. **grant 放宽上限**：对 org 页面上的 `block.visibility='granted'` 块（★ v4 改词：原写作 `'private'`）授予某用户 `viewer` ⇒ 该用户可见该块；但**不能让该块对匿名可见**。**再补一条（★ v4）**：`page.visibility='public'` 页面上的 `granted` 块，**未授权者（含匿名）也看不到它** —— 证明"授权是放宽方向、`granted` 是收紧档"两件事同时成立。
 4. **合并/删除已授权块** ⇒ 409 `block_merge_conflict` / `block_grant_orphan`（§4.2 表格逐行可测）。
 5. **拆分已授权块** ⇒ 两块都继承授权（安全方向）。
-6. **申请访问闭环**：匿名/无权用户申请 → 批准 → 无需重新登录即可见（`acl_revision` 失效无 TTL 窗口）。
+6. **申请访问闭环**：匿名/无权用户申请 → 批准 → 无需重新登录即可见（★ v8 订正：原因是**判定层没有任何决策缓存**（`packages/plugin-authz` 每请求现查库），**不是**因为 `acl_revision` 触发了失效 —— 它只是版本标记与观测信号。**保留的禁令：一旦给判定层加 TTL 缓存，这条性质立刻失效。** 见 §13.6 第 11 条）。
 
 **P3c**
 
@@ -1500,6 +1723,13 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 4. 越权尝试（匿名连续请求受限 slug 20 次）产生可查询的 `access.denied` 记录，且**不计入 `audit_log` 的权限变更视图**（两类分开）。
 5. **（v2 新增）** 两个 verify 端点（`/api/admin/search/verify`、`/api/admin/blocks/verify`）均返回 0 不一致。
 6. **（★ v3 新增，D11）** **权限版本不做清理**：代码中**无**删除 `page_versions` 行的路径（grep 断言）；只改 `visibility` 而产生的那一行（`content` 不变、`acl_json` 变）在任何时候都仍可查到并据此恢复回去。
+   > **★★ v8 订正：本条按字面无法执行，实现已按真实意图落为"白名单 + 锚定"。**
+   > - **为什么按字面写不行**：`deletePage` 本来就要删掉**被删页自己的**版本行 —— 那是**页面生命周期级联**，与 D11 反对的"**保留策略清理**"是**两回事**。
+   >   **按字面写会让守卫与既有合法代码直接冲突，然后被人放宽 —— 那等于没有守卫。**
+   > - **实际判据（`packages/plugin-authz/test/audit-appendonly.test.ts:121` 起）**：**只允许一处 `DELETE FROM page_versions`，且必须锚定在 `deletePage` 内**。
+   >   扫描正则 `/\bDELETE\s+FROM\s+page_versions\b/i`（`:131`）；`hits.length >= 1` 作为**前置断言**（`:132`，防止"扫描范围写错导致恒为空"的假绿）；
+   >   再断言**其所属函数名必须是 `deletePage`**（`:153-154`；锚定正则要求 `= async`，`:143-146` 说明了理由）。
+   > - **⇒ 建议把文档本条也改成这个口径**（原文保留在上面以留痕）：**判据 = "白名单 + 锚定"，而不是"零处"**。新增任何一个 `DELETE FROM page_versions` 点都会让守卫变红，正是我们要的。
 
 ---
 
@@ -1534,6 +1764,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 `packages/web/src/lib/pagesStore.ts` 是**模块级全局缓存**（`:9-10,:14`：刻意不引 react-query，一次拉全量并共享），字段 `PageSummary`（`packages/web/src/api.ts:165-170`）/`PageDetail`（`:177-181`）**无 owner/visibility/角色字段**。
 - **风险**：登录 → 拉全量 → 登出 → 缓存仍在 → 下一个身份（或匿名）看到**上一个身份的列表**。SSE 流若不中止会继续推送旧身份的内容。
 - **缓解**：`login()`/`logout()`/角色变更/`acl_revision` 变化 ⇒ **必须** `invalidatePages()`（`:97`）；SSE 用 `AbortController` 主动中止；`api.ts` 的 401 拦截里**先清 store 再跳转**。
+  > **★ v8 订正**：上面列举的触发条件里，**`acl_revision` 变化这一条在实现中不存在**（前端全仓**没有任何** `acl_revision` 引用，服务端也不下发它给列表接口）⇒ 前端的 `pagesStore` **不会**因权限变更自动失效。实际落地的触发点是**显式失效**：`login()` / `logout()`（`packages/web/src/lib/authStore.ts:168` 一带）与**写操作之后**（保存 / 删除 / 恢复版本，`packages/web/src/pages/WikiPage.tsx:846, :871, :1439`）、以及 `packages/web/src/lib/pagesStore.ts:128`。**⇒ 这条缓解仍然必须保留**（`login`/`logout` 后不清缓存就是"下一个身份看到上一个身份的列表"），但**不要指望 `acl_revision` 帮你失效**。
 
 ### R6 —— SSE 与静态资源路径的鉴权覆盖
 - SSE（`packages/plugin-ai/src/index.ts:913`）走**裸 fetch**（`packages/web/src/api.ts:341-350`）→ 不加 `credentials` 就是**永远匿名**（且静默，不报错）。
@@ -1555,7 +1786,9 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - `INSERT ... RETURNING id`：SQLite 与 PG 行为不同 → 统一用 `RunResult.lastInsertRowid`（`packages/core/src/index.ts:170-178`）。
 
 ### R9 —— 现有前端守卫测试的连锁改动
-26 个测试文件 314 例（`packages/web/test/`）。P2 必然触碰：`contrastPlan.test.ts`（新增 403/占位/锁图标需过对比度）、`designSystem.test.ts`（新页面必须复用 `ui/*` 与 tokens）、`navOrder.test.ts`（导航合并）、`errorText.test.ts`（新增 kind）、`pageMeta.test.ts`、`wikiRoute.test.ts`。
+26 个测试文件 314 例（`packages/web/test/`）。P2 必然触碰：`contrastPlan.test.ts`（新增 403/占位/锁图标需过对比度）、`designSystem.test.ts`（新页面必须复用 `ui/*` 与 tokens）、~~`navOrder.test.ts`（导航合并）~~、`errorText.test.ts`（新增 kind）、`pageMeta.test.ts`、`wikiRoute.test.ts`。
+> **★ v8 订正：`navOrder.test.ts` 不属于"必然触碰"（原文写错了）**。该文件测的是 **`packages/web/src/lib/navTree.ts` 的"上一篇 / 下一篇"顺序**（`packages/web/test/navOrder.test.ts:11` 的 import 即 `buildNavTree, flattenPages, neighborsOf`；用例名如"`neighborsOf：第一项无上一篇、最后一项无下一篇`"），**与顶栏导航没有任何关系**。审查用 `git diff --stat` 证明它在 P2 的改动里**diff 长度 0 行**。
+> **顶栏导航真正的守卫是** `packages/web/test/navGate.test.ts` 与 `packages/web/test/navPlan.test.ts`（另见 `navTree.test.ts`）。**⇒ 原文那一项应从"必然触碰"名单里划掉；要盯的是 `navGate` / `navPlan` 两个文件。**
 - **缓解**：P2 拆两个 PR —— **PR-A：纯后端（判定 + 迁移 + 读路径）**，无前端改动，可独立验收；**PR-B：前端 IA**。这样后端的安全价值能先落地，前端测试的连锁改动被隔离在一个 PR 里。
 
 ### R10 —— 授权反模式（本项目具体化的"绝不要做"清单）
@@ -1563,6 +1796,8 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 1. **靠不可猜测的 slug 当权限**（CWE-639）：slug 是用户可读可猜的，**永远不能**作为访问控制依据。
 2. **搜索"先取全量再后过滤"**：`total`/`highlight`/`score`/分页语义全部泄漏。必须在 SQL 层就 `WHERE ... IN (...)`。
 3. **权限缓存设 TTL 而不做变更失效**：必然出现"撤销后仍可见"的窗口。用 `acl_revision`。
+   > **★ v8 订正（这条反模式的判断不变，但"解法"写错了）**：本项目**根本没有决策缓存** —— `packages/plugin-authz` **每请求现查库**，全仓**没有任何代码读 `acl_revision`**（§13.6 第 11 条）。所以"撤销后仍可见"这个窗口在本项目里**不存在**，也**不需要**靠 `acl_revision` 去消除。
+   > **★ 真正要守的禁令是它反面那一句：不要给判定层加 TTL 缓存。** 一旦有人为了性能在判定层加缓存，"撤销后仍可见"会立刻复活，而那时 `acl_revision` **帮不上忙**（没有失效机制）。原文里"用 `acl_revision`"属于**过度声明**，保留在此仅作留痕。
 4. **只校验父与子各自的权限、不校验隶属关系**：Outline 的 [GHSA-rg4j-pmch-w6pm](https://github.com/outline/outline/security/advisories/GHSA-rg4j-pmch-w6pm)（CVE-2026-43889，*"Unauthorized Document Publication via Mixed collectionId+documentId Share"*）正是这个形态。在本设计里对应"移动条目"与"跨 slug 前缀的 grant"两条路径。**★ v3 注**：角色退出授权对象后，这条反模式的**组合维度少了一层**（不再有"父页按角色授权、子块按角色授权不同"的交叉）⇒ 剩余真正要盯的只有"**跨 slug 前缀的 grant**"这一条路径。
 5. **前端校验当判定**：前端隐藏按钮**只是体验**，判定一律在服务端。
 6. **把 `noindex`/`robots.txt` 当访问控制**：它们只做 SEO 去重。
@@ -1584,11 +1819,12 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 **缓解**：① **所有块写入必须收敛到 `blocksWriters` 单一模块**（grep 断言：除该模块外无 `INSERT INTO blocks`）；② 强制 `GET /api/admin/search/verify` 探针 + 启动自检；③ 自检发现不一致时**显式告警**（而不是静默返回错误结果）。
 > **这是 R1 的形态变化**：风险从"迁移期触发器变更"变成"运行期应用层同步" —— **长期风险更高**，因为它在每次写入时都存在。
 
-### R13 —— 块级 tier 重算的扇出（v2 新增）
-`blocks.tier = min(pageEffectiveVisibility, block.visibility)`。**页面祖先可见性一变，该页所有块的 `tier` 都要重算**；若一次变更影响 N 个页面（如把某祖先目录设为 `private`），会触发 N×M 次 `blocks.tier` 更新 + `blocks_fts` 的 delete/insert。
-> **★ v4**：档位序为 `public(0) < org(1) < granted(2)`，重算的**写入值**是"有效档位为 `public`/`org` ⇒ 写 `0`/`1`；**有效档位为 `granted` ⇒ 写 `NULL`**"（§4.3）。注意 `min()` 比较的是**档位序**（3 值域），而**落到列上**时 `granted` 折成 `NULL` —— 两件事不要混：**判定用档位序，索引列用 `0/1/NULL`**。
-**缓解**：① 祖先变更时**批量重算 + 单事务**（不要逐页开事务）；② `tier` **惰性重算**（判定时用 `min(page, block)` 实时算，`blocks.tier` 只作为**索引用的物化**，由 `acl_revision` 失效后异步重建）；③ 在 `acl_revision` 上做**代际标记**，避免重复重算同一页。
-**验证**：把 8 层深的祖先链设为 private ⇒ 断言子树下所有页面的块 `tier` 全部更新且 `blocks_fts` 命中数对 anon 归零。
+### R13 —— 块级 tier 重算的扇出（v2 新增；★ v8 显著加强：**它是跨阶段不变量**，见 §4.6）
+`blocks.tier = max(pageEffectiveVisibility, block.visibility)`（★ v8 订正：原写 `min`，方向反了 —— 理由见 §2.3 规则 B1）。**页面祖先可见性一变，该页及其全部子孙的块 `tier` 都要重算**；若一次变更影响 N 个页面（如把某祖先目录设为 `private`），会触发 N×M 次 `blocks.tier` 更新 + `blocks_fts` 的 delete/insert。
+> **★ v4**：档位序为 `public(0) < org(1) < granted(2)`，重算的**写入值**是"有效档位为 `public`/`org` ⇒ 写 `0`/`1`；**有效档位为 `granted` ⇒ 写 `NULL`**"（§4.3）。注意 `max()` 比较的是**档位序**（3 值域；★ v8：该刻度是"越窄数值越大"，故取更窄的一方是 `max`），而**落到列上**时 `granted` 折成 `NULL` —— 两件事不要混：**判定用档位序，索引列用 `0/1/NULL`**。
+> **★★ v8：这条风险已经"实际发生过三次"，不再是理论风险** —— 三次都由审查**端到端复现**（匿名 `/api/search` 返回了本该受限的唯一词），根因、提交号与修法见 **§4.6**。缺扇出的后果**不是**"索引陈旧"这种可用性问题，而是**内容泄漏**（读路径 404、检索却命中并吐出正文片段）。
+**缓解**：① 祖先变更时**批量重算**（不要逐页开事务）—— ★ v8 订正：**不能把扇出塞进"写档位"的那个事务**，必须在**该事务提交之后**跑，理由见 §4.6（`pageLevelOf` 走另一条连接、PG 的 MVCC 下看不到未提交的行）；② `tier` **惰性重算**（`blocks.tier` 只作为**索引用的物化**，判定一律走 §2.4 的单点函数）—— ★ v8 订正：原文说"由 `acl_revision` 失效后异步重建"，**该因果不成立**，见下条；③ 在 `acl_revision` 上做**代际标记**，避免重复重算同一页 —— **★ v8 订正：这条"代际标记"从未实现、也不必实现，因为根本没有缓存需要失效**（全仓**没有任何代码读 `acl_revision` 来做判定**；`packages/plugin-authz` 没有决策缓存，每请求现查库）。**保留此句只为留痕；真正要守的禁令是"不要给判定层加 TTL 缓存"**（§4.5、§9 R10 第 3 条）。
+**验证**：把 8 层深的祖先链设为 private ⇒ 断言子树下所有页面的块 `tier` 全部更新且 `blocks_fts` 命中数对 anon 归零。**★ v8 补**：仅测"改档位"这一条路径**不够** —— 必须同时覆盖**新建祖先**、**删除断链点（`inherit=false`）**、**版本恢复**三条路径，否则会出现"脚本绿着而泄漏仍在"（§4.6）。
 
 ### R14 —— 语义检索（向量）被块级权限反噬（v2 新增，未来风险）
 `packages/plugin-ai` 现在只有"检索-only"形态。**若将来引入 embedding / 向量库**：向量是按块计算的，而块级权限是**逐主体**的 ⇒ "同一个块对不同主体不同可见性"会让**向量库无法做静态可见性标注**。
@@ -1859,8 +2095,13 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 > | 19（P0 实现自行定义了文档未写的 API 形状） | **已解决**（v6：已回写为 §2.5；过程与根因见本条正文） |
 > | 20（`link_ticket` 要求"存 DB" vs §7.6 的"迁移增量 0"） | **已解决**（v7：改为 **HMAC 签名的自包含票据，不落库**；安全性与落库等价、代价已写明 —— §7.2 的 ★ v7 小节，事实基础见 §3.1 的 ★ v7 核对） |
 > | 21（§4.3 写"PG 侧不执行本文件" vs PG 实跑仍执行） | **已解决（且暴露了一个可选的诊断体验改进项）**（v7：控制器确按方言取目录，但 `@geewiki/search` 用裸字符串声明 ⇒ 归入 `'default'` 键 ⇒ PG 上照样执行并失败；修法 `{ sqlite: './migrations' }`，**不阻塞任何阶段** —— §4.3 的 ★ v7 小节） |
+> | 22（§2.3 规则 B1 的 `min` 方向写反） | **已解决（★ v8，安全相关）** —— 按 `tier` 刻度订正为 **`max`**，并说明"同一语义在两套刻度下方向相反"；该错误曾扩散到 4 处代码注释、已全部订正。见 §2.3 与 §13.6 第 1 条 |
+> | 23（§4.3 低估 P3a 的方言成本） | **已解决（★ v8）** —— 补记**三个只在真 PostgreSQL 上暴露**的缺陷（`96891db` / `e941da5` 已修）。见 §4.3 的「★ v8：P3a 的方言成本」与 §13.6 第 2 条 |
+> | 24（跨阶段不变量：`blocks.tier` 的扇出） | **已解决（★ v8）** —— 失效过三次，提为独立小节 **§4.6**，并记录四个调用点与"必须在提交之后"的理由。见 §13.6 第 3 条 |
+> | 25（`acl_revision` 的"代际失效"是过度声明） | **已解决（★ v8）** —— 全仓无读取方；结论（被批准者免重登即可见）仍成立但**理由不同**；**保留"不要给判定层加 TTL 缓存"这条禁令**。见 §13.6 第 11 条 |
+> | 26（其余九条就地补正） | **已解决（★ v8）** —— §3.6 迁移落点与 `tier` 内联、§9 R9 `navOrder`、§8.2 P2-14 脱敏判据、§4.3 `snippet()` 静默 `null`、§4.3 标题不参与 FTS 匹配、§8.2 P2 新增第 15 条（前端 IA）、§6.6 `系统状态` 归属、§2.3 一律 404、§8.2 P4-6 守卫口径。逐条见 §13.6 第 4 条 |
 >
-> 也就是说：**定稿后本节不再含"待拍板"类条目**，只剩第 11 条（可选简化）与第 12 条（需复核）这类**实现期事项**，外加 **v6 新增的第 19 条**（**实现回写留痕，已解决，不是待决项**）与 **v7 新增的第 20 / 21 条**（**实现反馈订正，均已解决**）。
+> 也就是说：**定稿后本节不再含"待拍板"类条目**，只剩第 11 条（可选简化）与第 12 条（需复核）这类**实现期事项**，外加 **v6 新增的第 19 条**（**实现回写留痕，已解决，不是待决项**）、**v7 新增的第 20 / 21 条**（**实现反馈订正，均已解决**）与 **★ v8 新增的第 22–26 条**（**实现反馈订正，均已解决**；其中第 22 条**是安全相关的方向性错误**，第 24 条提为独立小节 **§4.6**）。
 
 1. **v1 明确否决了块级模型，而用户选择了它。** v1 §6.3 的结论是"**推荐 A 方案**（内联标记 + 服务端投影裁剪），B 方案（blocks 表）列为 P4+ 可选演进"，并给出了理由：B 会**同时炸掉** FTS5 external content 触发器、版本历史、AI RAG 三条链路。用户选择了 B（完整块级模型）⇒ **v2 §6 整节重写**，v1 §6 与 §9-D3 作废。本文档以 v2 为准。**风险没有消失，只是被 v2 的具体方案接住了**（§4.3 的 tier 设计 + §4.4 的版本语义 + §4.5 的 RAG 契约），而 R11–R15 是这套方案**新增**的风险。
 2. **v1 推荐"仅本地密码"，用户要 OIDC** ⇒ v1 D2 作废，v2 新增 P1.5（§7）。
@@ -1926,6 +2167,47 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
     - **修法（可选，不阻塞任何阶段）**：把声明改成**按方言**的形式 `migrations: { sqlite: './migrations' }` ⇒ PG 下取不到目录，走"**未声明该方言的迁移目录，跳过迁移**"分支（`packages/manager/src/index.ts:1179-1183`），日志只剩一行告警。**先例**：`@geewiki/wiki` 正是只声明 sqlite 目录的那一类（`packages/server/src/index.ts:1391`）。
     - **v7 的处理**：在 §4.3 新增「**★ v7：方言语义**」小节（含 `tsvector` + `pg_trgm` 等价物与"**列为非目标**"的结论），并在 §4.3 那句"PG 侧不执行本文件"旁**就地标注**它是**目标行为而非当前事实**。
 
+22. **★ v8：§2.3 规则 B1 的方向写反了（安全相关 —— 本次修订最重要的一处）。** 文档写 `effectiveBlockTier(block) = min(block.visibilityRank, pageEffectiveRank(slug))`，而**按 `tier` 这一列的刻度必须是 `max`**。
+    - **两套刻度**：`blocks.tier` 的语义是**限制等级**（检索条件 `b.tier <= :readerTier`，**越小越公开** ⇒ "更窄" = **更大**），而文档那句的刻度是**宽松度**（越大越宽松 ⇒ "更窄" = `min`）。**方向相反，所以同一语义写法相反。**
+    - **★ 而且文档是自相矛盾的**：§2.3 自己声明的档位序写的是"**越右越窄**"（数值越大越窄）—— 在那个刻度上 `min` **本来也该是 `max`**。**⇒ 这里有两层错**（公式与自声明的刻度不符 + 两套刻度方向相反），不是单纯笔误。
+    - **写反的后果（为什么是安全相关）**：`max` 写成 `min` 会让"**页面 org + 块 public**"的块拿到 **`tier = 0`** ⇒ **匿名在站内搜索里就能搜到它** ⇒ "**读路径 404、检索却命中**"（§4.6）。
+    - **扩散与订正**：这条错误曾扩散到 **4 处代码注释**（分布在 **3 个迁移文件**）——`packages/db-sqlite/src/migrations/0015_blocks.sql`（两处）、`packages/db-postgres/migrations/0015_blocks.sql`（一处）由 `ade59ef` 订正；`packages/plugin-search/migrations/0002_blocks_fts.sql`（一处）由**更早**的 `1d608a6` 订正（`1d608a6` 是 `ade59ef` 的祖先）。**全部只改注释、未动 SQL 语句。**
+    - **★ 复核结论（v8 本轮重新 grep 过，方法与结果见 §13.6 第 1 条）**：**没有"照抄形态"的残留**。三个迁移文件里至今仍出现 `min(`，但**全部是"解释为什么不是 `min`"的行文**；`packages/plugin-wiki/src/blocks.ts:222` 那句同理（引用旧写法以说明代码为何用 `max`）。**⇒ 不要把它们再"改"一次，那会把注释改瞎。**
+    - **权威实现**：`packages/plugin-wiki/src/blocks.ts:235-239` 的 `tierFor(pageLevel, blockVisibility)`，真值表在 `:220-234`（该处小标题即"为什么这里是 `max` 而不是文档写的 `min`"）。**注意 `packages/plugin-authz/src/index.ts:127-129` 的 `RANK_*` 也是窄度刻度**（故 `:274-287` 的 `effectiveRank` 内部用 `Math.max`），**不要因为名字叫 `RANK` 就以为它是宽松度刻度**。
+
+23. **★ v8：§4.3 低估了 P3a 的方言成本 —— 三个只在真实 PostgreSQL 上暴露的缺陷。** 原文那句"块模型与读路径裁剪两部分仍可两方言落地"在修掉这三个缺陷之前**不成立**。三个缺陷的共同特征是：**类型检查、单元测试、SQLite e2e 全都照样全绿**。
+    - ① **写块靠捕获异常判断"`blocks_fts` 不存在"**，只匹配 SQLite 的 `no such table:`，PG 的文案是 `relation "blocks_fts" does not exist` ⇒ **每次写块都失败、`blocks` 恒为 0 条**。修法必须**事务外按方言判定**（PG 的事务在任一语句报错后进入 aborted 状态，"捕获后继续"不成立）。
+    - ② **缺 `RETURNING id`** ⇒ PG 报 `insert or update on table "blocks" violates foreign key constraint "blocks_page_id_fkey"` / `Key (page_id)=(0) is not present in table "pages"` ⇒ **新建 / 保存页面 500**。
+    - ③ **`deletePage` 里的 `DELETE FROM blocks_fts` 没有方言守卫** ⇒ **PostgreSQL 上删除任何页面返回 500 且页面删不掉**（PG 事务报错即整体回滚）。
+    - **订正**：①② 由 `96891db`、③ 由 `e941da5` 修掉。**③ 此前从未被发现，是因为 e2e 的阶段 G/H/I/K 靠直读 SQLite 文件核对 `tier`、在 PG 下整体跳过**（`packages/plugin-wiki/test/e2e-p3a.sh:293`、跳过点 `:319/:342/:369/:397`）⇒ `deletePage` 在 PG 上**从没被端到端跑到过**；已补**方言中立**的阶段 L（`:292`，含删除路径 L8 与 `tier_mismatched=0` 的 L9）。
+    - **结论性提示（可直接引用）**：*"块模型的 PG 可用性依赖 `RETURNING id`、索引表存在的方言判定、以及每一处 `blocks_fts` 语句的方言守卫 —— **这三点都不由类型系统保证，必须有真方言 e2e 兜底**。"* 详见 §4.3 的「★ v8：P3a 的方言成本」。
+
+24. **★ v8：跨阶段不变量 —— 写了 `pages` 的档位，就要补齐子孙 `tier`（实现中失效过三次）。** `blocks.tier` 是**物化派生列**；凡写了 `pages.visibility` / `inherit` / `published_at` 的路径，都必须在**该事务提交之后**调用子孙 `tier` 重算。
+    - **三次失效**：P3a 的 `savePage` create 分支（新建祖先，`a3d72b7`）、`deletePage`（删掉 `inherit=false` 的断链点，`a3d72b7`）、P3c 的**版本恢复路径**（`9699aa7`）。前两次由审查端到端复现（匿名 `/api/search` 返回了本该受限的唯一词），第三次由第二轮审查发现。
+    - **为什么必须在提交之后**：`pageLevelOf` 走策略层（**另一条数据库连接**），**PG 的 MVCC 下看不到本事务未提交的行** ⇒ 放进事务**不会死锁**，但会**读到旧值、等于没修**。
+    - **⇒ 失败必须升级为一等可观测信号**：`ResyncReport` + 审计 `acl.resync_failed` + 响应字段 `index_tiers_resync_failed`（让"重算了 0 个子孙"与"扇出整个失败"可区分）。
+    - **⇒ 教训（原话）**：*"新增一条写档位的路径，就应触发『补扇出』这个动作 —— 这是跨阶段不变量，而每个阶段只看自己那一段时必然漏。"* 完整小节见 **§4.6**；与 §9 R13 互为引用。
+
+25. **★ v8：`acl_revision` **没有任何读取方** —— 文档与代码注释里"判定单点按 `acl_revision` 做代际失效"属**过度声明**。**
+    - **事实**：`packages/plugin-authz` **没有决策缓存**（每请求现查库），全仓**没有任何代码读 `acl_revision` 来做判定**（它只被**递增**、被**回显**、被测试**断言递增**）。代码自己的注释已经把实情写对了（`packages/plugin-wiki/src/index.ts:2469-2472`）。
+    - **结论仍成立、但理由不同**：被批准者**无需重新登录即可见** —— **不是**因为"版本涨了触发失效"，而是因为"**本来就没有缓存可失效**"。
+    - **★ 保留真正那条禁令**：**不要给判定层加 TTL 缓存**（一旦加了，"撤销后仍可见"的窗口立刻复活，而 `acl_revision` **帮不上忙**）。原文里"用 `acl_revision`"属过度声明，保留作留痕。
+    - 已就地订正：§2.3 例子表、§3.3 / §3.4 的 DDL 注释、§4.4 的恢复步骤、§8.2 P2-4 / P3b-6、§9 R5、§9 R10 第 3 条、§9 R13。
+
+26. **★ v8：其余九条就地补正（逐条索引）。** 均为**实现反馈订正**，各自已写在对应章节，此处只做索引，避免两处维护：
+    | # | 事项 | 落点 |
+    |---|---|---|
+    | ① | **§3.6 的迁移落点是错的**：`@geewiki/wiki` 只声明 sqlite 迁移目录（`packages/server/src/index.ts:1405`）⇒ 照原文写，**PG 部署下 `blocks` 表根本不会被建出来**；实际落在 **db 包、两侧成对** | §3.6 的 ★ v8 订正①；§8.1 P3a 行 |
+    | ② | **`tier` 必须内联在 `CREATE TABLE` 里**：SQLite 没有"加列时若已存在则跳过"的语法 ⇒ 独立 `ALTER` 会让迁移**无法重放** | §3.6 的 ★ v8 订正②与 DDL |
+    | ③ | **§9 R9 把 `navOrder.test.ts` 列为"P2 必然触碰"是错的**：它测的是 `packages/web/src/lib/navTree.ts` 的上一篇/下一篇顺序，**与顶栏导航无关**（审查用 `git diff --stat` 证明 diff 长度 0 行）；顶栏的真正守卫是 `navGate` / `navPlan` | §9 R9 的 ★ v8 订正 |
+    | ④ | **config 脱敏的判据被放宽**（且有据）：实现为 **break-glass 或 `orgRole ∈ {owner, admin}`**（`mayReadPluginConfig`，`packages/manager/src/index.ts:1574`）；两条通道都堵（`/api/plugins` + `/api/session` 经 `PluginListFile.enabled[].config`）；**不能改 `snapshotOf()`**（改了会打瞎配置表单） | §8.2 P2 第 14 条 |
+    | ⑤ | **`snippet()` 是静默失败**：实测**返回 `null` 而不报错** ⇒ 用了它又没防护，**高亮会静默变空**，不专门断言高亮内容就发现不了 | §4.3 实测表 + §4.3 的 D5 取舍表 |
+    | ⑥ | **§8.2 的 P2 验收 1–14 全是后端项** ⇒ M5 那批工作**没有设计文档层面的验收标准**（规格来源是实现者的 TODO）；已补 P2 第 15 条 | §8.2 P2 第 15 条（新增） |
+    | ⑦ | **`blocks_fts` 只索引块文本** ⇒ **FTS 路不再按标题匹配**（LIKE 短查询路仍匹配标题）；已由断言钉住（`packages/plugin-search/test/search.test.ts:558`） | §4.3 的 ★ v8 小节 |
+    | ⑧ | **`系统状态`（服务健康 / DB 方言 / 表清单）随 `管理 ▾` 下沉为管理员专属** —— 文档里 `grep 系统状态\|服务健康` **零命中**，规格从未表态；**裁定维持管理员专属**；`GET /api/health` **仍是公共端点**（内联处理、不过闸门，看门狗不受影响） | §6.6 的 ★ v8 小节 |
+    | ⑨ | **§2.3 的"匿名 404 / 已登录 403"与实现有偏差** —— 实现对**所有主体一律 404**；代价是"申请访问"失去自然触发点，申请入口必须由前端在**已知 slug** 的拒绝页提供 | §2.3 例子表的 ★ v8 订正；§2.4 约束第 2 条 |
+    | ⑩ | **§8.2 的 P4 第 6 条按字面无法执行**（`deletePage` 本就要删被删页自己的版本）⇒ 实现落成"**白名单 + 锚定**" | §8.2 P4 第 6 条 |
+
 ---
 
 ## 13. 交付确认
@@ -1935,6 +2217,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - 文中标 **「实测」** 的结论来自对仓库实际执行过的只读 SQLite 探测（使用 `:memory:` 库，未触碰 `data/geewiki.db`）。
 - **★ v6 补充**：上面三条描述的是 **v1–v5 的写作过程**。**v6（本次修订）同样是纯文档改动**（只改本文件、**未动任何代码**）；但 v6 的**依据不再是用户决策**，而是 **P0 阶段的落地实现 + 一轮独立代码审查** —— 详见 §13.4。另需说明：v6 期间仓库里**已经存在 P0 的实现代码**（worktree 分支 `feat/p0-route-auth-guard`），它是本轮**核对的对象**，不是本文档的产出。
 - **★ v7 补充**：**v7 同样是纯文档改动**（只改本文件、**未动任何代码**）；依据是 **P1 / P1.5 阶段的落地实现 + 一次 PostgreSQL 实机试跑**，**仍不是用户决策**。本轮**只读**查阅了实现源码（其中 P1.5 的源码在 worktree `.wt-p15` 里，尚未合入 `main`），**没有运行任何代码、没有执行任何 SQL、没有跑任何迁移、没有复现 PG 试跑** —— 详细的范围与未验证项见 **§13.5**。另需说明：v7 期间仓库里 P0 与 P1 **已合入 `main`**，P1.5 / P2 **正在各自的 worktree 分支上演进** ⇒ 本轮引用的行号**取自核对当时的工作区状态**，可能小幅漂移。
+- **★ v8 补充**：**v8 同样是纯文档改动**（只改本文件与 `docs/design/access-control-handoff.md`、**未动任何代码、未动任何迁移**）；依据是 **P2 / P3a / P3b / P3c / P3d / P4 的落地实现 + 多轮独立审查**，**仍不是用户决策**。与 v6 / v7 的**关键差别**：v8 这一轮**真的跑了验证命令**（`pnpm typecheck` / `pnpm test` / `pnpm build`，结果见 §13.6 的验证基线），并在**合入 `main` 的实现**上**逐条复核了所有新增断言的出处（文件:行号）**；**但没有跑 e2e**（e2e 的数字按"交接文档的编排者记录"引用，**未由本轮复跑**）。详细范围与未验证项见 **§13.6**。另：v8 期间 **P0–P4 全部已合入 `main`**（`main` = `5536bfa`）⇒ 本轮引用的行号取自 **`main` 的提交状态**，不再有"worktree 未定型"的问题。
 
 ### 13.1 ★ v3 修订记录（本次修订；依据 = 用户的三项决定）
 
@@ -2073,5 +2356,82 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
   4. **§8.2 P3a 第 3 / 10 条有一处待复核**：`tier` 一致性探针的报警被 §4.3 挂在 `GET /api/admin/search/verify` 上，而该端点**是否随 `@geewiki/search`（仅 SQLite）提供**文档里从未写明 ⇒ 若是，则 **PG 部署下"静默漏算"的告警没有落点**。本轮**不臆断**，已就地标为待复核。
   5. 全文既有的 `文件:行号` 引用**仍未逐条复核**（继承 §13.3 第 4 条）；v7 只核对了**本次新增内容所引用的行号**。
   6. v7 **未修改 §12 的任何既有条目**（第 1–19 条原文保持），只**新增第 20 / 21 条**并在其现状表里追加两行。
+
+### 13.6 ★ v8 修订记录（依据 = **P2 / P3a–P3d / P4 实现反馈 + 多轮独立审查**，**不是**新的用户决策）
+
+- **本次修订的性质（务必与 §13.1–§13.3 区分）**：**v3 / v4 / v5 是"用户拍板驱动"**；**v6 是"P0 实现 + 独立代码审查"驱动**；**v7 是"P1 / P1.5 实现 + 一次 PG 实机试跑"驱动**；**v8 与它们都不同** —— 它由 **P2 / P3a / P3b / P3c / P3d / P4 的落地实现 + 多轮独立审查**驱动，**没有引入任何新的设计决策**，只做**订正与回写**。
+- **★ 本轮最重要的判断**：这次修订里**只有一条属"安全相关的方向性错误"**（第 1 条），**其余都是"文档与实现不一致"或"文档低估了成本"**。**⇒ 不要把它们当成同等严重的事**；但也**不要因为它只错了一处就轻视** —— 那处错误的方向恰好落在"**匿名能搜到本该受限的内容**"上。
+
+#### 改动清单（四项 + 十一条就地补正）
+
+| # | 改动 | 落点 |
+|---|---|---|
+| 1 | **§2.3 规则 B1 的方向写反 ⇒ 按 `tier` 刻度订正为 `max`**（**安全相关**）：补**真值表**（照抄 `packages/plugin-wiki/src/blocks.ts:220-234`）与"**这不是两种规则，是同一条『只能更窄』的两种刻度**"这句总结；说明**两套刻度方向相反**、**写反会让"页面 org + 块 public"的块拿到 `tier = 0`** ⇒ 匿名在站内搜索里搜得到；给出**权威实现落点**（`tierFor` / `blockLevelOf` / `BlockTier` / `PageLevel` / `RANK_*` 同为窄度刻度）；记录该错误**曾扩散到 4 处代码注释、已全部订正**并给出**复核命令与"不要误判"的判读方法** | **§2.3 规则 B1**（重写）；§2.0 阶梯句；§2.3 的 B2 裁决顺序第 2 步；§4.3 的 `tier` 冗余列段；§9 R13；§12 第 22 条 |
+| 2 | **§4.3 补 P3a 的方言成本**：新增小节「**★ v8：P3a 的方言成本**」—— **三个只在真实 PostgreSQL 上暴露**的缺陷（① 写块靠捕获异常判 `blocks_fts` 存在、只匹配 SQLite 文案；② 缺 `RETURNING id`；③ `deletePage` 的 `DELETE FROM blocks_fts` 无方言守卫），逐条给**现象 / 根因 / 修法 / 订正提交**；记录缺陷 ③ **为何长期未被发现**（e2e 阶段 G/H/I/K 直读 SQLite 文件、PG 下整体跳过）；补**结论性提示**与**两条派生要求** | **§4.3 新增 ★ v8 小节**；§4.3 的"列为非目标"句就地订正；**§8.1 P3a 行**；§12 第 23 条 |
+| 3 | **新增 §4.6「跨阶段不变量 —— 写了 `pages` 的档位，就要补齐子孙 `tier`」**：提为**独立小节**（不再只当 §9 R13 的一条风险）；含**不变量的一句话表述**、**失效过的三次**（含审查复现的具体 slug 与泄漏词 `CHILDUNIQ777` / `DEEPUNIQ999`）、**`continue`/`break` 不对称的根因**、**为什么扇出必须在提交之后**（`pageLevelOf` 走另一条连接、PG MVCC）、**失败升级为一等可观测信号的三件套**（`ResyncReport` / `acl.resync_failed` / `index_tiers_resync_failed`）、**四个调用点**、**验证必须覆盖四条路径**与**红-绿自检证据** | **新增 §4.6**（§4.5 之后）；§4.3 两处；§9 R13（显著加强 + 交叉引用）；§12 第 24 条 |
+| 4 | **其余十条逐条补正**（含一条"实现偏离"的措辞订正） | 见下方"就地补正清单"与 **§12 第 26 条** |
+
+#### 就地补正清单（第 4 项的展开）
+
+1. **§3.6 的迁移落点是错的**：`@geewiki/wiki` 的迁移目录**只声明了 sqlite**（`packages/plugin-wiki/src/index.ts:112` 的 `WIKI_MIGRATIONS_DIR` → `packages/server/src/index.ts:1405` 的 `builtinMigrations(wikiManifest, { sqlite: … })`）⇒ 照原文写，**PG 部署下 `blocks` 表根本不会被建出来**。实际落在 **db 包、两侧成对**（`packages/db-sqlite/src/migrations/0015_blocks.sql` 与 `packages/db-postgres/migrations/0015_blocks.sql`）。
+2. **`tier` 必须内联在 `CREATE TABLE` 里**（不是另起 `ALTER TABLE … ADD COLUMN`）：SQLite 没有"加列时若已存在则跳过"的语法 ⇒ 独立 `ALTER` 会让迁移**无法重放**。§3.6 的 DDL 已按实情改正（该列已从 `ALTER` 移到 `CREATE TABLE` 内，并保留"故意不给默认值"的理由）。
+3. **§9 R9 写错**：把 `navOrder.test.ts（导航合并）` 列为"P2 必然触碰" —— 该文件测的是 `packages/web/src/lib/navTree.ts` 的**上一篇/下一篇顺序**（`packages/web/test/navOrder.test.ts:11`），**与顶栏导航无关**（审查用 `git diff --stat` 证明其 diff 长度 **0 行**）。**顶栏导航真正的守卫是 `packages/web/test/navGate.test.ts` 与 `navPlan.test.ts`。**
+4. **config 脱敏的判据被放宽（有据）**：文档只写 break-glass，实现为 **break-glass 或 `orgRole ∈ {owner, admin}`**（`packages/manager/src/index.ts:1574-1579` 的 `mayReadPluginConfig`）。**理由**：写文档原文时（P1）还没有真实角色，`org_members` 是 P2 才建的；只认 break-glass 会让**登录为 owner 的管理员拿不到 `config`、配置表单无法回填**；放宽**不重新打开匿名泄漏**。**两条通道都必须堵**：`GET /api/plugins` 与 `GET /api/session`（后者经 `PluginListFile.enabled[].config`）；且**不能改 `snapshotOf()`**（改了会打瞎配置表单）⇒ 裁剪做在**路由层**（`withoutPluginConfig` `:1582` / `withoutListConfig` `:1587`）。**另记**：文档里的函数名 `redactConfig` 在仓库里**零命中**，定位请用上述三个真实名字。
+5. **`snippet()` 是静默失败**：文档写"不可用"，实测是**返回 `null` 而不报错** ⇒ 若实现里用了它且没防护，**高亮会静默变空**，**测试不专门断言高亮内容就发现不了**。
+6. **§8.2 的 P2 验收 1–14 全是后端项** ⇒ M5 那批工作**没有设计文档层面的验收标准**（其规格来源是**实现者留下的 TODO**）。已补 **P2 第 15 条**（前端 IA，含 ①–⑤ 与已知未完成项）。
+7. **`blocks_fts` 只索引块文本** ⇒ **FTS 路不再按标题匹配**（**LIKE 短查询路仍匹配标题**）。这是 §4.3 SQL 形态的直接后果，已被断言钉住（`packages/plugin-search/test/search.test.ts:558`、`:575`）。
+8. **`系统状态`（服务健康 / DB 方言 / 表清单）随 `管理 ▾` 下沉为管理员专属** —— 文档里 `grep 系统状态\|服务健康` **零命中**（规格从未表态，属**文档缺口**而非实现偏离）。**编排者裁定：维持管理员专属**（内容是运维细节，与所在分组的"运维台面"语义一致）。**`GET /api/health` 本身仍是公共端点**（`HEALTH_PATH` 在 `packages/server/src/index.ts:583` 内联处理、**不过 `access` 闸门**），看门狗不受影响。
+9. **§2.3 的"匿名 404 / 已登录 403"与实现有偏差**：实现对**所有主体一律 404**（区分 404/403 等于提供一个**匿名可用的存在性探测接口**）。这个选择**更严**，但**代价是"申请访问"失去自然触发点**（用户拿到 404 时分不清"无权"还是"不存在"）⇒ 申请入口必须由前端在**已知 slug** 的拒绝页 / 受限块占位文案上提供。
+10. **§8.2 的 P4 第 6 条按字面无法执行**：原文要求"代码中**无**删除 `page_versions` 行的路径"，但 `deletePage` 本就要删掉**被删页自己的**版本（**页面生命周期级联**，与 D11 反对的"保留策略清理"是两回事）。**按字面写会让守卫与既有合法代码冲突、然后被人放宽 —— 那等于没有守卫。** 实现落成"**白名单 + 锚定**"：只允许**一处**、且必须**锚定在 `deletePage` 内**（`packages/plugin-authz/test/audit-appendonly.test.ts:121` 起；扫描正则 `:131`、前置断言 `:132`、锚定断言 `:153-154`）。
+11. **（实现偏离，措辞订正）`acl_revision` 全仓无读取方** ⇒ 文档与代码注释里"判定单点按 `acl_revision` 做**代际失效**"属**过度声明**。`packages/plugin-authz` **没有决策缓存、每请求现查库** ⇒ 结论（**被批准者无需重新登录即可见**）**仍然成立，但理由不同**：**不是**"版本涨了触发失效"，而是"**本来就没有缓存可失效**"。**保留真正那条禁令：不要给判定层加 TTL 缓存。** 已订正 §2.3 例子表、§3.3 / §3.4 DDL 注释、§4.4 恢复步骤、§8.2 P2-4 / P3b-6、§9 R5（前端 `pagesStore` 其实**不会**因权限变更自动失效 —— 触发点是 `login`/`logout` 与写操作之后的**显式失效**）、§9 R10 第 3 条、§9 R13。
+
+#### 进度事实（v8 核对当时）
+
+- **`main` = `5536bfa`**（提交信息：`merge(ops): P4 审计与运维闭环 —— 越权告警、会话管理与过期回收`）。
+- **已合入 `main`**：**P0 / P1 / 文档 v7 / P1.5 / P2（含 M5 前三项）/ P3a / P3b / P3c / P3d / P4** —— 即**本文档 §8.1 阶段表里的全部阶段**。
+- **★ 仍未做的项（诚实列出，不是"已完成"）**：
+  1. **M5** 的**红链三步态 `exists: 'hidden'`**（设计 §6.6 / §5.5 要求保留，本批未实现）；
+  2. **P4** 的**反向展开**（"谁能看这条"：直接授予 / 祖先链收紧 / 组织角色覆盖三条来源）；
+  3. **P4** 的**运维动作**：门户缓存清理提示（`s-maxage=300` ⇒ 收紧后需"清缓存 + 重新抓取"）、`/sitemap.xml` 与匿名可见集合的**集合差核对入口**；
+  4. **`invitations.expires_at` 的回收**（本轮只做了 `page_grants`；`invitations` 在 `packages/plugin-org`）；
+  5. **审计页与会话管理页的前端界面** —— 两者**都只有后端端点**，未接界面；
+  6. **CodeMirror 内的标记语法高亮 / 自动补全**（P3d 的标记书写体验部分）。
+
+#### 验证基线（★ v8 本轮**实际复跑**的三条；e2e 未复跑）
+
+| 命令 | 结果 | 谁跑的 |
+|---|---|---|
+| `pnpm typecheck` | **exit 0**（**17 个包**，全部有 `typecheck` 脚本） | **v8 本轮实测** |
+| `pnpm test` | **870 例 / 870 通过 / 0 失败**（各包 `# pass` 求和） | **v8 本轮实测** |
+| `pnpm build` | **exit 0** | **v8 本轮实测** |
+| 六条 e2e **共 282 项断言零失败**：`e2e-p1` **38** / `e2e-p15` **44** / `e2e-p2-org` **44** / `e2e-p2` **34** / `e2e-p3a` **85 / 0 / 0**（SQLite）/ `e2e-p4` **37** | — | **未由 v8 复跑**，按**交接文档的编排者记录**引用 |
+
+> **⚠️ e2e 那一行必须这样读**：它**不是**本轮核验过的事实，而是**编排者的记录**（与 §13.5 处理"791 例"的方式一致）。**⇒ 需要复现时按 `docs/design/access-control-handoff.md` 的"验证基线（复现用）"一节跑**。
+
+#### ★ 方法学事实（本次新增，必须留痕）
+
+- **★ 两条"只在交界处存在"的缺陷，同一个成因**：跨阶段不变量漏扇出（第 3 项，失效三次）与 `blocks_fts` 的方言守卫漏一处（第 2 项，缺陷 ③）**都是"每个阶段各自看自己那一段都对"的缺陷**。
+  **⇒ 可复用的两条经验**：① **凡新增一条写共享状态的路径，都要问"谁还要跟着变"**；② **凡新增一个"靠直读 SQLite 文件断言"的 e2e 阶段，都要同时给出方言中立（纯 HTTP）的替代断言** —— 否则该阶段在 PG 下被整体跳过时，**不会有任何信号告诉你它没跑**（这正是缺陷 ③ 藏了整整一个阶段的原因）。
+- **★ "断言自己会骗人"的实例（本批踩到多次）**：`index_tiers_resynced: 0` 有**两种含义**（没有子孙 / 扇出整个失败），**没有 `index_tiers_resync_failed` 就不可区分** ⇒ 已把失败升级为可观测信号（§4.6）。同类的还有：e2e 阶段 H 曾按"`tier=0` 的行数"断言（**库里有合法的 `tier=0` 块即假绿**）、夹具的空 `catch {}` 会吞掉真错误而**照绿**（`1d608a6`）。
+- **★ 文档注释本身会成为错误的传播媒介**：第 1 条那处错误**正是从本文档抄进 4 处代码注释的**，而"照注释去修正实现"会**直接造出泄漏**。
+  **⇒ 可复用的经验**：**引用设计的注释必须写明"哪一份是权威、以及为什么"**，否则注释会先于代码老化。
+
+#### 本次修订的核对方式（与 v6 / v7 同源，但范围更大）
+
+- **只读**通读了 `main`（`5536bfa`）上的实现：`packages/plugin-wiki/src/blocks.ts`、`packages/plugin-wiki/src/index.ts`、`packages/plugin-authz/src/index.ts`、`packages/manager/src/index.ts`、`packages/plugin-search/src/index.ts` 及其迁移、`packages/plugin-search/test/search.test.ts`、`packages/plugin-authz/test/audit-appendonly.test.ts`、`packages/plugin-wiki/test/e2e-p3a.sh`、`packages/web/src/App.tsx`、`packages/web/test/navOrder.test.ts`、`packages/db-sqlite/src/migrations/0015_blocks.sql`、`packages/db-postgres/migrations/0015_blocks.sql`。
+- **全仓 grep 复核**：`min(`（含 `Math.min` / `least(`）在迁移与源码里的**全部**出现处；`acl_revision` 的**每一处**出现并逐条分类（列定义 / 递增 / 回显 / 注释 —— **无一处是"读取后用于判定"**）；`snippet(`；`系统状态|服务健康`；`redactConfig|mayReadPluginConfig|withoutPluginConfig|withoutListConfig`；`resync|ResyncReport|index_tiers_resync_failed`；`RANK_PUBLIC|RANK_ORG|RANK_PRIVATE`。
+- **跑过三条命令**（见上表）并**核对 git 历史**（`ade59ef` / `1d608a6` 的改动范围与先后关系、`96891db` / `e941da5` / `a3d72b7` / `9699aa7` / `2b5f13d` 的存在性）。
+- **★ 只改两个文档文件、未动任何代码**（约束与本轮任务书一致）。
+
+#### ★ 未验证项（诚实声明）
+
+1. **e2e 未复跑**（见上表）。六条 e2e 的断言数与"零失败"结论**来自交接文档的记录**，**不是本轮核验的事实**。
+2. **PG 侧的运行时端到端只覆盖了部分**：三个方言缺陷的**修法与根因**是本轮**读源码 + 读提交信息**核实过的，但**本轮没有起 PG 实例复现**（约束：只改文档）；`grants/purge` 等端点**未在 PG 上跑过**（见交接文档的"未验证项"）。
+3. **真实浏览器交互从未验证**：所有端到端都是 `curl`；前端只有类型检查、守卫测试与 SSR 测试。§8.2 新增的 P2 第 15 条（前端 IA）因此**不是"已验证的验收"**，而是**回写整理的判据**，其中两项**已知未完成**（`capabilities` 不随角色变更刷新、红链 `'hidden'` 未实现）。
+4. **`plugin-org` / `plugin-authz` 与 P3a / P3c 新增的辅助函数无单元测试**，**只由 e2e 覆盖**。
+5. **多实例部署必然失败**（OIDC 流程状态存进程内，**失败关闭方向**）—— 设计层面已记录，**未验证**。
+6. **全文既有的 `文件:行号` 引用仍未逐条复核**（继承 §13.3 第 4 条、§13.5 第 5 条）；v8 只核对了**本次新增内容所引用的行号**。
+7. **v8 未修改 §12 的任何既有条目**（第 1–21 条原文保持），只**新增第 22–26 条**并在其现状表里追加五行。
+
 
 
