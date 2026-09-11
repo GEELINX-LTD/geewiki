@@ -1049,7 +1049,21 @@ export const WikiPlugin = {
          * 检索查询会 JOIN `blocks`，所以孤儿行不会产出命中，但会**留着正文文本**，
          * 并让 `/api/admin/search/verify` 的 `extra` 计数非零。先删索引再删页。
          */
-        await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [page.id])
+        /*
+         * ⚠️ **必须受方言守卫**：`blocks_fts` 由 `@geewiki/search` 的迁移建立，是
+         * **FTS5 / SQLite 专有**表 —— PG 上它根本不存在。不加 `blocksIndexSupported`
+         * 就会直接抛 `relation "blocks_fts" does not exist`，而 PG 的事务一旦报错即进入
+         * aborted 状态、后续语句一律失败 ⇒ **在 PostgreSQL 上删除任何页面都返回 500，
+         * 且页面删不掉**（事务整体回滚）。
+         *
+         * 这个缺陷是新增的「阶段 L」方言中立断言抓到的（`deletePage` 此前从未在 PG 上被
+         * 端到端跑到过）—— 正是"块模型的 PG 可用性不由类型系统保证，必须有真方言 e2e 兜底"
+         * 的又一例。`blocks.ts` 那边靠调用方传 `syncIndex: blocksIndexSupported` 已经是
+         * 安全的，只有这里漏了。
+         */
+        if (blocksIndexSupported) {
+          await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [page.id])
+        }
         await tx.run('DELETE FROM pages WHERE id = ?', [page.id])
         await tx.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
         return true

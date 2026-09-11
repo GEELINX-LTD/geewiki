@@ -289,6 +289,31 @@ else
 fi
 
 echo
+echo "=== 阶段 L：扇出在**两种方言**下都要跑通（纯 HTTP 断言，不读 SQLite 文件）==="
+# 为什么单独有这一段：G/H/I/K 都靠直读 SQLite 文件核对 tier ⇒ 在 PG 下**整体跳过**，
+# 结果是"PG 上没有任何用例验证扇出真的跑通了"。而扇出正是 PG 上修过缺陷的地方
+# （方言语义判定 + `RETURNING id`）。这一段只用 HTTP 可见的信号，故两种方言都跑：
+#   - 响应里的 `index_tiers_resynced`（触到了几个子孙）与 `index_tiers_resync_failed`
+#   - `blocks/verify` 的 `tier_mismatched`（扇出没跑成 ⇒ 陈旧 tier ⇒ 大于 0）
+#
+# ⚠️ slug 带**每轮唯一**的后缀：PG 模式复用持久库（`geewiki_e2e_clean`）⇒ 用固定 slug
+#    时第二次跑会拿 `outcome: 'updated'`（页面已存在），而 `indexTiersResync` 只在
+#    `created` 时出现 ⇒ 断言会假红。这是**夹具不幂等**，不是产品缺陷。
+LNS="$$"
+check "L1 新建子页 → 200" "200" "$(put_page "fanout$LNS/x/y" '扇出测试子页')"
+check "L2 新建**祖先**（它让已有子页被收紧）→ 200" "200" "$(put_page "fanout$LNS/x" '扇出测试父页')"
+check_ge "L3 新建路径：扇出确实触到了子孙（index_tiers_resynced≥1）" "$(field index_tiers_resynced)" 1
+check "L4 新建路径：扇出未失败（index_tiers_resync_failed=false）" "false" "$(field index_tiers_resync_failed)"
+check "L5 改档位 → 200" "200" "$(set_vis "fanout$LNS/x" '{"visibility":"private"}')"
+check_ge "L6 改档位路径：扇出触到了子孙（≥1）" "$(field index_tiers_resynced)" 1
+check "L7 改档位路径：扇出未失败" "false" "$(field index_tiers_resync_failed)"
+check "L8 删除祖先 → 200" "200" "$(sess DELETE "/api/pages/$(urlenc "fanout$LNS/x")")"
+# 删除路径的响应不带扇出计数，但**扇出没跑成**会留下陈旧的 tier ⇒ 探针必须报 0
+sess GET /api/admin/blocks/verify >/dev/null
+check "L9 删除后 tier 仍全部一致（证明删除路径的扇出跑成了）" "0" "$(field tier_mismatched)"
+check "L10 且块↔正文也一致" "0" "$(field mismatched)"
+
+echo
 echo "=== 阶段 G：tier 重算扇出 —— 页面档位一变，本页与整棵子树的 tier 都要跟着变 ==="
 if [[ "$PG_MODE" == "1" ]]; then
   skip "G：本阶段直接读写 SQLite 文件核对 tier，PG 下需另写 psql 路径（未做）"
