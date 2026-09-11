@@ -31,7 +31,15 @@ import {
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
-import { sha256Hex, syncBlocksForPage, type PageLevel } from './blocks.js'
+import {
+  parseBlocks,
+  projectBlocks,
+  sha256Hex,
+  syncBlocksForPage,
+  type BlockVisibility,
+  type PageLevel,
+  type ReaderTier,
+} from './blocks.js'
 
 /**
  * `policy-service` 的**最小结构需求**（结构化类型，刻意不 import `@geewiki/authz`）。
@@ -254,6 +262,43 @@ export const manifest: GeeWikiManifest = {
     // 将来若真做出 wiki 的界面产物，把 `client` 加回来即可 —— 契约与入口表机制
     // （`GeeWikiClient` 类型、`GET /api/plugins/ui`）都未改动。
   },
+}
+
+/**
+ * ★ P3a：把某页正文投影成**该主体可见的样子**（受限块替换为显式占位）。
+ *
+ * 三条要点，每条都对应一个具体的失败模式：
+ *
+ * 1. **优先读 `blocks` 表**（P3a 起由 `syncBlocksForPage` 在写入事务里维护）。
+ * 2. **`blocks` 为空时现场解析 `pages.content`** —— P3a 之前保存的历史页面没有块行，
+ *    若此时直接返回 `page.content`，那些页面里可能存在的受限区段就会被**原样吐出**。
+ *    **读路径不能依赖"写入路径已经跑过"**：那是可被绕过的假设（旧数据、直接改库、
+ *    迁移未回填都能让它不成立），而它一旦不成立就是泄漏。
+ * 3. **读者等级只看组织角色**：匿名 = `0`，有组织角色 = `1`。`granted` 档由
+ *    `projectBlocks` 判为永不命中（授权分支 `block_grants` 属 P3b）—— 失败关闭。
+ *
+ * 与检索的分工：`blocks.tier` 管"搜不搜得到"，这里管"读不读得到"；两者共用
+ * `blockLevelOf` 的判据，写反方向会让"搜不到但读得到"成为泄漏。
+ */
+async function projectPageContent(
+  db: { query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> },
+  args: { pageId: number; content: string; principal: Principal },
+): Promise<{ text: string; gatedCount: number }> {
+  const rows = await db.query<{ ordinal: number; text: string; visibility: string }>(
+    'SELECT ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
+    [args.pageId],
+  )
+  const blocks =
+    rows.length > 0
+      ? rows.map((r) => ({
+          ordinal: r.ordinal,
+          text: r.text,
+          visibility: r.visibility as BlockVisibility,
+        }))
+      : parseBlocks(args.content)
+  const anonymous = args.principal.kind === 'anonymous'
+  const tier: ReaderTier = anonymous ? 0 : 1
+  return projectBlocks(blocks, { tier, anonymous })
 }
 
 interface PageRow {
@@ -561,6 +606,18 @@ export const WikiPlugin = {
       if (access.level === 'none') return undefined
       const page = (await adb.query<PageRow>('SELECT * FROM pages WHERE slug = ?', [slug]))[0]
       if (!page) return undefined
+      /*
+       * ★ P3a：**正文必须按读者等级投影后才能进响应体**（§2.4 约束 1、§5）。
+       *
+       * 位置很关键：在 `resolvePage` 判定之后、**在构造详情对象之前**。放到构造之后再
+       * "想办法删掉"正是最容易漏的形式 —— 那时原文已经进了对象，任何一条提前 return
+       * 都会把它带出去。
+       */
+      const projectedContent = await projectPageContent(adb, {
+        pageId: page.id,
+        content: page.content,
+        principal,
+      })
       const versions = await adb.query<{ id: number; saved_at: string }>(
         `SELECT id, saved_at FROM page_versions WHERE page_id = ? ORDER BY id DESC LIMIT ?`,
         [page.id, recentLimit],
@@ -579,7 +636,9 @@ export const WikiPlugin = {
       const detail: WikiPageDetail = {
         slug: page.slug,
         title: page.title,
-        content: page.content,
+        // ★ P3a：**投影后的**正文，不是 `page.content`。受限块在这里已经被替换成占位，
+        // 原文从未进入这个对象 ⇒ 也就不可能出现在任何响应分支里。
+        content: projectedContent.text,
         created_at: page.created_at,
         updated_at: page.updated_at,
         // **必须 Number() 强转**：`pg` 把 `COUNT(*)`（bigint）作为**字符串**返回以避免精度丢失，

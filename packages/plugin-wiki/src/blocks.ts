@@ -327,6 +327,93 @@ export async function syncBlocksForPage(
   return parsed
 }
 
+/* ------------------------------ 服务端正文投影 ------------------------------ */
+
+/**
+ * 读者等级 —— 与 {@link BlockTier} **同刻度**（`0` = 匿名读者，`1` = 组织成员）。
+ *
+ * 与 `BlockTier` 的区别只是语义方向：那个描述"这个块要求谁"，这个描述"你是哪一档"。
+ * 两者**必须同刻度**，否则 `<=` 比较会静默反向（把"更严"读成"更宽松"）。
+ */
+export type ReaderTier = 0 | 1
+
+/** 投影的输入：块的最小形状（`ParsedBlock` 与 `blocks` 表的行都满足）。 */
+export interface ProjectableBlock {
+  ordinal: number
+  text: string
+  visibility: BlockVisibility
+}
+
+export interface ProjectedContent {
+  /** 该读者可见的正文；受限块被替换为**显式占位**（不是删掉，也不是留下原文） */
+  text: string
+  /** 被裁剪掉的块数。**仅计数**，不含任何内容、标题或字数 */
+  gatedCount: number
+}
+
+/**
+ * ★ P3a 的**服务端正文投影**：把块序列按读者等级拼回 Markdown。
+ *
+ * ## 为什么必须在服务端做（§2.4 约束 1、§5）
+ *
+ * 数据一旦进入响应体，"前端隐藏"就只是装饰 —— DevTools、`curl`、SSR 载荷、CDN 缓存、
+ * 访问日志任一条路都能拿到原文。所以受限块的 `text` 必须**在序列化之前就不存在**，
+ * 客户端拿到的只有占位。这是"服务端裁剪"与"前端隐藏"的分界，也是本函数的全部意义。
+ *
+ * ## 与检索的关系
+ *
+ * `blocks.tier` 那一列管"**搜不搜得到**"，本函数管"**读不读得到**"。两者必须用同一条
+ * 判据（{@link blockLevelOf}）—— 否则会出现"搜不到但读得到"（读路径漏过滤）或
+ * "读得到但搜不到"（索引算错），前者是泄漏、后者是体验缺陷。
+ *
+ * ## 判据只看块自身的 `visibility`
+ *
+ * 页面级可见性由 `policy-service.resolvePage` 在此之前判定完毕（`level === 'none'`
+ * 早已 404）。所以到这里只需问"**这个块**对**这个读者**是否可见"。
+ * `granted` 档的 `blockLevelOf` 返回 `null` ⇒ 等级分支**永不命中**，只能靠授权分支
+ * （`block_grants`，属 P3b）。P3a 阶段还没有授权表，故 `granted` 块对所有人不可见 ——
+ * 这是**失败关闭**，方向正确（宁可少给，不可多给）。
+ */
+export function projectBlocks(
+  blocks: readonly ProjectableBlock[],
+  reader: { tier: ReaderTier; anonymous: boolean },
+): ProjectedContent {
+  const out: string[] = []
+  let gatedRun = 0
+  let gatedCount = 0
+
+  /*
+   * 连续受限块**合并成一个占位**。
+   *
+   * 为什么不是每块一个：那样"这里有 5 段受限内容"会渲染成 5 行重复文案，噪音大；
+   * 更要紧的是**行数会随作者的分段方式变化**，而分段方式是结构信息 —— 占位不该泄露它。
+   * 合并之后，占位只泄露"这里有一段（若干块）受限内容"这一个事实。
+   */
+  const flushGated = (): void => {
+    if (gatedRun === 0) return
+    // 措辞按**读者**而非**内容**选择：匿名读者给可行动的"需登录"，
+    // 已登录读者给"需更高权限"。这样既不泄露受限内容的档位（org 还是 granted），
+    // 又让匿名访客知道该做什么。
+    const suffix = reader.anonymous ? '需登录查看' : '需更高权限查看'
+    out.push(`> 🔒 此处有 ${gatedRun} 段内容${suffix}`)
+    gatedRun = 0
+  }
+
+  for (const b of blocks) {
+    const level = blockLevelOf(b.visibility)
+    if (level !== null && level <= reader.tier) {
+      flushGated()
+      out.push(b.text)
+    } else {
+      gatedRun += 1
+      gatedCount += 1
+    }
+  }
+  flushGated()
+
+  return { text: out.join('\n\n'), gatedCount }
+}
+
 /** 本模块需要的执行器形状（`DatabaseExecutor` 的结构子集，便于测试替身）。 */
 export interface BlockWriter {
   run(sql: string, params?: readonly unknown[]): Promise<{ changes: number; lastInsertRowid: number | bigint }>
