@@ -122,8 +122,13 @@ check "C1b 身份正确" "owner@example.com" "$(field user.email)"
 check "C2 登录后 PUT /api/pages（写能力恢复）→ 200" "200" \
   "$(code PUT /api/pages/p1-doc '{"title":"P1 文档","content":"正文"}')"
 check "C3 登录后 GET /api/auth/me → 200" "200" "$(code GET /api/auth/me)"
-check "C3b orgRole 在 P1 恒为 null（角色存储属 P2）" "null" "$(field user.orgRole)"
-check "C3c capabilities.administer 为 false" "false" "$(field capabilities.administer)"
+# ★ 期望值在 P2 合入后变化（不是回归，是设计要的行为变化）：
+#   P2 的 setup 会在同一事务里写入 setup 者的 owner 成员行（设计文档 §3.2 的 `org_members`），
+#   因此 `orgRole` 由 P1 阶段的恒 `null`（当时角色无处持久化）变为 `owner`，
+#   对应的 `capabilities.administer` 也由 `false` 变为 `true`（P2 交付内容明确包含
+#   "解除 P1 遗留后果：管理台写操作对 owner/admin 恢复可用"）。
+check "C3b setup 后 setup 者即为 owner" "owner" "$(field user.orgRole)"
+check "C3c owner 具备 administer 能力" "true" "$(field capabilities.administer)"
 
 check "C4 已登录时 GET /api/auth/state → authenticated=true" "true" \
   "$(code GET /api/auth/state >/dev/null; field authenticated)"
