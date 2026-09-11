@@ -158,6 +158,15 @@ export interface WikiSaveInput {
 export interface WikiSaveResult {
   outcome: 'created' | 'updated' | 'unchanged'
   version: number
+  /**
+   * 仅 `outcome === 'created'` 时可能出现：新建的页可能**成为已有页的祖先**（slug 前缀），
+   * 于是那些子孙的有效档位被收紧，必须重算它们的 `blocks.tier`（否则检索仍按旧档位 ⇒
+   * 读路径 404 而检索命中，属内容泄漏级）。
+   *
+   * `resynced` 与 `failed` 必须分开看：`resynced === 0 && !failed` 是"没有子孙"（正常），
+   * 而 `failed === true` 是"扇出抛错、一个都没算"（**必须处置**）。
+   */
+  indexTiersResync?: { resynced: number; failed: boolean; error?: string }
 }
 
 /** 反向链接项：**引用**了某页的页面（对应 GET /api/pages/:slug/backlinks 的单项） */
@@ -975,8 +984,32 @@ export const WikiPlugin = {
             [slug],
           )
         )[0] as unknown as { n: number }
+      /*
+       * ★ 新建的页可能**成为已有页的祖先**（slug 前缀）⇒ 那些子孙的有效档位被收紧，
+       * 而它们的 `blocks.tier` 是物化值、不会自己变。不重算就是**内容泄漏级**：
+       * 读路径已经 404（判定按前缀实时算），检索却仍按旧 tier 命中并吐出正文片段。
+       *
+       * 实测复现（审查给出）：建 `a/b`（public + published）→ 匿名读 200、匿名搜 total=1；
+       * 再 `PUT /api/pages/a`（默认 org）→ 匿名读 `a/b` 404，但匿名 `/api/search` 仍
+       * `total:1` 且响应体里出现该页的唯一词。
+       *
+       * **为什么只能在提交之后**：`pageLevelOf` 走策略层（另一条连接读 `pages`），
+       * PG 的 MVCC 下它看不到本事务未提交的插入 ⇒ 在事务内算会漏掉刚建的这个祖先，
+       * 等于没修。
+       */
+      const indexTiersResync =
+        outcome === 'created' ? await resyncDescendantsReporting(slug) : undefined
       // 同上：PG 的 COUNT(*) 是字符串，必须强转（否则 "1"+1 → "11"）
-      return { outcome, version: Number(version.n) + 1 }
+      const versionNo = Number(version.n) + 1
+      /*
+       * ⚠️ **键要条件构造**，不能写成 `{ outcome, version, indexTiersResync }` ——
+       * 后者在非 `created` 时会留下一个"存在但值为 `undefined`"的自有属性，
+       * 而 `assert.deepEqual` 与 `deepStrictEqual` **都会**把这个键算作差异
+       * （表现是 expected/actual 打印出来一模一样却断言失败，极难看出原因）。
+       */
+      return indexTiersResync === undefined
+        ? { outcome, version: versionNo }
+        : { outcome, version: versionNo, indexTiersResync }
     }
 
     /**
@@ -988,8 +1021,24 @@ export const WikiPlugin = {
      * 需引用方重新保存一次。选择"清两侧"是为了让索引与"页面存在"这一事实保持一致，
      * 不让索引里长期留有指向已删页面的边。
      */
-    const deletePage = (slug: string): Promise<boolean> =>
-      adb.transaction(async (tx) => {
+    /*
+     * ★ 删除同样要扇出，而且是**两条**独立的理由：
+     *
+     * 1. 被删页可能是别人的祖先 ⇒ 那些子孙的有效档位可能**变宽**（少了本页的收紧）。
+     * 2. 更阴的一条：被删页可能是**断链点**（`inherit = 0`）。策略层的 `effectiveRank`
+     *    对"祖先不存在"是 `continue`、对"`inherit !== 1`"才是 `break` —— 于是删掉断链点后，
+     *    更上层**更严**的祖先会重新开始压制，子孙的 rank 反而**变窄**。
+     *    这个 `continue`/`break` 的不对称是刻意的（缺失祖先不压制、断链才截断），
+     *    要修的是"档位变了要重算 tier"这条链，不是那个语义。
+     *
+     * 实测复现（审查给出）：`a`=private(inherit=1)、`a/b`=public+published+**inherit=0**、
+     * `a/b/c`=public+published ⇒ 匿名读 `c` 200、搜得到；`DELETE /api/pages/a%2Fb` 后
+     * ⇒ 匿名读 `a/b/c` **404**，但匿名搜仍 `total:1`、唯一词出现在响应体里。
+     *
+     * 同样必须在**提交之后**跑：策略层读的是另一条连接，PG 下看不到未提交的删除。
+     */
+    const deletePage = async (slug: string): Promise<boolean> => {
+      const deleted = await adb.transaction(async (tx) => {
         const page = (await tx.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
         if (!page) return false
         await tx.run('DELETE FROM page_versions WHERE page_id = ?', [page.id])
@@ -1005,6 +1054,9 @@ export const WikiPlugin = {
         await tx.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
         return true
       })
+      if (deleted) await resyncDescendantsReporting(slug)
+      return deleted
+    }
 
     /** 服务方法共用：卸载后任何仍持有 svc 引用的调用都应显式报错，而非返回空结果 */
     let disposed = false
@@ -1152,8 +1204,29 @@ export const WikiPlugin = {
           }
           throw err
         }
-        const { outcome, version } = result
-        h.json(200, { ok: true, slug, title: save.title, outcome, version })
+        const { outcome, version, indexTiersResync } = result
+        h.json(200, {
+          ok: true,
+          slug,
+          title: save.title,
+          outcome,
+          version,
+          /*
+           * ★ 仅 `outcome === 'created'` 时出现（见 `WikiSaveResult.indexTiersResync`）：
+           * 新建的页可能成为已有页的祖先，那些子孙的 `blocks.tier` 必须重算。
+           * `index_tiers_resync_failed: true` 表示**扇出整个失败**（内容泄漏级），
+           * 与 `index_tiers_resynced: 0`（没有子孙，正常）是两件事 —— 调用方必须分开判。
+           */
+          ...(indexTiersResync === undefined
+            ? {}
+            : {
+                index_tiers_resynced: indexTiersResync.resynced,
+                index_tiers_resync_failed: indexTiersResync.failed,
+                ...(indexTiersResync.error === undefined
+                  ? {}
+                  : { index_tiers_resync_error: indexTiersResync.error }),
+              }),
+        })
       }, { access: 'user' }),
     )
 
@@ -1251,6 +1324,49 @@ export const WikiPlugin = {
         }
         return touched
       })
+    }
+
+    /**
+     * 扇出的**结果**：把"没重算"与"重算失败"分开。
+     *
+     * 为什么需要这一层：`resynced === 0` 本身是**歧义**的 —— 它既可能是
+     * "该页没有子孙"（完全正常），也可能是"扇出抛错、一个都没算"（**内容泄漏级**：
+     * 祖先收紧没传导到子孙的 `tier`，于是读路径 404 而检索仍命中并吐出正文片段）。
+     * 调用方拿到一个裸数字时无法区分这两者，而它们的处置完全不同。
+     */
+    interface ResyncReport {
+      resynced: number
+      failed: boolean
+      error?: string
+    }
+
+    /**
+     * 跑扇出并把失败**升级为一等可观测信号**（响应字段 + 审计行），而不是只打一行 warn。
+     *
+     * 为什么失败不回滚、不抛给调用方：档位变更**已经提交且是用户要的结果**，
+     * 为了一个派生的索引列去回滚用户的操作是本末倒置。正确做法是让偏差**可发现**：
+     * 响应里带 `index_tiers_resync_failed`、审计里留 `acl.resync_failed`、
+     * 并由 `GET /api/admin/blocks/verify` 的 `tier_mismatched` 长期盯住。
+     */
+    const resyncDescendantsReporting = async (slug: string): Promise<ResyncReport> => {
+      try {
+        return { resynced: await resyncDescendantTiers(slug), failed: false }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        console.warn(
+          '[@geewiki/wiki] 子孙块的 tier 重算失败（检索可能仍按旧档位，属内容泄漏级，' +
+            `须用 /api/admin/blocks/verify 核对并重算）: slug=${slug}`,
+          err,
+        )
+        // 审计是持久信号：日志会被轮转，审计行不会
+        void writeAuditLog(adb, {
+          action: 'acl.resync_failed',
+          targetKind: 'page',
+          targetId: slug,
+          after: { error: message },
+        }).catch((e: unknown) => console.error('[@geewiki/wiki] 扇出失败的审计写入也失败了:', e))
+        return { resynced: 0, failed: true, error: message }
+      }
     }
 
     /**
@@ -1398,15 +1514,12 @@ export const WikiPlugin = {
         /*
          * 祖先的档位会传导到整棵子树（§9 R13）。放在提交**之后**：
          * `pageLevelOf` 走策略层，PG 下读不到本事务里未提交的那次 UPDATE。
+         *
+         * 失败**不回滚**已提交的档位变更（那是用户要的结果），但必须**可观测** ——
+         * 见 `resyncDescendantsReporting`：它把失败升级成响应字段 + 审计行，
+         * 因为"重算了 0 个子孙"与"扇出整个失败"是两件处置完全不同的事。
          */
-        let resynced = 0
-        try {
-          resynced = await resyncDescendantTiers(slug)
-        } catch (err) {
-          // 不回滚已提交的档位变更：那是用户要的结果。tier 的偏差由
-          // `GET /api/admin/blocks/verify` 的 tier 检查显式报出，不靠静默。
-          console.warn('[@geewiki/wiki] 子孙块的 tier 重算失败（检索可能仍按旧档位）:', err)
-        }
+        const resync = await resyncDescendantsReporting(slug)
 
         // 审计：只记档位与发布状态，**不含正文**
         void writeAuditLog(adb, {
@@ -1426,7 +1539,11 @@ export const WikiPlugin = {
           published_at: nextPublished,
           acl_revision: revision,
           // 子孙块被重算的条数（0 = 没有子孙）。让调用方能观测扇出是否真的发生了。
-          index_tiers_resynced: resynced,
+          index_tiers_resynced: resync.resynced,
+          // ★ 与上面那个 0 区分开：true 表示**扇出抛错、一个都没算**
+          //（内容泄漏级：读路径已收紧而检索仍按旧档位）。false 才是"没有子孙"。
+          index_tiers_resync_failed: resync.failed,
+          ...(resync.error === undefined ? {} : { index_tiers_resync_error: resync.error }),
         })
       }, { access: 'user' }),
     )

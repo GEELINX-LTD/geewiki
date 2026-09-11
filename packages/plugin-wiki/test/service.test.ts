@@ -350,9 +350,16 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
     const svc = h.svc()
 
     // 新建
+    /*
+     * `indexTiersResync` 是 P3a 新增的**加法式**字段（仅 `outcome === 'created'` 时出现）：
+     * 新建的页可能成为已有页的祖先 ⇒ 子孙的 `blocks.tier` 要重算。这里没有子孙，
+     * 故 `resynced: 0` 且 `failed: false` —— 两者必须分开，因为 `0` 单独看是歧义的
+     * （既可能"没有子孙"，也可能"扇出整个失败"，后者是内容泄漏级）。
+     */
     assert.deepEqual((await svc.save('getting-started', { title: '入门', content: '第一版' })), {
       outcome: 'created',
       version: 1,
+      indexTiersResync: { resynced: 0, failed: false },
     })
     const created = (await svc.get('getting-started', MEMBER))
     assert.ok(created, 'save 后应能读到')
