@@ -26,6 +26,7 @@ import { MAIN_CONTENT_ID } from './lib/domIds'
 import { stripHashQuery } from './lib/hashAnchor'
 import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
 import { titleForRoute } from './lib/pageMeta'
+import { visibleDests, type NavDest } from './lib/navPlan'
 import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice } from './lib/theme'
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
@@ -101,18 +102,35 @@ function useCommandPaletteShortcut(onOpen: () => void): void {
   }, [onOpen])
 }
 
-/** 主导航项（产品主入口） */
-interface NavItem {
-  id: string
-  label: string
+/**
+ * 主导航项。
+ *
+ * `requires`（P2-M5）是**该入口需要的能力**，缺省 = 对所有访问者可见（含未登录）。
+ * 判据与过滤逻辑在 `lib/navPlan.ts`，这里只是数据 —— 顶栏的三处渲染点与命令面板
+ * **共用同一个 `visibleDests()`**，避免出现"桌面看不到、窄屏却看得到"这类
+ * 只在某个宽度下复现的漂移。
+ */
+interface NavItem extends NavDest {
   icon: ReactNode
 }
 
 const WIKI_ITEM: NavItem = { id: 'wiki', label: '知识库', icon: <BookText className="size-4" /> }
-/** 运维/开发台面：收进「管理 ▾」，不与产品主入口平级 */
+/**
+ * 运维/开发台面：收进「管理 ▾」，不与产品主入口平级。
+ *
+ * **两项都要求 `administer`**（= 组织角色 owner / admin，见
+ * `packages/plugin-auth/src/index.ts:457-461`）⇒ 普通成员与匿名访客**完全看不到
+ * 这个下拉**，而不是看到一个置灰项。这是刻意的：置灰或加锁图标本身就在泄露
+ * "这里有个你够不着的运维面"，而"无权的分区完全不出现"才是设计要的形态。
+ *
+ * ⚠️ 连带后果（有意为之）：「系统状态」对话框与这两项同处一个下拉，因此它
+ * **也随之下沉为管理员可见**。它是运维台面（服务健康、DB 方言、表清单），
+ * 与「运维台面」这个分组标签一致；若将来需要让所有人都能看到服务健康，
+ * 正确做法是把它**移出这个分组**，而不是给它单开一个能力字段。
+ */
 const ADMIN_NAV: NavItem[] = [
-  { id: 'plugins', label: '插件管理', icon: <Puzzle className="size-4" /> },
-  { id: 'graph', label: '依赖图', icon: <GitBranch className="size-4" /> },
+  { id: 'plugins', label: '插件管理', icon: <Puzzle className="size-4" />, requires: 'administer' },
+  { id: 'graph', label: '依赖图', icon: <GitBranch className="size-4" />, requires: 'administer' },
 ]
 /**
  * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
@@ -203,6 +221,15 @@ export function App(): ReactNode {
    */
   const auth = useAuth()
 
+  /**
+   * 按能力过滤后的运维台面入口。**必须在 `auth` 之后算**（依赖 `auth.capabilities`）。
+   *
+   * 空数组 ⇒ 桌面端整个「管理 ▾」**不渲染**（不是渲染一个空下拉、也不是置灰）。
+   * 加载中（`capabilities === null`）同样为空 —— 见 `lib/navPlan.ts` 里
+   * 关于"失败关闭"的说明：宁可让管理员晚一次请求看到入口，也不让匿名访客先看到再收回。
+   */
+  const adminDests = visibleDests(ADMIN_NAV, auth.capabilities)
+
   let body: ReactNode
   if (active === 'wiki')
     body = (
@@ -219,7 +246,7 @@ export function App(): ReactNode {
   else if (active === 'notfound') body = <NotFoundPage />
   else body = <GraphPage />
 
-  const adminActive = ADMIN_NAV.some((t) => t.id === active)
+  const adminActive = adminDests.some((t) => t.id === active)
 
   return (
     <div className="flex min-h-full flex-col bg-bg text-ink">
@@ -271,46 +298,43 @@ export function App(): ReactNode {
         <nav aria-label="主导航" className="hidden flex-1 items-center gap-1 md:flex">
           <NavTab item={WIKI_ITEM} active={active === WIKI_ITEM.id} onNavigate={nav} />
 
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  'inline-flex h-8 items-center gap-1.5 rounded-md px-4 text-sm',
-                  'transition-colors duration-150 ease-standard',
-                  adminActive
-                    ? 'bg-white/15 font-semibold text-white'
-                    : 'text-header-dim hover:bg-white/10 hover:text-white',
-                  focusRing,
-                )}
-              >
-                <MonitorSmartphone className="size-4" aria-hidden="true" />
-                管理
-                <span aria-hidden="true" className="text-3xs opacity-70">
-                  ▾
-                </span>
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent>
-              <DropdownMenuLabel>运维台面</DropdownMenuLabel>
-              {ADMIN_NAV.map((item) => (
-                <DropdownMenuItem
-                  key={item.id}
-                  active={active === item.id}
-                  onSelect={() => nav(item.id)}
+          {/*
+            运维台面入口。**`adminDests` 为空时整个下拉不渲染** —— 这正是本次要修的
+            缺陷："无权的「管理 ▾」仍会渲染"。空下拉比不渲染更坏：它在告诉访客
+            "这里有个你进不去的运维面"。
+          */}
+          {adminDests.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    'inline-flex h-8 items-center gap-1.5 rounded-md px-4 text-sm',
+                    'transition-colors duration-150 ease-standard',
+                    adminActive
+                      ? 'bg-white/15 font-semibold text-white'
+                      : 'text-header-dim hover:bg-white/10 hover:text-white',
+                    focusRing,
+                  )}
                 >
-                  {item.icon}
-                  {item.label}
-                </DropdownMenuItem>
-              ))}
-              <DropdownMenuSeparator />
-              {/* 系统状态：取代原先头部那个指向裸 JSON 的「● 服务健康」链接 */}
-              <DropdownMenuItem onSelect={() => setStatusOpen(true)}>
-                <MonitorSmartphone className="size-4" aria-hidden="true" />
-                系统状态
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+                  <MonitorSmartphone className="size-4" aria-hidden="true" />
+                  管理
+                  <span aria-hidden="true" className="text-3xs opacity-70">
+                    ▾
+                  </span>
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuLabel>运维台面</DropdownMenuLabel>
+                <NavMenuItems
+                  dests={adminDests}
+                  active={active}
+                  nav={nav}
+                  onOpenStatus={() => setStatusOpen(true)}
+                />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </nav>
 
         <div className="ml-auto flex items-center gap-1">
@@ -348,19 +372,24 @@ export function App(): ReactNode {
                 {WIKI_ITEM.icon}
                 {WIKI_ITEM.label}
               </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuLabel>运维台面</DropdownMenuLabel>
-              {ADMIN_NAV.map((item) => (
-                <DropdownMenuItem key={item.id} active={active === item.id} onSelect={() => nav(item.id)}>
-                  {item.icon}
-                  {item.label}
-                </DropdownMenuItem>
-              ))}
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onSelect={() => setStatusOpen(true)}>
-                <MonitorSmartphone className="size-4" aria-hidden="true" />
-                系统状态
-              </DropdownMenuItem>
+              {/*
+                与桌面端**同一判据**（同一个 `adminDests`）：无可见的运维目的地时，
+                连分组标题与「系统状态」都不出现。窄屏曾经是这段清单的**复制粘贴**，
+                两处各自演化正是"桌面看不到、窄屏却看得到"的来源 —— 现在两处都走
+                `NavMenuItems` 这一个渲染函数。
+              */}
+              {adminDests.length > 0 && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>运维台面</DropdownMenuLabel>
+                  <NavMenuItems
+                    dests={adminDests}
+                    active={active}
+                    nav={nav}
+                    onOpenStatus={() => setStatusOpen(true)}
+                  />
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -482,6 +511,46 @@ function AuthArea({
     >
       {needsSetup ? '初始化' : '登录'}
     </Button>
+  )
+}
+
+/**
+ * **导航菜单项的唯一渲染点**（桌面「管理 ▾」与窄屏「菜单」下拉共用）。
+ *
+ * 在此之前这段清单在 App 里出现两次（两处 `ADMIN_NAV.map` + 两处「系统状态」），
+ * 改一处必须记得同步另一处 —— 这正是原缺陷里"三处重复渲染"的后两处。
+ * 收成一个组件后，增删一个目的地或调整顺序都只改一个地方。
+ *
+ * `dests` 必须是**已经按能力过滤过**的列表（调用方用 `visibleDests()` 算好）。
+ * 本组件**刻意不自己判断能力**：判据只该有一处（`lib/navPlan.ts`），
+ * 否则又会退化成"某个渲染点漏判"。
+ */
+function NavMenuItems({
+  dests,
+  active,
+  nav,
+  onOpenStatus,
+}: {
+  dests: readonly NavItem[]
+  active: string
+  nav: (id: string) => void
+  onOpenStatus: () => void
+}): ReactNode {
+  return (
+    <>
+      {dests.map((item) => (
+        <DropdownMenuItem key={item.id} active={active === item.id} onSelect={() => nav(item.id)}>
+          {item.icon}
+          {item.label}
+        </DropdownMenuItem>
+      ))}
+      <DropdownMenuSeparator />
+      {/* 系统状态：取代原先头部那个指向裸 JSON 的「● 服务健康」链接 */}
+      <DropdownMenuItem onSelect={onOpenStatus}>
+        <MonitorSmartphone className="size-4" aria-hidden="true" />
+        系统状态
+      </DropdownMenuItem>
+    </>
   )
 }
 

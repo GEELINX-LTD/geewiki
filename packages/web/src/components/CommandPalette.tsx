@@ -38,6 +38,8 @@ import {
 import { cn } from '../ui/cn'
 import { focusRing } from '../ui/a11y'
 import { usePages } from '../lib/pagesStore'
+import { useAuth } from '../lib/authStore'
+import { visibleDests, type NavDest } from '../lib/navPlan'
 import { wikiRouteHash } from '../lib/wikiRoute'
 import {
   buildPaletteGroups,
@@ -73,9 +75,15 @@ export interface CommandPaletteProps {
   restoreFocusTo?: { readonly current: HTMLElement | null }
 }
 
-interface ActionDef {
-  id: string
-  label: string
+/**
+ * 一个动作的定义。
+ *
+ * **`extends NavDest`**（P2-M5）：动作与导航项共用同一套能力字段与同一个
+ * `visibleDests()` 判据。理由：命令面板里的「插件管理」「依赖图」与顶栏「管理 ▾」
+ * 里的**是同两个目的地**，两处各写一遍能力判断迟早会分叉 ——
+ * 那正是"顶栏藏了、⌘K 还能搜到"这类漏洞的成因。
+ */
+interface ActionDef extends NavDest {
   hint: string
   keywords?: string
   icon: ReactNode
@@ -90,6 +98,13 @@ export function CommandPalette({
   restoreFocusTo,
 }: CommandPaletteProps): ReactNode {
   const { pages } = usePages()
+  /**
+   * 登录态。动作里有**管理员动作**（插件管理 / 依赖图）与**写内容动作**（新建页面），
+   * 都要按能力过滤（见下方 `actions` 的 `requires`）。
+   * 直接订阅 store 而不从 App 透传：本组件已在用 `usePages()`，取数方式保持一致，
+   * 也免得 App 每次多传一个 prop。
+   */
+  const auth = useAuth()
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(-1)
   /**
@@ -125,14 +140,30 @@ export function CommandPalette({
     [pages],
   )
 
-  const actions = useMemo<ActionDef[]>(
-    () => [
+  /**
+   * 动作清单，**按能力过滤**（P2-M5）。
+   *
+   * 过滤发生在构造 `entryIcon` / `runs` / `actionEntries` **之前**，所以被藏起来的
+   * 动作不仅不出现在列表里，也不会残留在那两个 id→值 的映射里 ——
+   * 否则将来若有人直接按 id 调 `runs.get()`，会拿到一个"界面上看不见但能执行"的动作。
+   *
+   * `requires` 的取值都来自服务端下发的 `AuthCapabilities`（`GET /api/auth/state`）：
+   * - `editContent`：member 及以上。匿名与 `viewer` 看不到「新建页面」——
+   *   否则点进去写一屏、保存时才拿到 401，是纯浪费。
+   * - `administer`：owner / admin。与顶栏「管理 ▾」**同一判据、同一来源**。
+   *
+   * 「浏览全部页面」「切换外观」**刻意不加限制**：前者是公开内容的入口，
+   * 后者是纯本地偏好，与身份无关。
+   */
+  const actions = useMemo<ActionDef[]>(() => {
+    const all: ActionDef[] = [
       {
         id: 'action:new',
         label: '新建页面',
         hint: '创建一个新的知识库页面',
         keywords: 'create new page',
         icon: <FilePlus className="size-4" aria-hidden="true" />,
+        requires: 'editContent',
         run: () => go('wiki/new'),
       },
       {
@@ -149,6 +180,7 @@ export function CommandPalette({
         hint: '启用、停用插件与调整配置',
         keywords: 'plugins admin',
         icon: <Puzzle className="size-4" aria-hidden="true" />,
+        requires: 'administer',
         run: () => go('plugins'),
       },
       {
@@ -157,6 +189,7 @@ export function CommandPalette({
         hint: '查看插件之间的依赖关系',
         keywords: 'graph dependencies',
         icon: <GitBranch className="size-4" aria-hidden="true" />,
+        requires: 'administer',
         run: () => go('graph'),
       },
       {
@@ -167,9 +200,9 @@ export function CommandPalette({
         icon: <SunMoon className="size-4" aria-hidden="true" />,
         run: onToggleTheme,
       },
-    ],
-    [go, onToggleTheme],
-  )
+    ]
+    return visibleDests(all, auth.capabilities)
+  }, [go, onToggleTheme, auth.capabilities])
 
   const entryIcon = useMemo(() => {
     const m = new Map<string, ReactNode>()
