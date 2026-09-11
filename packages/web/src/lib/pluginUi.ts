@@ -1,11 +1,16 @@
-import { registerSlot, type SlotComponent } from './slots'
+import { registerSlotByName, type AnySlotComponent } from './slots'
 import { hostSdk, type GeeWikiHostSdk } from './hostSdk'
 import {
   PLUGIN_UI_TABLE_PATH,
+  SLOT_TABLE_PATH,
+  isLazyOnlyEntry,
   isUiSettled,
+  parseSuppressedOwners,
   parseUiTable,
   planUiSync,
   pluginUiBase as baseOf,
+  type SlotName,
+  type SuppressedOwners,
   type UiSkipped,
   type UiTableEntry,
 } from './pluginUiPlan'
@@ -44,7 +49,7 @@ import {
 export interface PluginUiHost {
   readonly React: unknown
   readonly jsxRuntime: { jsx: unknown; jsxs: unknown; Fragment: unknown }
-  registerSlot(name: string, component: SlotComponent): () => void
+  registerSlot(name: string, component: AnySlotComponent): () => void
   unregisterSlot(name: string, token?: unknown): void
   readonly version: string
   readonly pluginName: string
@@ -86,10 +91,28 @@ const EMPTY_SKIPPED: readonly UiSkipped[] = Object.freeze([])
 const EMPTY_NAMES: readonly string[] = Object.freeze([])
 
 const failed = new Map<string, string>()
+/**
+ * 已按需推迟的条目（插件名 → 决定推迟时的 rev）。
+ *
+ * 与 {@link failed} 同构：用于让 {@link isSettled} 把"刻意推迟"视为已收敛，
+ * 否则每轮 15s 轮询都会放弃 304、白拉一次完整表。rev 变了自然作废并重新评估。
+ */
+const deferred = new Map<string, string>()
+/** 推迟中的条目（按需加载时要用它们的 entry/css） */
+const deferredEntries = new Map<string, UiTableEntry>()
+/** 按需加载的单飞标记（同一插件的并发触发只加载一次） */
+const onDemandInflight = new Map<string, Promise<void>>()
 /** 单飞：重叠的同步请求复用同一个 promise（三个触发点可能同时打过来） */
 let inflight: Promise<void> | null = null
 /** 最近一次成功解析的「未列出 UI 的插件与原因」，供管理台展示（见 `classifyUiSkips`） */
 let lastSkipped: readonly UiSkipped[] = EMPTY_SKIPPED
+/**
+ * 被抑制的单占用插槽声明者（插槽名 → 插件名集合），来自权威仲裁端点。
+ *
+ * 空 Map 表示"没有冲突"，此时不拦任何注册。取不到仲裁信息时**保持上一次的值**（不重置为空，
+ * 否则一次网络抖动会让被抑制者趁机注册进去，两个编辑器又同时出现）。
+ */
+let suppressedOwners: SuppressedOwners = new Map()
 
 /** 供 UI 订阅的只读快照（排障入口与管理台用） */
 export interface PluginUiState {
@@ -177,7 +200,7 @@ export function pluginUiSkipped(): readonly UiSkipped[] {
 function isSettled(): boolean {
   const loadedRevs = new Map<string, string>()
   for (const [name, entry] of loaded) loadedRevs.set(name, entry.rev)
-  return isUiSettled(desired, loadedRevs, failed)
+  return isUiSettled(desired, loadedRevs, failed, deferred)
 }
 
 /**
@@ -244,7 +267,35 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
     version: sdk.version,
     pluginName: name,
     registerSlot: (slot, component) => {
-      const off = registerSlot(slot, component, name)
+      /*
+       * **越权拦阻（两道）**。单占用插槽（editor）的权威裁决在后端，被抑制的插件**仍然是
+       * active 的**——它的 bundle 照样加载、照样调 registerSlot。不拦的后果是两个编辑器同时渲染。
+       *
+       * ① 权威仲裁（`GET /api/plugins/slots` 的 suppressed）：这是**主判据**。
+       *    不能只靠入口表的 `slots` 字段——实测证明那条路是漏的：后端在生效插槽为空时
+       *    **省略该键**，于是"声明了但被抑制"与"根本没声明插槽"无法区分，被抑制者会蒙混过关
+       *    （E2E 抓到过：赢家是 A，界面却渲染了被抑制的 B）。
+       * ② 入口表的生效插槽（次判据）：只有当该插件**声明过**插槽（字段存在）时才校验，
+       *    用于挡住"声明了 editor 却去注册 app-header"这种越界。
+       *    字段缺失 ⇒ 不校验：那是**纯浏览器侧注册**的插件（如 `plugins/ui-demo` 在 client.js 里
+       *    注册 app-header/app-footer），它们不在后端 owners 里，既有行为必须保留。
+       */
+      const suppressed = suppressedOwners.get(slot as SlotName)
+      if (suppressed?.has(name) === true) {
+        console.warn(
+          `[geewiki-plugin-ui] 插件 ${name} 是插槽 "${slot}" 的**被抑制**声明者（单占用插槽已被` +
+            `激活顺序更早的插件占用），其注册已忽略——否则会出现两个编辑器同时渲染。`,
+        )
+        return () => {}
+      }
+      if (meta.slots !== undefined && !meta.slots.includes(slot as SlotName)) {
+        console.warn(
+          `[geewiki-plugin-ui] 插件 ${name} 尝试注册未获生效的插槽 "${slot}"，已忽略` +
+            `（该插件生效插槽：${meta.slots.join(', ') || '无'}）`,
+        )
+        return () => {}
+      }
+      const off = registerSlotByName(slot, component, name)
       disposers.push(off)
       return off
     },
@@ -361,17 +412,83 @@ async function doSync(force: boolean): Promise<void> {
   lastRevision = table.revision
   desired = table.entries
   lastSkipped = Object.freeze(table.skipped)
+
+  /*
+   * 取权威插槽仲裁（与入口表**并行**，不额外增加一轮往返）。
+   * 失败时**保留上一次的值**（不重置）：一次网络抖动不该让被抑制者趁机注册进去。
+   */
+  try {
+    const slotRes = await fetch(new URL(SLOT_TABLE_PATH, window.location.origin).href)
+    if (slotRes.ok) {
+      const parsed = parseSuppressedOwners(await slotRes.json())
+      if (parsed) suppressedOwners = parsed
+      else console.debug('[geewiki-plugin-ui] 插槽仲裁响应不可信，沿用上一次结果')
+    }
+  } catch (err) {
+    console.debug('[geewiki-plugin-ui] 插槽仲裁请求失败，沿用上一次结果：', err instanceof Error ? err.message : err)
+  }
   // 先广播"跳过项变了"：即使随后没有任何 load/unload（这是常见情形——例如只是新装了一个
   // 未启用插件），管理台也要能立刻看到新的 skipped。
   emitState()
   const loadedRevs = new Map([...loaded].map(([name, entry]) => [name, entry.rev]))
-  const plan = planUiSync(table.entries, loadedRevs)
+
+  // 重算推迟集合：只有**非空且全部是 editor** 的生效插槽才推迟（理由见 isLazyOnlyEntry）。
+  // 每次都整体重算（而不是增量维护）——入口表就是真源，增量维护只会多一份可能漂移的账。
+  deferred.clear()
+  deferredEntries.clear()
+  for (const [name, meta] of Object.entries(table.entries)) {
+    if (isLazyOnlyEntry(meta)) {
+      deferred.set(name, meta.rev)
+      deferredEntries.set(name, meta)
+    }
+  }
+
+  const plan = planUiSync(table.entries, loadedRevs, new Set(deferred.keys()))
   // 先卸后装：产物更新的插件会同时出现在两个数组里（rev 变化），换新代码前必须先回收旧注册
   for (const name of plan.unload) unloadPluginUi(name)
   for (const name of plan.load) {
     const meta = table.entries[name]
     if (meta) await loadPluginUi(name, meta, sdk)
   }
+}
+
+/**
+ * 按需加载**被推迟**的插件界面，直到 `slot` 有贡献者为止（幂等、单飞）。
+ *
+ * 调用方：宿主在真正要渲染某个按需插槽之前（当前只有 `editor`，见 `WikiPage` 的编辑视图）。
+ * 返回的 promise 结算后，插槽注册表**可能**已经有了贡献者——调用方据此重渲染
+ * （`slots.tsx` 的 `useEditorSlot` 走 `useSyncExternalStore`，注册发生时自动触发）。
+ *
+ * 为什么需要"同步一次再加载"：推迟决定是基于**某一次**入口表快照做的，而插件可能在
+ * 这期间被启用/停用。先 `syncPluginUi()` 把快照对齐，再按新的推迟集合加载，才不会
+ * 加载一个已被停用的插件、也不会漏掉刚启用的那个。
+ *
+ * 单飞的理由与 `syncPluginUi` 相同：编辑视图挂载与用户手动刷新可能同时打过来。
+ */
+export function ensureSlotLoaded(slot: SlotName): Promise<void> {
+  const existing = onDemandInflight.get(slot)
+  if (existing) return existing
+  const run = (async () => {
+    // 先把入口表对齐（可能带 304 短路，代价极小），确保 deferredEntries 是最新的
+    await syncPluginUi()
+    const sdk = hostSdk()
+    if (!sdk) return
+    for (const [name, meta] of [...deferredEntries]) {
+      // 已被别处加载/卸载的跳过；只看"当前仍被推迟且仍需要"的
+      if (loaded.has(name) || !(name in desired)) continue
+      if (meta.slots === undefined || !meta.slots.includes(slot)) continue
+      await loadPluginUi(name, meta, sdk)
+    }
+  })().finally(() => {
+    onDemandInflight.delete(slot)
+  })
+  onDemandInflight.set(slot, run)
+  return run
+}
+
+/** 当前被推迟（尚未加载，等按需触发）的插件名。排障与测试断言用。 */
+export function deferredPluginUi(): string[] {
+  return [...deferred.keys()].sort()
 }
 
 /**
@@ -426,6 +543,10 @@ declare global {
       revision: () => string | undefined
       /** 插件名 → 界面目录 URL（非法名返回 undefined），供排障与测试断言 */
       base: (name: string) => string | undefined
+      /** 当前被推迟（等按需触发）的插件名，供懒加载验收断言 */
+      deferred: () => string[]
+      /** 按需加载某插槽的贡献者（幂等、单飞），供懒加载验收直接驱动 */
+      ensureSlot: (slot: SlotName) => Promise<void>
     }
   }
 }
@@ -437,4 +558,6 @@ window.__GEEWIKI_PLUGIN_UI__ = {
   loaded: loadedPluginUi,
   revision: pluginUiRevision,
   base: pluginUiBase,
+  deferred: deferredPluginUi,
+  ensureSlot: ensureSlotLoaded,
 }

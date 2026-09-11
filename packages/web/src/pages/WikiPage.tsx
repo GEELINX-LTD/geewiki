@@ -7,6 +7,8 @@ import { api, type PageDetail, type PageSummary } from '../api'
 import { AskPanel } from '../components/AskPanel'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
+import { EditorSlotOutlet, useEditorSlot } from '../lib/slots'
+import { ensureSlotLoaded } from '../lib/pluginUi'
 import { SearchView } from '../components/SearchView'
 import { TableOfContents } from '../components/TableOfContents'
 import { PageLinks } from '../components/PageLinks'
@@ -1252,6 +1254,23 @@ function WikiEdit(props: {
   const serverUpdatedAt = useRef<string | null>(null)
 
   const dirty = isDirty(original, { title, content, slugInput })
+  /*
+   * `editor` 插槽：有插件贡献时用它替代内置 CodeMirror。
+   *
+   * ⚠️ 这两个 hook 必须在下面的任何 early return 之前（React #310：hook 顺序不能随分支改变）。
+   *
+   * **宿主职责刻意留在插槽外面**：草稿落盘、脏值判定、未保存离开拦截、保存冲突检测、
+   * 字段校验全部由本组件继续负责（下面这些既有逻辑一行未改），插件只拿到
+   * `value` / `onChange` / `onSave` / `onCancel` 几个出口。
+   * 这样两条路径（插件编辑器 / 内置编辑器）在宿主侧的语义是**同一套代码**——
+   * 换编辑器不会丢掉草稿保护、冲突检测或未保存拦截。
+   */
+  const editorSlot = useEditorSlot()
+  useEffect(() => {
+    // 懒加载：只贡献 editor 的插件，其 client.js 推迟到真正进入编辑视图才请求。
+    // 失败不阻塞编辑（回落内置编辑器），故只 catch 不弹错。
+    void ensureSlotLoaded('editor').catch(() => {})
+  }, [])
 
   const load = useCallback((): void => {
     setErr('')
@@ -1585,16 +1604,35 @@ function WikiEdit(props: {
 
       <div className="grid items-start gap-4 xl:grid-cols-2">
         <div className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'preview' && 'hidden xl:flex')}>
-          <span className="text-xs font-semibold text-ink-soft">正文（Markdown）</span>
-          <MarkdownEditorLazy
-            value={content}
-            onChange={setContent}
-            onSave={() => void save()}
-            disabled={saving}
-            ariaLabel="Markdown 正文编辑器"
-            minHeight="480px"
-            placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
-          />
+          <span className="text-xs font-semibold text-ink-soft">
+            正文（Markdown）{editorSlot ? ` · 由 ${editorSlot.source} 提供` : ''}
+          </span>
+          {editorSlot ? (
+            /*
+             * 插件编辑器路径：宿主把受控值与保存/取消回调交出去，插件只负责"编辑区"。
+             * 草稿、脏值、冲突检测、未保存拦截仍由本组件的既有逻辑承担（见上面的 hook 注释）。
+             * `onSave` 指向同一个 `save()`——不存在第二套保存实现。
+             */
+            <EditorSlotOutlet
+              value={content}
+              mode={isNew ? 'create' : 'edit'}
+              slug={slugInput}
+              readOnly={saving}
+              onChange={setContent}
+              onSave={() => void save()}
+              onCancel={onCancel}
+            />
+          ) : (
+            <MarkdownEditorLazy
+              value={content}
+              onChange={setContent}
+              onSave={() => void save()}
+              disabled={saving}
+              ariaLabel="Markdown 正文编辑器"
+              minHeight="480px"
+              placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
+            />
+          )}
         </div>
 
         <div className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'edit' && 'hidden xl:flex')}>

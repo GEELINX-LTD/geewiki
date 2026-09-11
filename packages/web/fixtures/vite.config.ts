@@ -18,6 +18,15 @@ import { defineConfig } from 'vite'
  * `GET /api/plugins/ui` 从活状态派生（见 packages/manager/src/plugin-ui.ts）。
  */
 const out = process.env.FIXTURE_OUT ?? '@geewiki/wiki'
+/**
+ * 客户端入口源文件（相对本目录）。默认 `./src/index.tsx`（插槽演示夹具）；
+ * `FIXTURE_ENTRY` 可指向别的入口——`@geewiki/editor-plain` 的编辑器界面用 `./editor/index.tsx`。
+ *
+ * 为什么参数化而不是再写一份 config：两份只差 entry 与 outDir，复制等于把
+ * "react 必须 external、publicDir 必须关掉、NODE_ENV 必须 define"这几条踩过的坑再抄一遍，
+ * 迟早抄漏其中一条。
+ */
+const entry = process.env.FIXTURE_ENTRY ?? './src/index.tsx'
 const outDir = process.env.FIXTURE_OUT_DIR
 const resolve = (p: string): string => fileURLToPath(new URL(p, import.meta.url))
 
@@ -35,7 +44,7 @@ export default defineConfig({
     emptyOutDir: true,
     target: 'esnext',
     lib: {
-      entry: resolve('./src/index.tsx'),
+      entry: resolve(entry),
       formats: ['es'],
       fileName: () => 'client.js',
       // 不显式指定时 Vite 会回退读 package.json 的 name，夹具目录没有 package.json 会直接构建失败

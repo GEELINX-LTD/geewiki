@@ -37,6 +37,7 @@ import {
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
+import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
 import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
@@ -960,6 +961,17 @@ export function defaultRegistry(
     },
     { ...httpRegistryEntry(webDist, defaults, pluginUiRoots), source: 'builtin' },
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
+    // 纯文本编辑器：`editor` 插槽的第一个真实消费者（证明"插件可替换编辑器"这条扩展点可用）。
+    // **只登记、不写进基础清单**——它替换的是默认编辑器，是否替换应由使用者显式决定；
+    // 未启用时编辑页走内置 CodeMirror（回落路径已端到端覆盖）。
+    // 它的前端产物在 <webDist>/plugins-ui/@geewiki/editor-plain/（内置插件无自带产物根，
+    // 见 resolvePluginUiRoots 的第二候选根），由 `pnpm --filter @geewiki/web build:fixtures` 生成。
+    {
+      name: '@geewiki/editor-plain',
+      manifest: editorPlainManifest,
+      module: EditorPlainPlugin,
+      source: 'builtin',
+    },
     // LLM 契约插件：提供 llm-service（route→provider 注册表 + 终止保证 + 无 key 降级）。
     // **不声明 requires**：它自身零依赖，没有 provider 时也能装载并给出可迭代的降级流；
     // **不进 conflictGroup**：它是注册表而非某个厂商的实现，多家 provider 应共存。

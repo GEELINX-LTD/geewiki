@@ -15,8 +15,11 @@ import {
   UI_SKIP_LABEL,
   UI_SKIP_REASONS,
   classifyUiSkips,
+  SLOT_TABLE_PATH,
+  isLazyOnlyEntry,
   isPluginUiName,
   isUiSettled,
+  parseSuppressedOwners,
   parseUiTable,
   planUiSync,
   pluginUiBase,
@@ -321,4 +324,77 @@ test('UI_SKIP_LABEL / UI_SKIP_HELP：四个 reason 都有中文标签与解释',
     assert.ok(UI_SKIP_LABEL[reason], `${reason} 缺标签`)
     assert.ok(UI_SKIP_HELP[reason], `${reason} 缺解释`)
   }
+})
+
+/* ------------------------- 懒加载判定（isLazyOnlyEntry） ------------------------- */
+
+test('isLazyOnlyEntry：生效插槽只有 editor → 可推迟加载', () => {
+  assert.equal(isLazyOnlyEntry({ entry: 'c.js', rev: 'r', slots: ['editor'] }), true)
+})
+
+test('isLazyOnlyEntry：含首屏可见插槽 → 不推迟（推迟它们只会造成视觉抖动）', () => {
+  assert.equal(isLazyOnlyEntry({ entry: 'c.js', rev: 'r', slots: ['app-header'] }), false)
+  assert.equal(isLazyOnlyEntry({ entry: 'c.js', rev: 'r', slots: ['editor', 'app-header'] }), false)
+})
+
+test('isLazyOnlyEntry：未声明插槽 → 不推迟（无法判断何时需要，保守加载）', () => {
+  assert.equal(isLazyOnlyEntry({ entry: 'c.js', rev: 'r' }), false)
+  assert.equal(isLazyOnlyEntry({ entry: 'c.js', rev: 'r', slots: [] }), false)
+})
+
+test('planUiSync：被推迟的条目不进 load（懒加载的核心行为）', () => {
+  const entries = { '@gw/edit': { entry: 'c.js', rev: 'r1', slots: ['editor'] as const } } as unknown as Record<string, UiTableEntry>
+  assert.deepEqual(planUiSync(entries, new Map()).load, ['@gw/edit'])
+  assert.deepEqual(planUiSync(entries, new Map(), new Set(['@gw/edit'])).load, [], '被推迟 ⇒ 不该同步加载')
+})
+
+test('planUiSync：被推迟的条目 rev 变化时**仍要先卸**（旧产物必须停止贡献）', () => {
+  const entries = { '@gw/edit': { entry: 'c.js', rev: 'r2', slots: ['editor'] as const } } as unknown as Record<string, UiTableEntry>
+  const plan = planUiSync(entries, new Map([['@gw/edit', 'r1']]), new Set(['@gw/edit']))
+  assert.deepEqual(plan.unload, ['@gw/edit'], 'rev 变了必须卸掉旧注册')
+  assert.deepEqual(plan.load, [], '推迟中 ⇒ 重新装载留给按需触发')
+})
+
+test('isUiSettled：被推迟的条目算"处理完了"（否则每轮轮询都会白拉一次完整表）', () => {
+  const entries = { '@gw/edit': { entry: 'c.js', rev: 'r1', slots: ['editor'] as const } } as unknown as Record<string, UiTableEntry>
+  assert.equal(isUiSettled(entries, new Map()), false, '既没加载也没推迟 ⇒ 未收敛')
+  assert.equal(isUiSettled(entries, new Map(), new Map(), new Map([['@gw/edit', 'r1']])), true, '已按同一 rev 推迟 ⇒ 收敛')
+  assert.equal(isUiSettled(entries, new Map(), new Map(), new Map([['@gw/edit', 'r0']])), false, '推迟记录的 rev 不匹配 ⇒ 未收敛')
+})
+
+/* ------------------------- 插槽仲裁（parseSuppressedOwners） ------------------------- */
+
+test('parseSuppressedOwners：取出被抑制的声明者（这是"被抑制者不得注册"的权威判据）', () => {
+  const map = parseSuppressedOwners({
+    ok: true,
+    slots: [
+      { slot: 'editor', cardinality: 'single', owners: ['@a', '@b'], effective: ['@a'], suppressed: ['@b'] },
+      { slot: 'app-header', cardinality: 'multi', owners: ['@a'], effective: ['@a'], suppressed: [] },
+    ],
+  })
+  assert.ok(map)
+  assert.deepEqual([...(map.get('editor') ?? [])], ['@b'])
+  assert.equal(map.get('app-header'), undefined, '无抑制者的插槽不该出现在表里')
+})
+
+test('parseSuppressedOwners：响应不可信时返回 undefined（调用方据此沿用上一次结果）', () => {
+  assert.equal(parseSuppressedOwners(null), undefined)
+  assert.equal(parseSuppressedOwners([]), undefined)
+  assert.equal(parseSuppressedOwners({ ok: true }), undefined, 'slots 不是数组 ⇒ 不可信')
+})
+
+test('parseSuppressedOwners：未知插槽名与坏 owner 逐条丢弃，不影响其它条目', () => {
+  const map = parseSuppressedOwners({
+    slots: [
+      { slot: 'nonexistent', suppressed: ['@x'] },
+      { slot: 'editor', suppressed: ['@ok', 42, '', null] },
+    ],
+  })
+  assert.ok(map)
+  assert.equal(map.has('nonexistent' as never), false)
+  assert.deepEqual([...(map.get('editor') ?? [])], ['@ok'])
+})
+
+test('SLOT_TABLE_PATH：仲裁端点路径与后端注册一致', () => {
+  assert.equal(SLOT_TABLE_PATH, '/api/plugins/slots')
 })

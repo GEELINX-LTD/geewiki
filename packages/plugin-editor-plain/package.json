@@ -1,0 +1,17 @@
+{
+  "name": "@geewiki/editor-plain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 内置插件：纯文本编辑器（editor 插槽的第一个真实消费者，演示插件接管编辑区）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  }
+}

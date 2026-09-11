@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as jsxRuntime from 'react/jsx-runtime'
-import { registerSlot, unregisterSlot, type SlotComponent } from './slots'
+import { registerSlotByName, unregisterSlot, type AnySlotComponent } from './slots'
 
 /**
  * 宿主 SDK：插件客户端 bundle 与宿主之间唯一的进程内契约。
@@ -18,8 +18,13 @@ export const HOST_SDK_VERSION = '0.1.0'
 export interface GeeWikiHostSdk {
   readonly React: typeof React
   readonly jsxRuntime: { jsx: unknown; jsxs: unknown; Fragment: unknown }
-  /** 注册插槽组件，返回幂等的注销函数 */
-  registerSlot(name: string, component: SlotComponent): () => void
+  /**
+   * 注册插槽组件，返回幂等的注销函数。
+   *
+   * 名称是**运行期字符串**（插件 bundle 不参与本仓库的类型检查），由
+   * `registerSlotByName` 做运行期校验；组件类型是零属性与 editor（带数据）两种形态的联合。
+   */
+  registerSlot(name: string, component: AnySlotComponent): () => void
   /** 传入 token 只注销一条；不传则清空该插槽 */
   unregisterSlot(name: string, token?: unknown): void
   readonly version: string
@@ -38,7 +43,7 @@ const sdk: GeeWikiHostSdk = {
     jsxs: jsxRuntime.jsxs,
     Fragment: jsxRuntime.Fragment,
   },
-  registerSlot: (name, component) => registerSlot(name, component, 'host-sdk'),
+  registerSlot: (name, component) => registerSlotByName(name, component, 'host-sdk'),
   unregisterSlot,
   version: HOST_SDK_VERSION,
 }

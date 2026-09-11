@@ -61,8 +61,12 @@ function contrib(owner: string, slot: string, lazy = false): SlotContribution {
  * - **待同步方向**（core 有而 web 无）：必须逐字列在这里。web 一旦补上 `editor`，
  *   下面的 `assert.deepEqual(pending, ...)` 会因"清单里还有它"而变红，
  *   提醒移除该行——**清单位于唯一的收敛路径上，不会悄悄留在代码里**。
+ * ## 当前状态：**清单已空**（收敛完成）
+ * `editor` 已由前端批次补齐（`packages/web/src/lib/slots.tsx` 的 `SlotName`/`SLOT_NAMES`），
+ * 两侧现已全等，故清空记账。这条**记账机制保留**——下一个"core 先加、web 后跟"的插槽
+ * 仍应走同一条路径，而不是把断言放宽。
  */
-const PENDING_WEB_SYNC: readonly string[] = ['editor']
+const PENDING_WEB_SYNC: readonly string[] = []
 
 test('SlotName 白名单：core 与 web 两侧解析出的集合逐元素相等', () => {
   const root = findRepoRoot(fileURLToPath(import.meta.url))

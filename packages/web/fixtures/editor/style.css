@@ -1,0 +1,70 @@
+/*
+ * `@geewiki/editor-plain` 客户端样式。
+ *
+ * 用宿主的设计 token（`--gw-*` 与 Tailwind 主题变量）而不是硬编码颜色——
+ * 否则深色模式下插件界面会是一块刺眼的白板。token 由宿主页面注入到 `:root`，
+ * 插件 bundle 与宿主同源，故可直接 `var()` 引用。
+ *
+ * 边界：插件**不**假定 token 一定存在，故每个 `var()` 都给了回退值——
+ * 独立调试插件产物（不经宿主页面）时也不会变成无色。
+ */
+
+.gw-plain-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: var(--gw-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.gw-plain-editor-textarea {
+  min-height: 480px;
+  width: 100%;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid var(--gw-line, #d7dde5);
+  border-radius: var(--radius-md, 8px);
+  background: var(--gw-surface, #ffffff);
+  color: var(--gw-ink, #1c2733);
+  font: inherit;
+  font-size: 0.8125rem; /* 与宿主 --text-note 同档 */
+  line-height: 1.7;
+  tab-size: 2;
+}
+
+.gw-plain-editor-textarea:focus-visible {
+  outline: 2px solid var(--gw-accent, #2563eb);
+  outline-offset: 1px;
+}
+
+.gw-plain-editor-textarea[readonly] {
+  opacity: 0.7;
+}
+
+.gw-plain-editor-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--gw-font-sans, system-ui, sans-serif);
+  font-size: 0.6875rem; /* 与宿主 --text-2xs 同档 */
+  color: var(--gw-muted, #6b7a8c);
+}
+
+.gw-plain-editor-hint {
+  margin-inline-start: auto;
+}
+
+.gw-plain-editor-cancel {
+  padding: 3px 10px;
+  border: 1px solid var(--gw-line, #d7dde5);
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.gw-plain-editor-cancel:hover {
+  color: var(--gw-ink, #1c2733);
+}

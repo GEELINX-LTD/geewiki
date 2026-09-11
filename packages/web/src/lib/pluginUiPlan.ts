@@ -47,6 +47,123 @@ export interface UiTableEntry {
   css?: string
   /** 该插件产物指纹（后端 stat 出来的 mtime-大小哈希）；**只用于变更检测，不进 URL** */
   rev: string
+  /**
+   * 该插件**实际生效**的插槽（后端经 `effectiveSlotsByOwner` 按基数裁决后下发）。
+   *
+   * 两个用途，彼此独立：
+   * ① **越权拦阻**：被抑制的声明者不会出现在这里，宿主据此拒绝它注册该插槽——
+   *    于是单占用插槽的权威裁决在后端，前端不需要自己算激活顺序。
+   * ② **懒加载判定**：见 {@link isLazyOnlyEntry}。
+   *
+   * 后端在无生效插槽时**省略该键**（保持既有部署的 `revision` 不变），故这里可能缺省。
+   */
+  slots?: SlotName[]
+}
+
+/**
+ * 插槽白名单：与 core 的 `SLOT_NAMES` / `slots.tsx` 的 `SLOT_NAMES` 是同一份事实的镜像。
+ * web 侧不引 `@geewiki/core`（顶层 `import 'node:fs'`），故保留副本；
+ * 三处一致性由 `packages/web/test/editorSlotProps.test.ts` 的源码级守卫钉住。
+ */
+export type SlotName = 'app-header' | 'app-footer' | 'editor'
+
+export const SLOT_NAMES: readonly SlotName[] = ['app-header', 'app-footer', 'editor']
+
+function isSlotName(value: unknown): value is SlotName {
+  return typeof value === 'string' && (SLOT_NAMES as readonly string[]).includes(value)
+}
+
+/** 入口表的 `slots` 字段：非数组按缺省处理、未知插槽名逐条丢弃（前向兼容）。 */
+function readSlots(raw: unknown): SlotName[] | undefined {
+  if (!Array.isArray(raw)) {
+    if (raw !== undefined) console.debug('[geewiki-plugin-ui] 入口表 slots 不是数组，按缺省处理')
+    return undefined
+  }
+  const out: SlotName[] = []
+  for (const item of raw) {
+    if (!isSlotName(item)) {
+      console.debug(`[geewiki-plugin-ui] 入口表插槽名未知，已忽略：${String(item)}`)
+      continue
+    }
+    if (!out.includes(item)) out.push(item)
+  }
+  return out
+}
+
+/**
+ * 只有 `editor` 一个生效插槽的条目 ⇒ **可以推迟加载**。
+ *
+ * ## 为什么这是一个可推导的判据，而不是拍脑袋的启发式
+ * 懒加载的目的：**首屏不该为一个"用户大概率用不到"的插件付出加载成本**。
+ * 而"用户何时需要它"取决于它贡献到哪个插槽：
+ * - `app-header` / `app-footer` **首屏就渲染**（在 App 外壳里），推迟它们毫无意义，
+ *   反而会先渲染空位再补内容（视觉抖动）；
+ * - `editor` 只在进入编辑视图时才渲染，而绝大多数访问**只看文档**——正是值得推迟的那一类。
+ *
+ * 因此：**生效插槽非空且全部是 `editor`** 的插件，其 `client.js` 推迟到编辑视图真正挂载时再取。
+ * 若它同时还贡献了 header/footer，则**不推迟**（首屏就要用）。
+ *
+ * ## 已知边界（这是本判据的局限，已作为范围外发现上报）
+ * 后端 manifest 目前只能声明 `slots: SlotName[]`，**表达不了"某个插槽贡献是懒的"**——
+ * `SlotContributionMeta.lazy` 只在运行期 `contribute()` 时可用，而运行期 contribute 本身
+ * 就要求先加载 bundle，对懒加载是循环依赖。所以"部分懒"（同一插件既贡献 header 又懒贡献 editor）
+ * 今天**做不到**：这类插件只能整包不推迟。真正的解法是让 manifest/入口表带上 per-slot 的 lazy
+ * 标志（需改 core 契约）。
+ */
+export function isLazyOnlyEntry(entry: UiTableEntry): boolean {
+  const slots = entry.slots
+  if (slots === undefined || slots.length === 0) return false
+  return slots.every((slot) => slot === 'editor')
+}
+
+/* ===================== 插槽仲裁（单占用被抑制者不得注册） ===================== */
+
+/** 后端 `GET /api/plugins/slots` 的路径 */
+export const SLOT_TABLE_PATH = '/api/plugins/slots'
+
+/**
+ * 被抑制的声明者：插槽名 → 不得注册该插槽的插件名集合。
+ *
+ * ## 为什么前端必须独立拿这份信息（**这是实测抓出来的真缺陷**）
+ * `editor` 是单占用插槽，被抑制的插件**仍然是 active 的**：它的 bundle 照样加载、照样调用
+ * `registerSlot('editor', …)`。若不拦，两个编辑器会同时渲染。
+ *
+ * 最初我按入口表的 `slots` 字段来拦（"该字段存在且不含此插槽 ⇒ 拒绝"），**E2E 实测发现这条路
+ * 是漏的**：后端在**生效插槽为空时省略该键**（为了让既有部署的 revision 不无谓变化），
+ * 于是"声明了但被抑制"与"根本没声明插槽"在入口表里**无法区分**——被抑制者因为键缺失而通过了检查，
+ * 结果抑制者的编辑器真的渲染了出来（实测 `editorSource: '@geewiki/editor-plain'`，
+ * 而赢家是 `@demo/editor-alt`）。
+ *
+ * 故改为读**权威仲裁**：`GET /api/plugins/slots` 的 `suppressed` 字段。
+ * 这与管理器自己的注释一致——`packages/manager/src/index.ts:376-379` 明写
+ * "前端（`GET /api/plugins/ui`）与诊断端点（`GET /api/plugins/slots`）都必须读同一份结果；
+ * 若各处各自按 list() 重新判一遍基数，就会出现'表里说 A 生效、界面渲染 B'这种极难排查的分裂"。
+ *
+ * ## 为什么不会误伤"运行期贡献"的插件
+ * 后端 `owners` 只含**服务端**声明（manifest）与**服务端** `ctx.slot.contribute()` 的贡献；
+ * 纯浏览器侧注册的插件（如 `plugins/ui-demo` 在 `client.js` 里注册 app-header/app-footer）
+ * 根本不在 `owners` 里，因此**不受任何限制**——既有行为完全保留。
+ */
+export type SuppressedOwners = ReadonlyMap<SlotName, ReadonlySet<string>>
+
+/** 解析 `GET /api/plugins/slots` 响应，取出"被抑制的声明者"。整体不可信时返回 undefined。 */
+export function parseSuppressedOwners(payload: unknown): SuppressedOwners | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+  const body = payload as { slots?: unknown }
+  if (!Array.isArray(body.slots)) return undefined
+  const out = new Map<SlotName, Set<string>>()
+  for (const raw of body.slots) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const item = raw as { slot?: unknown; suppressed?: unknown }
+    if (!isSlotName(item.slot)) continue
+    if (!Array.isArray(item.suppressed) || item.suppressed.length === 0) continue
+    const set = out.get(item.slot) ?? new Set<string>()
+    for (const owner of item.suppressed) {
+      if (typeof owner === 'string' && owner) set.add(owner)
+    }
+    if (set.size > 0) out.set(item.slot, set)
+  }
+  return out
 }
 
 /**
@@ -128,7 +245,7 @@ export function pluginUiBase(name: string, origin: string): string | undefined {
 
 function readEntry(raw: unknown): UiTableEntry | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
-  const item = raw as { entry?: unknown; css?: unknown; rev?: unknown }
+  const item = raw as { entry?: unknown; css?: unknown; rev?: unknown; slots?: unknown }
   // entry 缺失或文件名非法 → 整条丢弃（后端保证不会发生，这里防的是中间层/旧版本)
   if (typeof item.entry !== 'string' || !PLUGIN_UI_FILE_SEGMENT.test(item.entry)) return undefined
   // css 非法同样整条丢弃：与后端 `pluginUiEntryOf` 的"坏声明整体视为未声明"保持一致，
@@ -138,7 +255,16 @@ function readEntry(raw: unknown): UiTableEntry | undefined {
   }
   // rev 只用于变更检测；不是字符串时整条丢弃（后端必定下发，宁可少加载一个也不做无依据的变更判断）
   if (typeof item.rev !== 'string') return undefined
-  return item.css === undefined ? { entry: item.entry, rev: item.rev } : { entry: item.entry, css: item.css, rev: item.rev }
+  // slots 从宽（与 skipped 同理）：它影响的是"哪些插槽允许注册"与"是否可推迟加载"，
+  // 坏掉的 slots 不该让整条 UI 加载失败——按缺省（无生效插槽）处理，
+  // 后果只是"该插件不能注册插槽 / 不被推迟"，而不是"界面消失"。
+  const slots = readSlots(item.slots)
+  return {
+    entry: item.entry,
+    rev: item.rev,
+    ...(item.css === undefined ? {} : { css: item.css }),
+    ...(slots === undefined ? {} : { slots }),
+  }
 }
 
 function isSkipReason(value: unknown): value is UiSkipReason {
@@ -264,19 +390,31 @@ export interface UiSyncPlan {
  *
  * @param entries 入口表条目
  * @param loaded  已加载插件的 `名字 → 当时加载的 rev`
- * @returns `load` = 表中新增的 + rev 变化的；`unload` = 已加载但表中没有的 + rev 变化的。
+ * @param defer   需要**推迟加载**的插件名（见 {@link isLazyOnlyEntry}）：它们**不出现在 `load` 里**，
+ *                改由 `ensureSlotLoaded()` 在插槽真正要渲染时按需加载。
+ *                刻意用**显式参数**而不是在函数里自行推导：推迟是调用方的策略，
+ *                这个纯函数只负责算差集，便于单测两种策略下的行为。
+ * @returns `load` = 表中新增的 + rev 变化的（**减去被推迟的**）；`unload` = 已加载但表中没有的 + rev 变化的。
  *          **rev 变化会同时出现在两个数组里**（先卸后装），因为产物换了必须重新执行 `register`；
  *          两者都按名排序，保证同一输入必定得到同一计划（幂等、可断言、不会因 Map 顺序抖动）。
  */
-export function planUiSync(entries: Readonly<Record<string, UiTableEntry>>, loaded: ReadonlyMap<string, string>): UiSyncPlan {
+export function planUiSync(
+  entries: Readonly<Record<string, UiTableEntry>>,
+  loaded: ReadonlyMap<string, string>,
+  defer: ReadonlySet<string> = new Set(),
+): UiSyncPlan {
   const load: string[] = []
   const unload: string[] = []
   for (const name of Object.keys(entries)) {
     const current = loaded.get(name)
-    if (current === undefined) load.push(name)
-    else if (current !== (entries[name] as UiTableEntry).rev) {
+    const rev = (entries[name] as UiTableEntry).rev
+    if (current === undefined) {
+      // 未加载且被推迟 ⇒ 不进 load（留给按需加载）
+      if (!defer.has(name)) load.push(name)
+    } else if (current !== rev) {
+      // rev 变化：**即使被推迟也必须先卸**（旧产物必须停止贡献），重新装载则等按需触发
       unload.push(name)
-      load.push(name)
+      if (!defer.has(name)) load.push(name)
     }
   }
   for (const name of loaded.keys()) {
@@ -289,7 +427,7 @@ export function planUiSync(entries: Readonly<Record<string, UiTableEntry>>, load
 
 /**
  * 界面是否已经"收敛"到入口表 `entries`：每个条目要么已按同一 rev 加载，要么已按同一 rev 失败过，
- * 且没有多余的在加载项。
+ * 要么**已被按需推迟**，且没有多余的在加载项。
  *
  * **为什么需要它**：调用方只有在收敛时才敢用 `If-None-Match` 做 304 短路。两者可能脱钩——某次加载
  * 失败时 `revision` 已推进到新值而该插件并不在已加载集合里；由于 `revision` 只是表格内容的哈希，
@@ -298,11 +436,15 @@ export function planUiSync(entries: Readonly<Record<string, UiTableEntry>>, load
  *
  * @param failed 已知加载失败的条目（插件名 → 失败时的 rev）。它们被视为已收敛，避免每轮轮询
  *               都为同一个坏产物重复 import 与重复告警；rev 变化后自然重新尝试。
+ * @param deferred 已按需推迟的条目（插件名 → 决定推迟时的 rev）。与 `failed` **同构**：
+ *               它们"处理完了"（按需加载是刻意的，不是遗漏），故视为收敛，
+ *               否则每轮轮询都会放弃 304、白拉一次完整表。rev 变化后推迟决定自然作废并重新评估。
  */
 export function isUiSettled(
   entries: Readonly<Record<string, UiTableEntry>>,
   loaded: ReadonlyMap<string, string>,
   failed: ReadonlyMap<string, string> = new Map(),
+  deferred: ReadonlyMap<string, string> = new Map(),
 ): boolean {
   let settled = 0
   for (const name of Object.keys(entries)) {
@@ -313,6 +455,8 @@ export function isUiSettled(
     }
     // 已按同一 rev 失败过 → 也算"处理完了"（它不在 loaded 里，故不计入 settled）
     if (failed.get(name) === rev) continue
+    // 已按同一 rev 决定按需推迟 → 同样算"处理完了"（推迟是刻意的，不是遗漏）
+    if (deferred.get(name) === rev) continue
     return false
   }
   // 除已成功加载的那些之外不该有多余项（多出来的要卸载；含"在加载但已不在表中"的情况）

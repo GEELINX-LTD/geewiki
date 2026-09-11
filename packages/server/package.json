@@ -18,6 +18,7 @@
     "@geewiki/core": "workspace:*",
     "@geewiki/db-sqlite": "workspace:*",
     "@geewiki/echo": "workspace:*",
+    "@geewiki/editor-plain": "workspace:*",
     "@geewiki/llm": "workspace:*",
     "@geewiki/manager": "workspace:*",
     "@geewiki/openai": "workspace:*",
