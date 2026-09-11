@@ -46,16 +46,19 @@ export interface CookieOptions {
 }
 
 /**
- * 序列化会话 cookie。
+ * 序列化任意 cookie（会话与 OIDC 绑定票据共用同一套属性规则）。
  *
- * - `HttpOnly`：JS 读不到 ⇒ XSS 不能直接偷走会话。
+ * - `HttpOnly`：JS 读不到 ⇒ XSS 不能直接偷走凭据。
  * - `SameSite=Lax`：阻断绝大多数跨站 POST（CSRF 主防线）。
  * - `Path=/`：全站可用（门户与 API 同源）。
- * - **不加 `Domain`**：保持 host-only，避免子域互相覆盖会话。
+ * - **不加 `Domain`**：保持 host-only，避免子域互相覆盖。
+ *
+ * 两个 cookie 必须用**同一套属性**：属性不一致会让浏览器留下两个同名但不同作用域的
+ * cookie，"登出后还能用"这类问题正是这么来的。
  */
-export function sessionCookie(rawToken: string, opts: CookieOptions): string {
+export function serializeCookie(name: string, value: string, opts: CookieOptions): string {
   const parts = [
-    `${SESSION_COOKIE}=${encodeURIComponent(rawToken)}`,
+    `${name}=${encodeURIComponent(value)}`,
     'Path=/',
     'HttpOnly',
     'SameSite=Lax',
@@ -63,6 +66,11 @@ export function sessionCookie(rawToken: string, opts: CookieOptions): string {
   ]
   if (opts.secure) parts.push('Secure')
   return parts.join('; ')
+}
+
+/** 序列化会话 cookie。 */
+export function sessionCookie(rawToken: string, opts: CookieOptions): string {
+  return serializeCookie(SESSION_COOKIE, rawToken, opts)
 }
 
 /** 清空会话 cookie（登出）。属性必须与设置时一致，否则浏览器不会覆盖同名 cookie。 */
