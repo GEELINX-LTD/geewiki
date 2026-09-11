@@ -31,7 +31,14 @@ import {
 } from '@geewiki/core'
 import type { RegisteredPlugin } from '@geewiki/manager'
 import { httpRegistryEntry, startServer } from '../src/index.js'
-import { freePort, sleep, waitForHealth } from './helpers.js'
+import { freePort, sleep, waitForHealth, ADMIN_TOKEN, adminHeaders } from './helpers.js'
+
+/**
+ * P0：本文件多处通过真实 HTTP 调管理端点（插件 enable/disable）来制造"卸载长连接持有者"
+ * 的场景。这些端点在 P0 被收进访问等级闸门（`admin`），故显式启用应急令牌并带上令牌头。
+ * **既有断言一字未改**——改的只是请求身份。
+ */
+process.env['GEEWIKI_ADMIN_TOKEN'] = ADMIN_TOKEN
 
 /* ------------------------------ 夹具 ------------------------------ */
 
@@ -244,7 +251,10 @@ test('SSE：长连接活跃期间 REST 卸载不空转、无假"排空超时"告
   const h = await startHarness([sseOwnerPlugin('@t/sse-owner')], { session: ['@t/sse-owner'] })
   try {
     const pluginPath = encodeURIComponent('@t/sse-owner')
-    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), { method: 'POST' })
+    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), {
+      method: 'POST',
+      headers: adminHeaders(),
+    })
     assert.equal(enabled.status, 200, '会话层热启用应成功')
     await enabled.arrayBuffer()
 
@@ -254,7 +264,10 @@ test('SSE：长连接活跃期间 REST 卸载不空转、无假"排空超时"告
 
     const { warns } = await captureConsole(async () => {
       const startedAt = Date.now()
-      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), { method: 'POST' })
+      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), {
+        method: 'POST',
+        headers: adminHeaders(),
+      })
       const elapsed = Date.now() - startedAt
       assert.equal(res.status, 200, '停用应成功')
       await res.arrayBuffer()
@@ -379,7 +392,10 @@ test('负对照：处理器返回永不 resolve 的 thenable → 排空确实等
   const h = await startHarness([hanging], { session: ['@t/hanging'] })
   try {
     const pluginPath = encodeURIComponent('@t/hanging')
-    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), { method: 'POST' })
+    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), {
+      method: 'POST',
+      headers: adminHeaders(),
+    })
     await enabled.arrayBuffer()
 
     // 先确认在途请求**确实已受理**（读到首帧即证明处理器已执行、exitHandler 挂在 pending 上），
@@ -389,7 +405,10 @@ test('负对照：处理器返回永不 resolve 的 thenable → 排空确实等
 
     const { warns } = await captureConsole(async () => {
       const startedAt = Date.now()
-      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), { method: 'POST' })
+      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), {
+        method: 'POST',
+        headers: adminHeaders(),
+      })
       const elapsed = Date.now() - startedAt
       await res.arrayBuffer()
       // 反面：这里**应当**等到超时（drainTimeout=1s），与用例 2 的 <1000ms 形成对照
@@ -476,7 +495,10 @@ test('SSE：插件卸载时由管理器定向回收其长连接（插件自身�
   })
   try {
     const pluginPath = encodeURIComponent(pluginName)
-    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), { method: 'POST' })
+    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), {
+      method: 'POST',
+      headers: adminHeaders(),
+    })
     assert.equal(enabled.status, 200, '会话层热启用应成功')
     await enabled.arrayBuffer()
 
@@ -486,7 +508,10 @@ test('SSE：插件卸载时由管理器定向回收其长连接（插件自身�
 
     const { warns } = await captureConsole(async () => {
       const startedAt = Date.now()
-      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), { method: 'POST' })
+      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), {
+        method: 'POST',
+        headers: adminHeaders(),
+      })
       const elapsed = Date.now() - startedAt
       assert.equal(res.status, 200, '停用应成功')
       await res.arrayBuffer()

@@ -1559,6 +1559,18 @@ function fail(h: RouteHandlerContext, err: unknown): void {
 
 /** 挂载管理器 REST 路由（导出以便集成测试直接以路由服务替身驱动，无需真实 HTTP） */
 export function registerRoutes(router: HttpRouterService, manager: GeeWikiManager): void {
+  /*
+   * 访问等级（P0）：
+   *
+   * - **读端点保持 `public`**（`/api/plugins`、`/graph`、`/slots`、`/ui`）：前端的插件
+   *   探测（`packages/web/src/pages/WikiPage.tsx` 据 `/api/plugins` 的 state 决定搜索/AI
+   *   入口是否可用）与插件 UI 加载（`/api/plugins/ui`）都依赖它们，收紧会让**内容浏览**
+   *   这一核心路径回归——那不属于 P0 要堵的"整类端点被匿名调用"。
+   * - **状态变更与配置读写一律 `admin`**：这些端点此前匿名可调，其中
+   *   `/api/plugins/:name/disable` 能热卸载数据库插件，是本项目当前最高危的一组。
+   *   注意：`GET /api/plugins` 的响应里含各插件的 `config`（可能含上游密钥），
+   *   本次**未**裁剪（属读路径改造，留给 P2 的"非 admin 返回公开子集"）。
+   */
   router.register('GET', '/api/plugins', (h) =>
     // issues：外部插件目录里被跳过的目录/清单（机器可读 code），前端与 CLI 据此提示"装了但没加载"
     ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() }),
@@ -1599,7 +1611,12 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
       fail(h, err)
     }
   })
-  router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()))
+  // 刻意保持 public：P0 的契约是"读端点行为与改动前完全一致"（设计文档 §8.1 P0 行），
+  // 读路径裁剪统一留给 P2。这里**不是"暂缓收紧"，而是收紧会直接弄坏管理台首屏**：
+  // AdminPage 用 Promise.all([api.plugins(), api.session(), api.slots().catch(() => null)]) 取数，
+  // 三个里只有 api.session() 没有 .catch()，它一旦 401/503 就整体 reject ⇒ 插件列表根本不渲染。
+  // （packages/web 在 P0 不得改动，前端测试又全部 mock 掉了 api 模块，故此回归不会有测试变红。）
+  router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()), { access: 'public' })
   router.register('POST', '/api/plugins/:name/enable', async (h) => {
     try {
       const name = h.params['name']
@@ -1613,7 +1630,7 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'admin' })
   router.register('GET', '/api/plugins/:name/config', (h) => {
     try {
       const name = h.params['name']
@@ -1622,7 +1639,7 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'admin' })
   router.register('PUT', '/api/plugins/:name/config', async (h) => {
     try {
       const name = h.params['name']
@@ -1634,7 +1651,7 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'admin' })
   router.register('POST', '/api/plugins/:name/replace', async (h) => {
     try {
       const name = h.params['name']
@@ -1648,7 +1665,7 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'admin' })
   router.register('POST', '/api/plugins/:name/disable', async (h) => {
     try {
       const name = h.params['name']
@@ -1658,7 +1675,7 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'admin' })
   router.register('POST', '/api/session/persist', async (h) => {
     try {
       const result = manager.persistSession()
@@ -1666,7 +1683,7 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'admin' })
   console.log(
     '[@geewiki/manager] REST API 已挂载: /api/plugins, /api/plugins/graph, /api/plugins/ui, /api/plugins/:name/config, /api/session',
   )

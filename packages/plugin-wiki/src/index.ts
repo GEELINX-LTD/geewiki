@@ -638,7 +638,13 @@ export const WikiPlugin = {
       }),
     )
 
-    /* ---------- PUT /api/pages/:slug：upsert（保存时先快照旧正文，幂等：内容未变不产生新历史） ---------- */
+    /* ---------- PUT /api/pages/:slug：upsert（保存时先快照旧正文，幂等：内容未变不产生新历史） ----------
+     *
+     * 访问等级 `user`（P0）：本端点此前**匿名可调**，任何人可增删改任何条目。
+     * 读端点（列表/详情/版本/反链/出链）**保持 public**，行为与 P0 之前完全一致——
+     * 按可见性裁剪读取是 P2 的事（需要在服务端逐对象判定，见设计文档 §5）。
+     * 注意：`access` 是**粗粒度**闸门，它只保证"不是匿名"，不区分"谁能改哪一条"。
+     */
     cleanups.push(
       router.register('PUT', '/api/pages/:slug', async (h) => {
         const slug = h.params.slug ?? ''
@@ -671,7 +677,7 @@ export const WikiPlugin = {
         }
         const { outcome, version } = await savePage(slug, save)
         h.json(200, { ok: true, slug, title: save.title, outcome, version })
-      }),
+      }, { access: 'user' }),
     )
 
     /* ---------- DELETE /api/pages/:slug（版本历史依赖外键级联；此处显式事务删除以防实现差异） ---------- */
@@ -683,7 +689,7 @@ export const WikiPlugin = {
           return
         }
         h.json(200, { ok: true, deleted: slug })
-      }),
+      }, { access: 'user' }),
     )
 
     /* ---------- GET /api/pages/:slug/backlinks：谁链接了本页 ---------- */

@@ -30,6 +30,17 @@ import {
 } from '@geewiki/core'
 import type { RegisteredPlugin } from '@geewiki/manager'
 import { httpRegistryEntry, defaultRegistry, startServer } from '../src/index.js'
+import { ADMIN_TOKEN, adminHeaders } from './helpers.js'
+
+/**
+ * P0：本文件有多处通过**真实 HTTP** 调用管理端点（插件 enable/disable）与条目写端点
+ * （`PUT /api/pages/...`）。这些端点在 P0 被收进访问等级闸门（`admin` / `user`），
+ * 而 P0 唯一的凭据来源就是应急令牌 `GEEWIKI_ADMIN_TOKEN`（用户会话属 P1），
+ * 因此这里显式启用它（模拟运维通道），并给相应请求带上令牌头。
+ *
+ * **既有断言一字未改**：改的只是"以什么身份发这个请求"，而不是"期望什么结果"。
+ */
+process.env['GEEWIKI_ADMIN_TOKEN'] = ADMIN_TOKEN
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -366,13 +377,19 @@ test('REST 卸载：空闲时立即完成，不再打印假的排空超时告警
   const h = await startHarness([testPlugin({ name: '@t/idle', drainTimeout: 5 })], { session: ['@t/idle'] })
   try {
     const pluginPath = encodeURIComponent('@t/idle')
-    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), { method: 'POST' })
+    const enabled = await fetch(base(h, `/api/plugins/${pluginPath}/enable`), {
+      method: 'POST',
+      headers: adminHeaders(),
+    })
     assert.equal(enabled.status, 200, '会话层热启用应成功')
     await enabled.arrayBuffer()
 
     const { logs, warns } = await captureConsole(async () => {
       const startedAt = Date.now()
-      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), { method: 'POST' })
+      const res = await fetch(base(h, `/api/plugins/${pluginPath}/disable`), {
+        method: 'POST',
+        headers: adminHeaders(),
+      })
       const elapsed = Date.now() - startedAt
       assert.equal(res.status, 200, '停用应成功')
       await res.arrayBuffer()
@@ -400,7 +417,10 @@ test('REST 卸载：有真实在途请求时等待其结算并打印"排空完�
   })
   try {
     const targetPath = encodeURIComponent('@t/target')
-    const enabled = await fetch(base(h, `/api/plugins/${targetPath}/enable`), { method: 'POST' })
+    const enabled = await fetch(base(h, `/api/plugins/${targetPath}/enable`), {
+      method: 'POST',
+      headers: adminHeaders(),
+    })
     assert.equal(enabled.status, 200)
     await enabled.arrayBuffer()
 
@@ -410,7 +430,10 @@ test('REST 卸载：有真实在途请求时等待其结算并打印"排空完�
 
     const startedAt = Date.now()
     const { logs } = await captureConsole(async () => {
-      const res = await fetch(base(h, `/api/plugins/${targetPath}/disable`), { method: 'POST' })
+      const res = await fetch(base(h, `/api/plugins/${targetPath}/disable`), {
+        method: 'POST',
+        headers: adminHeaders(),
+      })
       assert.equal(res.status, 200)
       await res.arrayBuffer()
     })
@@ -445,7 +468,7 @@ test('plugin-wiki：超限请求体返回 413 且计入 stats()（修复前绕�
     const before = h.router.stats()
     const tooBig = await fetch(base(h, '/api/pages/probe-413'), {
       method: 'PUT',
-      headers: { 'content-type': 'application/json' },
+      headers: adminHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ title: 'probe', content: 'x'.repeat(1_100_000) }),
     })
     assert.equal(tooBig.status, 413)
@@ -458,7 +481,7 @@ test('plugin-wiki：超限请求体返回 413 且计入 stats()（修复前绕�
     // (b) 正文 >500KB 但请求体 <1MB → content_too_large（与"请求体过大"分流，调用方可区分）
     const contentTooBig = await fetch(base(h, '/api/pages/probe-content'), {
       method: 'PUT',
-      headers: { 'content-type': 'application/json' },
+      headers: adminHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ title: 'probe', content: 'y'.repeat(600_000) }),
     })
     assert.equal(contentTooBig.status, 413)
@@ -467,7 +490,7 @@ test('plugin-wiki：超限请求体返回 413 且计入 stats()（修复前绕�
     // (c) 限额内写入仍然成功（确认 413 只针对超限，未误伤正常请求）
     const accepted = await fetch(base(h, '/api/pages/probe-ok'), {
       method: 'PUT',
-      headers: { 'content-type': 'application/json' },
+      headers: adminHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ title: '正常页面', content: 'hello' }),
     })
     assert.equal(accepted.status, 200)
