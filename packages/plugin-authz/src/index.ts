@@ -99,6 +99,22 @@ export interface PolicyService {
    * 传入后它**只覆盖该 slug 自身那一行**，祖先链仍按库里的真实状态算。
    */
   effectiveIndexLevel(slug: string, self?: PageVisRow): Promise<0 | 1 | null>
+  /**
+   * ★ P3a：本主体**被显式授权**的块 id 集合 —— `granted` 档块的唯一入口。
+   *
+   * 为什么必须有它：`granted` 档的 `blocks.tier` 写 `NULL`，于是**永远不会被等级分支
+   * 命中**（`NULL <= ?` 恒不成立，失败关闭）。要让这类块可检索，只能在检索 SQL 里
+   * 加一个显式的授权分支，而那个集合的**判定必须来自这里**（单点）——
+   * 检索插件若自己查 `block_grants`，就等于造出第二套授权规则，迟早漂移。
+   *
+   * **P3a 阶段恒返回空数组**：`block_grants` 表属 **P3b**（`0016_block_grants.sql`），
+   * 在它落地之前不存在任何块级授权。返回空数组是**语义正确**的，不是占位 TODO：
+   * 没有授权 = 没有块能被授权分支放行。SQL 侧因此退化为"只看等级分支"。
+   *
+   * ⚠️ 实现 P3b 时必须遵守的边界：本方法只返回**块 id**，不返回任何文本；
+   * 且必须按 `expires_at` 过滤（过期的授权不算授权）。
+   */
+  grantedBlockIds(p: Principal): Promise<readonly number[]>
 }
 
 /* ============================== 档位序 ============================== */
@@ -483,6 +499,24 @@ export const AuthzPlugin = {
           if (levels.has(access.level)) out.push(slug)
         }
         return out
+      },
+
+      /**
+       * ★ P3a：块级授权的**唯一入口**。
+       *
+       * 现在恒为空数组，因为 `block_grants` 表属 P3b（`0016_block_grants.sql`）——
+       * 在它落地之前，**不存在任何块级授权**，空数组是语义正确的结果。
+       * 检索侧因此退化为"只看 `tier` 等级分支"，与其 SQL 里的 `OR b.id IN (...)`
+       * 收在恒假分支上，行为等价。
+       *
+       * **为什么不做"表存在就查、不存在就空"的自适应**：那会让同一份代码在不同
+       * schema 版本下走不同分支，而"没有授权"与"查不到授权表"在授权语义上是**必须
+       * 区分**的两件事（后者应当显式失败，而不是静默降级成"没人有权限"或"所有人有权限"）。
+       * P3b 落地这张表时，把本方法换成真实查询即可 —— 调用方无需改动。
+       */
+      async grantedBlockIds(rawP): Promise<readonly number[]> {
+        requirePrincipal(rawP, 'grantedBlockIds')
+        return []
       },
     }
 

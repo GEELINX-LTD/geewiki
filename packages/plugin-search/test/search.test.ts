@@ -11,6 +11,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -60,6 +61,10 @@ interface Harness {
    * `null` = 回到默认行为「库里所有页面都可见」—— 既有用例因此语义不变。
    */
   setVisible(slugs: readonly string[] | null): void
+  /** ★ P3a：切换请求主体（匿名的读者等级 0 / 组织成员的 1） */
+  setPrincipal(who: 'anonymous' | 'member'): void
+  /** ★ P3a：设置某一页全部块的档位（`null` = granted 档，只有显式授权才可见） */
+  setBlockTier(slug: string, tier: 0 | 1 | null, visibility: 'public' | 'org' | 'granted'): void
   /** 仅卸载插件（保留 db 与 ctx，便于断言卸载后的服务状态） */
   unload(): void
   dispose(): void
@@ -111,6 +116,13 @@ function makeHarness(): Harness {
         db.query<{ slug: string }>('SELECT slug FROM pages ORDER BY slug').map((r) => r.slug),
       )
     },
+    /*
+     * ★ P3a：检索现在**不再**走 `visibleSlugs` 下推，而走 `blocks.tier` 的等级分支 +
+     * 这个授权分支。夹具必须提供它，否则第一次检索就抛
+     * "policy(...).grantedBlockIds is not a function"。默认空集合 = 没有任何块级授权，
+     * 与 P3a 阶段的真实实现一致（`block_grants` 表属 P3b）。
+     */
+    grantedBlockIds: (_principal: Principal): Promise<readonly number[]> => Promise.resolve([]),
   }
   const services = new Map<string, unknown>([
     ['db', db],
@@ -130,16 +142,28 @@ function makeHarness(): Harness {
   const dispose = SearchPlugin.apply(ctx, { limit: 20, snippetRadius: 48 }) as () => void
 
   /*
-   * ★ P2：请求主体。默认匿名 —— 检索结果是否含某条完全由策略层决定，
-   * 与主体本身的具体字段无关（本插件的用例只验证"策略层说不给就不给"）。
+   * ★ P2：请求主体。默认匿名。
+   *
+   * ★ P3a：检索的可见性判定**不再依赖策略层的可见集合**，而是由 `blocks.tier`
+   * （等级分支）与 `grantedBlockIds`（授权分支）在 SQL 里决定 ⇒ **主体本身参与了判定**
+   * （匿名 → 读者等级 0；有 `orgRole` 的组织成员 → 1）。故它必须可变，用例才能
+   * 用同一个库演示"同一条命中，匿名搜不到、成员搜得到"。
    */
-  const principal: Principal = {
+  let principal: Principal = {
     kind: 'anonymous',
     userId: null,
     orgId: null,
     orgRole: null,
     groupIds: [],
     sessionId: null,
+  }
+
+  /** 切换主体：`'anonymous'` 或 `'member'`（有组织角色 = 读者等级 1） */
+  const setPrincipal = (who: 'anonymous' | 'member'): void => {
+    principal =
+      who === 'anonymous'
+        ? { kind: 'anonymous', userId: null, orgId: null, orgRole: null, groupIds: [], sessionId: null }
+        : { kind: 'user', userId: 1, orgId: 1, orgRole: 'member', groupIds: [], sessionId: 's1' }
   }
 
   const search = (queryString: string) => {
@@ -161,10 +185,38 @@ function makeHarness(): Harness {
     })
   }
 
+  /**
+   * ★ P3a：写 `pages` 的同时维护 `blocks` 与 `blocks_fts`。
+   *
+   * **为什么夹具必须自己做这件事**：检索现在只读 `blocks` —— `pages.content` 已从
+   * 检索路径彻底移除（它含未裁剪全文，是 §5.6 点名的泄漏源）。夹具若仍只写 `pages`，
+   * 任何一条用例都搜不到东西。
+   *
+   * **为什么用"整页一个块"的最小实现、而不复刻 plugin-wiki 的 `parseBlocks`**：
+   * 本包测的是**检索**（匹配、高亮、可见性过滤、分页），不是解析。在夹具里复刻解析器
+   * 会让两处实现漂移，并把 wiki 的解析规则变成检索测试的隐式依赖。解析与块身份的正确性
+   * 由 `plugin-wiki` 自己的单测 + P3a 端到端脚本覆盖。
+   */
+  const writeBlocks = (pageId: number, content: string): void => {
+    // 顺序不可换：清索引的子查询依赖 blocks 行还在 —— 先删块会让子查询恒空，
+    // 旧文本会静默留在 contentless 索引里成为孤儿（这条坑由 P3a 的单测抓出过）
+    db.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])
+    db.run('DELETE FROM blocks WHERE page_id = ?', [pageId])
+    if (content === '') return
+    const at = '2024-01-01T00:00:00.000Z'
+    const res = db.run(
+      `INSERT INTO blocks (page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, created_at, updated_at, tier)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [pageId, 0, 'paragraph', content, 'public', 1, null, createHash('sha256').update(content).digest('hex'), at, at, 0],
+    )
+    db.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [Number(res.lastInsertRowid), content])
+  }
+
   const putPage = (slug: string, title: string, content: string, updatedAt = '2024-01-01T00:00:00.000Z'): void => {
     const existing = db.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
     if (existing) {
       db.run('UPDATE pages SET title = ?, content = ?, updated_at = ? WHERE id = ?', [title, content, updatedAt, existing.id])
+      writeBlocks(existing.id, content)
       return
     }
     db.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
@@ -174,6 +226,22 @@ function makeHarness(): Harness {
       updatedAt,
       updatedAt,
     ])
+    const created = db.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
+    if (created) writeBlocks(created.id, content)
+  }
+
+  /**
+   * ★ P3a：把某一页的**全部块**设成指定档位 —— 用来演示"同一条命中，不同读者等级
+   * 搜到的结果不同"。
+   *
+   * `tier` 的语义（§4.3）：`0` = 匿名可见、`1` = 仅组织成员、`null` = 只有被显式授权的
+   * 块能看（`granted` 档，P3a 阶段没有授权表 ⇒ 谁都搜不到）。
+   */
+  const setBlockTier = (slug: string, tier: 0 | 1 | null, visibility: 'public' | 'org' | 'granted'): void => {
+    db.run(
+      'UPDATE blocks SET tier = ?, visibility = ? WHERE page_id = (SELECT id FROM pages WHERE slug = ?)',
+      [tier, visibility, slug],
+    )
   }
 
   let unloaded = false
@@ -189,7 +257,12 @@ function makeHarness(): Harness {
     services,
     search,
     putPage,
-    principal,
+    /** 用 getter 而不是快照：`setPrincipal()` 之后 `h.principal` 必须立刻反映新主体 */
+    get principal(): Principal {
+      return principal
+    },
+    setPrincipal,
+    setBlockTier,
     setVisible: (slugs) => {
       visibleOverride = slugs === null ? null : [...slugs]
     },
@@ -322,13 +395,13 @@ test('一致性：删除页面后搜不到（AFTER DELETE 触发器）', async (
   }
 })
 
-test('存量数据回填：迁移应用前已存在的页面也能被检索到（rebuild 路径）', async () => {
-  // 这是真实的升级路径：用户先有 wiki 数据，之后才装上检索插件。
-  // 触发器只对"此后发生的"变更生效，存量行必须靠迁移末尾的 rebuild 回填。
+test('存量页面不进块索引：本插件只建表，块的回填归 plugin-wiki（不解析 Markdown）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gw-search-upgrade-'))
   const db = new SqliteDatabase(join(dir, 'test.db'))
+  const count = (table: string): number =>
+    Number(db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)[0]?.n ?? 0)
   try {
-    db.open() // 只跑 db-sqlite 的迁移：此时还没有 pages_fts
+    db.open() // 只跑 db-sqlite 的迁移
     db.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
       'legacy',
       '存量标题',
@@ -336,47 +409,34 @@ test('存量数据回填：迁移应用前已存在的页面也能被检索到�
       '2023-01-01T00:00:00.000Z',
       '2023-01-01T00:00:00.000Z',
     ])
-    assert.equal(
-      db.query<{ n: number }>("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'pages_fts'")[0]?.n,
-      0,
-      '前置：此时索引尚不存在',
-    )
 
-    // 安装检索插件：迁移控制器执行本插件迁移（建索引 + 触发器 + rebuild 回填）
     db.migrate(SEARCH_MIGRATIONS_DIR)
-    assert.equal(
-      Number(db.query<{ n: number }>('SELECT COUNT(*) AS n FROM pages_fts WHERE pages_fts MATCH ?', ['"存量独特词西格玛"'])[0]?.n ?? 0),
-      1,
-      'rebuild 必须把存量行回填进索引',
-    )
 
-    // 回填之后，触发器对新变更同样生效
-    db.run("UPDATE pages SET content = ?, updated_at = ? WHERE slug = 'legacy'", ['改成了新词陶，旧词不再出现。', '2024-01-01T00:00:00.000Z'])
-    assert.equal(
-      Number(db.query<{ n: number }>('SELECT COUNT(*) AS n FROM pages_fts WHERE pages_fts MATCH ?', ['"存量独特词西格玛"'])[0]?.n ?? 0),
-      0,
-      '回填后触发器仍须与内容表同步',
-    )
-    assert.equal(
-      Number(db.query<{ n: number }>('SELECT COUNT(*) AS n FROM pages_fts WHERE pages_fts MATCH ?', ['"新词陶"'])[0]?.n ?? 0),
-      1,
-    )
+    /*
+     * ★ P3a 的语义变化（这一条是**刻意的显式化**，不是"测试被放宽"）：
+     *
+     * 检索只读 `blocks`（`pages.content` 已从检索路径整体移除）。而 `blocks` 是
+     * **解析 Markdown 的产物**，解析器 `parseBlocks` 归 `@geewiki/wiki` ——
+     * 本插件既不拥有它，也不该在迁移里凭空造块。
+     *
+     * 于是：**存量页面的块回填由 `@geewiki/wiki` 在激活时完成**（与它的"反向链接
+     * 回填"同款做法）。本用例把这条契约钉在这里 —— 断言"表建好了、但仍是空的"，
+     * 免得将来有人把"存量搜不到"当成索引 bug 去修。
+     */
+    assert.equal(count('blocks'), 0, '本插件不解析 Markdown ⇒ 不会凭空造块')
+    assert.equal(count('blocks_fts'), 0, '块索引随块一起为空')
 
-    // 迁移可重放（幂等）：再跑一次不应抛错，也不应把索引搞乱
+    // 迁移可重放（幂等）：再跑一次不应抛错
     assert.doesNotThrow(() => db.migrate(SEARCH_MIGRATIONS_DIR))
-    assert.equal(
-      Number(db.query<{ n: number }>('SELECT COUNT(*) AS n FROM pages_fts WHERE pages_fts MATCH ?', ['"新词陶"'])[0]?.n ?? 0),
-      1,
-      '重放迁移（含 rebuild）后索引内容不变',
-    )
+    assert.equal(count('blocks'), 0)
   } finally {
     db.close()
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('LIKE 兜底不依赖 FTS 索引：索引缺失时短查询仍给出正确结果（且长查询显式报错）', async () => {
-  // 兜底路径直接扫 pages 表，故索引漂移/缺失不会让短查询静默漏行。
+test('LIKE 兜底不依赖块索引：索引缺失时短查询仍给出正确结果（且长查询显式报错）', async () => {
+  // 兜底路径扫 `blocks`（普通表），故索引漂移/缺失不会让短查询静默漏行。
   const h = makeHarness()
   try {
     h.putPage('p1', '标题甲', '正文含两字词检索，用于验证兜底路径的独立性。')
@@ -384,17 +444,17 @@ test('LIKE 兜底不依赖 FTS 索引：索引缺失时短查询仍给出正确�
     // 走一遍正常路径，确认基线
     assert.equal((await searchAs(h, 'q=检索', 'like')).total, 1)
 
-    // 制造"索引缺失"：把 FTS 表整个删掉（模拟迁移未跑全 / 索引被误删）
-    h.db.run('DROP TABLE pages_fts')
+    // 制造"索引缺失"：把块索引表整个删掉（模拟迁移未跑全 / 索引被误删）
+    h.db.run('DROP TABLE blocks_fts')
 
-    // 短查询（LIKE 路）仍应正确返回——它读的是真源
+    // 短查询（LIKE 路）仍应正确返回 —— 它读的是 `blocks`，不碰索引
     const fallback = await searchAs(h, 'q=兜底', 'like')
-    assert.equal(fallback.total, 1, '索引缺失时短查询仍须命中（LIKE 扫 pages 表）')
+    assert.equal(fallback.total, 1, '索引缺失时短查询仍须命中（LIKE 扫 blocks 表）')
     assert.deepEqual(fallback.hits.map((x) => x.slug), ['p1'])
     // 长查询无法回避索引：应显式抛错（宁可响，不可静默返回空结果）
     await assert.rejects(
       () => h.search('q=验证兜底'),
-      (err: unknown) => /no such table: pages_fts/.test((err as Error).message),
+      (err: unknown) => /no such table: blocks_fts/.test((err as Error).message),
       '≥3 字符查询在索引缺失时必须显式失败，而不是静默返回空',
     )
   } finally {
@@ -495,13 +555,32 @@ test('snippet：HTML 转义 + <mark> 高亮（正文是用户内容，不能变�
   }
 })
 
-test('snippet：只命中标题时退回标题片段；截断处补省略号', async () => {
+test('snippet：截断补省略号；★ P3a 标题不再参与 FTS 匹配（只索引块文本）', async () => {
   const h = makeHarness()
   try {
+    /*
+     * ★ P3a 的行为变化（**显式化，不是放宽**）：`blocks_fts` 只索引**块文本**，
+     * `p.title` 不在其中 ⇒ "只命中标题"在 FTS 路上不再成立。这是设计文档 §4.3 的
+     * SQL 形态的直接后果（它 MATCH 的是 `blocks_fts`，只 SELECT `p.title`）。
+     *
+     * 把这条断言留在测试里是为了**让回归可见**：将来若把标题重新纳入索引
+     * （例如写入端额外造一个 heading 块），这里会立刻变红，而不是悄无声息地改行为。
+     *
+     * 短查询的 LIKE 路**仍然匹配标题**（`p.title LIKE ?`），故"按标题搜"并未整体失效。
+     */
     h.putPage('p1', '标题含独特词艾普西龙', '正文里完全没有那个词。')
-    const body = await searchAs(h, 'q=独特词艾普西龙', 'fts')
-    assert.equal(body.total, 1)
-    assert.ok(body.hits[0]?.snippet.includes('<mark>独特词艾普西龙</mark>'), `应退回标题片段: ${body.hits[0]?.snippet}`)
+    assert.equal(
+      (await searchAs(h, 'q=独特词艾普西龙', 'fts')).total,
+      0,
+      '块索引不含标题 ⇒ FTS 路搜不到"只出现在标题里"的词',
+    )
+    // 反向：LIKE 路仍能按标题命中，且片段退回标题
+    const likeBody = await searchAs(h, 'q=艾普', 'like')
+    assert.equal(likeBody.total, 1, '短查询的 LIKE 路仍按标题匹配')
+    assert.ok(
+      (likeBody.hits[0]?.snippet ?? '').includes('<mark>艾普</mark>'),
+      `应退回标题片段: ${likeBody.hits[0]?.snippet}`,
+    )
 
     // 长正文：片段应被截断并带省略号
     const long = `${'铺垫'.repeat(80)}命中词泽塔${'收尾'.repeat(80)}`
@@ -659,11 +738,18 @@ test('search-service.contents：批量取正文，只含存在的 slug（供 RAG
 
     const single = await svc.contents(h.principal, ['a'])
     assert.equal(single.size, 1)
-    assert.equal(single.get('a'), '甲的完整正文，含独特词阿尔法。', 'value 必须是该页完整正文（逐字一致）')
+    // ★ P3a：value 由"整页正文串"改为 `ContentView`（可见块投影）
+    assert.equal(single.get('a')?.text, '甲的完整正文，含独特词阿尔法。', 'text 必须是可见块拼接后的文本')
+    assert.deepEqual(
+      single.get('a')?.blocks.map((b) => b.ordinal),
+      [0],
+      'blocks 给出可见块的 ordinal（供 sources 帧做块级引用定位）',
+    )
+    assert.equal(single.get('a')?.gatedCount, 0, '没有受限块时 gatedCount 为 0')
 
     const both = await svc.contents(h.principal, ['a', 'b'])
     assert.equal(both.size, 2)
-    assert.equal(both.get('b'), '乙的完整正文，含独特词贝塔。')
+    assert.equal(both.get('b')?.text, '乙的完整正文，含独特词贝塔。')
 
     // 查不到的 slug 不进 Map（消费方据此区分"页面不存在"与"正文为空串"）
     const mixed = await svc.contents(h.principal, ['a', '不存在的slug', 'b'])
@@ -680,17 +766,23 @@ test('search-service.contents：批量取正文，只含存在的 slug（供 RAG
     assert.deepEqual([...(await svc.contents(h.principal, ['b', 'a'])).keys()].sort(), ['a', 'b'])
 
     /*
-     * ★ P2：**策略层说不给就不给**。
-     * 这一条是 P2 引入的核心不变式：`contents` 是 RAG 的正文入口，原先它对任意 slug
-     * 都原样返回正文（"给什么吐什么"的裸接口）。现在所有返回都必须先过策略层。
+     * ★ P3a：**看不见的块取不到**。
+     * 这一条是 P2 引入、P3a 换机制的核心不变式：`contents` 是 RAG 的正文入口，
+     * 原先它对任意 slug 都原样返回正文（"给什么吐什么"的裸接口）；P2 靠"先取可见集合
+     * 求交集"挡住，P3a 改为**在 SQL 里按 `blocks.tier` 过滤**（页面级与块级一起）。
      * 注意断言的是"正文取不到"，不是"报错"——不可见与不存在在**这一层**同构，
      * 存在性差异由 HTTP 层统一翻成 404（见 wiki 的读端点）。
      */
-    h.setVisible(['a'])
+    h.setBlockTier('b', 1, 'org')
     const gated = await svc.contents(h.principal, ['a', 'b'])
-    assert.equal(gated.size, 1, '只有策略层放行的 slug 才应取到正文')
-    assert.equal(gated.has('b'), false, '被策略层挡下的 slug 绝不能出现在结果里')
-    h.setVisible(null)
+    assert.equal(gated.size, 1, '只有可见块所在的 slug 才应取到正文（此处主体是匿名）')
+    assert.equal(gated.has('b'), false, '受限块所在的 slug 绝不能出现在结果里')
+
+    // 反向：同一个库、换成组织成员 ⇒ 立刻取得到（证明挡住它的是**读者等级**而非别的）
+    h.setPrincipal('member')
+    const asMember = await svc.contents(h.principal, ['a', 'b'])
+    assert.equal(asMember.size, 2, '组织成员应能取到 org 档块的正文')
+    h.setPrincipal('anonymous')
   } finally {
     h.dispose()
   }
@@ -722,54 +814,63 @@ test('search-service.contents：SQL 注入防护——slug 走参数绑定，绝
   }
 })
 
-test('★ P2 权限：不可见条目既不进 hits 也不进 total —— FTS 路与短查询 LIKE 路分别验证', async () => {
+test('★ P3a 权限：org 档的块匿名搜不到、组织成员搜得到 —— FTS 路与短查询 LIKE 路分别验证', async () => {
   const h = makeHarness()
   try {
     h.putPage('公开页', '公开标题', '正文含公开词阿尔法。')
-    h.putPage('私有页', '私有标题', '正文含机密词奥米克戎。')
+    h.putPage('受限页', '受限标题', '正文含机密词奥米克戎。')
+    // 受限页的块标成 org 档（tier=1）：组织成员够得着，匿名够不着
+    h.setBlockTier('受限页', 1, 'org')
 
-    // 前置：默认（全部可见）时两条都能搜到 —— 证明下面的 0 是**过滤**造成的，不是本来就搜不到
-    assert.equal((await h.search('q=机密词奥米克戎')).body['total'], 1, '前置：默认可见时应有 1 条命中')
+    // 前置：**成员身份下能搜到** —— 证明下面的 0 是等级过滤造成的，不是本来就搜不到
+    h.setPrincipal('member')
+    assert.equal((await h.search('q=机密词奥米克戎')).body['total'], 1, '前置：成员应有 1 条命中')
 
-    h.setVisible(['公开页'])
+    h.setPrincipal('anonymous')
 
-    // ① FTS 路（查询串 ≥3 字符，走 pages_fts MATCH）
+    // ① FTS 路（查询串 ≥3 字符 → blocks_fts MATCH）
     const fts = await h.search('q=机密词奥米克戎')
     assert.equal(fts.status, 200)
-    assert.equal(fts.body['total'], 0, 'FTS 路：不可见条目的命中数必须为 0')
-    assert.deepEqual(fts.body['hits'], [], 'FTS 路：不可见条目不得出现在 hits 里')
+    assert.equal(fts.body['total'], 0, 'FTS 路：tier=1 的块对匿名必须 0 命中')
+    assert.deepEqual(fts.body['hits'], [], 'FTS 路：受限块不得出现在 hits 里')
 
-    // ② 短查询 LIKE 路 —— **另一条 SQL**，最容易被漏改。
-    //    2 字元中文低于 trigram 的 3 字元门槛，必然走这里。
+    // ② 短查询 LIKE 路 —— **独立的另一条 SQL**，最容易被漏改（2 字元中文低于 trigram 门槛）
     const like = await h.search('q=机密')
     assert.equal(like.body['mode'], 'like', '前置：2 字元查询应走 LIKE 路（否则本用例没测到想测的东西）')
-    assert.equal(like.body['total'], 0, 'LIKE 路：不可见条目的命中数必须为 0（括号没加会让过滤只作用于一半条件）')
-    assert.deepEqual(like.body['hits'], [], 'LIKE 路：不可见条目不得出现在 hits 里')
+    assert.equal(like.body['total'], 0, 'LIKE 路：同样必须 0 命中（括号没加会让可见性只作用于一半条件）')
+    assert.deepEqual(like.body['hits'], [], 'LIKE 路：受限块不得出现在 hits 里')
 
-    // ③ 反向：可见条目仍然搜得到 —— 证明过滤没有把整条路一起堵死
-    assert.equal((await h.search('q=公开词阿尔法')).body['total'], 1, 'FTS 路：可见条目必须照常命中')
-    assert.equal((await h.search('q=公开')).body['total'], 1, 'LIKE 路：可见条目必须照常命中')
+    // ③ 反向：公开块（tier=0）照常命中 —— 证明过滤没有把整条路一起堵死
+    assert.equal((await h.search('q=公开词阿尔法')).body['total'], 1, 'FTS 路：公开块必须照常命中')
+    assert.equal((await h.search('q=公开')).body['total'], 1, 'LIKE 路：公开块必须照常命中')
   } finally {
     h.dispose()
   }
 })
 
-test('★ P2 权限：一条都看不见时直接返回空结果（不查库、也不暴露"有没有内容"）', async () => {
+test('★ P3a 权限：granted 档（tier 为 NULL）谁都搜不到，且 mode 仍如实上报', async () => {
   const h = makeHarness()
   try {
     h.putPage('p1', '标题', '正文含独特词伽马。')
-    h.setVisible([])
+    // granted 档：tier 写 NULL ⇒ 等级分支的 `NULL <= ?` 恒不成立 ⇒ 永不命中。
+    // 它只能靠**授权分支**放行，而块级授权表属 P3b ⇒ P3a 阶段谁都搜不到。
+    // 方向是刻意的失败关闭：写错的后果是"搜不到"，不是"泄漏"。
+    h.setBlockTier('p1', null, 'granted')
 
     const fts = await h.search('q=独特词伽马')
     assert.equal(fts.status, 200)
-    assert.equal(fts.body['total'], 0)
+    assert.equal(fts.body['total'], 0, 'granted 档在 P3a 没有授权来源 ⇒ 必须 0 命中')
     assert.deepEqual(fts.body['hits'], [])
+    // mode 按"本来会走哪条路"上报，不据结果反推"这个人有没有可见内容"
+    assert.equal(fts.body['mode'], 'fts')
 
     const like = await h.search('q=独特')
     assert.equal(like.body['total'], 0)
-    // mode 仍按"本来会走哪条路"报告：不能让调用方据 mode 反推出"这个人有没有可见内容"
     assert.equal(like.body['mode'], 'like')
-    assert.equal(fts.body['mode'], 'fts')
+
+    // 反向：改回 public 后**立刻**能搜到 —— 证明上面的 0 是档位造成的，不是索引坏了
+    h.setBlockTier('p1', 0, 'public')
+    assert.equal((await h.search('q=独特词伽马')).body['total'], 1, '改档后必须立刻可检索')
   } finally {
     h.dispose()
   }

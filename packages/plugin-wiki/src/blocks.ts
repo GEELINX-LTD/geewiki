@@ -278,7 +278,26 @@ export async function syncBlocksForPage(
    * 旧文本会**静默留在 contentless 索引里**成为孤儿（检索查询 JOIN blocks 所以不会
    * 产出命中，但正文还在索引文件里，且 verify 探针的 `extra` 会非零）。
    */
-  await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])
+  /*
+   * ★ P3a：`blocks_fts` 由 **`@geewiki/search` 的迁移**建立，而**搜索是可选插件** ——
+   * 没装它时这张表根本不存在。块写入**不能**因此失败：那会让"保存一个页面"依赖
+   * "装了检索插件"，是荒谬的耦合（server 的路由用例正是这么把它暴露出来的：
+   * 保存返 500 `no such table: blocks_fts`）。
+   *
+   * 故索引同步是**尽力而为**：表在就同步，不在就跳过并**告警一次**。
+   * 这只影响检索召回，不影响正确性 —— `blocks` 与 `pages.content` 才是真源，
+   * 索引任何时候都能从 `blocks` 重建，差异由 `GET /api/admin/search/verify` 显式报出。
+   */
+  let indexEnabled = true
+  try {
+    await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    // 只吞"表不存在"这一种；其它错误照抛（别把真故障伪装成"搜索没装"）
+    if (!/no such table: blocks_fts/.test(msg)) throw err
+    indexEnabled = false
+    warnBlocksIndexMissingOnce()
+  }
   await tx.run('DELETE FROM blocks WHERE page_id = ?', [pageId])
 
   for (const b of parsed) {
@@ -303,7 +322,7 @@ export async function syncBlocksForPage(
     if (!Number.isFinite(blockId) || blockId <= 0) {
       throw new Error('blocks_writer_no_rowid: 插入块后拿不到 rowid，无法对齐 blocks_fts')
     }
-    await tx.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [blockId, b.text])
+    if (indexEnabled) await tx.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [blockId, b.text])
   }
   return parsed
 }
@@ -311,4 +330,20 @@ export async function syncBlocksForPage(
 /** 本模块需要的执行器形状（`DatabaseExecutor` 的结构子集，便于测试替身）。 */
 export interface BlockWriter {
   run(sql: string, params?: readonly unknown[]): Promise<{ changes: number; lastInsertRowid: number | bigint }>
+}
+
+/**
+ * ★ P3a：`blocks_fts` 缺席时**只告警一次**。
+ *
+ * 为什么是"一次"：这条路径在每次保存时都会走。逐次打印会把日志淹掉，而这件事
+ * 本身不是错误（搜索是可选插件），只是"检索索引未启用"的运维事实。
+ */
+let warnedMissingBlocksIndex = false
+function warnBlocksIndexMissingOnce(): void {
+  if (warnedMissingBlocksIndex) return
+  warnedMissingBlocksIndex = true
+  console.warn(
+    '[@geewiki/wiki] 未找到 blocks_fts（@geewiki/search 未安装或未激活）⇒ 跳过块索引同步。' +
+      '块与页面正文照常写入，检索索引可在装上搜索插件后从 blocks 重建。',
+  )
 }

@@ -29,7 +29,7 @@ import {
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { redact, type LlmErrorCode, type LlmMessage, type LlmService, type LlmUsage } from '@geewiki/llm'
-import type { SearchHit, SearchService } from '@geewiki/search'
+import type { ContentView, SearchHit, SearchService } from '@geewiki/search'
 import { extractiveSummary, type ExtractInput } from './extract.js'
 import { buildMessages } from './prompt.js'
 import { selectSources, type Selection } from './select.js'
@@ -414,7 +414,8 @@ export const AiPlugin = {
           hits: readonly SearchHit[]
           retrievalMode: 'fts' | 'like'
           total: number
-          contents: ReadonlyMap<string, string>
+          /** ★ P3a：`contents()` 现在返回**可见块投影**（`ContentView`），不再是整页正文串 */
+          contents: ReadonlyMap<string, ContentView>
         }
       | { ok: false; degraded: Degraded }
 
@@ -525,11 +526,13 @@ export const AiPlugin = {
 
       const selection = selectFrom(stage)
 
-      // 抽取式摘要用**未截断**的原文定位命中词（命中点可能落在 perSourceChars 之外）
+      // 抽取式摘要用**未截断**的可见正文定位命中词（命中点可能落在 perSourceChars 之外）。
+      // ★ P3a：`contents()` 返回的是可见块投影，取它的 `text`（可见块拼接，未截断）
+      // —— 抽取式摘要因此也不可能引用到主体看不到的块。
       const extractInputs: ExtractInput[] = selection.selected.map((s) => ({
         slug: s.slug,
         title: s.title,
-        text: stage.contents.get(s.slug) ?? '',
+        text: stage.contents.get(s.slug)?.text ?? '',
       }))
 
       const model = await generate(buildMessages(query, selection.selected))
@@ -760,11 +763,11 @@ export const AiPlugin = {
         selection = selectFrom(stage)
         sources = selection.sources
         retrieval = { mode: stage.retrievalMode, total: stage.total, limit }
-        // 抽取式摘要用未截断原文（命中点可能落在 perSourceChars 之外），与 ask() 同口径
+        // 抽取式摘要用未截断的**可见**正文（命中点可能落在 perSourceChars 之外），与 ask() 同口径
         extractInputs = selection.selected.map((s) => ({
           slug: s.slug,
           title: s.title,
-          text: stage.contents.get(s.slug) ?? '',
+          text: stage.contents.get(s.slug)?.text ?? '',
         }))
       }
 

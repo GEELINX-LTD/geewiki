@@ -82,10 +82,33 @@ export const manifest: GeeWikiManifest = {
  * 检索命中的一条结果（与 `GET /api/search` 响应里 `hits[]` 的元素**逐字段一致**）。
  * 抽成具名类型是为了让它成为跨包契约：AI/RAG 插件消费 `search-service` 时依赖这里。
  */
+/** 命中的块（★ P3a：命中定位与高亮的唯一来源）。 */
+export interface SearchBlockRef {
+  ordinal: number
+  kind: string
+  text: string
+}
+
 export interface SearchHit {
   slug: string
   title: string
   snippet: string
+  /**
+   * ★ P3a：本页**当前主体可见**的块（按 `ordinal` 升序）。
+   *
+   * 为什么要有它：块级模型下"这一页为什么命中"必须落在**具体的块**上 —— 高亮片段
+   * 也正是从这些块的文本里取的（见 {@link snippetFor}）。**这里只可能出现可见块**：
+   * 不可见的块既不出现在数组里，其文本也从不经过 SQL 返回给本层。
+   */
+  blocks: readonly SearchBlockRef[]
+  /**
+   * ★ P3a：本页**被裁剪掉**（当前主体看不到）的块数。**不含任何内容，只是计数。**
+   *
+   * **对匿名主体恒为 0**（设计文档 §4.5 第 3 条）：匿名下若 `gatedCount > 0`，就等于
+   * 确认"这里存在你看不到的内容"，那是存在性泄漏。故匿名一律拿到 0，与"这页确实没有
+   * 受限块"不可区分。
+   */
+  gatedCount: number
   /**
    * 相关度：FTS 路为 BM25 取负后的值（**越大越相关**），LIKE 路恒为 0。
    *
@@ -113,6 +136,40 @@ export interface SearchResult {
  */
 interface PolicyServiceLike {
   visibleSlugs(principal: Principal, q?: { prefix?: string; levels?: readonly string[] }): Promise<string[]>
+  /**
+   * ★ P3a：本主体**被显式授权**的块 id 集合 —— `granted` 档块的**唯一入口**。
+   *
+   * `granted` 档的 `blocks.tier` 写 `NULL`，因此**永远不会被等级分支命中**
+   * （`NULL <= ?` 恒不成立，失败关闭，见 §4.3）：它只能靠检索时的这个授权分支放行。
+   *
+   * **为什么不在这里自己查 `block_grants`**：那会在检索插件里造出**第二套授权判定**，
+   * 与 `policy-service` 的单点判定漂移。授权规则只有一处真源，本插件只消费它的结果。
+   *
+   * **P3b 之前没有块级授权表** ⇒ 现返回空数组；SQL 侧用 `IN (NULL)` 保持"恒不成立"
+   * 且语法合法，无需为空列表拼 `IN ()`。
+   */
+  grantedBlockIds(principal: Principal): Promise<readonly number[]>
+}
+
+/**
+ * ★ P3a：一页正文的**可见块投影**（`contents()` 的返回值，设计文档 §4.5）。
+ *
+ * 为什么不直接返回字符串：RAG 需要**块级引用定位**（`sources` 帧按 `ordinal` 指向具体块），
+ * 而那必须来自**同一次**投影结果 —— 二次查询会让"答案提到了、sources 里没有"成为可能。
+ */
+export interface ContentView {
+  /** 该主体可见块的拼接文本（块间 `'\n\n'`） */
+  text: string
+  /** 可见块，按 `ordinal` 升序 —— 供 `sources` 帧与引用定位 */
+  blocks: readonly SearchBlockRef[]
+  /** 被裁剪掉的块数（**不含内容**，仅计数）。**对匿名主体恒为 0**（同 {@link SearchHit.gatedCount}） */
+  gatedCount: number
+  /**
+   * 可见块里 `tier` 的最大值（域 `{0,1}`）。
+   * **仅诊断用**：它**不反映** `granted` 档的可见块（那些块 `tier` 为 `NULL`）。
+   * 判定一律走 `policy-service`，**不得**据本字段做任何放行/拒绝。
+   */
+  maxVisibleTier: number
 }
 
 /**
@@ -151,14 +208,17 @@ export interface SearchService {
   ): Promise<SearchResult>
 
   /**
-   * 按 slug 批量取整页正文，供 RAG 拼上下文。
+   * 按 slug 批量取**可见块投影**，供 RAG 拼上下文。
    * 只包含**真实存在且当前主体可见（`full` 档）**的 slug（查不到/无权看的键不出现）；
-   * 空数组直接返回空 Map。
+   * 空数组直接返回空 Map。**值里只有可见块** —— 不可见块的文本从不进入返回结构。
    *
    * ⚠️ 这是 RAG 的**正文入口**，也是 §5.6 点名的第三条泄漏旁路：调用方若绕过它
-   * 直接读 `pages` 表，权限就白做了。裁剪在本方法内部完成（唯一出口）。
+   * 直接读 `pages` / `blocks` 表，权限就白做了。裁剪在本方法内部完成（唯一出口）。
+   *
+   * ★ P3a：返回值由 `ReadonlyMap<string, string>` 改为 `ReadonlyMap<string, ContentView>`
+   * （**破坏性契约变更**）—— RAG 的 `sources` 帧需要块级引用定位，而它必须来自同一次投影。
    */
-  contents(principal: Principal, slugs: readonly string[]): Promise<ReadonlyMap<string, string>>
+  contents(principal: Principal, slugs: readonly string[]): Promise<ReadonlyMap<string, ContentView>>
 }
 
 /**
@@ -186,14 +246,13 @@ export const MIN_TRIGRAM_LENGTH = 3
 /** limit 的硬上限（与 configSchema 的 max 一致，防止手改配置绕过校验） */
 const MAX_LIMIT = 100
 
-/**
- * 下推到 SQL 的可见 slug 上限。
- *
- * 取值依据：SQLite 自 3.32 起 `SQLITE_MAX_VARIABLE_NUMBER` 默认为 **32766**，
- * 这里保守取一半，给 `matchExpr`/`pattern`/`limit` 等其它参数留余量。
- * 超限时 {@link SearchPlugin} 会**显式抛错**（见 `visiblePlaceholders` 的说明）。
+/*
+ * ★ P3a 删除了 `MAX_VISIBLE_SLUGS`（= 16_000）与 `visiblePlaceholders()` —— 它们是
+ * "把可见 slug 集合下推进 `IN (...)`"那套做法的产物。改用 `blocks.tier` 之后：
+ *   - 检索不再需要逐主体构造 slug 列表（等级过滤是**与主体无关**的列比较，见 §4.3）；
+ *   - 于是那条"可见条目数超过 16_000 就显式抛错"的**规模边界也随之消失**。
+ * 保留这段说明是为了让后人知道那道上限**不是被遗忘，而是被设计取代了**。
  */
-const MAX_VISIBLE_SLUGS = 16_000
 
 /**
  * 查询串长度上限（服务层护栏）。
@@ -346,16 +405,38 @@ export function buildSnippet(text: string, query: string, radius: number): strin
 
 /* ============================ 插件本体 ============================ */
 
-interface SearchHitRow {
+/**
+ * ★ P3a：检索的**页面级**结果行（每条命中一页）。
+ *
+ * 为什么还要页面级聚合：`hits` 的行语义是"一页"，而块级模型下一条 SQL 会为同一页
+ * 返回**多行**（每个命中块一行）。若直接把这些行当 hits，`total`（= `COUNT(DISTINCT
+ * b.page_id)`）与 `hits.length` 的行语义就对不上，分页也会错。
+ * 故：**`LIMIT` 作用在页上**（Q1 先 `GROUP BY` 取出至多 `limit` 页），块再按页取（Q2）。
+ */
+interface PageHitRow {
+  page_id: number
   slug: string
   title: string
-  content: string
   updated_at: string
-  /** FTS 路为 FTS5 `rank` 原始值（BM25，**负值**，越小越相关）；LIKE 路恒为 0 */
+  /** FTS 路为 `MIN(f.rank)`（BM25，**负值**，越小越相关）；LIKE 路不取（恒 0） */
   score?: number
 }
 
-const SELECT_COLUMNS = `p.slug AS slug, p.title AS title, p.content AS content, p.updated_at AS updated_at`
+/** ★ P3a：块行（Q2 的返回）。**只含可见块** —— 谓词在 SQL 里，不在这里过滤。 */
+interface BlockRow {
+  page_id: number
+  ordinal: number
+  kind: string
+  text: string
+  tier: number | null
+}
+
+/**
+ * 把 `pages` 表从检索的列清单里摘掉了 —— 这是 P3a 的关键：**不再有
+ * `p.content`**（它就是 §5.6 点名的泄漏源）。命中与高亮现在全部来自 `blocks`。
+ */
+const PAGE_COLUMNS = `p.id AS page_id, p.slug AS slug, p.title AS title, p.updated_at AS updated_at`
+const BLOCK_COLUMNS = `b.page_id AS page_id, b.ordinal AS ordinal, b.kind AS kind, b.text AS text, b.tier AS tier`
 
 export const SearchPlugin = {
   name: '@geewiki/search',
@@ -413,24 +494,13 @@ export const SearchPlugin = {
     }
 
     /**
-     * `IN (?,?,…)` 的占位符串。
-     *
-     * 为什么把**可见集合**而不是"隐藏集合"传进来：隐藏集合在"全站皆私有"时同样是
-     * 全量，不解决规模问题；而可见集合是策略层的**唯一真源**输出，语义直白。
-     *
-     * 规模边界（**已知并接受**）：SQLite 的绑定参数上限是 32766（3.32+），故设
-     * {@link MAX_VISIBLE_SLUGS} 为保守阈值。**超限时显式抛错而不是静默截断**：
-     * 截断会让 `total` 变成"部分集合的总数"，是那种"看起来正常但结果是错的"故障。
-     */
-    const visiblePlaceholders = (slugs: readonly string[]): string => slugs.map(() => '?').join(',')
-
-    /**
      * **检索的单一实现**：`GET /api/search` 与 `search-service.search()` 都走这里。
      * 端点只负责把 HTTP 参数解析成 `(q, limit)` 并把结果包成响应体——
      * 若两处各写一份 SQL，迟早会出现"REST 与插件内检索结果不一致"的漂移。
      *
-     * ★ P2：**先按主体取可见集合，再把它下推到 SQL**。三条路（FTS / 短查询 LIKE /
-     * `contents`）全部如此。**绝不先取全量再在 JS 里过滤** —— 那样 `total`、高亮
+     * ★ P3a：**可见性判定全部下沉到 SQL**，走 `blocks.tier` 的等级分支与块级授权的
+     * 授权分支（见 {@link visibilityPredicates}）。两条路（FTS / 短查询 LIKE）与
+     * `contents()` 共用同一对谓词。**绝不先取全量再在 JS 里过滤** —— 那样 `total`、
      * 片段与分页语义会一起泄漏（设计文档 §5.6 明令禁止）。
      */
     const search = async (
@@ -471,80 +541,83 @@ export const SearchPlugin = {
       const useFts = queryMode === 'terms' ? terms.length > 0 : q.length >= MIN_TRIGRAM_LENGTH
 
       /*
-       * ★ P2：本主体的**可见集合**，交给下面的 SQL 下推（三条路共用）。
+       * ★ P3a：可见性判定**下沉到 SQL**，走 `blocks.tier` 的分层模型（设计文档 §4.3 / §5.6）。
+       * 两条路共用同一对谓词，见 {@link visibilityPredicates}。
        *
-       * 为什么只取 `full` 档：`summary` 档的语义是"只见标题与占位"（§2.2）。若让它
-       * 参与检索，命中片段（`snippet`）与 `SELECT_COLUMNS` 里的 `p.content` 就会把
-       * 正文带出来 —— 那正是"看起来有权限"的假象。**宁可少给，不可多给。**
+       * **为什么不再用 `visibleSlugs()` 下推 `slug IN (...)`**：`blocks.tier` 已经把
+       * "页面有效档位"与"块自身档位"合并成一个**与主体无关**的冗余列（`tierFor` 取更严
+       * 的一方）。检索索引是全体的、不能按人算，所以等级过滤就该用这一列 —— 而把某个人的
+       * 可见集合塞进 `IN` 列表既撞绑定上限（旧实现有一道 `MAX_VISIBLE_SLUGS` 硬闸），
+       * 又**表达不了块级差异**。
        */
-      const visible = await policy().visibleSlugs(principal, { levels: ['full'] })
-      if (visible.length > MAX_VISIBLE_SLUGS) {
-        throw new Error(
-          `@geewiki/search: 可见条目数（${visible.length}）超过下推上限 ${MAX_VISIBLE_SLUGS} —— ` +
-            '拒绝静默截断（截断会让 total 变成"部分集合的总数"，属于"看起来正常但结果是错的"）。' +
-            '这是本实现已知的规模边界，需要改为数据库侧可见性下推（设计文档 §5.6）。',
-        )
-      }
-      // 一条都看不见 ⇒ 直接返回空结果、**不查库**：既省一次全表扫，也避免构造 `IN ()` 这种非法 SQL。
-      // mode 仍按"本来会走哪条路"报告，避免调用方据 mode 反推出"这个人有没有可见内容"。
-      if (visible.length === 0) return { mode: useFts ? 'fts' : 'like', total: 0, hits: [] }
-      const inClause = visiblePlaceholders(visible)
+      const readerTier = readerTierOf(principal)
+      const grantedIds = [...(await policy().grantedBlockIds(principal))]
+      const vis = visibilityPredicates(readerTier, grantedIds)
+      // 匿名主体不得拿到 `gatedCount`：`> 0` 就等于确认"这里存在你看不到的内容"（§4.5 第 3 条）
+      const exposeGated = principal.kind !== 'anonymous'
 
       let total: number
-      let rows: SearchHitRow[]
+      let pages: PageHitRow[]
       let mode: 'fts' | 'like'
-      let scoreOf: (row: SearchHitRow) => number
+      let scoreOf: (row: PageHitRow) => number
 
       if (useFts) {
         // phrase：整串一个短语。terms：每个词元各自 toFtsPhrase（**仍字面、仍防注入**）后 OR 连接。
         const matchExpr =
           queryMode === 'terms' ? terms.map((t) => toFtsPhrase(t)).join(' OR ') : toFtsPhrase(q)
-        // total 必须是 **distinct 行数**：OR 会让同一行被多个词元各自命中，
-        // COUNT(*) 会把行数按命中次数重复计入（实测一行命中 2 个词元时 COUNT(*)=该行计 2 次），
-        // 而契约里 total 是"全量命中数"（与 hits 的行语义一致）。
+        // ★ 坑 1（已实测）：tier 过滤**绝不能写在 FTS 表上** —— contentless 表的
+        //   `UNINDEXED` 列不可读，谓词恒不成立 ⇒ **静默返回 0 行**（不报错）。
+        //   正确形态是把 `tier` 冗余在 `blocks` 上，检索时 JOIN 过去过滤。
+        // `COUNT(DISTINCT b.page_id)`：一条 SQL 会为同一页返回多个命中块（每块一行），
+        // 不 distinct 的话 total 会把"块数"当成"页数"。
         total = countOf(
           db.query<{ n: number }>(
-            `SELECT COUNT(DISTINCT p.id) AS n FROM pages_fts f JOIN pages p ON p.id = f.rowid
-              WHERE f.pages_fts MATCH ? AND p.slug IN (${inClause})`,
-            [matchExpr, ...visible],
+            `SELECT COUNT(DISTINCT b.page_id) AS n
+               FROM blocks_fts f JOIN blocks b ON b.id = f.rowid
+              WHERE f.blocks_fts MATCH ? AND ${vis.visible}`,
+            [matchExpr, readerTier, ...vis.params],
           ),
         )
-        rows = db.query<SearchHitRow>(
-          `SELECT ${SELECT_COLUMNS}, f.rank AS score
-             FROM pages_fts f JOIN pages p ON p.id = f.rowid
-            WHERE f.pages_fts MATCH ? AND p.slug IN (${inClause}) ORDER BY f.rank LIMIT ?`,
-          [matchExpr, ...visible, limit],
+        // LIMIT 作用在**页**上（GROUP BY p.id），否则一页的多块命中会吃掉配额，
+        // 让 hits 的页数少于 limit，且 total 与 hits 的行语义对不上。
+        pages = db.query<PageHitRow>(
+          `SELECT ${PAGE_COLUMNS}, MIN(f.rank) AS score
+             FROM blocks_fts f JOIN blocks b ON b.id = f.rowid JOIN pages p ON p.id = b.page_id
+            WHERE f.blocks_fts MATCH ? AND ${vis.visible}
+            GROUP BY p.id ORDER BY score LIMIT ?`,
+          [matchExpr, readerTier, ...vis.params, limit],
         )
         mode = 'fts'
         // BM25（FTS5 的 `rank`）原始值是**负的**，越小越相关；这里**取负**换成
         // "越大越相关"再对外。**这不是归一化**：值域没有界、量级随语料规模与查询词
         // 变化，故**只在同一次查询的结果内部可比**，跨查询（乃至跨库）比大小无意义。
-        // terms 模式下 BM25 天然让"命中词元更多"的行排前（OR 的相关度是各词元得分之和）。
         scoreOf = (row) => -(row.score ?? 0)
       } else {
         const pattern = `%${escapeLike(q)}%`
-        // **LIKE 路直接扫 pages 表（不经过 pages_fts）**，这是刻意的：
-        // 1. 短查询本就用不上 trigram 索引（切不出完整 3 字符片段），走索引没有收益
-        //    （实测 5000 行语料：裸表 3.0ms vs 经 pages_fts 4.0ms，裸表还更快）；
-        // 2. 更稳：万一索引与内容表出现漂移（迁移未跑全、触发器被删），短查询仍能给出
-        //    正确结果，而不会静默漏行——"兜底"就该兜在真正的真源上。
-        // ≥3 字符的 FTS 路则必须有索引，索引缺失会显式报错（宁可响，不可静默空）。
+        // ★ 短查询 LIKE 路是**独立的另一条 SQL**（v1 曾漏判它）：它原先直接扫 `pages` 并读
+        //   `p.content` —— 块级模型下那等于读出不看可见性的全文，中文 2 字词会成为匿名
+        //   泄漏通道。现在改扫 `blocks`。
+        //   **权衡退化（显式记录）**：兜底不再兜在"页面真源"上而兜在 `blocks` 上 ⇒ 若
+        //   `blocks` 与 `pages.content` 漂移，短查询会漏行。缓解是 `content_hash` 自检 +
+        //   `GET /api/admin/search/verify`，把"静默漏行"变成"显式不一致"。
         total = countOf(
           db.query<{ n: number }>(
-            // 括号不能省：`A OR B AND C` 的优先级是 `A OR (B AND C)`，会让权限过滤只作用于一半条件。
-            `SELECT COUNT(*) AS n FROM pages p
-              WHERE (p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\')
-                AND p.slug IN (${inClause})`,
-            [pattern, pattern, ...visible],
+            // 括号不能省：`A OR B AND C` 的优先级是 `A OR (B AND C)`，会让匹配条件与
+            // 可见性谓词各作用于一半 —— 那是真实的泄漏路径。
+            `SELECT COUNT(DISTINCT b.page_id) AS n
+               FROM blocks b JOIN pages p ON p.id = b.page_id
+              WHERE (p.title LIKE ? ESCAPE '\\' OR b.text LIKE ? ESCAPE '\\')
+                AND ${vis.visible}`,
+            [pattern, pattern, readerTier, ...vis.params],
           ),
         )
-        rows = db.query<SearchHitRow>(
-          `SELECT ${SELECT_COLUMNS}
-             FROM pages p
-            WHERE (p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\')
-              AND p.slug IN (${inClause})
-            ORDER BY p.updated_at DESC LIMIT ?`,
-          [pattern, pattern, ...visible, limit],
+        pages = db.query<PageHitRow>(
+          `SELECT ${PAGE_COLUMNS}
+             FROM blocks b JOIN pages p ON p.id = b.page_id
+            WHERE (p.title LIKE ? ESCAPE '\\' OR b.text LIKE ? ESCAPE '\\')
+              AND ${vis.visible}
+            GROUP BY p.id ORDER BY p.updated_at DESC LIMIT ?`,
+          [pattern, pattern, readerTier, ...vis.params, limit],
         )
         mode = 'like'
         // LIKE 路没有相关度可言（全表子串匹配），统一给 0；
@@ -552,63 +625,136 @@ export const SearchPlugin = {
         scoreOf = () => 0
       }
 
+      /*
+       * 命中页的**可见块**（Q2）与**受限块计数**（Q3）。
+       *
+       * 为什么分两条查、而不是把受限块也取回来在 JS 里分开：那会把**受限块的文本**带进
+       * 本层内存 —— 一旦后续某处漏判就会泄漏。这里受限块的文本**从不离开数据库**，
+       * 出来的只有一个计数。
+       */
+      const pageIds = pages.map((r) => r.page_id)
+      const blocksByPage = new Map<number, SearchBlockRef[]>()
+      if (pageIds.length > 0) {
+        const rows = db.query<BlockRow>(
+          `SELECT ${BLOCK_COLUMNS} FROM blocks b
+            WHERE b.page_id IN (${placeholders(pageIds.length)}) AND ${vis.visible}
+            ORDER BY b.page_id, b.ordinal`,
+          [...pageIds, readerTier, ...vis.params],
+        )
+        for (const r of rows) {
+          const list = blocksByPage.get(r.page_id) ?? []
+          list.push({ ordinal: r.ordinal, kind: r.kind, text: r.text })
+          blocksByPage.set(r.page_id, list)
+        }
+      }
+
+      const gatedByPage = new Map<number, number>()
+      if (exposeGated && pageIds.length > 0) {
+        const rows = db.query<{ page_id: number; n: number }>(
+          `SELECT b.page_id AS page_id, COUNT(*) AS n FROM blocks b
+            WHERE b.page_id IN (${placeholders(pageIds.length)}) AND ${vis.gated}
+            GROUP BY b.page_id`,
+          [...pageIds, readerTier, ...vis.params],
+        )
+        for (const r of rows) gatedByPage.set(r.page_id, Number(r.n))
+      }
+
       return {
         mode,
         total,
-        hits: rows.map((row) => ({
-          slug: row.slug,
-          title: row.title,
-          // 片段优先取正文；正文没出现（例如只命中标题）时退回标题。
-          // terms 模式下**不能用整句去定位**：问句本身不在正文里，那样每条命中都会
-          // snippet 为空、高亮消失（命中却看不到"为什么命中"）。故逐个词元试，取第一个
-          // 能在正文里定位到的词元作为锚点；都定位不到时退回整句（结果为 ''）。
-          snippet: snippetFor(row, terms, q, snippetRadius),
-          score: scoreOf(row),
-          updated_at: row.updated_at,
-        })),
+        hits: pages.map((row) => {
+          const blocks = blocksByPage.get(row.page_id) ?? []
+          return {
+            slug: row.slug,
+            title: row.title,
+            // 片段优先取**可见块**的正文；都没定位到（例如只命中标题）时退回标题。
+            // terms 模式下**不能用整句去定位**：问句本身不在正文里，那样每条命中都会
+            // snippet 为空、高亮消失（命中却看不到"为什么命中"）。故逐个词元试。
+            snippet: snippetFor({ title: row.title, blocks }, terms, q, snippetRadius),
+            blocks,
+            gatedCount: exposeGated ? (gatedByPage.get(row.page_id) ?? 0) : 0,
+            score: scoreOf(row),
+            updated_at: row.updated_at,
+          }
+        }),
       }
     }
 
     /**
-     * 批量取正文（RAG 拼上下文用）。
+     * 批量取**可见块投影**（RAG 拼上下文用）。
      *
-     * **占位符按 slugs.length 动态生成**：SQLite 的 `?` 绑定不接受数组
-     * （better-sqlite3 传数组会抛 "Too many parameter values were provided"），
-     * 故必须按个数拼 `?,?,?`。**拼的只是占位符本身，slug 值一律走参数绑定**——
-     * 绝不把 slug 文本拼进 SQL（否则 `' OR 1=1 --` 之类的输入会变成注入）。
+     * ★ P3a：这是第三条泄漏旁路的封堵点（另两处是检索的 FTS 路与 LIKE 路）。它现在
+     * **只从 `blocks` 取内容**，并按可见性谓词在 SQL 里过滤 —— `pages.content` 是
+     * 作者源快照（含未裁剪的全文与标记本身）⇒ **绝不能再作为 RAG 的正文来源**。
+     *
+     * **占位符按个数动态生成**：SQLite 的 `?` 绑定不接受数组，故必须按个数拼 `?,?,?`。
+     * **拼的只是占位符本身，slug / id 值一律走参数绑定** —— 绝不把文本拼进 SQL。
      */
     const contents = async (
       principal: Principal,
       slugs: readonly string[],
-    ): Promise<ReadonlyMap<string, string>> => {
+    ): Promise<ReadonlyMap<string, ContentView>> => {
       assertLive()
       assertPrincipal(principal)
-      const out = new Map<string, string>()
+      const out = new Map<string, ContentView>()
       if (slugs.length === 0) return out
 
-      /*
-       * ★ P2：这是 RAG 的**正文入口**，也是设计文档 §5.6 点名的第三条泄漏旁路
-       * （原先它是"给什么 slug 就吐什么正文"的裸接口）。
-       *
-       * 做法是**先求交集再查库**：`allowed = 请求的 slug ∩ 本主体可见（full 档）`。
-       * 因此不可见的 slug **从来没有**进入过 SQL —— 这不是"先取全量再在 JS 里过滤"
-       * （那种做法会把 `total`、高亮、分页一起泄漏，是被明令禁止的）。
-       *
-       * 为什么不像检索那样把"可见集合"也一并下推做第二道过滤：`allowed` 由构造保证
-       * 是 `visible` 的子集，第二道 `IN` 是可证明冗余的，却会让绑定参数翻倍并更早
-       * 撞上 SQLite 的参数上限。**冗余检查换不来安全性，只换来更早的规模边界。**
-       */
-      const visible = new Set(await policy().visibleSlugs(principal, { levels: ['full'] }))
-      const allowed = slugs.filter((slug) => visible.has(slug))
-      if (allowed.length === 0) return out
+      const readerTier = readerTierOf(principal)
+      const grantedIds = [...(await policy().grantedBlockIds(principal))]
+      const vis = visibilityPredicates(readerTier, grantedIds)
+      const exposeGated = principal.kind !== 'anonymous'
 
-      const placeholders = allowed.map(() => '?').join(',')
-      const rows = db.query<{ slug: string; content: string }>(
-        `SELECT slug, content FROM pages WHERE slug IN (${placeholders})`,
-        [...allowed],
+      // 先把 slug 映射成 page_id —— **这条 SQL 不取任何正文**（只取 id/slug），
+      // 所以它本身不构成泄漏面；真正的裁剪在下面那条带可见性谓词的块查询上。
+      // 也因此不必再走 `visibleSlugs()` 求交集：页面级有效档位已经体现在 `blocks.tier` 里。
+      const pageRows = db.query<{ id: number; slug: string }>(
+        `SELECT id, slug FROM pages WHERE slug IN (${placeholders(slugs.length)})`,
+        [...slugs],
       )
-      for (const row of rows) out.set(row.slug, row.content)
-      // 查不到 / 无权看的 slug 都不进 Map（消费方据此区分"页面不存在"与"正文为空串"）
+      if (pageRows.length === 0) return out
+      const pageIds = pageRows.map((r) => r.id)
+
+      const rows = db.query<BlockRow>(
+        `SELECT ${BLOCK_COLUMNS} FROM blocks b
+          WHERE b.page_id IN (${placeholders(pageIds.length)}) AND ${vis.visible}
+          ORDER BY b.page_id, b.ordinal`,
+        [...pageIds, readerTier, ...vis.params],
+      )
+      const byPage = new Map<number, BlockRow[]>()
+      for (const r of rows) {
+        const list = byPage.get(r.page_id) ?? []
+        list.push(r)
+        byPage.set(r.page_id, list)
+      }
+
+      // 受限块**只计数、不取文本**（同一理由：受限块的文本从不离开数据库）
+      const gatedByPage = new Map<number, number>()
+      if (exposeGated) {
+        const g = db.query<{ page_id: number; n: number }>(
+          `SELECT b.page_id AS page_id, COUNT(*) AS n FROM blocks b
+            WHERE b.page_id IN (${placeholders(pageIds.length)}) AND ${vis.gated}
+            GROUP BY b.page_id`,
+          [...pageIds, readerTier, ...vis.params],
+        )
+        for (const r of g) gatedByPage.set(r.page_id, Number(r.n))
+      }
+
+      for (const row of pageRows) {
+        const own = byPage.get(row.id) ?? []
+        /*
+         * 一个可见块都没有 ⇒ **不进 Map**（与既有语义一致：查不到 / 无权看的 slug 都不出现）。
+         * 这里刻意把"页面存在但块全受限"与"页面不存在"压成同一种表现 —— 后者本就不该出现，
+         * 而前者若出现在 Map 里，RAG 的 `sources` 帧就会带出空条目并**暗示存在受限内容**。
+         */
+        if (own.length === 0) continue
+        out.set(row.slug, {
+          text: own.map((b) => b.text).join('\n\n'),
+          blocks: own.map((b) => ({ ordinal: b.ordinal, kind: b.kind, text: b.text })),
+          gatedCount: exposeGated ? (gatedByPage.get(row.id) ?? 0) : 0,
+          // 仅诊断用：`granted` 档的可见块 `tier` 为 NULL，故本值不反映它们
+          maxVisibleTier: own.reduce((m, b) => Math.max(m, b.tier ?? 0), 0),
+        })
+      }
       return out
     }
 
@@ -722,22 +868,91 @@ function countOf(rows: { n: number }[]): number {
   return Number(rows[0]?.n ?? 0)
 }
 
+/** `?,?,?` 占位符串（个数决定），值一律走参数绑定 */
+function placeholders(n: number): string {
+  return Array.from({ length: n }, () => '?').join(',')
+}
+
+/**
+ * ★ P3a：主体的**读者等级**（`blocks.tier` 的分档刻度）。
+ *
+ * - 匿名 ⇒ `0`：只够得着 `tier = 0`（有效公开）的块
+ * - **组织成员（有 `orgRole`）** ⇒ `1`：还够得着 `tier = 1`（组织内）的块
+ * - `guest`（已登录但无组织角色，`orgRole === null`）⇒ **`0`**：他不是组织成员，
+ *   `org` 档的内容与他无关（设计 §2.1：guest 是"没有默认组织角色"，不是最低档角色）
+ * - break-glass ⇒ `1`：应急通道视同最高读者等级
+ *
+ * ⚠️ **不能只看 `kind === 'user'`**：那会把 guest 抬到 `org` 档，等于让"登录了但不是
+ * 成员"的人读到组织内内容。
+ */
+function readerTierOf(principal: Principal): 0 | 1 {
+  if (principal.kind === 'break-glass') return 1
+  return principal.orgRole !== null ? 1 : 0
+}
+
+/**
+ * ★ P3a：检索的可见性谓词（**两个分支，缺一不可**，设计文档 §4.3 / §5.6）。
+ *
+ * ```
+ * 可见  = ( b.tier <= :readerTier OR b.id IN (:grantedBlockIds) )
+ * 受限  = ( b.tier IS NULL OR b.tier > :readerTier ) AND b.id NOT IN (:grantedBlockIds)
+ * ```
+ *
+ * **为什么空列表时用字面量 `0` / `1` 而不是 `IN (NULL)`**：`x NOT IN (NULL)` 与
+ * `x IN (NULL)` 一样恒为 `NULL`（不是 `FALSE`），而 `NULL` 在 `WHERE` 里不成立 ——
+ * 于是"受限块计数"会恒为 0，探针与 `gatedCount` 双双失真。用 `0`（恒假）与 `1`（恒真）
+ * 既准确又无需绑定参数。
+ *
+ * **为什么 `tier` 的比较天然 NULL 安全**：`NULL <= ?` 求值为 `NULL` ⇒ 不成立 ⇒
+ * `granted` 档（`tier IS NULL`）**永不被等级分支命中**，只能由授权分支放行。
+ * 这是刻意的失败关闭方向（写错的后果是"搜不到"，不是"泄漏"）。
+ */
+function visibilityPredicates(readerTier: 0 | 1, grantedIds: readonly number[]): {
+  visible: string
+  gated: string
+  params: number[]
+} {
+  const positive = grantedIds.length === 0 ? '0' : `b.id IN (${placeholders(grantedIds.length)})`
+  const negative = grantedIds.length === 0 ? '1' : `b.id NOT IN (${placeholders(grantedIds.length)})`
+  return {
+    // 括号不能省：`A OR B AND C` 的优先级是 `A OR (B AND C)`。调用方会把本谓词与
+    // 其它条件用 `AND` 串起来，少了这层括号会让可见性只作用于其中一个分支。
+    visible: `( b.tier <= ? OR ${positive} )`,
+    gated: `( ( b.tier IS NULL OR b.tier > ? ) AND ${negative} )`,
+    params: [...grantedIds],
+  }
+}
+
 /**
  * 取一条命中的高亮片段。
  *
  * phrase 模式：整串即锚点（行为与既有实现逐字一致）。
  * terms 模式：整句通常不在正文里，故**按词元顺序**试锚点，取第一个能定位到的；
- * 正文与标题都定位不到时退回整句（buildSnippet 返回 null，最终得到空串）——
+ * 块正文与标题都定位不到时退回整句（buildSnippet 返回 null，最终得到空串）——
  * 与既有"只命中标题时退回标题片段"的降级链保持一致。
+ *
+ * ★ P3a：片段来源由 `pages.content` 换成**该主体可见的块**（按 `ordinal` 升序）。
+ * 两个必须守住的性质：
+ *   1. **只用可见块** —— 受限块的文本从不进入参数，故片段里不可能出现它；
+ *   2. **非空且含命中词** —— 不能用 FTS5 的 `snippet()`：实测它在 contentless 表上
+ *      **静默返回 `null` 而不报错**，一旦沿用会让所有高亮静默消失。这里自己定位，
+ *      并有"高亮非空且含命中词"的单测钉住。
  */
-function snippetFor(row: SearchHitRow, terms: readonly string[], q: string, radius: number): string {
+function snippetFor(
+  hit: { title: string; blocks: readonly SearchBlockRef[] },
+  terms: readonly string[],
+  q: string,
+  radius: number,
+): string {
   const anchors = terms.length > 0 ? terms : [q]
-  for (const anchor of anchors) {
-    const content = buildSnippet(row.content, anchor, radius)
-    if (content !== null) return content
+  for (const block of hit.blocks) {
+    for (const anchor of anchors) {
+      const content = buildSnippet(block.text, anchor, radius)
+      if (content !== null) return content
+    }
   }
   for (const anchor of anchors) {
-    const title = buildSnippet(row.title, anchor, radius)
+    const title = buildSnippet(hit.title, anchor, radius)
     if (title !== null) return title
   }
   return ''
