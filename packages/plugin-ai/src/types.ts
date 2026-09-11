@@ -12,8 +12,13 @@ import type { LlmErrorCode, LlmUsage } from '@geewiki/llm'
 /**
  * 降级原因（**跨 provider 可判别**，前端据此选文案，不要按 message 分支）。
  *
- * 前 8 个与 `LlmErrorCode` 一一对应（映射见 `./degrade.ts`），后 2 个是本插件自身
- * 产生的原因：检索服务不可用、查询为空。
+ * 前 8 个由 `LlmErrorCode` 映射而来（映射见 `./degrade.ts`）；`search_unavailable`
+ * 是本插件自身产生的原因。**每一个成员都必须可达**（要么是 `CODE_TO_REASON` 的值，
+ * 要么有 `makeDegraded('<reason>', …)` 调用点），由
+ * `packages/web/test/degradedReason.test.ts` 的守卫钉住。
+ *
+ * 注意与 **HTTP 错误码**的区别：`empty_query` 是 `400` 错误码（见各端点的 `h.json`），
+ * **不是**降级原因——空查询不可能"降级后仍给出答案"，故它不在本枚举里。
  */
 export type DegradedReason =
   | 'no_provider'
@@ -25,7 +30,6 @@ export type DegradedReason =
   | 'network'
   | 'provider_error'
   | 'search_unavailable'
-  | 'empty_query'
 
 /** 降级说明：`message` **必须**经 `@geewiki/llm` 的 `redact` 处理后才可外发 */
 export interface Degraded {

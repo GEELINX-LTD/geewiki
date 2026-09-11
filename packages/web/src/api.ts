@@ -240,7 +240,16 @@ export interface SearchResponse {
   hits: SearchHit[]
 }
 
-/** 降级原因：**按它分支文案，绝不按 message 文本分支**（上游 message 可能变化/被脱敏） */
+/**
+ * 降级原因：**按它分支文案，绝不按 message 文本分支**（上游 message 可能变化/被脱敏）。
+ *
+ * ⚠️ 这是 `packages/plugin-ai/src/types.ts` 的**手抄镜像**（web 不能 import 后端包）。
+ * 手抄会漂移 ⇒ 两侧成员集合由 `packages/web/test/degradedReason.test.ts` 的
+ * 源码级守卫逐个比对，**改一侧必须改另一侧**。
+ *
+ * 注意与 **HTTP 错误码**的区别：`empty_query` / `too_long` 等是 400 错误码
+ * （走 `ApiError.code`），**不是**降级原因，故都不在本枚举里。
+ */
 export type DegradedReason =
   | 'no_provider'
   | 'missing_credential'
@@ -251,7 +260,6 @@ export type DegradedReason =
   | 'network'
   | 'provider_error'
   | 'search_unavailable'
-  | 'empty_query'
 
 export interface Degraded {
   reason: DegradedReason

@@ -180,7 +180,6 @@ const REASON_NOTICE: Record<DegradedReason, DegradedNotice> = {
   network: { title: '模型网络异常，已降级为检索结果', detail: '检索结果不受影响。', level: 'warn' },
   provider_error: { title: '模型调用失败，已降级为检索结果', detail: '检索结果不受影响。', level: 'warn' },
   search_unavailable: { title: '检索服务不可用', detail: '请先启用检索插件（@geewiki/search）。', level: 'warn' },
-  empty_query: { title: '查询为空', detail: '请输入要检索的内容。', level: 'warn' },
 }
 
 /**
