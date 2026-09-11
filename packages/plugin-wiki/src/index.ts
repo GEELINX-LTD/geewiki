@@ -22,6 +22,7 @@ import Schema from 'schemastery'
 import {
   asAsync,
   closeAfterResponse,
+  writeAuditLog,
   type AnyDatabaseAdapter,
   type DatabaseExecutor,
   type GeeWikiManifest,
@@ -836,6 +837,330 @@ export const WikiPlugin = {
           return
         }
         h.json(200, { ok: true, deleted: slug })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- 可见性写侧（P2）：改档位 / 发与撤授权 ---------- */
+
+    /*
+     * 为什么这组端点必须存在：P2 之前**没有任何端点能改 `pages.visibility`** ——
+     * 读侧判定全部就位，但功能实际不可用（每条永远停留在创建时的那个档）。
+     *
+     * 治理规则（设计文档 §2.3）：改可见性与改授权同权，都要 `canManageVisibility`。
+     * **收紧与放宽同门**：收紧是安全方向、放宽是风险方向，但两者都在改变"谁能看"，
+     * 把放宽单列一道门的收益很小、却会多出"谁有权放宽"这个第二真源。
+     *
+     * 三条不变式：
+     * 1. **不泄露存在性** —— `level === 'none'` 一律 404（不是 403）：无权看的人
+     *    也不该通过"403 vs 404"知道它存在。
+     * 2. **每次 ACL 变更都递增 `acl_revision`**（全局行 + 该条目自己的列）——
+     *    策略层据此做代际失效；**绝不用 TTL**（TTL 必然产生"撤销后仍可见"的窗口）。
+     * 3. **审计不含正文**（`before`/`after` 只放档位与授权元数据）。
+     */
+    const VISIBILITIES = ['private', 'org', 'public'] as const
+    /** ★ D13：授权对象**只有** user|group —— 角色不是授权对象（角色只决定能力） */
+    const SUBJECT_KINDS = ['user', 'group'] as const
+    const GRANT_ROLES = ['editor', 'viewer'] as const
+
+    /** 递增全局 ACL 版本号。单行表，`id = 1` 由迁移预置。 */
+    const bumpAclRevision = async (tx: DatabaseExecutor, slug: string): Promise<number> => {
+      await tx.run('UPDATE acl_revision SET revision = revision + 1 WHERE id = 1')
+      await tx.run('UPDATE pages SET acl_revision = acl_revision + 1 WHERE slug = ?', [slug])
+      const row = (await tx.query<{ revision: number }>('SELECT revision FROM acl_revision WHERE id = 1'))[0]
+      return Number(row?.revision ?? 0)
+    }
+
+    /**
+     * 管理权限守卫：解析主体、判定可见性与 `canManageVisibility`、取回 page id。
+     * 返回 `null` 表示已写出响应（调用方直接 return）。
+     */
+    const requireManage = async (
+      h: RouteHandlerContext,
+      slug: string,
+    ): Promise<{ principal: Principal } | null> => {
+      const principal = h.principal
+      if (!principal) {
+        h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息，无法判定可管理性' })
+        return null
+      }
+      if (!isValidSlug(slug)) {
+        h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+        return null
+      }
+      // 策略层是判定单点：**不在这里自己查 visibility**（那会成为第二个真源）
+      const access = await policy().resolvePage(principal, slug)
+      if (access.level === 'none') {
+        h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+        return null
+      }
+      if (!access.canManageVisibility) {
+        h.json(403, {
+          ok: false,
+          error: 'forbidden',
+          message: '没有管理该条目可见性的权限',
+          details: { reason: access.reason },
+        })
+        return null
+      }
+      return { principal }
+    }
+
+    const visibilityStateOf = async (
+      slug: string,
+    ): Promise<{ visibility: string; inherit: number; published_at: string | null } | undefined> =>
+      (await adb.query<{ visibility: string; inherit: number; published_at: string | null }>(
+        'SELECT visibility, inherit, published_at FROM pages WHERE slug = ?',
+        [slug],
+      ))[0]
+
+    /* ---------- PUT /api/pages/:slug/visibility：改档位 / 发布 / 断继承 ---------- */
+    cleanups.push(
+      router.register('PUT', '/api/pages/:slug/visibility', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+
+        let body: Record<string, unknown>
+        try {
+          body = (await readBody(h)) as Record<string, unknown>
+        } catch (err) {
+          const message = (err as Error).message
+          if (message.startsWith('payload_too_large')) {
+            closeAfterResponse(h)
+            h.json(413, { ok: false, error: 'payload_too_large', message })
+            return
+          }
+          h.json(400, { ok: false, error: 'invalid_body', message })
+          return
+        }
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+          h.json(400, { ok: false, error: 'invalid_body', message: '请求体须为 JSON 对象' })
+          return
+        }
+        const unknown = Object.keys(body).filter(
+          (k) => k !== 'visibility' && k !== 'inherit' && k !== 'published',
+        )
+        if (unknown.length > 0) {
+          h.json(400, { ok: false, error: 'invalid_body', message: `未知字段: ${unknown.join(', ')}` })
+          return
+        }
+
+        const before = await visibilityStateOf(slug)
+        if (!before) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+
+        const nextVisibility = body['visibility'] ?? before.visibility
+        if (typeof nextVisibility !== 'string' || !(VISIBILITIES as readonly string[]).includes(nextVisibility)) {
+          h.json(400, {
+            ok: false,
+            error: 'invalid_visibility',
+            message: `visibility 须为 ${VISIBILITIES.join(' | ')} 之一`,
+          })
+          return
+        }
+        const nextInherit = body['inherit'] === undefined ? before.inherit : body['inherit'] === true ? 1 : 0
+        if (body['inherit'] !== undefined && typeof body['inherit'] !== 'boolean') {
+          h.json(400, { ok: false, error: 'invalid_inherit', message: 'inherit 须为布尔值' })
+          return
+        }
+        /*
+         * 发布是**独立开关**（设计文档 §2.2）：`public` 档只有配上 `published_at`
+         * 才真正对匿名可见，而发布**不继承**。`published: true` 打上时间戳；
+         * `false` 清空。不传则保持原状。
+         */
+        let nextPublished = before.published_at
+        if (body['published'] === true) nextPublished = before.published_at ?? new Date().toISOString()
+        else if (body['published'] === false) nextPublished = null
+        else if (body['published'] !== undefined) {
+          h.json(400, { ok: false, error: 'invalid_published', message: 'published 须为布尔值' })
+          return
+        }
+
+        const revision = await adb.transaction(async (tx) => {
+          await tx.run('UPDATE pages SET visibility = ?, inherit = ?, published_at = ? WHERE slug = ?', [
+            nextVisibility,
+            nextInherit,
+            nextPublished,
+            slug,
+          ])
+          return bumpAclRevision(tx, slug)
+        })
+
+        // 审计：只记档位与发布状态，**不含正文**
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'page',
+          targetId: slug,
+          actorId: guard.principal.userId,
+          before: { visibility: before.visibility, inherit: before.inherit === 1, published_at: before.published_at },
+          after: { visibility: nextVisibility, inherit: nextInherit === 1, published_at: nextPublished },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, {
+          ok: true,
+          slug,
+          visibility: nextVisibility,
+          inherit: nextInherit === 1,
+          published_at: nextPublished,
+          acl_revision: revision,
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- GET /api/pages/:slug/grants：列出例外授予 ---------- */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/grants', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const grants = await adb.query<{
+          id: number
+          subject_kind: string
+          subject_id: string
+          role: string
+          granted_at: string
+          expires_at: string | null
+        }>(
+          `SELECT id, subject_kind, subject_id, role, granted_at, expires_at
+             FROM page_grants WHERE page_slug = ? ORDER BY id`,
+          [slug],
+        )
+        h.json(200, { ok: true, slug, grants })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/grants：新增/更新一条例外授予 ---------- */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/grants', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+
+        let body: Record<string, unknown>
+        try {
+          body = (await readBody(h)) as Record<string, unknown>
+        } catch (err) {
+          const message = (err as Error).message
+          if (message.startsWith('payload_too_large')) {
+            closeAfterResponse(h)
+            h.json(413, { ok: false, error: 'payload_too_large', message })
+            return
+          }
+          h.json(400, { ok: false, error: 'invalid_body', message })
+          return
+        }
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+          h.json(400, { ok: false, error: 'invalid_body', message: '请求体须为 JSON 对象' })
+          return
+        }
+        const unknown = Object.keys(body).filter(
+          (k) => k !== 'subjectKind' && k !== 'subjectId' && k !== 'role' && k !== 'expiresAt',
+        )
+        if (unknown.length > 0) {
+          h.json(400, { ok: false, error: 'invalid_body', message: `未知字段: ${unknown.join(', ')}` })
+          return
+        }
+        const subjectKind = body['subjectKind']
+        if (typeof subjectKind !== 'string' || !(SUBJECT_KINDS as readonly string[]).includes(subjectKind)) {
+          // ★ D13：这里**明确拒绝** `org_role` —— 角色只决定能力，不是授权对象
+          h.json(400, {
+            ok: false,
+            error: 'invalid_subject_kind',
+            message: `subjectKind 须为 ${SUBJECT_KINDS.join(' | ')} 之一（角色不是授权对象，见 D13）`,
+          })
+          return
+        }
+        const subjectId = body['subjectId']
+        if (typeof subjectId !== 'string' || subjectId.length === 0 || subjectId.length > 128) {
+          h.json(400, { ok: false, error: 'invalid_subject_id', message: 'subjectId 须为非空字符串（≤128 字符）' })
+          return
+        }
+        const role = body['role']
+        if (typeof role !== 'string' || !(GRANT_ROLES as readonly string[]).includes(role)) {
+          h.json(400, { ok: false, error: 'invalid_role', message: `role 须为 ${GRANT_ROLES.join(' | ')} 之一` })
+          return
+        }
+        const expiresAt = body['expiresAt'] === undefined || body['expiresAt'] === null ? null : body['expiresAt']
+        if (expiresAt !== null && typeof expiresAt !== 'string') {
+          h.json(400, { ok: false, error: 'invalid_expires_at', message: 'expiresAt 须为 ISO 时间字符串或 null' })
+          return
+        }
+
+        const now = new Date().toISOString()
+        const grantedBy = guard.principal.userId
+        /*
+         * 幂等 upsert：同一 `(page_slug, subject_kind, subject_id)` 唯一（迁移里建了唯一索引）。
+         * 先查后写（而不是 `INSERT OR REPLACE`）：后者会重置 `granted_at` 与 `granted_by`，
+         * 把"改角色"伪装成"新授予"，审计会失真。
+         */
+        const revision = await adb.transaction(async (tx) => {
+          const existing = (
+            await tx.query<{ id: number; role: string; expires_at: string | null }>(
+              'SELECT id, role, expires_at FROM page_grants WHERE page_slug = ? AND subject_kind = ? AND subject_id = ?',
+              [slug, subjectKind, subjectId],
+            )
+          )[0]
+          if (existing) {
+            await tx.run('UPDATE page_grants SET role = ?, expires_at = ? WHERE id = ?', [role, expiresAt, existing.id])
+          } else {
+            await tx.run(
+              `INSERT INTO page_grants (page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [slug, subjectKind, subjectId, role, grantedBy, now, expiresAt],
+            )
+          }
+          return bumpAclRevision(tx, slug)
+        })
+
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}:${subjectKind}:${subjectId}`,
+          actorId: grantedBy,
+          after: { role, expires_at: expiresAt },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, { ok: true, slug, subjectKind, subjectId, role, expiresAt, acl_revision: revision })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- DELETE /api/pages/:slug/grants/:id：撤销一条例外授予 ---------- */
+    cleanups.push(
+      router.register('DELETE', '/api/pages/:slug/grants/:id', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const revision = await adb.transaction(async (tx) => {
+          // 带上 page_slug 条件：防止用 A 页的授权 id 去操作 B 页（越权改他人授权）
+          const removed = (await tx.query<{ id: number; subject_kind: string; subject_id: string; role: string }>(
+            'SELECT id, subject_kind, subject_id, role FROM page_grants WHERE id = ? AND page_slug = ?',
+            [id, slug],
+          ))[0]
+          if (!removed) return null
+          await tx.run('DELETE FROM page_grants WHERE id = ? AND page_slug = ?', [id, slug])
+          const rev = await bumpAclRevision(tx, slug)
+          return { rev, removed }
+        })
+        if (!revision) {
+          h.json(404, { ok: false, error: 'not_found', message: `授权不存在: ${id}` })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}:${revision.removed.subject_kind}:${revision.removed.subject_id}`,
+          actorId: guard.principal.userId,
+          before: { role: revision.removed.role },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, { ok: true, slug, removed: id, acl_revision: revision.rev })
       }, { access: 'user' }),
     )
 
