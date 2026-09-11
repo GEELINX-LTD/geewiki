@@ -14,7 +14,7 @@
  */
 import { ApiError } from '../api'
 
-export type ErrorKind = 'unreachable' | 'notFound' | 'server' | 'client' | 'unknown'
+export type ErrorKind = 'unreachable' | 'notFound' | 'unauthorized' | 'forbidden' | 'server' | 'client' | 'unknown'
 
 export interface ErrorView {
   kind: ErrorKind
@@ -92,6 +92,33 @@ export function describeError(err: unknown): ErrorView {
         title: '服务暂时出错',
         hint: cleanHint(err.message) || '请稍后重试。',
         retryable: true,
+      }
+    }
+    /*
+      401 / 403 **必须排在通用的 `>= 400` 之前**（P1 新增）。
+
+      在此之前它们都落进 `client` 桶、显示成"请求未被接受"——对用户而言这是
+      完全不可理解的信息：他既不知道要登录，也不知道是权限不够。
+      这两类还要分别给出**不同的下一步**，故不能合并成一个 kind：
+        401 → 去登录（`lib/authFailure.ts` 的统一出口会自动跳转，不会停在错误页）
+        403 → 权限不足，要联系管理员（跳"无访问权限"页，见 pages/DeniedPage.tsx）
+
+      `retryable: false`：401/403 重试同样的请求永远不会成功，给"重试"按钮是误导。
+    */
+    if (err.status === 401) {
+      return {
+        kind: 'unauthorized',
+        title: '需要登录',
+        hint: cleanHint(err.message) || '登录后才能继续。',
+        retryable: false,
+      }
+    }
+    if (err.status === 403) {
+      return {
+        kind: 'forbidden',
+        title: '没有访问权限',
+        hint: cleanHint(err.message) || '请联系管理员为你开通权限。',
+        retryable: false,
       }
     }
     if (err.status >= 400) {

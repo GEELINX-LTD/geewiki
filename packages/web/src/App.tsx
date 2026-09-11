@@ -2,10 +2,12 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   BookText,
   GitBranch,
+  LogIn,
   Menu as MenuIcon,
   MonitorSmartphone,
   Puzzle,
   Search,
+  UserRound,
 } from 'lucide-react'
 import { Button } from './ui/Button'
 import {
@@ -28,8 +30,12 @@ import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AdminPage } from './pages/AdminPage'
+import { DeniedPage } from './pages/DeniedPage'
 import { GraphPage } from './pages/GraphPage'
+import { LoginPage } from './pages/LoginPage'
+import { SetupPage } from './pages/SetupPage'
 import { WikiPage } from './pages/WikiPage'
+import { logout, useAuth } from './lib/authStore'
 import { cn } from './ui/cn'
 
 /**
@@ -106,11 +112,20 @@ const ADMIN_NAV: NavItem[] = [
   { id: 'plugins', label: '插件管理', icon: <Puzzle className="size-4" /> },
   { id: 'graph', label: '依赖图', icon: <GitBranch className="size-4" /> },
 ]
+/**
+ * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
+ * （或顶栏的身份区），列在这里只是为了路由分派与文档标题。
+ */
+const AUTH_ROUTES = ['login', 'setup', 'denied'] as const
+
+function isAuthRoute(id: string): boolean {
+  return (AUTH_ROUTES as readonly string[]).includes(id)
+}
 
 export function App(): ReactNode {
   const route = useRoute()
   const root = route.split('/')[0] ?? 'wiki'
-  const known = [WIKI_ITEM, ...ADMIN_NAV].some((t) => t.id === root)
+  const known = [WIKI_ITEM, ...ADMIN_NAV].some((t) => t.id === root) || isAuthRoute(root)
   const active = known ? root : 'wiki'
 
   /** 路由级基线标题；详情页拿到页面数据后会覆盖成真实标题（见 WikiDetail） */
@@ -172,6 +187,13 @@ export function App(): ReactNode {
    */
   const [statusOpen, setStatusOpen] = useState(false)
 
+  /**
+   * 登录态。**在 App 层订阅**（而不是只让登录页订阅）：顶栏的身份区需要它，
+   * 且它承担"应用启动时问一次我是谁"的职责 —— 放在叶子组件里，
+   * 未挂载那些组件时就不会发起检查，顶栏会一直显示成未登录。
+   */
+  const auth = useAuth()
+
   let body: ReactNode
   if (active === 'wiki')
     body = (
@@ -181,6 +203,9 @@ export function App(): ReactNode {
       />
     )
   else if (active === 'plugins') body = <AdminPage />
+  else if (active === 'login') body = <LoginPage />
+  else if (active === 'setup') body = <SetupPage />
+  else if (active === 'denied') body = <DeniedPage />
   else body = <GraphPage />
 
   const adminActive = ADMIN_NAV.some((t) => t.id === active)
@@ -293,6 +318,8 @@ export function App(): ReactNode {
             搜索
           </Button>
           <ThemeToggle key={themeEpoch} />
+          {/* 身份区（P1）：登录入口 / 当前身份与登出 */}
+          <AuthArea auth={auth} />
           {/* 窄屏导航降级：把全部目的地收进一个菜单 */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -371,6 +398,59 @@ export function App(): ReactNode {
         <SlotOutlet name="app-footer" />
       </footer>
     </div>
+  )
+}
+
+/**
+ * 顶栏身份区（P1）。
+ *
+ * 三态，**每一态都给一个明确的下一步**：
+ * - 已登录 ⇒ 显示身份 + 登出（`登出` 会先让服务端吊销会话，见 authStore.logout）；
+ * - 未初始化 ⇒ 「初始化」（去 `#/setup`）。这与「登录」**不是同一个入口**：
+ *   库里还没有账号时，登录页只会让人白试一遍（设计文档 §2.5 ⑥ 把 503 与 401 分开的
+ *   产品理由就在这儿）。
+ * - 未登录 ⇒ 「登录」。
+ *
+ * 加载中**渲染占位而不是空白**：否则顶栏会在首帧后突然多出一个按钮，
+ * 造成布局跳动（CLS），而 `authState` 是很快的一次请求。
+ */
+function AuthArea({ auth }: { auth: ReturnType<typeof useAuth> }): ReactNode {
+  if (auth.user !== null) {
+    return (
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            icon={<UserRound className="size-4" />}
+            className="text-header-dim hover:bg-white/10 hover:text-white"
+            aria-label={`账号菜单（当前身份：${auth.user.displayName}）`}
+          >
+            <span className="hidden max-w-[12ch] truncate sm:inline">{auth.user.displayName}</span>
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuLabel>{auth.user.email}</DropdownMenuLabel>
+          <DropdownMenuItem onSelect={() => void logout()}>登出</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    )
+  }
+  if (auth.loading) {
+    // 占位保持宽度稳定；`aria-hidden` 是因为它没有语义（读屏不该播报一个空按钮）
+    return <span aria-hidden="true" className="inline-block h-8 w-16 rounded-md bg-white/10" />
+  }
+  const needsSetup = auth.setupRequired === true
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      icon={<LogIn className="size-4" />}
+      onClick={() => (window.location.hash = needsSetup ? '/setup' : '/login')}
+      className="text-header-dim hover:bg-white/10 hover:text-white"
+    >
+      {needsSetup ? '初始化' : '登录'}
+    </Button>
   )
 }
 

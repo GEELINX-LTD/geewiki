@@ -4,6 +4,7 @@
  * HTTP 状态码与 ManagerError.code 映射（404 not_found / 409 冲突类 / 400 / 500）。
  */
 import { createAiStreamDecoder, type AiStreamEvent } from './lib/aiStreamPlan'
+import { authFailureAction, type AuthFailureAction } from './lib/authFailure'
 import type { SlotName } from './lib/slots'
 
 export interface ApiFailure {
@@ -24,11 +25,63 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 认证失败的**全局出口**（由 `lib/authStore.ts` 在模块加载时注册）。
+ *
+ * 为什么用"注册回调"而不是让 api.ts 直接跳转：
+ * 1. **避免循环依赖** —— `api → authStore → api` 在 ESM 下能跑但初始化顺序敏感；
+ *    这里 api 只提供一个注册点，谁想处理谁注册。
+ * 2. api.ts 保持"只做 HTTP"的单一职责，跳转策略（含"401 不弹提示"这类产品判断）
+ *    留在 `lib/authFailure.ts` + authStore。
+ */
+export type AuthFailureHandler = (action: NonNullable<AuthFailureAction>) => void
+
+let authFailureHandler: AuthFailureHandler | null = null
+
+export function setAuthFailureHandler(handler: AuthFailureHandler): void {
+  authFailureHandler = handler
+}
+
+/**
+ * **提交凭据**的端点：它们返回 401 表示"这次提交的凭据不对"，而不是"你的会话失效了"。
+ *
+ * 必须排除在全局出口之外，否则用户在登录页输错口令会被"跳转到登录页"（页面上刚显示的
+ * 错误提示随之消失，表现为"点了一下登录、页面闪了一下什么都没发生"），
+ * 改口令时输错当前口令也会被踢到登录页。
+ */
+const CREDENTIAL_ENDPOINTS = new Set(['/api/auth/login', '/api/auth/password'])
+
+/** 认证类失败时调用统一出口（非认证类失败、以及提交凭据的端点，都不触发）。 */
+function notifyAuthFailure(status: number, code: string | undefined, path: string): void {
+  if (authFailureHandler === null) return
+  if (CREDENTIAL_ENDPOINTS.has(path)) return
+  const action = authFailureAction(status, code, window.location.hash)
+  if (action !== null) authFailureHandler(action)
+}
+
+/**
+ * 统一请求头。
+ *
+ * - `x-gw-csrf: 1`：**每个请求都带**。跨站表单无法设置自定义头，因此这一个头就是
+ *   CSRF 的第二道闸门（服务端只在"带会话 cookie"时强制要求它，见 plugin-auth 的 checkCsrf）。
+ * - **不加 `Authorization`**：会话走 HttpOnly cookie，令牌对 JS 不可见
+ *   （XSS 偷不到会话；代价是必须防 CSRF，故有上面那个头）。
+ * - `credentials: 'same-origin'`：带 cookie。**SSE 那条裸 fetch 同样必须带**，
+ *   否则流永远是匿名的，且失败是静默的。
+ */
+function requestHeaders(hasBody: boolean): Record<string, string> {
+  return {
+    ...(hasBody ? { 'content-type': 'application/json' } : {}),
+    'x-gw-csrf': '1',
+  }
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
+    headers: requestHeaders(body !== undefined),
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
   })
   let data: unknown = null
   try {
@@ -38,6 +91,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
   if (!res.ok) {
     const f = (data ?? {}) as Partial<ApiFailure>
+    notifyAuthFailure(res.status, f.error, path)
     throw new ApiError(res.status, f.error ?? 'http_' + res.status, f.message ?? `请求失败 (${res.status})`, f.details)
   }
   return data as T
@@ -340,7 +394,10 @@ export interface AiStreamOptions {
 export async function aiAskStream(q: string, opts: AiStreamOptions): Promise<void> {
   const res = await fetch('/api/ai/stream', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    // 与 `request()` 同一套头与凭据：**漏掉 `credentials` 会让这条流永远是匿名的**，
+    // 而且失败是静默的（服务端只会把主体当成 anonymous，不报错）。
+    headers: requestHeaders(true),
+    credentials: 'same-origin',
     body: JSON.stringify({
       q,
       ...(opts.limit === undefined ? {} : { limit: opts.limit }),
@@ -414,7 +471,77 @@ export interface SlotsResponse {
   conflicts: SlotAssignmentInfo[]
 }
 
+/* ------------------------- 身份与登录（P1） ------------------------- */
+
+/**
+ * 当前登录用户（**后端 AuthUser 的前端镜像**）。
+ *
+ * ⚠️ **本仓库的 core 包不能进浏览器包**（它顶层 `import 'node:fs'`），所以这类
+ * 前后端共享的形状只能在前端持一份副本 —— 与 `lib/slugRules.ts`、`lib/pluginUiPlan.ts`
+ * 的做法一致。副本与后端不一致的症状是"类型说有的字段运行时是 undefined"，
+ * 故改动后端 `AuthUser` 时必须同步这里。
+ */
+export interface AuthUser {
+  id: number
+  email: string
+  displayName: string
+  orgId: number
+  /** P1 恒为 null（组织的角色存储属 P2）；null 表示"无组织角色"= Guest 语义 */
+  orgRole: 'owner' | 'admin' | 'member' | 'viewer' | null
+  emailVerified: boolean
+  createdAt: string
+  lastSeenAt: string | null
+}
+
+/** 服务端下发的能力。**只用于前端隐藏入口**，服务端判定独立进行（前端隐藏不是安全措施）。 */
+export interface AuthCapabilities {
+  editContent: boolean
+  administer: boolean
+  manageVisibility: boolean
+}
+
+export interface AuthStateResponse {
+  ok: true
+  /** true ⇒ 库里还没有任何可登录账号，应去 #/setup */
+  setupRequired: boolean
+  authenticated: boolean
+  user: AuthUser | null
+  capabilities: AuthCapabilities
+  oidc: { available: boolean }
+}
+
+export interface AuthMeResponse {
+  ok: true
+  user: AuthUser
+  session: { id: string | null }
+  capabilities: AuthCapabilities
+}
+
 export const api = {
+  /* 身份与登录（P1） */
+  /**
+   * 登录态与初始化状态。**公共端点**：未登录时也返回 200（`user: null`），
+   * 因此它是 `authStore` 的唯一数据源 —— 用一个必然成功（而非必然 401）的端点
+   * 表达"当前是谁"，冷启动时就不会因为 401 而无谓地跳一次登录页。
+   */
+  authState: () => request<AuthStateResponse>('GET', '/api/auth/state'),
+  /** 当前身份。`access:'user'`：未登录时 **401**（验收标准要求的行为）。 */
+  authMe: () => request<AuthMeResponse>('GET', '/api/auth/me'),
+  authLogin: (email: string, password: string) =>
+    request<{ ok: true; user: AuthUser | null }>('POST', '/api/auth/login', { email, password }),
+  authLogout: () => request<{ ok: true }>('POST', '/api/auth/logout'),
+  authSetup: (email: string, password: string, displayName?: string) =>
+    request<{ ok: true; user: AuthUser | null }>('POST', '/api/auth/setup', {
+      email,
+      password,
+      ...(displayName === undefined || displayName === '' ? {} : { displayName }),
+    }),
+  authChangePassword: (currentPassword: string, newPassword: string) =>
+    request<{ ok: true; revokedOtherSessions: boolean }>('POST', '/api/auth/password', {
+      currentPassword,
+      newPassword,
+    }),
+
   /* 插件管理 */
   plugins: () =>
     request<{ ok: true; plugins: PluginInfo[]; issues?: DiscoveryIssueInfo[] }>('GET', '/api/plugins'),

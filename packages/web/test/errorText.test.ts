@@ -48,6 +48,28 @@ test('describeError：4xx 参数类错误**不给重试**（重试同样会失�
   assert.equal(v.retryable, false)
 })
 
+/*
+ * 401 / 403 必须与通用 4xx **分开**（P1 新增）。
+ *
+ * 在此之前两者都落进 `client` 桶、显示成"请求未被接受"——用户既不知道要登录、
+ * 也不知道是权限不够；而且这两类要给出**完全不同的下一步**（去登录 vs 找管理员），
+ * 所以不能合并成一个 kind。这里把分类与"不给重试"一起钉住。
+ */
+test('describeError：401 归"需要登录"、403 归"没有访问权限"，且都**不给重试**', () => {
+  const unauth = describeError(new ApiError(401, 'unauthorized', '需要登录'))
+  assert.equal(unauth.kind, 'unauthorized')
+  assert.equal(unauth.retryable, false, '重试同样的请求永远不会成功，给重试是误导')
+  assert.match(unauth.title, /登录/)
+
+  const forbidden = describeError(new ApiError(403, 'forbidden', '需要管理员权限'))
+  assert.equal(forbidden.kind, 'forbidden')
+  assert.equal(forbidden.retryable, false)
+  assert.match(forbidden.title, /权限/)
+
+  // 两者必须是不同的 kind —— 合并会让"下一步"无法区分
+  assert.notEqual(unauth.kind, forbidden.kind)
+})
+
 test('describeError：非 Error 的抛出值也不会把原始值泄漏到标题', () => {
   const v = describeError('boom /api/secret')
   assert.equal(v.kind, 'unknown')
