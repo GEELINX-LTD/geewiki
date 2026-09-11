@@ -433,6 +433,8 @@ test('源码级守卫：块与索引的写入必须成对（不得绕过唯一�
     [],
     '索引插入只允许 blocks.ts 的逐页同步与 search 的全量重建（后者从 blocks 派生）',
   )
+})
+
 /* ------------------------------ 保守重解析（§4.2，P3b） ------------------------------ */
 
 /**
@@ -463,6 +465,9 @@ async function seedOne(db: DatabaseSync, content: string, pageLevel: 0 | 1 | nul
     pageLevel,
     now: 't1',
     existing: await existingOf(db),
+    // 本夹具建了 `blocks_fts`（SQLite）⇒ 与生产同一取值。
+    // `syncIndex` 在 P3a 修复轮改成必填后，这一组用例（写于旧的可选签名）需逐个补齐。
+    syncIndex: true,
   })
 }
 
@@ -484,6 +489,7 @@ test('保守重解析：纯文本编辑（块数不变）⇒ 块 id 全部保留
     pageLevel: 0,
     now: 't2',
     existing: await existingOf(db),
+    syncIndex: true,
   })
   assert.deepEqual(ids(db), before, '块数不变时 id 必须原样保留（授权挂在 id 上）')
   assert.deepEqual(texts(db), ['a改', 'b改', 'c改'])
@@ -499,6 +505,7 @@ test('保守重解析：在某块后插入新块 ⇒ 未改动的块 id 保留�
     pageLevel: 0,
     now: 't2',
     existing: await existingOf(db),
+    syncIndex: true,
   })
   const after = ids(db)
   assert.equal(after.length, 3)
@@ -518,6 +525,7 @@ test('保守重解析：删除**未授权**的块 ⇒ 正常删除，其余 id �
     pageLevel: 0,
     now: 't2',
     existing: await existingOf(db),
+    syncIndex: true,
   })
   const after = ids(db)
   assert.deepEqual(after, [before[0], before[2]], '删掉中间那块，首尾 id 不变')
@@ -535,6 +543,7 @@ test('保守重解析：合并两个**可见性不同**的块 ⇒ 409 block_merg
       pageLevel: 0,
       now: 't2',
       existing: await existingOf(db),
+      syncIndex: true,
     }),
     (err: Error) => {
       assert.match(err.message, /^block_merge_conflict:/)
@@ -556,6 +565,7 @@ test('保守重解析：合并两个**可见性相同**的块 ⇒ 允许（不�
     pageLevel: 0,
     now: 't2',
     existing: await existingOf(db),
+    syncIndex: true,
   })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
   assert.deepEqual(ids(db), [before[0]], '合并保留首块的 id')
@@ -576,6 +586,7 @@ test('保守重解析：拆分一个**已授权**的块 ⇒ 两块都继承授�
     pageLevel: 1,
     now: 't2',
     existing: await existingOf(db),
+    syncIndex: true,
   })
   const after = ids(db)
   assert.equal(after.length, 2, '拆成两块')
@@ -599,6 +610,7 @@ test('保守重解析：删除一个**已授权**的块 ⇒ 409 block_grant_orph
       pageLevel: 1,
       now: 't2',
       existing: await existingOf(db),
+      syncIndex: true,
     }),
     (err: Error) => {
       assert.match(err.message, /^block_grant_orphan:/)

@@ -1364,6 +1364,9 @@ export const WikiPlugin = {
               pageLevel: await pageLevelOf(slug),
               now,
               existing: await readExistingBlocks(tx, Number(page.id)),
+              // ★ rebase 收尾：P3a 把 `syncIndex` 改成必填后，P3c 新增的恢复路径也必须显式传
+              //   （否则 PG 上会去写不存在的 `blocks_fts` ⇒ 整个恢复事务失败）
+              syncIndex: blocksIndexSupported,
               // ★ 恢复是"显式回到那个状态"，可能改变块结构 ⇒ 放行编辑路径那三道守卫
               restructure: true,
             })
@@ -1473,6 +1476,8 @@ export const WikiPlugin = {
             now,
             existing: await readExistingBlocks(tx, Number(page.id)),
             parse: () => parsed,
+            // ★ rebase 收尾：同上，`syncIndex` 在 P3a 修复后是必填
+            syncIndex: blocksIndexSupported,
             /*
              * ★ 同上：恢复可能改变块结构（快照里的块数与当前不同），
              * 而 `restructure` 只放行"改结构"，不触及任何可见性判定。
