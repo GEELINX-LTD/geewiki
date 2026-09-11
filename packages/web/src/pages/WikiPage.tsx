@@ -12,7 +12,13 @@ import { ensureSlotLoaded } from '../lib/pluginUi'
 import { SearchView } from '../components/SearchView'
 import { TableOfContents } from '../components/TableOfContents'
 import { PageLinks } from '../components/PageLinks'
-import { FILTER_HINT_ID, FILTER_INPUT_ID, SEARCH_INPUT_ID } from '../lib/domIds'
+import {
+  EDITOR_PANE_LABEL_ID,
+  FILTER_HINT_ID,
+  FILTER_INPUT_ID,
+  PREVIEW_PANE_LABEL_ID,
+  SEARCH_INPUT_ID,
+} from '../lib/domIds'
 import {
   decideDraftRestore,
   draftKey,
@@ -1603,8 +1609,23 @@ function WikiEdit(props: {
       </div>
 
       <div className="grid items-start gap-4 xl:grid-cols-2">
-        <div className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'preview' && 'hidden xl:flex')}>
-          <span className="text-xs font-semibold text-ink-soft">
+        {/*
+          两个面板都做成**可命名区域**（`<section aria-labelledby>`）而不是裸 div + span：
+          按 HTML-AAM，`<section>` 只有具备可访问名称时才映射为 `region` 地标，否则是
+          `generic`（等于白写）。命名后屏幕阅读器可以把「正文」与「预览」当作两个区域来
+          跳转，而不是在一条无结构的文本流里摸索。
+
+          这里**刻意不做**的事（重要）：
+          - 不把预览里的 `h1` 降级、也不加 `aria-hidden`。用户正文自带的一级标题**就是内容
+            结构**，而预览是"Markdown 渲染成什么样"的唯一凭据——对非视觉用户藏掉是净损失。
+            故编辑页出现 2 个 h1 是**合法的**（axe 的 page-has-heading-one 只要求 ≥1，
+            实测也不报此项）。
+        */}
+        <section
+          aria-labelledby={EDITOR_PANE_LABEL_ID}
+          className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'preview' && 'hidden xl:flex')}
+        >
+          <span id={EDITOR_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
             正文（Markdown）{editorSlot ? ` · 由 ${editorSlot.source} 提供` : ''}
           </span>
           {editorSlot ? (
@@ -1633,10 +1654,15 @@ function WikiEdit(props: {
               placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
             />
           )}
-        </div>
+        </section>
 
-        <div className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'edit' && 'hidden xl:flex')}>
-          <span className="text-xs font-semibold text-ink-soft">预览（本地实时渲染，非最终发布稿）</span>
+        <section
+          aria-labelledby={PREVIEW_PANE_LABEL_ID}
+          className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'edit' && 'hidden xl:flex')}
+        >
+          <span id={PREVIEW_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
+            预览（本地实时渲染，非最终发布稿）
+          </span>
           <div className="min-h-[480px] overflow-auto rounded-md border border-line bg-surface px-5 py-4">
             {previewEmpty ? (
               <p className="m-0 text-sm text-muted">（空白）</p>
@@ -1644,7 +1670,7 @@ function WikiEdit(props: {
               <MarkdownBody html={previewRendered.html} className="md-body" />
             )}
           </div>
-        </div>
+        </section>
       </div>
 
       <p className="m-0 text-xs text-muted">
