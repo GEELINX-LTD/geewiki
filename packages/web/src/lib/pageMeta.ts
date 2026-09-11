@@ -14,6 +14,11 @@ const SECTION_LABEL: Record<string, string> = {
   wiki: '知识库',
   plugins: '插件管理',
   graph: '依赖图',
+  // 身份相关（P1）。它们不进导航，但会出现在 `document.title` 里 ——
+  // 浏览器标签页与历史记录里显示"登录 · GeeWiki"远比显示裸产品名有用。
+  login: '登录',
+  setup: '初始化',
+  denied: '无访问权限',
 }
 
 /** 知识库下的保留子路由 → 展示名 */

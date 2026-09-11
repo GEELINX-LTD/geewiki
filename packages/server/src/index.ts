@@ -27,9 +27,11 @@ import {
   PLUGIN_UI_PREFIX,
   asAsync,
   anonymousPrincipal,
+  auditIpHash,
   breakGlassPrincipal,
   normalizeRuntime,
   resolveProjectPath,
+  writeAuditLog,
   type AnyDatabaseAdapter,
   type GeeWikiManifest,
   type HttpRouterService,
@@ -44,6 +46,7 @@ import {
 } from '@geewiki/core'
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
+import { AuthPlugin, manifest as authManifest } from '@geewiki/auth'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
@@ -170,12 +173,16 @@ function secretsMatch(presented: string, expected: string): boolean {
 }
 
 /**
- * 应急通道使用留痕（P0-6）。
+ * 应急通道使用留痕。
  *
- * TODO(audit-service)：P1 建 `audit_log` 表、P4 建审计闭环后，本函数改为写入
- * audit-service（`action='access.break_glass'`，`actor` 记 break-glass 来源）。
- * **P0 刻意不建表**——P0 的范围明确不新增表/迁移，故先用结构化 stdout 行，
- * 前缀固定为 `[audit]` 便于日志系统采集与 grep。
+ * **两级留痕**：
+ * 1. stdout 结构化行（P0 起就有）—— 容器日志被采集时它是第一手证据，**永远保留**；
+ * 2. `audit_log` 表（P1 建表后）—— 经 {@link RouterIdentityDeps.onBreakGlassUse}
+ *    由组合根接上，落库可查询、可长期留存。
+ *
+ * 为什么要两级：stdout **只活在容器日志里** ⇒ 日志轮转或容器重建之后，
+ * "谁用应急令牌做了什么"就不可追责了（设计文档 §8.2 P0-6 明确记录了这个取舍与风险）。
+ * 落库补齐的正是这一环。
  */
 function auditBreakGlassUse(req: IncomingMessage): void {
   console.log(
@@ -193,15 +200,43 @@ interface AccessDenial {
 }
 
 /**
+ * 路由服务的身份注入点（P1 新增；全部可选）。
+ *
+ * 存在的意义是**把 server 与具体身份实现解耦**：P0 的凭据来源只有环境变量令牌，
+ * P1 起还要算上"库里有没有可登录的账号"（由 @geewiki/auth 提供），
+ * 而 server 不该 import auth 的实现细节 —— 它只拿到两个回调。
+ */
+export interface RouterIdentityDeps {
+  /**
+   * "当前是否存在任何可用的凭据来源"的**同步**探针。
+   *
+   * 必须是同步的：消费方 `judgeAccess` 是纯函数、在请求热路径上被同步调用。
+   * 它决定未认证请求收到的是 503 `bootstrap_required`（根本没东西可登录）
+   * 还是 401 `unauthorized`（请去登录）—— 混为一谈会让前端在登录页与初始化向导之间死循环。
+   */
+  credentialSourceProbe?: () => boolean
+  /**
+   * 应急通道（break-glass）**认证通过**时的回调，用于把使用记录写进 `audit_log`。
+   *
+   * P0 只在 stdout 留痕（当时还没有审计表）；P1 建表后由组合根接上这个回调，
+   * stdout 那一行**保留**作为冗余（容器日志被采集时它是第一手证据）。
+   */
+  onBreakGlassUse?: (req: IncomingMessage) => void
+}
+
+/**
  * 粗粒度访问等级闸门（纯函数，便于单测）。
  *
  * 判定顺序即优先级，**每一步都是失败关闭**：
  * 1. `public` ⇒ 放行（与 P0 之前的行为完全一致）；
  * 2. 应急主体 ⇒ 放行（旁路；留痕在前一步的解析里已完成）；
  * 3. **没有任何凭据来源** ⇒ 503 `bootstrap_required`。
- *    为什么不是 401：401 的语义是"你去登录"，但引导期**根本没有可登录的东西**
- *    （P0 无用户表；P1 起是"库里没有任何 owner/admin"）。把它与"未登录"混为一谈，
- *    会让前端把运维问题显示成"请重新登录"，并在登录页里死循环。
+ *    为什么不是 401：401 的语义是"你去登录"，但引导期**根本没有可登录的东西**。
+ *    把它与"未登录"混为一谈，会让前端把运维问题显示成"请重新登录"，并在登录页里死循环。
+ *    **判据由调用方给出**（`credentialSourceAvailable`）：P0 恒为"配没配
+ *    `GEEWIKI_ADMIN_TOKEN`"；P1 起还必须算上 {@link RouterIdentityDeps.credentialSourceProbe}
+ *    —— 即"库里有没有可登录的账号"。漏掉后者会让正常的未登录请求拿到 503，
+ *    前端于是永远跳去初始化向导（这正是 P1 必须改掉的一处）。
  * 4. 匿名 ⇒ 401（此时确实存在凭据来源，只是没带或带错）；
  * 5. `user` ⇒ 放行（已认证即可）；
  * 6. 组织角色为 owner/admin ⇒ 放行；
@@ -286,7 +321,14 @@ class HttpRouter implements HttpRouterService {
   /** 累计被拒的长连接请求数（持有者经 noteStreamRejected 上报；见 HttpStreamStats） */
   private streamsRejected = 0
 
-  constructor(private readonly healthHandler: RouteHandler) {}
+  constructor(
+    private readonly healthHandler: RouteHandler,
+    /**
+     * 身份相关的注入点（P1 新增）。**全部可选**，省略时行为与 P0 完全一致 ——
+     * 既有测试直接 `new HttpRouter(handler)` 构造的用法不受影响。
+     */
+    private readonly identity: RouterIdentityDeps = {},
+  ) {}
 
   register(
     method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
@@ -623,16 +665,21 @@ class HttpRouter implements HttpRouterService {
    * 未配置令牌 ⇒ **直接匿名，即使请求带了令牌头也一样**——
    * 这是"未设置环境变量即整条通道禁用"的落点，也是 P0-5 的验收点。
    *
-   * TODO(p1): 接入会话查询后**必须改为异步**，签名对齐设计文档 §2.4 的
-   * `principalFromRequest(req): Promise<Principal>`。P0 保持同步是合理的——
-   * 凭据来源只有环境变量 + 常量时间比较，没有任何跨 IO 的查询。
+   * **P1 决议：本方法保持同步，会话解析不走这里。**
    *
-   * 改造时注意两处连带影响（不要只把本方法加上 `async` 就以为完事）：
-   * 1. 本方法在 dispatch 里是**无条件**调用的（在 `hooks.length === 0` 分支之外），
-   *    因此一旦异步化，**默认（无钩子）路径也会变成异步**，`hooks.length === 0` 那条
-   *    全同步快路径需要一并重做——它现在的注释承诺"既有的同步返回语义逐字不变"。
-   * 2. 异步接缝已经留好：`runHooks` 是 async 通路，`dispatch` 的返回类型已放宽为
-   *    `boolean | Promise<boolean>`，`createServer` 调用点也已适配。
+   * P0 留的 `TODO(p1)` 曾设想"接入会话查询后把本方法改为异步"。P1 实际选了另一条路：
+   * 会话解析由 @geewiki/auth 经 `router.use?.(hook)` 挂载（设计文档 §2.5 ③ 契约第 3 条
+   * 明确把钩子点名为"P1 会话解析的挂载点"）。权衡如下：
+   *
+   * - 本方法在 `dispatch` 里是**无条件**调用的（在 `hooks.length === 0` 分支**之外**），
+   *   一旦异步化，**默认（无钩子）路径也会变成异步**，那条"全同步、语义逐字不变"的
+   *   快路径承诺就得一并作废；而钩子通路本来就是 async，把 IO 放进去**零代价**。
+   * - 本方法的职责因此收敛为"**只解应急令牌**"：读环境变量 + 常量时间比较，没有任何
+   *   跨 IO 查询 ⇒ 同步是它最自然的形态；且它在钩子之前执行，保证 `h.principal`
+   *   进钩子时已经反映了应急通道（钩子据此决定是否覆盖）。
+   *
+   * 若将来确有必要在这里做 IO（例如给非 HTTP 入口解析身份），再按原 TODO 的两条
+   * 连带影响改造：异步化 + 重做全同步快路径。
    */
   private resolvePrincipal(req: IncomingMessage): Principal {
     const expected = envAdminToken()
@@ -641,6 +688,7 @@ class HttpRouter implements HttpRouterService {
     if (presented === null || !secretsMatch(presented, expected)) return anonymousPrincipal()
     // 通过应急通道认证即留痕（不区分端点等级：令牌本身的"使用"就要可追责）
     auditBreakGlassUse(req)
+    this.identity.onBreakGlassUse?.(req)
     return breakGlassPrincipal()
   }
 
@@ -697,7 +745,8 @@ class HttpRouter implements HttpRouterService {
     method: string,
     pathname: string,
   ): void {
-    const denial = judgeAccess(route.access, h.principal ?? anonymousPrincipal(), envAdminToken() !== null)
+    const credentialSource = envAdminToken() !== null || this.identity.credentialSourceProbe?.() === true
+    const denial = judgeAccess(route.access, h.principal ?? anonymousPrincipal(), credentialSource)
     if (denial) {
       h.json(denial.status, {
         ok: false,
@@ -1047,6 +1096,35 @@ export const HttpPlugin = {
           ...(streams ? { streams } : {}),
         })
       })()
+    }, {
+      /*
+       * **身份注入点（P1）**。路由服务**不 import 任何身份实现**，只拿两个回调：
+       *
+       * 1. `credentialSourceProbe` —— 问"现在有没有可登录的账号"。
+       *    每次请求现算（`ctx.get` 是活查询）：@geewiki/auth 在本插件**之后**才激活，
+       *    构造期快照必然是 undefined，与 `pluginUiRoots` 是同一类注册顺序陷阱。
+       * 2. `onBreakGlassUse` —— 应急令牌认证通过时落库留痕。
+       *    审计写入是**旁路**：失败只记日志，绝不让"审计表写不进去"变成"应急通道不可用"
+       *    （应急通道的意义正是身份系统出问题时还能进场）。
+       */
+      credentialSourceProbe: () => {
+        const auth = ctx.get('auth-service') as { hasCredentialSource?: () => boolean } | undefined
+        return auth?.hasCredentialSource?.() === true
+      },
+      onBreakGlassUse: (req) => {
+        const rawDb = ctx.get('db') as AnyDatabaseAdapter | undefined
+        if (!rawDb) return
+        void writeAuditLog(asAsync(rawDb), {
+          action: 'access.break_glass',
+          targetKind: 'session',
+          targetId: 'break-glass',
+          actorId: null,
+          actorIpHash: auditIpHash(req.socket.remoteAddress),
+          after: { method: req.method ?? 'GET', path: req.url ?? '/' },
+        }).catch((err: unknown) => {
+          console.error('[http] 应急通道审计写入失败（stdout 留痕仍在）:', err)
+        })
+      },
     })
 
     const server: Server = createServer((req, res) => {
@@ -1265,6 +1343,14 @@ export function defaultRegistry(
       source: 'builtin',
     },
     { ...httpRegistryEntry(webDist, defaults, pluginUiRoots), source: 'builtin' },
+    // 身份与登录（P1）：提供 auth-service。**默认启用**（写进 config/plugins.base.json）——
+    // 它不是一个"可选功能"，而是 P1 起所有 `access:'user'` 端点的凭据来源：
+    // 不启用则登录不可用、写入只能靠应急令牌。
+    // **无自带迁移**：users/sessions/audit_log 等表由 db 插件的 0010/0013 建立
+    // （它们属核心基础设施，不属于某个业务插件）。
+    // runtime.supportsHotReload=false：热卸载会让所有会话的解析通道瞬间消失，
+    // 而"谁登录了"没有安全的即时降级方式。
+    { name: '@geewiki/auth', manifest: authManifest as GeeWikiManifest, module: AuthPlugin, source: 'builtin' },
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
     // 纯文本编辑器：`editor` 插槽的第一个真实消费者（证明"插件可替换编辑器"这条扩展点可用）。
     // **只登记、不写进基础清单**——它替换的是默认编辑器，是否替换应由使用者显式决定；
