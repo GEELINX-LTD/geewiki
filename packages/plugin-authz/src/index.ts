@@ -26,6 +26,7 @@ import type { Context } from 'cordis'
 import {
   anonymousPrincipal,
   asAsync,
+  auditIpHash,
   writeAuditLog,
   type AnyDatabaseAdapter,
   type DatabaseAdapterAsync,
@@ -665,6 +666,7 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'admin.verify_blocks',
         'admin.verify_search',
         'admin.session_revoke',
+        'admin.grants_purge',
         'org.group.add_member',
         'org.group.create',
         'org.group.delete',
@@ -789,6 +791,61 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
               requestId: r.request_id,
             })),
           })
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- POST /api/admin/grants/purge：回收已过期的条目授权（★ P4） ----------
+       *
+       * ⚠️ **这不是"让过期授权失效"的手段** —— 失效在**判定时**就已经发生：
+       * `loadGrants` 里那句 `if (r.expires_at <= now) continue // 已过期 ⇒ 视同没有`。
+       * 本条端点只做**空间回收**（§8.2 P4 第 3 条原话："无需人工清理即生效；清理任务只是回收"）。
+       *
+       * **为什么非要把这层区分写进注释和响应**：一旦它被当成"失效开关"，就会派生出
+       * "清理任务没跑 ⇒ 过期授权仍然有效"这种最糟的误解 —— 而那是**失败开放**方向。
+       * 响应里同时给 `expired`（本次回收数）与 `remaining`（表里还剩多少），
+       * 让运维一眼看出这条端点的作用域。
+       *
+       * **只在真的回收了东西时才写审计**：与"踢人下线"不同，维护动作的空跑没有副作用，
+       * 每 N 分钟记一条"回收了 0 条"只会把审计淹掉。有副作用才留痕。
+       */
+      router.register(
+        'POST',
+        '/api/admin/grants/purge',
+        async (h: RouteHandlerContext) => {
+          const now = new Date().toISOString()
+          const count = async (): Promise<number> => {
+            const rows = await db.query<{ n: number | string }>(
+              'SELECT COUNT(*) AS n FROM page_grants WHERE expires_at IS NOT NULL AND expires_at <= ?',
+              [now],
+            )
+            // PG 的 COUNT(*) 返回字符串，必须强转
+            return Number(rows[0]?.n ?? 0)
+          }
+          const expired = await count()
+          if (expired > 0) {
+            await db.run(
+              'DELETE FROM page_grants WHERE expires_at IS NOT NULL AND expires_at <= ?',
+              [now],
+            )
+          }
+          const remainRows = await db.query<{ n: number | string }>(
+            'SELECT COUNT(*) AS n FROM page_grants',
+            [],
+          )
+          const remaining = Number(remainRows[0]?.n ?? 0)
+          if (expired > 0) {
+            void writeAuditLog(db, {
+              action: 'admin.grants_purge',
+              targetKind: 'grant',
+              targetId: 'page_grants',
+              actorId: h.principal?.userId ?? null,
+              actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+              after: { expired, remaining, at: now },
+            }).catch((e: unknown) => console.error('[@geewiki/authz] 回收审计写入失败:', e))
+          }
+          h.json(200, { ok: true, expired, remaining, at: now })
         },
         { access: 'admin' },
       )

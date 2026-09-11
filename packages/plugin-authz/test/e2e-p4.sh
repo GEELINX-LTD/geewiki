@@ -135,6 +135,28 @@ check_ge "F2 limit 上限被夹紧（请求 9999 → ≤200）" 1 "$(adm '/api/a
 check "F3 不存在的 action 返回空集而不是报错" "0" "$(adm '/api/admin/audit?action=no.such.action' | field 'total')"
 
 echo
+echo "=== 阶段 G：过期授权回收（§8.2 P4 第 3 条）==="
+# ⚠️ 两处坑，都是本阶段第一版踩到的：
+#  ① 授予端点是**按主体幂等 upsert**的 —— 若造两条 subjectId 相同的授予，第二条会覆盖第一条，
+#     库里就没有过期行，purge 恒返回 expired=0 也照样"通过"（空洞断言）。现在只造**一条**。
+#  ② 阶段 E 结尾按用户批量吊销了所有会话，`$JAR` 已经失效 —— 必须重新登录取新 jar，
+#     否则下面的建授予会被 401 挡掉，而断言会以"看起来对"的方式失败。
+JAR_G="$TMP/jar-g.txt"
+curl -s -c "$JAR_G" -X POST "http://127.0.0.1:$PORT/api/auth/login" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"email":"owner@example.com","password":"correct-horse-battery"}' >/dev/null
+GRANT="$(curl -s -b "$JAR_G" -X POST "http://127.0.0.1:$PORT/api/pages/secret/grants" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"subjectKind":"user","subjectId":"1","role":"viewer","expiresAt":"2020-01-01T00:00:00.000Z"}')"
+check "G0 造出一条已过期授权" "2020-01-01T00:00:00.000Z" "$(echo "$GRANT" | field 'expiresAt')"
+PURGE="$(curl -s -H "x-gw-admin-token: $TOKEN" -X POST "http://127.0.0.1:$PORT/api/admin/grants/purge")"
+check "G1 回收了那条过期授权" "1" "$(echo "$PURGE" | field 'expired')"
+check "G2 回收后表里不再有它" "0" "$(echo "$PURGE" | field 'remaining')"
+PURGE2="$(curl -s -H "x-gw-admin-token: $TOKEN" -X POST "http://127.0.0.1:$PORT/api/admin/grants/purge")"
+check "G3 空跑返回 expired=0" "0" "$(echo "$PURGE2" | field 'expired')"
+check "G4 只有真回收了才写审计（恰 1 条）" "1" "$(adm '/api/admin/audit?action=admin.grants_purge' | field 'total')"
+check "G5 它属于权限变更视图，不属于安全视图" "1/0" "$(adm '/api/admin/audit?view=acl&action=admin.grants_purge' | field 'total')/$(adm '/api/admin/audit?view=security&action=admin.grants_purge' | field 'total')"
+check "G6 非 admin 不得调用" "401" "$(code_of -X POST "http://127.0.0.1:$PORT/api/admin/grants/purge")"
+
+echo
 echo "==================================="
 echo "通过 $PASS 项，失败 $FAIL 项"
 [[ "$FAIL" -eq 0 ]] || exit 1
