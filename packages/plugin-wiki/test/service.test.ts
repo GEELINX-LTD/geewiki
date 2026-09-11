@@ -29,13 +29,37 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
-import { asAsync, MIGRATION_TABLE } from '@geewiki/core'
+import { asAsync, MIGRATION_TABLE, type Principal } from '@geewiki/core'
+import { AuthzPlugin } from '@geewiki/authz'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
 /* ------------------------------ 夹具 ------------------------------ */
 
-/** db-sqlite 的真实初始迁移（wiki 的 pages / page_versions 表由它建立） */
+/**
+ * db-sqlite 的真实迁移（**读真实文件，不抄一份 DDL**）：
+ * `0001_init.sql` 建 pages / page_versions；`0012_page_acl.sql` 给 pages 补上 P2 的
+ * 可见性列并建 `page_grants` —— 本插件自 P2 起在提供任何内容前都要过策略层，
+ * 而策略层要读这几列，缺了它每个用例都会炸。
+ */
+/**
+ * 夹具用的主体：**已登录的组织成员**。
+ *
+ * 为什么不用匿名：新建条目一律写成 `visibility='org'`（两层默认值的应用层那一半），
+ * 匿名看不到它 —— 用匿名主体会让每个"建完再读"的用例都变成 404。
+ * 用 member 既贴近真实用法，又顺带钉住"org 档对成员可见、不需要 published_at"。
+ */
+const MEMBER: Principal = {
+  kind: 'user',
+  userId: 1,
+  orgId: 1,
+  orgRole: 'member',
+  groupIds: [],
+  sessionId: null,
+}
 const INIT_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0001_init.sql')
+/** `page_grants.granted_by` 有 `REFERENCES users(id)`，故 0010 必须一并加载 */
+const IDENTITY_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0010_identity.sql')
+const ACL_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0012_page_acl.sql')
 
 /**
  * `node:sqlite`（Node 内置）上的 DatabaseAdapter 实现。
@@ -57,8 +81,10 @@ class NodeSqliteAdapter implements DatabaseAdapter {
       applied_at TEXT NOT NULL
     )`)
     const seed = this.db.prepare(`INSERT OR IGNORE INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`)
-    // 只登记本夹具实际执行过的那一个脚本（本文件只加载 0001_init.sql）
+    // 只登记本夹具实际执行过的脚本
     seed.run(basename(INIT_SQL_PATH), new Date().toISOString())
+    seed.run(basename(IDENTITY_SQL_PATH), new Date().toISOString())
+    seed.run(basename(ACL_SQL_PATH), new Date().toISOString())
   }
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
@@ -153,7 +179,14 @@ async function makeHarness(
   config: { recentVersions?: number; asyncDb?: boolean; pgBigintAsString?: boolean } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gw-wiki-'))
-  const adapter = new NodeSqliteAdapter(join(dir, 'test.db'), readFileSync(INIT_SQL_PATH, 'utf8'))
+  const adapter = new NodeSqliteAdapter(
+    join(dir, 'test.db'),
+    [
+      readFileSync(INIT_SQL_PATH, 'utf8'),
+      readFileSync(IDENTITY_SQL_PATH, 'utf8'),
+      readFileSync(ACL_SQL_PATH, 'utf8'),
+    ].join('\n'),
+  )
 
   const routes = new Map<string, RouteHandler>()
   const routerService: HttpRouterService = {
@@ -207,7 +240,17 @@ async function makeHarness(
       }
     },
   } as unknown as Context
-  const dispose = (await WikiPlugin.apply(ctx, { recentVersions: 10, ...config })) as () => void
+  /*
+   * **先装真实的策略层**（不造假替身）：wiki 的读路径自 P2 起在提供任何内容之前
+   * 都要向 `policy-service` 要判定，而可见性规则本身也该在这个夹具里被真跑 ——
+   * 用替身会把"权限真的接线了没有"这件事一并测掉。
+   */
+  const disposeAuthz = (await (AuthzPlugin.apply as (c: Context) => Promise<unknown>)(ctx)) as () => void
+  const disposeWiki = (await WikiPlugin.apply(ctx, { recentVersions: 10, ...config })) as () => void
+  const dispose = (): void => {
+    disposeWiki()
+    disposeAuthz()
+  }
 
   const call = (
     method: string,
@@ -227,6 +270,13 @@ async function makeHarness(
         res: { once: () => {} } as unknown as ServerResponse,
         url: new URL(`http://localhost${path}`),
         params,
+        /*
+         * ★ P2：路由上下文必须带主体。生产里由 @geewiki/auth 的钩子填充，而本夹具
+         * 手工驱动处理器（只跑处理器、不跑钩子），所以在这里显式给一个已登录成员。
+         * 读路径**保持 public**，匿名访客拿到的是 anonymousPrincipal —— 本夹具刻意
+         * 不用匿名，因为新建条目一律写成 `visibility='org'`，匿名看不到它。
+         */
+        principal: MEMBER,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)
@@ -269,8 +319,8 @@ test('wiki-service：apply 后 ctx.get 拿得到，四个方法与 manifest 的 
     for (const m of ['list', 'get', 'save', 'remove'] as const) {
       assert.equal(typeof svc[m], 'function', `wiki-service.${m} 应是函数`)
     }
-    assert.deepEqual((await svc.list()), [], '空库应返回空列表')
-    assert.equal((await svc.get('nope')), undefined, '不存在的 slug 返回 undefined（对应端点 404）')
+    assert.deepEqual((await svc.list(MEMBER)), [], '空库应返回空列表')
+    assert.equal((await svc.get('nope', MEMBER)), undefined, '不存在的 slug 返回 undefined（对应端点 404）')
   } finally {
     h.dispose()
   }
@@ -286,7 +336,7 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
       outcome: 'created',
       version: 1,
     })
-    const created = (await svc.get('getting-started'))
+    const created = (await svc.get('getting-started', MEMBER))
     assert.ok(created, 'save 后应能读到')
     assert.equal(created.title, '入门')
     assert.equal(created.content, '第一版')
@@ -298,7 +348,7 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
       outcome: 'unchanged',
       version: 1,
     })
-    const afterNoop = (await svc.get('getting-started'))
+    const afterNoop = (await svc.get('getting-started', MEMBER))
     assert.equal(afterNoop?.version, 1, 'unchanged 不应推进版本号')
     assert.deepEqual(afterNoop?.versions, [], 'unchanged 不应写历史快照')
     assert.equal(afterNoop?.updated_at, created.updated_at, 'unchanged 不应改 updated_at')
@@ -308,7 +358,7 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
       outcome: 'updated',
       version: 2,
     })
-    const updated = (await svc.get('getting-started'))
+    const updated = (await svc.get('getting-started', MEMBER))
     assert.equal(updated?.content, '第二版')
     assert.equal(updated?.version, 2)
     assert.equal(updated?.versions.length, 1, '更新应留下一条历史')
@@ -321,7 +371,7 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
     )
 
     // 列表：摘要字段与排序（单条时只校验字段形状）
-    assert.deepEqual((await svc.list()), [
+    assert.deepEqual((await svc.list(MEMBER)), [
       {
         slug: 'getting-started',
         title: '入门',
@@ -346,8 +396,8 @@ test('wiki-service：remove 删除页面与历史；不存在的 slug 返回 fal
     assert.equal(h.adapter.query('SELECT id FROM page_versions').length, 1, '前置：应有一条历史')
 
     assert.equal((await svc.remove('temp')), true, '删除存在的页面应返回 true')
-    assert.equal((await svc.get('temp')), undefined, '删除后 get 应返回 undefined')
-    assert.deepEqual((await svc.list()), [], '删除后列表应为空')
+    assert.equal((await svc.get('temp', MEMBER)), undefined, '删除后 get 应返回 undefined')
+    assert.deepEqual((await svc.list(MEMBER)), [], '删除后列表应为空')
     assert.equal(h.adapter.query('SELECT id FROM page_versions').length, 0, '版本历史应一并清除')
 
     assert.equal((await svc.remove('temp')), false, '删除不存在的页面应返回 false（对应端点 404）')
@@ -373,7 +423,7 @@ test('wiki-service：非法入参抛错，消息前缀与端点的错误码同�
     )
     // 非法 remove 入参同样拒绝
     assert.rejects(async () => (await svc.remove('../etc')), /^Error: invalid_slug: /)
-    assert.deepEqual((await svc.list()), [], '校验失败不得留下任何落库副作用')
+    assert.deepEqual((await svc.list(MEMBER)), [], '校验失败不得留下任何落库副作用')
   } finally {
     h.dispose()
   }
@@ -391,13 +441,13 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
     assert.equal(put.status, 200)
     assert.equal(put.body['outcome'], 'created')
     assert.deepEqual(
-      (await svc.get('via-http')),
+      (await svc.get('via-http', MEMBER)),
       {
         slug: 'via-http',
         title: 'HTTP 写入',
         content: 'v1',
-        created_at: (await svc.get('via-http'))?.created_at,
-        updated_at: (await svc.get('via-http'))?.updated_at,
+        created_at: (await svc.get('via-http', MEMBER))?.created_at,
+        updated_at: (await svc.get('via-http', MEMBER))?.updated_at,
         version: 1,
         versions: [],
       },
@@ -422,7 +472,7 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
 
     // 列表：服务的 list() 与端点 pages 数组逐字段一致（含顺序）
     const list = await h.call('GET', '/api/pages')
-    assert.deepEqual(list.body['pages'], (await svc.list()))
+    assert.deepEqual(list.body['pages'], (await svc.list(MEMBER)))
 
     // 幂等语义在两条路径上一致：端点 unchanged ⇔ 服务 unchanged
     const putSame = await h.call('PUT', '/api/pages/:slug', { slug: 'via-svc' }, { title: '服务写入', content: 'v1' })
@@ -482,8 +532,8 @@ test('wiki-service：卸载后 ctx.get 回到 undefined、路由摘除、旧引�
     assert.equal(h.adapter.query('SELECT id FROM pages').length, 1, '数据仍在（卸载不删数据）')
 
     // 旧引用不得静默返回空结果，而应显式报错
-    assert.rejects(async () => (await svc.list()), /插件已卸载，wiki-service 不可再调用/)
-    assert.rejects(async () => (await svc.get('p')), /插件已卸载，wiki-service 不可再调用/)
+    assert.rejects(async () => (await svc.list(MEMBER)), /插件已卸载，wiki-service 不可再调用/)
+    assert.rejects(async () => (await svc.get('p', MEMBER)), /插件已卸载，wiki-service 不可再调用/)
     assert.rejects(async () => (await svc.save('p', { title: 't', content: 'c' })), /插件已卸载，wiki-service 不可再调用/)
     assert.rejects(async () => (await svc.remove('p')), /插件已卸载，wiki-service 不可再调用/)
   } finally {
@@ -496,7 +546,16 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
   // 而消费方会是**另一个插件**（各自跑在 ctx.plugin() 的子 fiber 里）。
   // 这里用真实 cordis + 真实 ctx.plugin() 装配，证明跨插件可见性在生产路径上成立。
   const dir = mkdtempSync(join(tmpdir(), 'gw-wiki-cordis-'))
-  const adapter = new NodeSqliteAdapter(join(dir, 'test.db'), readFileSync(INIT_SQL_PATH, 'utf8'))
+  // 与其他夹具同源：0010（page_grants 的外键目标）+ 0012（P2 的可见性列）都必须加载，
+  // 否则真实 cordis 那条路径上策略层会以"缺少可见性列"显式拒绝启动
+  const adapter = new NodeSqliteAdapter(
+    join(dir, 'test.db'),
+    [
+      readFileSync(INIT_SQL_PATH, 'utf8'),
+      readFileSync(IDENTITY_SQL_PATH, 'utf8'),
+      readFileSync(ACL_SQL_PATH, 'utf8'),
+    ].join('\n'),
+  )
   try {
     const routes = new Map<string, RouteHandler>()
     const routerService: HttpRouterService = {
@@ -514,7 +573,11 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
     root.provide('db', adapter)
     root.provide('http', routerService)
 
-    // 生产路径：管理器就是 `await ctx.plugin(module, config)` 逐插件激活
+    // 生产路径：管理器就是 `await ctx.plugin(module, config)` 逐插件激活。
+    // **先装真实的策略层**（不造假替身）：wiki 的读路径在 P2 起会向它要判定，
+    // 用替身会把"权限规则真的接线了没有"这件事测掉。
+    const authzFork = root.plugin(AuthzPlugin)
+    await authzFork
     const fork = root.plugin(WikiPlugin, { recentVersions: 10 })
     await fork
 
@@ -542,6 +605,7 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
     // 卸载后对所有人注销
     await siblingFork.dispose()
     await fork.dispose()
+    await authzFork.dispose()
     assert.equal(root.get('wiki-service'), undefined, '卸载后服务应注销')
     assert.equal(routes.has('GET /api/pages'), false, '卸载后路由应摘除')
   } finally {
@@ -601,7 +665,7 @@ test('异步数据库适配器：wiki 正常激活并走通全部读写（不再
     )
 
     // 服务方法同样可用（与端点共用实现）
-    assert.ok((await h.svc().get('async-p')), '异步适配器下 wiki-service 也应可用')
+    assert.ok((await h.svc().get('async-p', MEMBER)), '异步适配器下 wiki-service 也应可用')
   } finally {
     h.dispose()
   }
@@ -644,7 +708,7 @@ test('pg 把 COUNT(*) 返回为字符串时，version 仍是数字（PG 实测�
     assert.equal(item?.version, 2)
 
     // 服务方法与端点共用实现，故同样必须是数字
-    const svcDetail = await h.svc().get('v')
+    const svcDetail = await h.svc().get('v', MEMBER)
     assert.equal(typeof svcDetail?.version, 'number')
   } finally {
     h.dispose()
@@ -761,7 +825,9 @@ test('backlinks：指向尚未创建的页面是合法的（title 为 null）', 
         slug: string
         title: string | null
       }[]),
-      [{ slug: 'ghost', title: null }],
+      // ★ P2：出链新增 `exists` 三步态 —— ghost 不存在 ⇒ false（红链，可引导创建）。
+      // 注意它**不是** 'hidden'：那表示"存在但你看不到"，两者绝不可混（否则红链功能失效）
+      [{ slug: 'ghost', title: null, exists: false }],
     )
     // ghost 不存在 → 其 backlinks 是 404（"页面不存在"与"存在但没人链接"必须可区分）
     assert.equal((await h.call('GET', `${P}/backlinks`, { slug: 'ghost' })).status, 404)
@@ -789,10 +855,11 @@ test('backlinks：wiki-service 的两个新方法与端点结果一致', async (
     await h.call('PUT', P, { slug: 'x' }, { title: '甲', content: '[乙](/wiki/y)' })
     await h.call('PUT', P, { slug: 'y' }, { title: '乙', content: '乙' })
     const svc = h.svc()
-    assert.deepEqual(plain((await svc.links('x'))!), [{ slug: 'y', title: '乙' }])
-    assert.deepEqual(plain((await svc.backlinks('y'))!), [{ slug: 'x', title: '甲' }])
-    assert.equal((await svc.links('nope')), undefined)
-    assert.equal((await svc.backlinks('nope')), undefined)
+    // ★ P2：出链新增 `exists` 字段（§5.5 的三步态）；"存在且可见" 即 true
+    assert.deepEqual(plain((await svc.links('x', MEMBER))!), [{ slug: 'y', title: '乙', exists: true }])
+    assert.deepEqual(plain((await svc.backlinks('y', MEMBER))!), [{ slug: 'x', title: '甲' }])
+    assert.equal((await svc.links('nope', MEMBER)), undefined)
+    assert.equal((await svc.backlinks('nope', MEMBER)), undefined)
   } finally {
     h.dispose()
   }

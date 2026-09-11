@@ -26,9 +26,35 @@ import {
   type DatabaseExecutor,
   type GeeWikiManifest,
   type HttpRouterService,
+  type Principal,
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
+
+/**
+ * `policy-service` 的**最小结构需求**（结构化类型，刻意不 import `@geewiki/authz`）。
+ *
+ * 与 plugin-org 对 `auth-service` 的处理同理：插件间依赖应当经**服务标识**表达
+ * （manifest 的 `requires`），而不是钉死在某个包的模块上 —— 将来完全可能有另一种
+ * 策略实现（例如把判定下沉到外部授权服务），只要它 `ctx.provide('policy-service', …)`
+ * 就应当能接上。
+ */
+interface PolicyServiceLike {
+  resolvePage(principal: Principal, slug: string): Promise<PageAccessLike>
+  resolvePages(principal: Principal, slugs: readonly string[]): Promise<Map<string, PageAccessLike>>
+  visibleSlugs(principal: Principal, q?: { prefix?: string; levels?: readonly string[] }): Promise<string[]>
+}
+
+interface PageAccessLike {
+  slug: string
+  level: 'none' | 'summary' | 'full'
+  canEdit: boolean
+  canDelete: boolean
+  canManageVisibility: boolean
+  reason: string
+  /** 载荷裁剪的唯一出口（见 policy-service 的实现说明） */
+  project<T extends { content?: string }>(payload: T): T
+}
 
 /**
  * 本插件自带迁移目录（`page_links` 表）。
@@ -106,6 +132,12 @@ export interface WikiBacklink {
  * 与 wiki 的"红链"语义一致），这正是本表 `target_slug` 不加外键的原因。
  */
 export interface WikiOutlink {
+  /**
+   * `true`=目标存在且可见；`false`=目标不存在（红链，可创建）；
+   * `'hidden'`=**存在但你看不到** —— 前端不得把它渲染成"不存在"，
+   * 否则用户会去创建一个已存在的页面（脏数据 + 错误引导）。
+   */
+  exists?: boolean | 'hidden'
   slug: string
   title: string | null
 }
@@ -139,18 +171,25 @@ export interface WikiOutlink {
  * （只有提及它的注释），故不存在需要同步迁移的调用方。
  */
 export interface WikiService {
-  /** 页面摘要列表（按 updated_at 倒序，与端点同序） */
-  list(): Promise<WikiPageSummary[]>
-  /** 页面详情；slug 不存在时返回 `undefined`（对应端点 404） */
-  get(slug: string): Promise<WikiPageDetail | undefined>
+  /*
+   * ★ P2：**所有读方法都显式要求 `principal`**（设计文档 §9 R2）。
+   *
+   * 本服务是 cordis 全局单例，不持有请求上下文。若把主体做成可选参数，
+   * 任何"忘了传"的调用点都会静默退化成"不过滤"—— 那是把一次编码疏忽变成全量泄漏。
+   * 加必填参数让它在**编译期**就炸，而不是在运行时悄悄放行。
+   */
+  /** 页面摘要列表（按 updated_at 倒序，与端点同序）；只含该主体可见的条目 */
+  list(principal: Principal): Promise<WikiPageSummary[]>
+  /** 页面详情；**不存在或无权**均返回 `undefined`（对应端点 404，不泄露存在性） */
+  get(slug: string, principal: Principal): Promise<WikiPageDetail | undefined>
   /** 新建或更新（幂等 upsert）：标题与正文均未变化时 outcome='unchanged' 且不写历史 */
   save(slug: string, input: WikiSaveInput): Promise<WikiSaveResult>
   /** 删除页面及其全部版本历史；返回是否确实删除（false 对应端点 404） */
   remove(slug: string): Promise<boolean>
-  /** 引用了该页的页面（按标题、slug 稳定排序）；页面不存在时返回 `undefined`（对应端点 404） */
-  backlinks(slug: string): Promise<WikiBacklink[] | undefined>
-  /** 该页正文指向的目标（含尚未创建的页面，其 title 为 null）；同理 `undefined` 对应 404 */
-  links(slug: string): Promise<WikiOutlink[] | undefined>
+  /** 引用了该页的页面（按标题、slug 稳定排序）；页面不存在时返回 `undefined`（对应端点 404）。已按主体可见性过滤 */
+  backlinks(slug: string, principal: Principal): Promise<WikiBacklink[] | undefined>
+  /** 该页正文指向的目标；`undefined` 对应 404。不可见的目标带 `exists:'hidden'`，**不得**当作"不存在" */
+  links(slug: string, principal: Principal): Promise<WikiOutlink[] | undefined>
 }
 
 export const manifest: GeeWikiManifest = {
@@ -162,7 +201,9 @@ export const manifest: GeeWikiManifest = {
     provides: 'wiki-service',
     // 依赖以服务标识声明（非具体插件名）：数据库切换（SQLite→PG）对业务插件透明，
     // 依赖边由管理器按 provides 解析（deps.ts resolveDependency）
-    requires: ['http-service', 'database-provider'],
+    // `policy-service` 是 P2 引入的**读路径依赖**：本插件在提供任何内容之前必须
+    // 先问它"这个主体能不能看这条"。声明它同时也保证了激活顺序（策略层先就绪）。
+    requires: ['http-service', 'database-provider', 'policy-service'],
     conflictGroup: undefined,
     // 页面/版本历史两张表由 db-sqlite 的 0001 迁移建立（本插件在 db 之后激活）。
     // 本插件**自己**的迁移（page_links）不在此声明：内置插件的迁移目录在组合根
@@ -385,22 +426,68 @@ export const WikiPlugin = {
      * 即"看起来稳定"的顺序会在加索引那一刻悄悄翻转——分页/侧边栏会因此漏项或重项。
      * 显式 tiebreaker 让顺序由 SQL 决定，而非由计划决定。
      */
-    const listPages = async (): Promise<WikiPageSummary[]> =>
-      (
+    /**
+     * 策略服务（P2）。**逐请求活查询**，不做构造期快照 —— `@geewiki/authz` 在本插件
+     * 之后才激活，构造期拿到的一定是 undefined（与 server 侧 `credentialSourceProbe`
+     * 是同一类注册顺序陷阱）。
+     *
+     * **拿不到就抛错，绝不降级放行**（设计文档 §9 R2 铁律）：策略层缺失时若"不过滤"，
+     * 等于把一次插件装配事故变成一个静默的全量泄漏。宁可让读操作 500。
+     */
+    /**
+     * 主体守卫。路由层已保证 `h.principal` 存在（`judgeAccess` 对每个非 public 端点
+     * 都要求非匿名），但**读端点保持 public** —— 匿名访客拿到的就是 `anonymousPrincipal`。
+     * 这里仍显式判空：`Principal` 的缺位绝不允许被解释成"那就不过滤"。
+     */
+    const requirePrincipal = (h: RouteHandlerContext): Principal => {
+      const p = h.principal
+      if (!p || typeof p.kind !== 'string') {
+        throw new Error('@geewiki/wiki: 请求缺少 Principal —— 拒绝提供内容（失败关闭）')
+      }
+      return p
+    }
+
+    const policy = (): PolicyServiceLike => {
+      const svc = ctx.get('policy-service') as PolicyServiceLike | undefined
+      if (!svc) {
+        throw new Error(
+          '@geewiki/wiki: policy-service 不可用 —— 拒绝提供内容（绝不因策略层缺失而放行，见设计文档 §9 R2）',
+        )
+      }
+      return svc
+    }
+
+    const listPages = async (principal: Principal): Promise<WikiPageSummary[]> => {
+      // 先拿"这个主体看得见的集合"，再用它过滤 —— 过滤发生在**服务端**，
+      // 且复用策略层的唯一出口（不自己写第二套可见性规则）
+      const visible = new Set(await policy().visibleSlugs(principal))
+      return (
         await adb.query<PageRow>(
           `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at,
                   (SELECT COUNT(*) FROM page_versions v WHERE v.page_id = p.id) AS version_count
              FROM pages p ORDER BY p.updated_at DESC, p.id DESC`,
         )
-      ).map((r) => ({
-        slug: r.slug,
-        title: r.title,
-        updated_at: r.updated_at,
-        version: Number((r as unknown as { version_count: number }).version_count) + 1,
-      }))
+      )
+        .filter((r) => visible.has(r.slug))
+        .map((r) => ({
+          slug: r.slug,
+          title: r.title,
+          updated_at: r.updated_at,
+          version: Number((r as unknown as { version_count: number }).version_count) + 1,
+        }))
+    }
 
-    /** 页面详情（正文 + 最近 recentLimit 条版本历史）；slug 不存在返回 undefined */
-    const getPage = async (slug: string): Promise<WikiPageDetail | undefined> => {
+    /** 页面详情（正文 + 最近 recentLimit 条版本历史）；不存在**或无权**一律返回 undefined */
+    const getPage = async (slug: string, principal: Principal): Promise<WikiPageDetail | undefined> => {
+      /*
+       * **判定先于取数**：`level='none'` 直接返回 undefined，调用方翻译成 404。
+       *
+       * 为什么"不存在"与"无权"返回同一个值：区分开就等于提供了一个
+       * "这个 slug 存不存在"的探测接口（设计文档 §2.3 明确要求匿名一律 404）。
+       * 已登录用户的 403 语义在**写路径**与显式的拒绝页上表达，不在详情读路径。
+       */
+      const access = await policy().resolvePage(principal, slug)
+      if (access.level === 'none') return undefined
       const page = (await adb.query<PageRow>('SELECT * FROM pages WHERE slug = ?', [slug]))[0]
       if (!page) return undefined
       const versions = await adb.query<{ id: number; saved_at: string }>(
@@ -410,7 +497,15 @@ export const WikiPlugin = {
       const totalVersions = (
         await adb.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])
       )[0] as unknown as { n: number }
-      return {
+      /*
+       * ★ **载荷裁剪的唯一出口**（设计文档 §2.4 约束 1）：详情对象在这里过一遍
+       * `access.project(...)`，`level !== 'full'` 时正文根本不会进入响应
+       * —— 这不是"前端隐藏"，而是服务端序列化之前就不存在。
+       *
+       * `versions` 一并裁掉：历史列表暴露的是"这条改过几次、什么时候改的"，
+       * 对只该看到占位的主体属于多余的结构信息；正文历史另有独立端点且要求编辑权。
+       */
+      const detail: WikiPageDetail = {
         slug: page.slug,
         title: page.title,
         content: page.content,
@@ -422,6 +517,9 @@ export const WikiPlugin = {
         version: Number(totalVersions.n) + 1,
         versions: versions.map((v) => ({ id: v.id, saved_at: v.saved_at })),
       }
+      const projected = access.project(detail)
+      if (projected === detail) return detail
+      return { ...projected, versions: [] }
     }
 
     /* ---------------- 反向链接索引（page_links 的读写） ---------------- */
@@ -453,22 +551,66 @@ export const WikiPlugin = {
      * 排序 `title, slug`：标题做主序便于阅读，`slug` 是不能省的次级键——
      * 同名页面（或中文标题的同一码点序）下顺序才不会由查询计划决定。
      */
-    const listBacklinks = (slug: string): Promise<WikiBacklink[]> =>
-      adb.query<WikiBacklink>(
+    const listBacklinks = async (slug: string, principal: Principal): Promise<WikiBacklink[]> => {
+      /*
+       * ★ **反链会泄露标题**（设计文档 §5.4）：引用方的 `title` 直接暴露了
+       * "存在这样一条你看不到的条目"。所以结果必须按主体可见集合过滤 ——
+       * 不可见的引用方**整条不出现**（不是"标题打码"：打码仍然确认了它的存在）。
+       */
+      const visible = new Set(await policy().visibleSlugs(principal))
+      const rows = await adb.query<WikiBacklink>(
         `SELECT p.slug AS slug, p.title AS title
            FROM page_links l JOIN pages p ON p.slug = l.source_slug
           WHERE l.target_slug = ? ORDER BY p.title, p.slug`,
         [slug],
       )
+      return rows.filter((r) => visible.has(r.slug))
+    }
 
     /** 该页正文指向的目标；`LEFT JOIN` 让"尚未创建的目标"也返回（title 为 null） */
-    const listOutlinks = (slug: string): Promise<WikiOutlink[]> =>
-      adb.query<WikiOutlink>(
+    const listOutlinks = async (slug: string, principal: Principal): Promise<WikiOutlink[]> => {
+      /*
+       * ★ **出链要区分三种"没有标题"**（设计文档 §5.5）：目标不存在（红链，可创建）、
+       * 目标存在但你看不到（`hidden`，不能渲染成"不存在"——否则用户会去创建一个
+       * 已存在的页面，产生脏数据与错误引导）。
+       */
+      const visible = new Set(await policy().visibleSlugs(principal))
+      /*
+       * ★ 必须区分**三种**"没有标题"，而不是两种：
+       *   - 目标存在且可见      → 正常返回 title，`exists: true`
+       *   - 目标存在但你看不到  → `exists: 'hidden'`（**存在性本身也不该暴露**：
+       *                          传 `slug` 是必要的，否则前端连"这是个链接"都不知道；
+       *                          但标题与正文一律不给）
+       *   - 目标根本不存在      → `exists: false`（红链，前端可以引导创建）
+       *
+       * 判据必须是"**存在性**"而不是"可见性"：只拿可见集合去判，会把"不存在"误标成
+       * `'hidden'`，于是前端永远不敢让用户创建新页面（红链功能整条失效）。
+       */
+      const existing = new Set(
+        (await adb.query<{ slug: string }>('SELECT slug FROM pages')).map((r) => r.slug),
+      )
+      const rows = await adb.query<WikiOutlink>(
         `SELECT l.target_slug AS slug, p.title AS title
            FROM page_links l LEFT JOIN pages p ON p.slug = l.target_slug
           WHERE l.source_slug = ? ORDER BY l.target_slug`,
         [slug],
       )
+      const mayKnowExistence = principal.kind === 'user'
+      return rows.map((r) => {
+        if (visible.has(r.slug)) return { ...r, exists: true as const }
+        /*
+         * ★ 匿名主体一律报 `false`（= "不存在"）：`'hidden'`（存在但你看不到）与
+         * `false`（根本不存在）的**区别本身就是存在性信息**。设计文档要求"匿名访问受限
+         * 资源一律 404、不泄露存在性"（§2.3），所以对匿名必须把两者压成同一个值。
+         * 已登录用户（`kind='user'`）已知组织存在这些条目，`'hidden'` 不额外泄露，
+         * 而它换来的"灰锁链接"体验正是 §5.5 想要的三步态。
+         */
+        if (mayKnowExistence && existing.has(r.slug)) {
+          return { slug: r.slug, title: null, exists: 'hidden' as const }
+        }
+        return { slug: r.slug, title: null, exists: false as const }
+      })
+    }
 
     /** 老库升级时一次性回填（恰好一次；理由见上面迁移段落） */
     const backfillLinks = async (): Promise<void> => {
@@ -491,13 +633,18 @@ export const WikiPlugin = {
       const outcome = await adb.transaction(async (tx): Promise<'created' | 'updated' | 'unchanged'> => {
         const existing = (await tx.query<PageRow>('SELECT id, title, content FROM pages WHERE slug = ?', [slug]))[0]
         if (!existing) {
-          await tx.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
-            slug,
-            input.title,
-            input.content,
-            now,
-            now,
-          ])
+          /*
+           * ★ **两层默认值的应用层那一半**（设计文档 §3.3 v5 说明 / D8）：
+           * `pages.visibility` 的 DDL 默认值是 `'private'`（失败关闭，守"没人管的写入路径"），
+           * 而**经产品新建的条目一律显式写 `'org'`**（组织内可见）—— 这是本产品的常态。
+           * 若这里图省事省略该列，新建的页面会默认为私有，与用户预期相反；
+           * 而若把 DDL 默认改成 'org'，则导入脚本/第三方插件的插入路径会意外公开内容。
+           */
+          await tx.run(
+            `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, acl_revision)
+             VALUES (?, ?, ?, ?, ?, 'org', 1, 0)`,
+            [slug, input.title, input.content, now, now],
+          )
           await rebuildLinks(tx, slug, input.content)
           return 'created'
         }
@@ -559,13 +706,13 @@ export const WikiPlugin = {
 
     /** 服务实例：契约见 {@link WikiService}（方法集与六个端点一一对应） */
     const svc: WikiService = {
-      list: async () => {
+      list: async (principal) => {
         assertLive()
-        return listPages()
+        return listPages(principal)
       },
-      get: async (slug) => {
+      get: async (slug, principal) => {
         assertLive()
-        return getPage(slug)
+        return getPage(slug, principal)
       },
       save: async (slug, input) => {
         assertLive()
@@ -577,13 +724,13 @@ export const WikiPlugin = {
         assertValidSlug(slug)
         return deletePage(slug)
       },
-      backlinks: async (slug) => {
+      backlinks: async (slug, principal) => {
         assertLive()
-        return (await pageExists(slug)) ? listBacklinks(slug) : undefined
+        return (await pageExists(slug)) ? listBacklinks(slug, principal) : undefined
       },
-      links: async (slug) => {
+      links: async (slug, principal) => {
         assertLive()
-        return (await pageExists(slug)) ? listOutlinks(slug) : undefined
+        return (await pageExists(slug)) ? listOutlinks(slug, principal) : undefined
       },
     }
 
@@ -599,7 +746,7 @@ export const WikiPlugin = {
      */
     cleanups.push(
       router.register('GET', '/api/pages', async (h) => {
-        h.json(200, { pages: await listPages() })
+        h.json(200, { pages: await listPages(requirePrincipal(h)) })
       }),
     )
 
@@ -607,7 +754,7 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('GET', '/api/pages/:slug', async (h) => {
         // 路由段存在即为字符串；`?? ''` 仅为类型收窄（无匹配行 → 404，与既有行为一致）
-        const page = await getPage(h.params.slug ?? '')
+        const page = await getPage(h.params.slug ?? '', requirePrincipal(h))
         if (!page) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${h.params.slug}` })
           return
@@ -707,11 +854,20 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('GET', '/api/pages/:slug/backlinks', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!(await pageExists(slug))) {
+        /*
+         * ★ 两重检查，缺一不可：
+         *   1. 目标页**存在** —— 不存在时 404 才能与"存在但没人链接"区分开；
+         *   2. 目标页**对该主体可见** —— 只看存在性的话，`/api/pages/<受限slug>/backlinks`
+         *      的 200/404 就成了一个匿名可用的**存在性探测接口**（真机端到端验收时抓到）。
+         * 注意第 2 条与 `pageExists` 是两件事：前者是权限，后者是数据。
+         */
+        const p = requirePrincipal(h)
+        const target = await policy().resolvePage(p, slug)
+        if (target.level === 'none' || !(await pageExists(slug))) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
-        h.json(200, { ok: true, slug, backlinks: await listBacklinks(slug) })
+        h.json(200, { ok: true, slug, backlinks: await listBacklinks(slug, p) })
       }),
     )
 
@@ -719,11 +875,14 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('GET', '/api/pages/:slug/links', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!(await pageExists(slug))) {
+        // 与 backlinks 同理：目标页不可见时一律 404，不给出存在性差异
+        const p = requirePrincipal(h)
+        const target = await policy().resolvePage(p, slug)
+        if (target.level === 'none' || !(await pageExists(slug))) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
-        h.json(200, { ok: true, slug, links: await listOutlinks(slug) })
+        h.json(200, { ok: true, slug, links: await listOutlinks(slug, p) })
       }),
     )
 

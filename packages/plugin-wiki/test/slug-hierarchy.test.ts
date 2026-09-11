@@ -32,8 +32,16 @@ import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
-import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
+import type {
+  DatabaseAdapter,
+  HttpRouterService,
+  Principal,
+  RouteHandler,
+  RouteHandlerContext,
+  RunResult,
+} from '@geewiki/core'
 import { MIGRATION_TABLE } from '@geewiki/core'
+import { AuthzPlugin } from '@geewiki/authz'
 import {
   SLUG_HINT,
   SLUG_MAX_DEPTH,
@@ -46,6 +54,19 @@ import {
 /* ------------------------------ 夹具 ------------------------------ */
 
 /** db-sqlite 的真实迁移目录（0001 建表、0002 建排序索引） */
+/**
+ * 夹具主体：**已登录的组织成员**。新建条目一律写 `visibility='org'`，匿名看不到它，
+ * 用成员主体才能让"建完再读"的往返成立。
+ */
+const MEMBER: Principal = {
+  kind: 'user',
+  userId: 1,
+  orgId: 1,
+  orgRole: 'member',
+  groupIds: [],
+  sessionId: null,
+}
+
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
 
 /** 按文件名序读出全部真实迁移 SQL（与 `db.migrate()` 的 `readdirSync().sort()` 同序） */
@@ -178,7 +199,14 @@ async function makeHarness(): Promise<Harness> {
       }
     },
   } as unknown as Context
-  const dispose = (await WikiPlugin.apply(ctx, { recentVersions: 10 })) as () => void
+  // ★ P2：wiki 的读路径要向 policy-service 要判定，故夹具装**真实的**策略层
+  // （不造假替身 —— 那会把"权限真的接线了没有"一并测掉）
+  const disposeAuthz = (await (AuthzPlugin.apply as (c: Context) => Promise<unknown>)(ctx)) as () => void
+  const disposeWiki = (await WikiPlugin.apply(ctx, { recentVersions: 10 })) as () => void
+  const dispose = (): void => {
+    disposeWiki()
+    disposeAuthz()
+  }
 
   const call = (
     method: string,
@@ -198,6 +226,8 @@ async function makeHarness(): Promise<Harness> {
         res: { once: () => {} } as unknown as ServerResponse,
         url: new URL(`http://localhost${path}`),
         params,
+        // 生产里由 auth 的钩子填充；本夹具手工驱动处理器（不跑钩子），故显式给一个成员主体
+        principal: MEMBER,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)

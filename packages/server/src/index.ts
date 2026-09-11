@@ -47,6 +47,7 @@ import {
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
 import { AuthPlugin, manifest as authManifest } from '@geewiki/auth'
+import { AuthzPlugin, manifest as authzManifest } from '@geewiki/authz'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
@@ -1359,6 +1360,10 @@ export function defaultRegistry(
     // **无自带迁移**：org_* 表由 db 插件的 0011 建立（核心基础设施，不属于业务插件）。
     // runtime.supportsHotReload=false：热卸载会让"谁是 owner"瞬间无人可答。
     { name: '@geewiki/org', manifest: orgManifest as GeeWikiManifest, module: OrgPlugin, source: 'builtin' },
+    // 授权策略（P2）：提供 policy-service，是**可见性判定的唯一真源**。
+    // 默认启用 —— 不启用则所有读路径拿不到策略服务（消费方必须显式失败而不是放行）。
+    // runtime.supportsHotReload=true：策略层不持有状态，卸载后消费方在 ctx.get 处显式失败。
+    { name: '@geewiki/authz', manifest: authzManifest as GeeWikiManifest, module: AuthzPlugin, source: 'builtin' },
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
     // 纯文本编辑器：`editor` 插槽的第一个真实消费者（证明"插件可替换编辑器"这条扩展点可用）。
     // **只登记、不写进基础清单**——它替换的是默认编辑器，是否替换应由使用者显式决定；

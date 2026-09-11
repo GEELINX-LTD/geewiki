@@ -16,6 +16,7 @@
   "dependencies": {
     "@geewiki/ai": "workspace:*",
     "@geewiki/auth": "workspace:*",
+    "@geewiki/authz": "workspace:*",
     "@geewiki/core": "workspace:*",
     "@geewiki/db-sqlite": "workspace:*",
     "@geewiki/echo": "workspace:*",
