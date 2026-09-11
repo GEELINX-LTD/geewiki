@@ -157,6 +157,146 @@ check "G5 它属于权限变更视图，不属于安全视图" "1/0" "$(adm '/ap
 check "G6 非 admin 不得调用" "401" "$(code_of -X POST "http://127.0.0.1:$PORT/api/admin/grants/purge")"
 
 echo
+echo "=== 阶段 H：反向展开「谁能看这条」（§8.1 P4）==="
+# 造两层树：hx → hx/pub。先让 hx/pub 自己 public+published 且**前置可读**，
+# 再把祖先 hx 收紧成 private —— 这样"被祖先收紧"才是可归因的，而不是一开始就读不到。
+curl -s -b "$JAR_G" -X PUT "http://127.0.0.1:$PORT/api/pages/hx%2Fpub" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"title":"孙页","content":"HXUNIQBODY"}' >/dev/null
+curl -s -b "$JAR_G" -X PUT "http://127.0.0.1:$PORT/api/pages/hx%2Fpub/visibility" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"visibility":"public","published":true}' >/dev/null
+# 前置断言：否则下面的"被收紧"可能是假绿（一开始就读不到也会让 H1 变成 404）
+check "H0 前置：此刻匿名读得到 hx/pub" "200" "$(code_of "http://127.0.0.1:$PORT/api/pages/hx%2Fpub")"
+# ⚠️ 必须先**把 hx 建出来**：缺失的祖先是 `continue`（不构成收紧），这是刻意语义。
+#    若 hx 不存在，"把 hx 设成 private" 只会 404，H1 会因为"压根没被收紧"而失败 ——
+#    这个坑我在第一版里踩了（当时 hx 从未创建）。
+curl -s -b "$JAR_G" -X PUT "http://127.0.0.1:$PORT/api/pages/hx" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"title":"祖先","content":"HXPARENT"}' >/dev/null
+check "H0b 前置：hx 已存在（否则下面的收紧动作是空转）" "200" \
+  "$(code_of -H "x-gw-admin-token: $TOKEN" "http://127.0.0.1:$PORT/api/admin/access-explain?slug=hx")"
+curl -s -b "$JAR_G" -X PUT "http://127.0.0.1:$PORT/api/pages/hx/visibility" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"visibility":"private"}' >/dev/null
+EX="$(adm '/api/admin/access-explain?slug=hx%2Fpub')"
+check "H1 祖先收紧后匿名读不到" "404" "$(code_of "http://127.0.0.1:$PORT/api/pages/hx%2Fpub")"
+check "H2 解释里 reach.anonymous=none" "none" "$(echo "$EX" | field 'reach.anonymous')"
+# ⚠️ 这里**不能**期望 inherited-denied：`decideNormally` 的 reason 是按**有效档位**给的，
+#    而 hx/pub 的有效档位被祖先压成了 private ⇒ 落空原因是 default-deny。
+#    "是祖先把它收紧的"这件事要看 `sources.ancestors`（下一条 H4），不是靠 reason 字符串。
+check "H3 落空原因是 default-deny（有效档位已被压到最窄档）" \
+  "default-deny" "$(echo "$EX" | field 'reach.anonymousReason')"
+check "H4 祖先 hx 被标为**真的收紧了**（不是笼统列出）" "1" \
+  "$(echo "$EX" | grep -c '"slug":"hx","visibility":"private","inherit":true,"effect":"tightens"')"
+check "H5 组织角色那条只标相关、不标生效（生效与否取决于看的人）" "false/true" \
+  "$(echo "$EX" | field 'sources.orgRole.effective')/$(echo "$EX" | field 'sources.orgRole.relevant')"
+check "H6 应急覆盖那条同样只标相关" "false/true" \
+  "$(echo "$EX" | field 'sources.adminOverride.effective')/$(echo "$EX" | field 'sources.adminOverride.relevant')"
+check "H7 无授予时 grants.effective=false" "false" "$(echo "$EX" | field 'sources.grants.effective')"
+# 显式授予 ⇒ 它就是"明确指名的例外"，应当恢复可见
+curl -s -b "$JAR_G" -X POST "http://127.0.0.1:$PORT/api/pages/hx%2Fpub/grants" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"subjectKind":"user","subjectId":"1","role":"viewer"}' >/dev/null
+check "H8 显式授予后被授权者恢复可见（授予排在祖先收紧之前）" "200" \
+  "$(code_of -b "$JAR_G" "http://127.0.0.1:$PORT/api/pages/hx%2Fpub")"
+check "H9 此时 grants.effective=true" "true" "$(adm '/api/admin/access-explain?slug=hx%2Fpub' | field 'sources.grants.effective')"
+check "H10 需要 slug 参数" "400" "$(code_of -H "x-gw-admin-token: $TOKEN" "http://127.0.0.1:$PORT/api/admin/access-explain")"
+check "H11 页面不存在时如实 404（不编造"可能是红链"）" "404" \
+  "$(code_of -H "x-gw-admin-token: $TOKEN" "http://127.0.0.1:$PORT/api/admin/access-explain?slug=no/such/page")"
+check "H12 非 admin 不得调用" "401" "$(code_of "http://127.0.0.1:$PORT/api/admin/access-explain?slug=hx%2Fpub")"
+check_ge "H13 反向展开写审计" 1 "$(adm '/api/admin/audit?action=admin.access_explain' | field 'total')"
+
+echo
+echo "=== 阶段 I：sitemap 与匿名可读的**独立**核对（§5.12）==="
+# 前置：sitemap 只列**匿名可见**的页。本脚本此前把唯一那条页（secret）改成了 private，
+# 所以这里必须先造一条真正公开的页 —— 否则下面的逐条读是空转（I0 反空洞断言会红）。
+curl -s -b "$JAR_G" -X PUT "http://127.0.0.1:$PORT/api/pages/pubpage" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"title":"公开页","content":"PUBUNIQBODY"}' >/dev/null
+curl -s -b "$JAR_G" -X PUT "http://127.0.0.1:$PORT/api/pages/pubpage/visibility" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"visibility":"public","published":true}' >/dev/null
+check "I00 前置：匿名读得到那条公开页" "200" "$(code_of "http://127.0.0.1:$PORT/api/pages/pubpage")"
+# ⚠️ 为什么这里才是"独立的"那一半：进程内的 /api/admin/sitemap-audit 用的是与
+# visibleSlugs 同一套判定（都对匿名调 decideNormally），所以它自己证明不了什么。
+# 真正独立的口径是：取自 /sitemap.xml 的 slug，**再逐条真去匿名读一次** ——
+# 读走的是另一条 HTTP 路径（`GET /api/pages/:slug`），两者不一致就是泄漏。
+SITEMAP="$(curl -s "http://127.0.0.1:$PORT/sitemap.xml")"
+SLUGS_IN_MAP="$(echo "$SITEMAP" | grep -o '<loc>[^<]*</loc>' | sed 's|<loc>/p/||; s|</loc>||')"
+MAP_N="$(printf '%s\n' "$SLUGS_IN_MAP" | grep -c .)"
+# 反空洞：sitemap 得真的广告了东西，否则下面的逐条读是空转
+check_ge "I0 前置：sitemap 至少广告了一条" 1 "$MAP_N"
+BAD_READ=0
+while IFS= read -r s; do
+  [[ -z "$s" ]] && continue
+  # ⚠️ 嵌套 slug 必须 URL 编码才能路由到 `GET /api/pages/:slug`（`hx/pub` → `hx%2Fpub`）
+  enc="${s//\//%2F}"
+  [[ "$(code_of "http://127.0.0.1:$PORT/api/pages/$enc")" == "200" ]] || BAD_READ=$((BAD_READ + 1))
+done <<< "$SLUGS_IN_MAP"
+check "I1 sitemap 广告的每一条都真的匿名读得到（独立 oracle，必须 0）" "0" "$BAD_READ"
+check "I2 进程内核对也报一致" "true" "$(adm '/api/admin/sitemap-audit' | field 'consistent')"
+check "I3 且如实标注 sameSource（不夸大成"两条独立来源的差集"）" "true" \
+  "$(adm '/api/admin/sitemap-audit' | field 'sameSource')"
+check "I4 sitemap 自身 no-store（否则运维核对到的是缓存副本）" "1" \
+  "$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/sitemap.xml" | grep -ci 'cache-control: no-store')"
+check "I5 非 admin 不得调用 sitemap-audit" "401" "$(code_of "http://127.0.0.1:$PORT/api/admin/sitemap-audit")"
+
+echo
+echo "=== 阶段 J：清缓存指引（§5.10）==="
+CP="$(adm '/api/admin/cache-plan')"
+check "J1 指出唯一可被共享缓存的是门户" "/portal" "$(echo "$CP" | grep -o '"path":"[^"]*"' | head -1 | cut -d'"' -f4)"
+check "J2 复述的缓存串与门户实际响应头一致" "1" \
+  "$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/portal" | grep -c 'max-age=60, s-maxage=300')"
+check "J3 明说 sitemap 无需清理" "1" "$(echo "$CP" | grep -c '/sitemap.xml')"
+check "J4 近期有 ACL 变更 ⇒ 建议清缓存" "true" "$(echo "$CP" | field 'purgeRecommended')"
+check "J5 非 admin 不得调用" "401" "$(code_of "http://127.0.0.1:$PORT/api/admin/cache-plan")"
+
+echo
+echo "=== 阶段 K：过期邀请回收（回收只是回收）==="
+# ⚠️ 与阶段 G 同一条口径：**过期失效在判定时就已经发生**，回收只做空间回收。
+# 所以本阶段除了断言"回收了过期的"，还必须断言"**不跑回收时那条邀请也已经无效**"——
+# 后者才是真正要守的性质（否则运维会以为"不跑清理 ⇒ 过期邀请仍可用"）。
+#
+# 造过期行的办法：邀请创建端点**不接受**客户端指定 expires_at（服务端算
+# `isoPlus(now, invitationTtlMs)`），所以只能直接改库。库路径来自脚本自己设的
+# GEEWIKI_DATA_DIR，服务与这里是两个连接，SQLite 允许这种一行 UPDATE。
+INV="$(curl -s -b "$JAR_G" -X POST "http://127.0.0.1:$PORT/api/org/invitations" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d '{"email":"expired@example.com","orgRole":"viewer"}')"
+INV_ID="$(echo "$INV" | field 'invitation.id')"
+INV_TOKEN="$(echo "$INV" | field 'token')"
+check "K0 建出一条邀请" "1" "$(echo "$INV" | grep -c '"ok":true')"
+# 反空洞：id 与 token 都得真的取到，否则后面几条会以"看起来对"的方式失败
+check_ge "K0b 反空洞：拿到了邀请 id" 8 "$(printf '%s' "$INV_ID" | wc -c)"
+check_ge "K0c 反空洞：拿到了明文令牌" 20 "$(printf '%s' "$INV_TOKEN" | wc -c)"
+
+# 前置：未过期时**不**得被回收（否则"回收过期"这条断言可能只是"把全都清了"）
+PURGE_I0="$(curl -s -b "$JAR_G" -H 'x-gw-csrf: 1' -X POST "http://127.0.0.1:$PORT/api/org/invitations/purge")"
+check "K1 未过期的邀请**不**被回收" "0" "$(echo "$PURGE_I0" | field 'expired')"
+check_ge "K2 且它仍在表里（remaining ≥ 1）" 1 "$(echo "$PURGE_I0" | field 'remaining')"
+check "K3 空跑不写审计（避免把审计淹掉）" "0" "$(adm '/api/admin/audit?action=org.invitation.purge' | field 'total')"
+
+# 把它改成已过期
+node -e "
+const Database = require(process.argv[1] + '/packages/db-sqlite/node_modules/better-sqlite3')
+const db = new Database(process.argv[2])
+db.prepare('UPDATE invitations SET expires_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', process.argv[3])
+db.close()
+" "$ROOT" "$TMP/data/geewiki.db" "$INV_ID"
+check "K4 已把该邀请改成过期" "2020-01-01T00:00:00.000Z" \
+  "$(node -e "
+const Database = require(process.argv[1] + '/packages/db-sqlite/node_modules/better-sqlite3')
+const db = new Database(process.argv[2])
+process.stdout.write(String(db.prepare('SELECT expires_at FROM invitations WHERE id = ?').get(process.argv[3]).expires_at))
+db.close()
+" "$ROOT" "$TMP/data/geewiki.db" "$INV_ID")"
+
+# ★ 关键：**在回收之前**先验兑换已经失效 —— 这才是"判定不依赖回收"
+check "K5 未跑回收时，兑换已过期邀请即失败（判定不依赖回收）" "400" \
+  "$(code_of -X POST "http://127.0.0.1:$PORT/api/org/invitations/redeem" -H 'content-type: application/json' \
+     -d "{\"token\":\"$INV_TOKEN\"}")"
+
+PURGE_I="$(curl -s -b "$JAR_G" -H 'x-gw-csrf: 1' -X POST "http://127.0.0.1:$PORT/api/org/invitations/purge")"
+check "K6 回收了那条过期邀请" "1" "$(echo "$PURGE_I" | field 'expired')"
+check "K7 真有副作用时才写审计" "1" "$(adm '/api/admin/audit?action=org.invitation.purge' | field 'total')"
+check "K8 它属于权限变更视图，不属于安全视图" "1/0" \
+  "$(adm '/api/admin/audit?view=acl&action=org.invitation.purge' | field 'total')/$(adm '/api/admin/audit?view=security&action=org.invitation.purge' | field 'total')"
+check "K9 未登录不得调用（该端点的判据是会话角色，不是 break-glass 令牌）" "401" "$(code_of -X POST "http://127.0.0.1:$PORT/api/org/invitations/purge")"
+
+echo
 echo "==================================="
 echo "通过 $PASS 项，失败 $FAIL 项"
 [[ "$FAIL" -eq 0 ]] || exit 1
