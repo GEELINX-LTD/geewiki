@@ -19,6 +19,8 @@ const SECTION_LABEL: Record<string, string> = {
   login: '登录',
   setup: '初始化',
   denied: '无访问权限',
+  // P1.5：SSO 身份的绑定/解绑入口
+  account: '账号',
 }
 
 /** 知识库下的保留子路由 → 展示名 */

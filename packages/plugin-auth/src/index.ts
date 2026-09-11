@@ -6,14 +6,23 @@
  * §8.1 的 P1 行 / §8.2 的 P1 验收标准。
  *
  * 挂载路由（经 @geewiki/http 路由服务；`access` 为粗粒度准入等级，见设计文档 §2.5）：
- *   GET    /api/auth/state    初始化状态（public）—— 前端据此决定去 #/setup 还是 #/login
- *   POST   /api/auth/setup    创建首个账号（public，但自守卫：已有账号即 409）
- *   POST   /api/auth/login    登录（public）
- *   POST   /api/auth/logout   登出（public；吊销服务端会话，不只是删 cookie）
- *   GET    /api/auth/me       当前身份（user）
- *   POST   /api/auth/password 修改自己的口令（user）
+ *   GET    /api/auth/state              初始化状态（public）—— 前端据此决定去 #/setup 还是 #/login
+ *   POST   /api/auth/setup              创建首个账号（public，但自守卫：已有账号即 409）
+ *   POST   /api/auth/login              登录（public）
+ *   POST   /api/auth/logout             登出（public；吊销服务端会话，不只是删 cookie）
+ *   GET    /api/auth/me                 当前身份（user）
+ *   POST   /api/auth/password           修改自己的口令（user）
+ *   GET    /api/auth/identities         列出自己的外部身份（user）—— P1.5
+ *   POST   /api/auth/identities/link    确认绑定外部身份（user）—— P1.5，读 HttpOnly 票据 cookie
+ *   POST   /api/auth/identities/unlink  解绑外部身份（user）—— P1.5，至少保留一种登录方式
  *
  * 同时经 `ctx.provide('auth-service', …)` 提供身份服务（契约见 {@link AuthService}）。
+ *
+ * **P1.5（OIDC）在本包内的分工**：本包持有 **provider 注册表**与**账号策略**（谁可以建号、
+ * 绑定与解绑的裁决、票据的签发校验），而 **OIDC 协议本身**（发现文档、JWKS、PKCE、回跳路由）
+ * 全在 `@geewiki/oidc` —— 形态对齐 `llm-service` 持有注册表、`@geewiki/openai` 提供协议实现。
+ * 因此**未启用 `@geewiki/oidc` 时 `/api/auth/oidc/*` 根本不存在（404）**，
+ * 而本包的本地密码通道完全不受影响（设计文档 §7.5）。
  *
  * **两条与 P0 骨架的接缝**（设计文档 §2.5）：
  * 1. **会话解析挂在 `router.use?.(hook)` 上**，不改进 server 的 `resolvePrincipal`。
@@ -45,7 +54,39 @@ import {
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { dummyVerify, hashPassword, verifyPassword, type StoredCredential } from './password.js'
-import { checkCsrf, clearedSessionCookie, readSessionToken, sessionCookie } from './http.js'
+import {
+  checkCsrf,
+  clearedSessionCookie,
+  readCookie,
+  readSessionToken,
+  serializeCookie,
+  sessionCookie,
+} from './http.js'
+import {
+  LINK_COOKIE,
+  TICKET_TTL_MS,
+  normalizeIssuer,
+  signLinkTicket,
+  verifyLinkTicket,
+  type OidcClaims,
+  type OidcProvider,
+  type OidcProviderInfo,
+} from './oidc.js'
+
+export type { OidcClaims, OidcProvider, OidcProviderInfo } from './oidc.js'
+export { LINK_COOKIE, normalizeIssuer, TICKET_TTL_MS } from './oidc.js'
+/*
+ * cookie 工具对外导出：SSO 适配器（`@geewiki/oidc`）要用**同一套 cookie 属性**写票据 cookie。
+ * 属性不一致会让浏览器留下两个同名但不同作用域的 cookie —— "登出后还能用"正是这么来的。
+ */
+export {
+  CSRF_HEADER,
+  SESSION_COOKIE,
+  clearedSessionCookie,
+  readCookie,
+  serializeCookie,
+  sessionCookie,
+} from './http.js'
 
 export interface AuthConfig {
   /** 会话绝对有效期（天）：从登录那一刻起算，不可滑动延长 */
@@ -58,6 +99,19 @@ export interface AuthConfig {
   loginWindowSeconds?: number
   /** 强制 cookie 带 Secure（生产必须；本地 http 调试须关掉，否则浏览器不回传） */
   cookieSecure?: boolean
+  /**
+   * OIDC 首登的 provisioning 策略（设计文档 §7.3）。
+   *
+   * - `off`：OIDC 首登**一律不建号**
+   * - `invite_only`（**默认**）：必须存在该 email 的未消费邀请，否则 403 `no_invitation`
+   * - `auto`：直接建号 —— **等价于把入站访问控制交给 IdP**，需显式开启
+   *
+   * 该策略放在**本包**而不是 `@geewiki/oidc`：它决定的是"账号能不能被创建"，
+   * 属于身份策略而非协议细节；放两处会让"禁用 OIDC 插件"与"建号策略"两套配置互相打架。
+   */
+  oidcProvisioningMode?: 'off' | 'invite_only' | 'auto'
+  /** `auto` 模式下的邮箱域名白名单（空数组 = 不限制；仅对 `auto` 生效） */
+  oidcAllowedEmailDomains?: string[]
 }
 
 export const AuthConfigSchema = Schema.object({
@@ -80,6 +134,16 @@ export const AuthConfigSchema = Schema.object({
   cookieSecure: Schema.boolean()
     .default(false)
     .description('会话 cookie 是否强制带 Secure 属性（生产环境应开启）'),
+  oidcProvisioningMode: Schema.union([
+    Schema.const('off').description('OIDC 首登一律不建号'),
+    Schema.const('invite_only').description('必须存在该邮箱的未消费邀请（默认）'),
+    Schema.const('auto').description('直接建号 —— 等价于把入站访问控制交给 IdP'),
+  ])
+    .default('invite_only')
+    .description('OIDC 首次登录时的建号策略'),
+  oidcAllowedEmailDomains: Schema.array(Schema.string())
+    .default([])
+    .description('auto 模式下的邮箱域名白名单（空 = 不限制；仅对 auto 生效）'),
 })
 
 /* ======================= auth-service 服务契约 ======================= */
@@ -102,6 +166,25 @@ export interface AuthUser {
   lastSeenAt: string | null
 }
 
+/**
+ * `authenticateOidc` 的裁决结果（设计文档 §7.2 那张表）。
+ *
+ * 每个分支都对应一个明确的 HTTP 语义，由**调用方**（`@geewiki/oidc` 的回跳路由）翻译：
+ * 本包不认识 HTTP，保持可测。
+ */
+export type OidcAuthOutcome =
+  /** 身份已绑定（或按策略新建并绑定）⇒ 已建会话；`setCookie` 可直接写进响应头 */
+  | { kind: 'login'; user: AuthUser; setCookie: string; expiresAt: string }
+  /**
+   * `(issuer,sub)` 未绑定，但该 email 已有本地账号 ⇒ **绝不自动合并**。
+   * `ticket` 是 bearer 凭据，**只能经 HttpOnly cookie 交付**，不得出现在 URL / 响应体里。
+   */
+  | { kind: 'link_required'; ticket: string; email: string; expiresAt: string }
+  /** `invite_only` 且无未消费邀请 */
+  | { kind: 'no_invitation'; email: string | null }
+  /** 其它拒绝（`off` / 域名不允许 / 账号停用 / 声明不合法） */
+  | { kind: 'denied'; reason: string; email: string | null }
+
 export interface AuthService {
   /**
    * 是否存在**任何可用的凭据来源**（存在可登录账号，或将来接入的 OIDC 通道）。
@@ -113,6 +196,22 @@ export interface AuthService {
   hasCredentialSource(): boolean
   /** 解析原始会话令牌（cookie 值）→ 用户；无效 / 过期 / 已吊销 / 账号停用一律 `undefined` */
   resolveSession(rawToken: string): Promise<AuthUser | undefined>
+  /**
+   * 注册一个 OIDC provider（由 `@geewiki/oidc` 调用）。返回注销函数。
+   *
+   * 同 id 重复注册**抛错**而非静默覆盖 —— 两个 adapter 抢同一个 id 是需要被看见的配置冲突
+   * （与 `llm-service` 的路由注册表同一裁决）。
+   */
+  registerOidcProvider(provider: OidcProvider): () => void
+  /** 当前已注册的 provider 快照（供 `capabilities` 下发；已停用的返回空数组） */
+  listOidcProviders(): readonly OidcProviderInfo[]
+  /**
+   * 用**已验证**的 OIDC 身份声明完成登录 / 建号 / 判定需要绑定。
+   *
+   * 调用方必须先完成全部密码学校验（签名、`iss`、`aud`、`exp`、`nonce`）——
+   * 本方法**不做任何 token 校验**，它只负责账号策略与数据库。
+   */
+  authenticateOidc(claims: OidcClaims, req: IncomingMessage): Promise<OidcAuthOutcome>
 }
 
 export const manifest: GeeWikiManifest = {
@@ -157,6 +256,15 @@ interface SessionJoinRow extends UserRow {
   s_idle_expires_at: string
   s_revoked_at: string | null
   s_last_used_at: string
+}
+
+interface IdentityRow {
+  id: number
+  issuer: string
+  subject: string
+  email_at_link: string | null
+  linked_at: string
+  last_login_at: string | null
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -286,10 +394,17 @@ export const AuthPlugin = {
     /* ---------- 凭据来源探针（同步，供 judgeAccess） ---------- */
     let credentialSource = false
     const refreshCredentialSource = async (): Promise<void> => {
+      /*
+       * **"可登录的账号"必须把 OIDC 身份也算上**：OIDC 首登建出来的账号**没有口令行**
+       * （身份即凭据）。若这里只数 `user_credentials`，一个"只有 SSO 用户"的实例会被判成
+       * 没东西可登录 ⇒ 所有 `access:'user'` 端点返回 503 `bootstrap_required`（系统未就绪）
+       * 而不是 401，前端会掉进"去初始化"的死循环。
+       */
       const rows = await db.query<{ n: number | string }>(
-        `SELECT COUNT(*) AS n FROM users u
-           JOIN user_credentials c ON c.user_id = u.id
-          WHERE u.status = 'active'`,
+        `SELECT COUNT(DISTINCT u.id) AS n FROM users u
+           LEFT JOIN user_credentials c ON c.user_id = u.id
+           LEFT JOIN user_identities  i ON i.user_id = u.id
+          WHERE u.status = 'active' AND (c.user_id IS NOT NULL OR i.user_id IS NOT NULL)`,
       )
       credentialSource = Number(rows[0]?.n ?? 0) > 0
     }
@@ -338,6 +453,61 @@ export const AuthPlugin = {
         console.error('[@geewiki/auth] 审计写入失败:', err)
       })
     }
+
+    /* ---------- OIDC：provider 注册表 + 绑定票据 ---------- */
+    /*
+     * 本包只持有**注册表与账号策略**，协议实现在 `@geewiki/oidc`（见文件头）。
+     * 注册表为空 ⇒ `capabilities.oidc.available=false`（reason `'disabled'`），
+     * 前端不渲染 SSO 按钮；这与"插件未启用"是同一条通路，无需第二套判据。
+     */
+    const provisioningMode = config.oidcProvisioningMode ?? 'invite_only'
+    const allowedEmailDomains = (config.oidcAllowedEmailDomains ?? [])
+      .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+      .filter((d) => d.length > 0)
+
+    /**
+     * 票据签名密钥。
+     *
+     * 优先取 `GEEWIKI_OIDC_TICKET_SECRET`（多实例 / 重启后仍有效）；未配置则**每进程随机**。
+     * 随机密钥的后果是"进程重启让有效期内的票据失效"——**失败关闭**方向（拒绝而非放行），
+     * 且票据只有 5 分钟，用户重走一次 SSO 即可。绝不用固定默认值兜底：那等于把
+     * "猜不到密钥"这条保证换成"读源码就知道"。
+     */
+    const ticketSecretEnv = (process.env.GEEWIKI_OIDC_TICKET_SECRET ?? '').trim()
+    const ticketSecret =
+      ticketSecretEnv.length >= 16 ? Buffer.from(ticketSecretEnv, 'utf8') : randomBytes(32)
+
+    const oidcProviders = new Map<string, OidcProvider>()
+
+    /**
+     * `capabilities.oidc` 的取值。
+     *
+     * 三种形态对前端是**同一个判据**（`available === false` ⇒ 不渲染 SSO 按钮）：
+     * - 没有 provider（插件未装 / 未启用）⇒ `reason: 'disabled'`
+     * - 有 provider 但 IdP 不可达 / 配置不全 ⇒ `reason: 'unreachable' | 'unconfigured'`
+     * - 可用 ⇒ 带 `startPath`，前端直接导航过去
+     *
+     * **同步**：`GET /api/auth/state` 是每个访客冷启动都会打的热路径，不能在这里做网络 IO ——
+     * 可用性由 provider 自己缓存（见 `@geewiki/oidc`）。
+     */
+    const oidcCapability = ():
+      | { available: true; providerId: string; label: string; startPath: string }
+      | { available: false; reason: string } => {
+      const all = [...oidcProviders.values()]
+      const usable = all.find((p) => p.available())
+      if (usable) {
+        return {
+          available: true,
+          providerId: usable.id,
+          label: usable.label,
+          startPath: usable.startPath,
+        }
+      }
+      return { available: false, reason: all[0]?.reason() ?? 'disabled' }
+    }
+
+    /** 邀请表是否已存在（`invitations` 属 P2 的 `0011_org_team.sql`；缺失时 `invite_only` 一律拒绝） */
+    const hasInvitations = tables.has('invitations')
 
     /* ---------- 会话 ---------- */
     interface SessionLookup {
@@ -480,6 +650,238 @@ export const AuthPlugin = {
       return toAuthUser(row, resolveOrgRole(userId))
     }
 
+    /* ---------- OIDC：账号策略（设计文档 §7.2 / §7.3） ---------- */
+    /*
+     * 本段**不做任何 token 校验** —— 签名、`iss`、`aud`、`exp`、`nonce` 全部由调用方
+     * （`@geewiki/oidc`）在拿到 ID token 时完成。这里只回答三个问题：
+     * 这个外部身份是谁？它对应哪个账号？要不要建号 / 要不要先绑定？
+     */
+
+    /** 建会话 + 刷新 last_seen + 组装可直接写进响应头的 Set-Cookie */
+    const loginAs = async (
+      userId: number,
+      req: IncomingMessage,
+    ): Promise<{ user: AuthUser; setCookie: string; expiresAt: string }> => {
+      await db.run('UPDATE users SET last_seen_at = ? WHERE id = ?', [new Date().toISOString(), userId])
+      const session = await createSession(userId, req)
+      const user = await loadUser(userId)
+      // 会话已建但账号读不到 = 并发删号。抛出去让调用方 500，而不是发一个指向空账号的 cookie。
+      if (!user) throw new Error('@geewiki/auth: 会话已建立但账号不可读（并发删除？）')
+      return {
+        user,
+        setCookie: sessionCookie(session.rawToken, {
+          maxAgeSeconds: session.maxAgeSeconds,
+          secure: secureCookie,
+        }),
+        expiresAt: session.expiresAt,
+      }
+    }
+
+    /** 统一拒绝出口：先落审计（**不含任何 token 内容**），再返回裁决 */
+    const denyOidc = (
+      reason: string,
+      email: string | null,
+      ipHash: string | null,
+    ): OidcAuthOutcome => {
+      audit({
+        action: 'login.fail',
+        targetKind: 'user',
+        targetId: email ?? '(unknown)',
+        actorIpHash: ipHash,
+        after: { via: 'oidc', reason },
+      })
+      return { kind: 'denied', reason, email }
+    }
+
+    const issueTicket = (
+      issuer: string,
+      claims: OidcClaims,
+    ): { ticket: string; expiresAt: string } => {
+      const exp = Date.now() + TICKET_TTL_MS
+      const ticket = signLinkTicket(
+        {
+          iss: issuer,
+          sub: claims.subject,
+          email: claims.email,
+          emailVerified: claims.emailVerified,
+          displayName: claims.displayName,
+          exp,
+        },
+        ticketSecret,
+      )
+      return { ticket, expiresAt: new Date(exp).toISOString() }
+    }
+
+    const authenticateOidc = async (
+      claims: OidcClaims,
+      req: IncomingMessage,
+    ): Promise<OidcAuthOutcome> => {
+      const ipHash = auditIpHash(clientIp(req))
+      const issuer = normalizeIssuer(claims.issuer)
+      const subject = claims.subject.trim()
+      if (issuer === null || subject.length === 0) return denyOidc('invalid_claims', null, ipHash)
+      const email = claims.email === null ? null : claims.email.trim().toLowerCase()
+
+      /* ① 已绑定的外部身份 → 直接登录（绝大多数登录走这条） */
+      const bound = await db.query<{ iid: number; user_id: number; status: string }>(
+        `SELECT i.id AS iid, i.user_id, u.status
+           FROM user_identities i JOIN users u ON u.id = i.user_id
+          WHERE i.issuer = ? AND i.subject = ?`,
+        [issuer, subject],
+      )
+      const b = bound[0]
+      if (b) {
+        if (b.status !== 'active') return denyOidc('account_disabled', email, ipHash)
+        const userId = Number(b.user_id)
+        await db.run('UPDATE user_identities SET last_login_at = ? WHERE id = ?', [
+          new Date().toISOString(),
+          b.iid,
+        ])
+        const out = await loginAs(userId, req)
+        audit({
+          action: 'login.ok',
+          targetKind: 'user',
+          targetId: String(userId),
+          actorId: userId,
+          actorIpHash: ipHash,
+          after: { via: 'oidc', issuer },
+        })
+        return { kind: 'login', ...out }
+      }
+
+      /*
+       * ② 未绑定，但该 email 已有本地账号 ⇒ **绝不自动合并**（设计文档 §7.2）。
+       * 两条理由都是账号接管：IdP 的 email 未验证或被攻破时可接管本地账号；
+       * 反向也能预先占位等真实用户"被合并"进攻击者的账号。
+       * 注意：即便 `emailVerified` 为真也**仍然要求手动确认** —— 那只是 IdP 的**声明**。
+       */
+      if (email !== null) {
+        const existing = await db.query<{ id: number }>(
+          'SELECT id FROM users WHERE org_id = 1 AND email = ?',
+          [email],
+        )
+        if (existing[0]) {
+          const { ticket, expiresAt } = issueTicket(issuer, claims)
+          audit({
+            action: 'login.fail',
+            targetKind: 'user',
+            targetId: email,
+            actorIpHash: ipHash,
+            after: { via: 'oidc', reason: 'identity_link_required' },
+          })
+          return { kind: 'link_required', ticket, email, expiresAt }
+        }
+      }
+
+      /* ③ 建号策略 */
+      if (provisioningMode === 'off') return denyOidc('provisioning_off', email, ipHash)
+      if (email === null) return denyOidc('email_required', null, ipHash)
+      if (provisioningMode === 'auto') {
+        if (allowedEmailDomains.length > 0) {
+          const domain = email.slice(email.lastIndexOf('@') + 1).toLowerCase()
+          if (!allowedEmailDomains.includes(domain)) {
+            return denyOidc('email_domain_not_allowed', email, ipHash)
+          }
+        }
+      } else {
+        // invite_only（默认）。邀请表属 P2 的 0011 迁移：不存在时一律按"无邀请"拒绝，
+        // 且**查询失败也按无邀请处理**（失败关闭），不让表结构差异变成一条放行路径。
+        const invited = hasInvitations ? await hasUnconsumedInvite(email) : false
+        if (!invited) {
+          audit({
+            action: 'login.fail',
+            targetKind: 'user',
+            targetId: email,
+            actorIpHash: ipHash,
+            after: { via: 'oidc', reason: 'no_invitation' },
+          })
+          return { kind: 'no_invitation', email }
+        }
+      }
+
+      /* ④ 建号 + 绑定（同事务；两处唯一索引兜住并发） */
+      const displayName = (claims.displayName ?? email.split('@')[0] ?? 'user').slice(
+        0,
+        DISPLAY_NAME_MAX,
+      )
+      try {
+        const created = await db.transaction(async (tx) => {
+          const now = new Date().toISOString()
+          const inserted = await tx.run(
+            `INSERT INTO users (org_id, email, display_name, status, email_verified, created_at)
+             VALUES (?, ?, ?, 'active', ?, ?) RETURNING id`,
+            [1, email, displayName, claims.emailVerified ? 1 : 0, now],
+          )
+          const userId = Number(inserted.lastInsertRowid)
+          await tx.run(
+            `INSERT INTO user_identities (user_id, issuer, subject, email_at_link, linked_at)
+             VALUES (?, ?, ?, ?, ?)`,
+            [userId, issuer, subject, email, now],
+          )
+          if (hasInvitations) {
+            await tx.run(
+              `UPDATE invitations SET accepted_at = ?
+                WHERE org_id = 1 AND email = ? AND accepted_at IS NULL`,
+              [now, email],
+            )
+          }
+          return userId
+        })
+        // 首个 SSO 账号同样是"可登录账号" ⇒ 探针必须即时更新（否则写端点会一直 503）
+        await refreshCredentialSource()
+        const out = await loginAs(created, req)
+        audit({
+          action: 'user.create',
+          targetKind: 'user',
+          targetId: String(created),
+          actorId: created,
+          actorIpHash: ipHash,
+          after: { via: 'oidc', issuer, email, emailVerified: claims.emailVerified },
+        })
+        /*
+         * 建号与首次登录是**两件事**，审计里都要有：只记 `user.create` 的话，
+         * "某个账号第一次是怎么进来的"在登录流水里会显示成空白。
+         */
+        audit({
+          action: 'login.ok',
+          targetKind: 'user',
+          targetId: String(created),
+          actorId: created,
+          actorIpHash: ipHash,
+          after: { via: 'oidc', issuer, created: true },
+        })
+        return { kind: 'login', ...out }
+      } catch (err) {
+        /*
+         * 并发下可能撞 `idx_users_org_email` 或 `idx_identities_issuer_sub`。
+         * 退化成"需要绑定"（不是放行、也不是 500）；若账号确实还不存在，说明是别的故障，
+         * 原样抛出，不要把它伪装成可恢复的业务结果。
+         */
+        const again = await db.query<{ id: number }>(
+          'SELECT id FROM users WHERE org_id = 1 AND email = ?',
+          [email],
+        )
+        if (!again[0]) throw err
+        const { ticket, expiresAt } = issueTicket(issuer, claims)
+        return { kind: 'link_required', ticket, email, expiresAt }
+      }
+    }
+
+    /** 是否存在该 email 的未消费邀请。**任何异常都按"没有"处理**（失败关闭）。 */
+    const hasUnconsumedInvite = async (email: string): Promise<boolean> => {
+      try {
+        const rows = await db.query<{ n: number | string }>(
+          `SELECT COUNT(*) AS n FROM invitations
+            WHERE org_id = 1 AND email = ? AND accepted_at IS NULL AND expires_at > ?`,
+          [email, new Date().toISOString()],
+        )
+        return Number(rows[0]?.n ?? 0) > 0
+      } catch (err) {
+        console.error('[@geewiki/auth] 邀请查询失败，按"无邀请"处理（失败关闭）:', err)
+        return false
+      }
+    }
+
     /* ---------- GET /api/auth/state（public） ---------- */
     /*
      * **一次调用拿到"我该去哪 + 我是谁"**，这是前端 authStore 的唯一数据源。
@@ -511,8 +913,8 @@ export const AuthPlugin = {
             administer: false,
             manageVisibility: false,
           },
-          /** OIDC 通道属 P1.5：这里恒为 false，前端据此不渲染 SSO 按钮 */
-          oidc: { available: false },
+          /** OIDC 通道（P1.5）：未启用 `@geewiki/oidc` 时 `available:false`，前端不渲染 SSO 按钮 */
+          oidc: oidcCapability(),
         })
       }),
     )
@@ -819,10 +1221,225 @@ export const AuthPlugin = {
       ),
     )
 
+    /* ---------- GET /api/auth/identities（user） ---------- */
+    cleanups.push(
+      router.register(
+        'GET',
+        '/api/auth/identities',
+        async (h) => {
+          const userId = h.principal?.userId ?? null
+          if (userId === null) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '需要登录' })
+            return
+          }
+          const rows = await db.query<IdentityRow>(
+            `SELECT id, issuer, subject, email_at_link, linked_at, last_login_at
+               FROM user_identities WHERE user_id = ? ORDER BY id`,
+            [userId],
+          )
+          const cred = await db.query<{ n: number | string }>(
+            'SELECT COUNT(*) AS n FROM user_credentials WHERE user_id = ?',
+            [userId],
+          )
+          h.json(200, {
+            ok: true,
+            /** 前端据此判断"能不能解绑"：没有口令且只有一个身份时不可以 */
+            hasPassword: Number(cred[0]?.n ?? 0) > 0,
+            identities: rows.map((r) => ({
+              id: Number(r.id),
+              issuer: r.issuer,
+              subject: r.subject,
+              emailAtLink: r.email_at_link,
+              linkedAt: r.linked_at,
+              lastLoginAt: r.last_login_at,
+            })),
+          })
+        },
+        { access: 'user' },
+      ),
+    )
+
+    /* ---------- POST /api/auth/identities/link（user） ---------- */
+    /*
+     * 票据**只从 HttpOnly cookie 读**，不接受请求体传入：票据是 bearer 凭据，
+     * 一旦允许从 body/query 传，它就会出现在前端代码、日志与截图里。
+     * 前端因此不需要（也看不到）票据，只需"带着 cookie"调用本端点。
+     */
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/auth/identities/link',
+        async (h) => {
+          const userId = h.principal?.userId ?? null
+          if (userId === null) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '需要登录' })
+            return
+          }
+          const clearLink = (): void => {
+            h.res.setHeader('set-cookie', serializeCookie(LINK_COOKIE, '', { maxAgeSeconds: 0, secure: secureCookie }))
+          }
+          const raw = readCookie(h.req, LINK_COOKIE)
+          if (raw === null) {
+            h.json(400, { ok: false, error: 'link_ticket_missing', message: '没有待确认的绑定请求' })
+            return
+          }
+          const payload = verifyLinkTicket(raw, ticketSecret)
+          if (payload === null) {
+            clearLink()
+            h.json(400, { ok: false, error: 'link_ticket_invalid', message: '绑定请求已过期或无效，请重新登录 SSO' })
+            return
+          }
+          const existing = await db.query<{ id: number; user_id: number }>(
+            'SELECT id, user_id FROM user_identities WHERE issuer = ? AND subject = ?',
+            [payload.iss, payload.sub],
+          )
+          const found = existing[0]
+          if (found) {
+            clearLink()
+            if (Number(found.user_id) !== userId) {
+              // 该外部身份已属于别人 —— 这是需要人工介入的状态，不能静默改绑
+              h.json(409, {
+                ok: false,
+                error: 'identity_already_bound',
+                message: '该外部身份已绑定到其他账号',
+              })
+              return
+            }
+            h.json(200, { ok: true, alreadyLinked: true })
+            return
+          }
+          try {
+            await db.run(
+              `INSERT INTO user_identities (user_id, issuer, subject, email_at_link, linked_at)
+               VALUES (?, ?, ?, ?, ?)`,
+              [userId, payload.iss, payload.sub, payload.email, new Date().toISOString()],
+            )
+          } catch {
+            /*
+             * 撞 `idx_identities_issuer_sub` = 票据被重放，或并发下另一个请求先插进去了。
+             * **唯一索引就是"一次性"的实现**（见 oidc.ts 的说明）：这里如实报冲突，不放行。
+             */
+            clearLink()
+            h.json(409, {
+              ok: false,
+              error: 'identity_already_bound',
+              message: '该外部身份已绑定',
+            })
+            return
+          }
+          clearLink()
+          audit({
+            action: 'identity.link',
+            targetKind: 'user',
+            targetId: String(userId),
+            actorId: userId,
+            actorIpHash: auditIpHash(clientIp(h.req)),
+            after: { issuer: payload.iss, subject: payload.sub },
+          })
+          h.json(200, { ok: true, alreadyLinked: false })
+        },
+        { access: 'user' },
+      ),
+    )
+
+    /* ---------- POST /api/auth/identities/unlink（user） ---------- */
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/auth/identities/unlink',
+        async (h) => {
+          const userId = h.principal?.userId ?? null
+          if (userId === null) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '需要登录' })
+            return
+          }
+          let body: Record<string, unknown>
+          try {
+            body = await readJsonBody(h)
+          } catch (err) {
+            const message = (err as Error).message
+            const [code = 'invalid_body'] = message.split(':')
+            h.json(code === 'payload_too_large' ? 413 : 400, { ok: false, error: code, message })
+            return
+          }
+          const identityId = Number(body.identityId)
+          if (!Number.isInteger(identityId) || identityId <= 0) {
+            h.json(400, { ok: false, error: 'invalid_identity_id', message: 'identityId 不合法' })
+            return
+          }
+          const rows = await db.query<IdentityRow>(
+            'SELECT id, issuer, subject, email_at_link, linked_at, last_login_at FROM user_identities WHERE id = ? AND user_id = ?',
+            [identityId, userId],
+          )
+          const row = rows[0]
+          if (!row) {
+            // 不属于自己与不存在返回同一个结果：不泄漏"某个 id 是否存在"
+            h.json(404, { ok: false, error: 'identity_not_found', message: '外部身份不存在' })
+            return
+          }
+          /*
+           * **至少保留一种登录方式**（设计文档 §7.2）：解绑最后一个身份且没有口令
+           * ⇒ 该账号再也无法登录，而它可能还挂着内容的所有权。
+           */
+          const cred = await db.query<{ n: number | string }>(
+            'SELECT COUNT(*) AS n FROM user_credentials WHERE user_id = ?',
+            [userId],
+          )
+          const ident = await db.query<{ n: number | string }>(
+            'SELECT COUNT(*) AS n FROM user_identities WHERE user_id = ?',
+            [userId],
+          )
+          const hasPassword = Number(cred[0]?.n ?? 0) > 0
+          if (!hasPassword && Number(ident[0]?.n ?? 0) <= 1) {
+            h.json(409, {
+              ok: false,
+              error: 'last_credential',
+              message: '这是最后一个登录方式，无法解绑（请先设置口令）',
+            })
+            return
+          }
+          await db.run('DELETE FROM user_identities WHERE id = ? AND user_id = ?', [identityId, userId])
+          audit({
+            action: 'identity.unlink',
+            targetKind: 'user',
+            targetId: String(userId),
+            actorId: userId,
+            actorIpHash: auditIpHash(clientIp(h.req)),
+            before: { issuer: row.issuer, subject: row.subject },
+          })
+          h.json(200, { ok: true })
+        },
+        { access: 'user' },
+      ),
+    )
+
     /* ---------- 对外服务 ---------- */
     const svc: AuthService = {
       hasCredentialSource: () => credentialSource,
       resolveSession: async (rawToken: string) => (await lookupSession(rawToken))?.user,
+      registerOidcProvider: (provider: OidcProvider) => {
+        // 重复 id 抛错而非静默覆盖：两个 adapter 抢同一个 id 是需要被看见的配置冲突
+        // （与 llm-service 的路由注册表同一裁决）。
+        if (oidcProviders.has(provider.id)) {
+          throw new Error(`@geewiki/auth: OIDC provider id 重复注册: ${provider.id}`)
+        }
+        oidcProviders.set(provider.id, provider)
+        return () => {
+          if (oidcProviders.get(provider.id) === provider) oidcProviders.delete(provider.id)
+        }
+      },
+      listOidcProviders: () =>
+        [...oidcProviders.values()].map((p) => {
+          const available = p.available()
+          return {
+            id: p.id,
+            label: p.label,
+            startPath: p.startPath,
+            available,
+            reason: available ? null : (p.reason() ?? 'unavailable'),
+          }
+        }),
+      authenticateOidc,
     }
     const unprovide = ctx.provide('auth-service', svc)
 

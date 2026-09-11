@@ -48,6 +48,31 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   iconOnly?: boolean
 }
 
+/**
+ * 按钮的类名（供**必须用 `<a>` 的场合**复用：导航类动作要走真实链接，
+ * 否则中键/新标签页/无 JS 场景全部失效）。样式只有这一份定义，避免两处漂移。
+ */
+export function buttonClassName(options: {
+  variant?: ButtonVariant
+  size?: ButtonSize
+  iconOnly?: boolean
+  className?: string
+} = {}): string {
+  const { variant = 'secondary', size = 'md', iconOnly = false, className } = options
+  return cn(
+    'relative inline-flex shrink-0 items-center justify-center font-medium',
+    'transition-colors duration-150 ease-standard select-none',
+    'disabled:cursor-not-allowed disabled:opacity-55',
+    touchTarget,
+    SIZE[size],
+    VARIANT[variant],
+    // 只要图标时给正方形尺寸，否则图标会被文字宽度撑开而显得偏左
+    iconOnly && (size === 'sm' ? 'w-7 px-0' : 'w-8 px-0'),
+    focusRing,
+    className,
+  )
+}
+
 export function Button({
   variant = 'secondary',
   size = 'md',
@@ -68,18 +93,7 @@ export function Button({
       // 但额外用 aria-busy 告诉辅助技术"是忙，不是坏了"。
       disabled={isDisabled}
       aria-busy={loading || undefined}
-      className={cn(
-        'relative inline-flex shrink-0 items-center justify-center font-medium',
-        'transition-colors duration-150 ease-standard select-none',
-        'disabled:cursor-not-allowed disabled:opacity-55',
-        touchTarget,
-        SIZE[size],
-        VARIANT[variant],
-        // 只要图标时给正方形尺寸，否则图标会被文字宽度撑开而显得偏左
-        iconOnly && (size === 'sm' ? 'w-7 px-0' : 'w-8 px-0'),
-        focusRing,
-        className,
-      )}
+      className={buttonClassName({ variant, size, iconOnly, className })}
       {...rest}
     >
       {/* loading 时把内容隐藏但**保留占位**（宽度不变） */}

@@ -30,6 +30,7 @@ import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AdminPage } from './pages/AdminPage'
+import { AccountPage } from './pages/AccountPage'
 import { DeniedPage } from './pages/DeniedPage'
 import { GraphPage } from './pages/GraphPage'
 import { LoginPage } from './pages/LoginPage'
@@ -116,7 +117,7 @@ const ADMIN_NAV: NavItem[] = [
  * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
  * （或顶栏的身份区），列在这里只是为了路由分派与文档标题。
  */
-const AUTH_ROUTES = ['login', 'setup', 'denied'] as const
+const AUTH_ROUTES = ['login', 'setup', 'denied', 'account'] as const
 
 function isAuthRoute(id: string): boolean {
   return (AUTH_ROUTES as readonly string[]).includes(id)
@@ -206,6 +207,7 @@ export function App(): ReactNode {
   else if (active === 'login') body = <LoginPage />
   else if (active === 'setup') body = <SetupPage />
   else if (active === 'denied') body = <DeniedPage />
+  else if (active === 'account') body = <AccountPage />
   else body = <GraphPage />
 
   const adminActive = ADMIN_NAV.some((t) => t.id === active)
@@ -319,7 +321,7 @@ export function App(): ReactNode {
           </Button>
           <ThemeToggle key={themeEpoch} />
           {/* 身份区（P1）：登录入口 / 当前身份与登出 */}
-          <AuthArea auth={auth} />
+          <AuthArea auth={auth} active={active} nav={nav} />
           {/* 窄屏导航降级：把全部目的地收进一个菜单 */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -414,7 +416,16 @@ export function App(): ReactNode {
  * 加载中**渲染占位而不是空白**：否则顶栏会在首帧后突然多出一个按钮，
  * 造成布局跳动（CLS），而 `authState` 是很快的一次请求。
  */
-function AuthArea({ auth }: { auth: ReturnType<typeof useAuth> }): ReactNode {
+function AuthArea({
+  auth,
+  active,
+  nav,
+}: {
+  auth: ReturnType<typeof useAuth>
+  /** 当前激活的路由 id（用于给「账号」项标记 `aria-current`） */
+  active: string
+  nav: (id: string) => void
+}): ReactNode {
   if (auth.user !== null) {
     return (
       <DropdownMenu>
@@ -431,6 +442,17 @@ function AuthArea({ auth }: { auth: ReturnType<typeof useAuth> }): ReactNode {
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuLabel>{auth.user.email}</DropdownMenuLabel>
+          {/*
+            「账号」是绑定/解绑外部身份（SSO）的**唯一入口**：绑定要求"已登录的本地会话"
+            （设计文档 §7.2 禁止按 email 自动绑定），所以它只能出现在已登录的身份区里。
+          */}
+          <DropdownMenuItem
+            active={active === 'account'}
+            onSelect={() => nav('account')}
+          >
+            <UserRound className="size-4" />
+            账号
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void logout()}>登出</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

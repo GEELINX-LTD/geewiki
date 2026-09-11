@@ -500,6 +500,27 @@ export interface AuthCapabilities {
   manageVisibility: boolean
 }
 
+/**
+ * SSO 通道的能力下发（P1.5）。
+ *
+ * **三种形态对前端是同一个判据**：`available === false` ⇒ 不渲染 SSO 按钮。
+ * 区分 `reason` 只为排障与文案（`disabled` = 没装/没启用 OIDC 插件；
+ * 其它值 = 装了但不可用，如 `unreachable` / `issuer_mismatch`）。
+ */
+export type AuthOidcCapability =
+  | { available: true; providerId: string; label: string; startPath: string }
+  | { available: false; reason: string }
+
+/** 已绑定的外部身份（**不含**任何凭据） */
+export interface AuthIdentity {
+  id: number
+  issuer: string
+  subject: string
+  emailAtLink: string | null
+  linkedAt: string
+  lastLoginAt: string | null
+}
+
 export interface AuthStateResponse {
   ok: true
   /** true ⇒ 库里还没有任何可登录账号，应去 #/setup */
@@ -507,7 +528,7 @@ export interface AuthStateResponse {
   authenticated: boolean
   user: AuthUser | null
   capabilities: AuthCapabilities
-  oidc: { available: boolean }
+  oidc: AuthOidcCapability
 }
 
 export interface AuthMeResponse {
@@ -541,6 +562,28 @@ export const api = {
       currentPassword,
       newPassword,
     }),
+
+  /* 外部身份绑定（P1.5） */
+  /**
+   * 我的外部身份列表。`hasPassword` 用于前端判断"能不能解绑"
+   * （没有口令且只剩一个身份时服务端会 409 `last_credential`，前端先hide入口更友好）。
+   */
+  authIdentities: () =>
+    request<{ ok: true; hasPassword: boolean; identities: AuthIdentity[] }>(
+      'GET',
+      '/api/auth/identities',
+    ),
+  /**
+   * 确认绑定待处理的外部身份。
+   *
+   * **不带任何参数**：票据只存在于 `HttpOnly` cookie 里（服务端在 SSO 回跳时下发），
+   * JS 读不到也传不了 —— 这是刻意的，票据放进 URL 或请求体会经 Referer、历史、
+   * 日志与错误上报泄漏。调用方只需确保浏览器带着 cookie。
+   */
+  authLinkIdentity: () =>
+    request<{ ok: true; alreadyLinked: boolean }>('POST', '/api/auth/identities/link'),
+  authUnlinkIdentity: (identityId: number) =>
+    request<{ ok: true }>('POST', '/api/auth/identities/unlink', { identityId }),
 
   /* 插件管理 */
   plugins: () =>

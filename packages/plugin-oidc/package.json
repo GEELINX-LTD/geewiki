@@ -1,0 +1,23 @@
+{
+  "name": "@geewiki/oidc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki OIDC 身份源：向 auth-service 注册一条 provider 与 /api/auth/oidc/* 路由（零新依赖）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/auth": "workspace:*",
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
