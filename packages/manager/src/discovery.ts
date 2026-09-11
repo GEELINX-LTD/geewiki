@@ -266,26 +266,36 @@ export async function loadExternalPlugins(options: DiscoveryOptions): Promise<Di
         )
       }
 
-      // 迁移目录：声明则必须位于插件目录内；不存在仅告警（该插件自管表结构）
-      let migrationsDir: string | undefined
+      // 迁移目录：声明则必须位于插件目录内；不存在仅告警（该插件自管表结构）。
+      // 支持 string（通用）与 { default?, postgres? }（按方言）两种写法，逐个变体做同样的
+      // 路径安全校验——**安全校验不能被"新写法"绕过**。
+      const migrationsDirs: Record<string, string> = {}
       const declaredMigrations = manifest.geewiki.migrations
-      if (declaredMigrations) {
-        const abs = resolve(dir, declaredMigrations)
+      const migrationVariants: Array<[string, string]> =
+        typeof declaredMigrations === 'string'
+          ? [['default', declaredMigrations]]
+          : declaredMigrations
+            ? Object.entries(declaredMigrations).filter(
+                (entry): entry is [string, string] => typeof entry[1] === 'string',
+              )
+            : []
+      for (const [dialectKey, rel] of migrationVariants) {
+        const abs = resolve(dir, rel)
         if (!isInsideDir(dir, abs)) {
           throw new DiscoveryError(
             'invalid_plugin_path',
-            `迁移目录 "${declaredMigrations}" 越出插件目录（拒绝路径穿越）`,
+            `迁移目录 "${rel}"（${dialectKey}）越出插件目录（拒绝路径穿越）`,
           )
         }
         if (!existsSync(abs)) {
-          warn(`[manager:discovery] ${manifest.name}: 迁移目录不存在，已忽略: ${abs}`)
+          warn(`[manager:discovery] ${manifest.name}: 迁移目录不存在，已忽略（${dialectKey}）: ${abs}`)
         } else if (!isInsideDirReal(dir, abs)) {
           // 符号链接越界：只忽略该迁移目录并记 issue，不因此拒绝整个插件
-          const message = `迁移目录 "${declaredMigrations}" 的真实路径越出插件目录（拒绝符号链接穿越），已忽略该迁移目录`
+          const message = `迁移目录 "${rel}"（${dialectKey}）的真实路径越出插件目录（拒绝符号链接穿越），已忽略该迁移目录`
           result.issues.push({ code: 'invalid_plugin_path', dir, message })
           warn(`[manager:discovery] ${manifest.name}: ${message}`)
         } else {
-          migrationsDir = abs
+          migrationsDirs[dialectKey] = abs
         }
       }
 
@@ -304,7 +314,7 @@ export async function loadExternalPlugins(options: DiscoveryOptions): Promise<Di
         name: manifest.name,
         manifest: { name: manifest.name, version: manifest.version, geewiki: manifest.geewiki },
         module: mod as RegisteredPlugin['module'],
-        migrationsDir,
+        migrationsDirs: Object.keys(migrationsDirs).length > 0 ? migrationsDirs : undefined,
         source: 'external',
         dir,
       })

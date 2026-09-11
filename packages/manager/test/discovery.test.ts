@@ -335,7 +335,7 @@ test('loadExternalPlugins：migrations 符号链接越界 → 记 issue 且不�
       ['@ext/m'],
       '迁移目录越界只影响迁移，不应连插件一起拒绝',
     )
-    assert.equal(result.plugins[0]?.migrationsDir, undefined, '越界的迁移目录不得被采用（否则会执行目录外 SQL）')
+    assert.equal(result.plugins[0]?.migrationsDirs, undefined, '越界的迁移目录不得被采用（否则会执行目录外 SQL）')
     assert.ok(
       result.issues.some((i) => i.code === 'invalid_plugin_path' && i.message.includes('迁移目录')),
       `应记录迁移目录越界的 issue: ${JSON.stringify(result.issues)}`,
@@ -428,6 +428,121 @@ test('外部清单：displayName/description 被完整解析（证明 manifest �
     assert.ok(found, '应发现该外部插件')
     assert.equal(found.manifest.geewiki.displayName, '命名插件', '展示字段不得在发现期被丢弃')
     assert.equal(found.manifest.geewiki.description, '一句话说明')
+  } finally {
+    cleanup()
+  }
+})
+
+test('migrations：string 写法解析为 default 键（向后兼容）', async () => {
+  const { root, cleanup } = makeRoot()
+  try {
+    const dir = writePlugin(root, 'plugin-legacy', {
+      pkg: {
+        name: '@ext/legacy',
+        version: '1.0.0',
+        type: 'module',
+        geewiki: { entry: 'index.js', migrations: './migrations' },
+      },
+      entryFile: 'index.js',
+      entryContent: OK_MODULE.replace('%NAME%', '@ext/legacy'),
+    })
+    mkdirSync(join(dir, 'migrations'), { recursive: true })
+    const result = await loadExternalPlugins({ root, log: () => {} })
+    const dirs = result.plugins[0]?.migrationsDirs
+    assert.ok(dirs, '应解析出迁移目录表')
+    assert.deepEqual(Object.keys(dirs), ['default'], 'string 写法等价于 { default: … }')
+    assert.ok(
+      dirs['default']?.endsWith(join('plugin-legacy', 'migrations')),
+      `default 键应指向插件内目录: ${String(dirs['default'])}`,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('migrations：对象写法按方言解析出多个键', async () => {
+  const { root, cleanup } = makeRoot()
+  try {
+    const dir = writePlugin(root, 'plugin-dialect', {
+      pkg: {
+        name: '@ext/dialect',
+        version: '1.0.0',
+        type: 'module',
+        geewiki: {
+          entry: 'index.js',
+          migrations: { default: './m', postgres: './m-pg' },
+        },
+      },
+      entryFile: 'index.js',
+      entryContent: OK_MODULE.replace('%NAME%', '@ext/dialect'),
+    })
+    mkdirSync(join(dir, 'm'), { recursive: true })
+    mkdirSync(join(dir, 'm-pg'), { recursive: true })
+    const result = await loadExternalPlugins({ root, log: () => {} })
+    const dirs = result.plugins[0]?.migrationsDirs
+    assert.ok(dirs)
+    assert.deepEqual(Object.keys(dirs).sort(), ['default', 'postgres'])
+    assert.ok(
+      dirs['postgres']?.endsWith('m-pg'),
+      `postgres 键应指向 m-pg: ${String(dirs['postgres'])}`,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('migrations：只声明某方言时，该方言键存在而不补 default', async () => {
+  const { root, cleanup } = makeRoot()
+  try {
+    const dir = writePlugin(root, 'plugin-pgonly', {
+      pkg: {
+        name: '@ext/pgonly',
+        version: '1.0.0',
+        type: 'module',
+        geewiki: { entry: 'index.js', migrations: { postgres: './pg' } },
+      },
+      entryFile: 'index.js',
+      entryContent: OK_MODULE.replace('%NAME%', '@ext/pgonly'),
+    })
+    mkdirSync(join(dir, 'pg'), { recursive: true })
+    const result = await loadExternalPlugins({ root, log: () => {} })
+    const dirs = result.plugins[0]?.migrationsDirs
+    assert.deepEqual(Object.keys(dirs ?? {}), ['postgres'], '缺 default 时不臆造')
+  } finally {
+    cleanup()
+  }
+})
+
+test('migrations：**对象写法同样受路径穿越防护**（安全校验不能被新写法绕过）', async () => {
+  const { root, cleanup } = makeRoot()
+  try {
+    const outside = join(root, 'outside-pg')
+    mkdirSync(outside, { recursive: true })
+    writeFile(join(outside, '0001.sql'), 'create table x(id integer);\n')
+    const dir = writePlugin(root, 'plugin-escape', {
+      pkg: {
+        name: '@ext/escape',
+        version: '1.0.0',
+        type: 'module',
+        geewiki: {
+          entry: 'index.js',
+          migrations: { default: './migrations', postgres: '../outside-pg' },
+        },
+      },
+      entryFile: 'index.js',
+      entryContent: OK_MODULE.replace('%NAME%', '@ext/escape'),
+    })
+    mkdirSync(join(dir, 'migrations'), { recursive: true })
+    const result = await loadExternalPlugins({ root, log: () => {} })
+    assert.deepEqual(
+      result.plugins.map((p) => p.name),
+      [],
+      '越界变体应让整个插件被拒绝（与 string 写法同口径）',
+    )
+    assert.ok(
+      result.issues.some((i) => i.code === 'invalid_plugin_path'),
+      `应记录越界 issue: ${JSON.stringify(result.issues)}`,
+    )
   } finally {
     cleanup()
   }

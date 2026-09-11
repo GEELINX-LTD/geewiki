@@ -1032,3 +1032,39 @@ test('语义记录：混排里的 <3 字符片段不参与 FTS 召回（既有�
   assert.ok(mixed.length > 0, '中文侧够长时应切出词元')
   assert.ok(mixed.every((t) => !t.includes('ab')), '过短的 ASCII 片段不产生词元')
 })
+
+/* ---------------------- 能力边界：非 sqlite 方言必须显式拒绝 ---------------------- */
+
+/**
+ * 本插件的全文索引建立在 SQLite 专有的 **FTS5**（`tokenize='trigram'`）之上，
+ * PostgreSQL 没有 FTS5。若静默放行，会先炸在迁移脚本语法上、或更糟：
+ * 启动成功但检索恒为空。故钉住"必须抛错、且说明原因与替代方案"。
+ */
+test('非 sqlite 方言：search 显式拒绝并说明 FTS5 依赖（不静默失效）', () => {
+  const services = new Map<string, unknown>([
+    [
+      'db',
+      {
+        kind: 'async',
+        dialect: 'postgres',
+        query: async () => [],
+        run: async () => ({ changes: 0, lastInsertRowid: 0 }),
+        migrate: async () => undefined,
+        listTables: async () => [],
+        appliedMigrations: async () => [],
+        transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
+        close: async () => undefined,
+      },
+    ],
+  ])
+  const ctx = { get: (n: string) => services.get(n) } as unknown as Context
+  assert.throws(
+    () => SearchPlugin.apply(ctx, {}),
+    (err: Error) => {
+      assert.match(err.message, /postgres/, '错误里必须点明方言')
+      assert.match(err.message, /FTS5/, '错误里必须说明真实原因（FTS5 是 SQLite 专有）')
+      assert.match(err.message, /db-sqlite/, '错误里必须给出可执行的替代方案')
+      return true
+    },
+  )
+})

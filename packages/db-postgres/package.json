@@ -1,0 +1,24 @@
+{
+  "name": "@geewiki/postgres",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 的 PostgreSQL 数据库插件（异步适配器，与 @geewiki/db-sqlite 同属 database-provider 冲突组）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "pg": "^8.13.1",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10"
+  }
+}

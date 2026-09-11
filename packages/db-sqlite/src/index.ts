@@ -38,6 +38,9 @@ export interface SqliteDbConfig {
  * 在这里自然落地（PG 等异步实现可另行封装 Promise 语义的适配接口）。
  */
 export class SqliteDatabase implements DatabaseAdapter {
+  /** 方言标识：供迁移目录选择与插件能力判断（见 core 的 DatabaseDialect） */
+  readonly dialect = 'sqlite' as const
+
   private db: Database.Database | null = null
 
   constructor(private readonly filename: string) {}

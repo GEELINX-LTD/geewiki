@@ -22,8 +22,10 @@ import {
   HEALTH_PATH,
   PLUGIN_UI_FILE_SEGMENT,
   PLUGIN_UI_PREFIX,
+  asAsync,
   normalizeRuntime,
   resolveProjectPath,
+  type AnyDatabaseAdapter,
   type GeeWikiManifest,
   type HttpRouterService,
   type HttpRouterStats,
@@ -36,6 +38,7 @@ import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
 import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
+import { POSTGRES_MIGRATIONS_DIR, PostgresPlugin, manifest as postgresManifest } from '@geewiki/postgres'
 import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
 import {
   PluginManagerPlugin,
@@ -359,14 +362,29 @@ class HttpRouter implements HttpRouterService {
     if (method === 'GET' && url.pathname === HEALTH_PATH) {
       const state: RequestState = { active: false }
       this.enterHandler(state)
-      // 同步处理器：仍置于请求上下文中，保证下游（探针触发的卸载）视角一致
+      // 处理器可以是同步的，也可以是 thenable（异步数据库适配器需要 await 取表清单）。
+      // 与路由分支同样的契约：**同步返回就在本拍结算，返回 thenable 则挂到结算上**——
+      // 否则排空计数会提前归零（健康检查被算作已完成，而响应还没写完）。
       this.requestScope.run(state, () => {
+        let result: unknown
         try {
-          this.healthHandler({ req, res, url, params: {}, json, noteStatus })
+          result = this.healthHandler({ req, res, url, params: {}, json, noteStatus })
         } catch (err) {
           console.error('[http] 健康检查异常:', err)
           json(500, { ok: false, error: 'health_check_failed' })
-        } finally {
+          this.exitHandler(state)
+          return
+        }
+        if (isThenable(result)) {
+          void Promise.resolve(result).then(
+            () => this.exitHandler(state),
+            (err: unknown) => {
+              console.error('[http] 健康检查异常:', err)
+              json(500, { ok: false, error: 'health_check_failed' })
+              this.exitHandler(state)
+            },
+          )
+        } else {
           this.exitHandler(state)
         }
       })
@@ -644,20 +662,41 @@ export const HttpPlugin = {
     // 插件发现"的注册顺序陷阱，与缓存无关，不要改回快照。
     const pluginUiRoots = (): Record<string, string> => config.pluginUiRoots?.() ?? {}
     const router = new HttpRouter((h) => {
-      const db = ctx.get('db')
+      const rawDb = ctx.get('db') as AnyDatabaseAdapter | undefined
+      // **归一化为异步**：同步（sqlite）与异步（pg）两种驱动走同一条代码路径，
+      // 不必在健康检查里写 `instanceof` 分支。
+      const db = rawDb ? asAsync(rawDb) : undefined
       // 长连接可观测性：让运维能从健康检查看出"是否有流卡住 / 是否有人在被拒"。
       // **只新增字段**：既有 ok/uptime/timestamp/db 的形状与语义一字未改 ——
       // Dockerfile 的 HEALTHCHECK 判据是 `j.ok===true && j.db && j.db.present===true`。
       const { streams } = router.stats()
-      h.json(200, {
-        ok: true,
-        uptime: Math.round((Date.now() - startedAt) / 1000),
-        timestamp: new Date().toISOString(),
-        db: db
-          ? { present: true, tables: db.listTables(), migrations: db.appliedMigrations() }
-          : { present: false },
-        ...(streams ? { streams } : {}),
-      })
+      // 异步处理器：返回 Promise，由 dispatch 的 thenable 分支负责结算
+      return (async () => {
+        let dbPart: Record<string, unknown>
+        if (!db) {
+          dbPart = { present: false }
+        } else {
+          try {
+            dbPart = {
+              present: true,
+              dialect: db.dialect,
+              tables: await db.listTables(),
+              migrations: await db.appliedMigrations(),
+            }
+          } catch (err) {
+            // 数据库已不可用（连接断开等）：如实报告 present:false 且带上原因，
+            // 而不是让健康检查整体 500 —— 容器编排据此重启，但运维仍能看到原因。
+            dbPart = { present: false, dialect: db.dialect, error: (err as Error).message }
+          }
+        }
+        h.json(200, {
+          ok: true,
+          uptime: Math.round((Date.now() - startedAt) / 1000),
+          timestamp: new Date().toISOString(),
+          db: dbPart,
+          ...(streams ? { streams } : {}),
+        })
+      })()
     })
 
     const server: Server = createServer((req, res) => {
@@ -787,7 +826,16 @@ export function defaultRegistry(
       name: '@geewiki/db-sqlite',
       manifest: dbSqliteManifest as GeeWikiManifest,
       module: SqliteDbPlugin,
-      migrationsDir: DB_SQLITE_MIGRATIONS_DIR,
+      migrationsDirs: { sqlite: DB_SQLITE_MIGRATIONS_DIR },
+      source: 'builtin',
+    },
+    // PostgreSQL：与 sqlite 同属 database-provider 冲突组 ⇒ 同组互斥自动生效。
+    // **不加入 config/plugins.base.json**（默认仍是 SQLite；切库是显式决策）。
+    {
+      name: '@geewiki/postgres',
+      manifest: postgresManifest,
+      module: PostgresPlugin,
+      migrationsDirs: { postgres: POSTGRES_MIGRATIONS_DIR },
       source: 'builtin',
     },
     { ...httpRegistryEntry(webDist, defaults, pluginUiRoots), source: 'builtin' },
@@ -798,14 +846,15 @@ export function defaultRegistry(
     // 与 @geewiki/echo 同形态：**只登记、不写进默认基础层清单**，即"已注册但未启用"，
     // 由使用者在管理台按需热启用（需要 LLM 的插件应在自己的 requires 里点名它）。
     { name: '@geewiki/llm', manifest: llmManifest as GeeWikiManifest, module: LlmPlugin, source: 'builtin' },
-    // 全文检索：索引表由插件自带迁移建立（migrationsDir 交给管理器在激活前执行）。
+    // 全文检索：索引表由插件自带迁移建立（按方言声明——只有 SQLite 有 FTS5；
+    // 该插件在其它方言下会在 apply 里显式拒绝，见其源码的能力守卫）。
     // 注册表数组序不影响激活顺序——管理器按 requires 拓扑排序激活（database-provider /
     // http-service 必先于本插件），故这里只需登记 + 声明迁移目录。
     {
       name: '@geewiki/search',
       manifest: searchManifest as GeeWikiManifest,
       module: SearchPlugin,
-      migrationsDir: SEARCH_MIGRATIONS_DIR,
+      migrationsDirs: { sqlite: SEARCH_MIGRATIONS_DIR },
       source: 'builtin',
     },
     { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin, source: 'builtin' },

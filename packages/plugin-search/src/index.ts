@@ -21,12 +21,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import type {
-  DatabaseAdapter,
-  GeeWikiManifest,
-  HttpRouterService,
-  RouteHandlerContext,
-} from '@geewiki/core'
+import { isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
 
 /* ============================== 配置 ============================== */
 
@@ -310,6 +305,18 @@ export const SearchPlugin = {
   apply(ctx: Context, config: SearchConfig = {}) {
     const db = ctx.get('db') as DatabaseAdapter | undefined
     if (!db) throw new Error('@geewiki/search: 数据库服务不可用（@geewiki/db-sqlite 未激活）')
+    // **能力边界：显式失败**。全文索引建立在 SQLite 专有的 FTS5 之上（`tokenize='trigram'`，
+    // 中文子串检索的关键），**PostgreSQL 没有 FTS5**——PG 侧的等价物是 `tsvector` +
+    // 分词配置，属另一个工程（本批不做）。若在这里静默放行，会先炸在迁移脚本的语法上，
+    // 或更糟：启动成功但检索恒为空。故提前拒绝并说清原因与替代方案。
+    // 判据用「方言」而非「同步/异步」：将来若有同步的 PG 驱动，本插件同样不适用。
+    const dialect = isAsyncAdapter(db) ? db.dialect : (db.dialect ?? 'sqlite')
+    if (dialect !== 'sqlite') {
+      throw new Error(
+        `@geewiki/search: 当前数据库方言是 ${dialect}，而本插件的全文索引依赖 SQLite 专有的 FTS5` +
+          '（trigram 分词器），暂不支持该方言。请改用 @geewiki/db-sqlite，或等待基于 tsvector 的 PG 检索实现。',
+      )
+    }
     const router = ctx.get('http') as HttpRouterService | undefined
     if (!router) throw new Error('@geewiki/search: http 路由服务不可用（@geewiki/http 未激活）')
 

@@ -19,8 +19,14 @@ export interface RegisteredPlugin {
     apply: (ctx: any, config?: any) => unknown // eslint-disable-line @typescript-eslint/no-explicit-any -- cordis 插件形态多样，registry 统一收纳
     Config?: unknown
   }
-  /** 迁移脚本目录绝对路径（激活前由迁移控制器执行；缺省则插件自管） */
-  migrationsDir?: string
+  /**
+   * 迁移脚本目录：**按方言**解析后的绝对路径表（激活前由迁移控制器执行；缺省则插件自管）。
+   *
+   * 键为方言名（`'sqlite'` / `'postgres'`）或通用回退键 `'default'`。
+   * 管理器激活插件时按当前适配器的 `dialect` 取用：先精确匹配方言键，再回退 `'default'`，
+   * 两者都没有 ⇒ 视为"该插件在当前数据库下没有迁移"，跳过并记警告（不阻断激活）。
+   */
+  migrationsDirs?: Readonly<Record<string, string>>
   /** 来源：内置（组合根静态登记）或外部（<仓库根>/plugins/ 目录发现） */
   source?: 'builtin' | 'external'
   /** 外部插件的目录绝对路径（内置插件无此字段） */

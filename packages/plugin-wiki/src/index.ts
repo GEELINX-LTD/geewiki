@@ -17,7 +17,7 @@
  */
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import { closeAfterResponse, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
+import { closeAfterResponse, isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
 
 export interface WikiConfig {
   /** 页面详情中返回的最近版本历史条数上限 */
@@ -275,6 +275,16 @@ export const WikiPlugin = {
   apply(ctx: Context, config: WikiConfig = {}) {
     const db = ctx.get('db') as DatabaseAdapter | undefined
     if (!db) throw new Error('@geewiki/wiki: 数据库服务不可用（@geewiki/db-sqlite 未激活）')
+    // **能力边界：显式失败，而不是静默坏掉**。本插件的查询/事务按**同步**适配器
+    // （better-sqlite3）编写；异步驱动（PostgreSQL）下这些调用返回 Promise 而拿不到行，
+    // 表现为"能启动但每个接口都读不到数据"——最难排查的一类故障。
+    // 异步化改造（约 15 处 db 调用）留待后续批次；在此之前明确拒绝并给出可执行指引。
+    if (isAsyncAdapter(db)) {
+      throw new Error(
+        `@geewiki/wiki: 当前数据库是异步适配器（${db.dialect}），本插件尚未支持。` +
+          '请改用 @geewiki/db-sqlite，或等待本插件的异步化改造（见 docs/plugin-platform-plan.md 的 PostgreSQL 条目）。',
+      )
+    }
     const router = ctx.get('http') as HttpRouterService | undefined
     if (!router) throw new Error('@geewiki/wiki: http 路由服务不可用（@geewiki/http 未激活）')
     const recentLimit = config.recentVersions ?? 10

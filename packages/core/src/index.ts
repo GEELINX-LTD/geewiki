@@ -84,8 +84,20 @@ export interface GeeWikiMeta {
   requires?: string[]
   /** 广义冲突组名：同组内全局仅允许激活一个（如 "database-provider"、"llm-provider"） */
   conflictGroup?: string
-  /** 迁移脚本目录（相对插件根目录，SQL/JS），插件激活前由迁移控制器执行 */
-  migrations?: string
+  /**
+   * 迁移脚本目录（相对插件根目录，SQL/JS），插件激活前由迁移控制器执行。
+   *
+   * 两种写法（**向后兼容**：`string` 写法语义完全不变）：
+   * - `string`：所有方言共用同一目录（等价于 `{ default: '…' }`）；
+   * - `{ default?, postgres? }`：按当前数据库方言取目录；`default` 是通用回退，
+   *   其余键名与 `DatabaseAdapter.dialect` 的取值对应。
+   *
+   * **取不到当前方言的目录时**：视为"该插件在当前数据库下没有迁移"——跳过并记警告
+   * （与"声明目录不存在"的既有语义一致：表结构由插件自管，不阻断激活）。
+   * 若插件在该方言下**根本无法工作**，应由插件自己在 `apply` 里显式拒绝
+   * （例如 plugin-search 依赖 SQLite 专有的 FTS5）。
+   */
+  migrations?: string | { default?: string; postgres?: string }
   /**
    * 外部插件入口文件（相对插件目录，如 "index.ts"）。
    * 仅外部插件（<仓库根>/plugins/<name>/）使用；缺省时按
@@ -151,10 +163,28 @@ export interface RunResult {
 }
 
 /**
+ * 数据库方言标识。
+ *
+ * 用途有二：① `GeeWikiMeta.migrations` 的方言键（按当前适配器的方言选迁移目录）；
+ * ② 插件在 `apply` 里显式判断"本插件在当前数据库下能否工作"
+ * （例如依赖 SQLite 专有 FTS5 的 plugin-search 必须拒绝非 sqlite 方言）。
+ */
+export type DatabaseDialect = 'sqlite' | 'postgres'
+
+/**
  * 数据库适配层接口：所有数据库插件（SQLite / PostgreSQL）实现本接口，
  * 业务代码只面向本接口编程，使数据库切换对上层透明。
+ *
+ * 注意本接口是**同步**形态（为 better-sqlite3 而生）。异步驱动（pg）请实现
+ * {@link DatabaseAdapterAsync}；消费方若两者都要支持，用 {@link asAsync} 归一化，
+ * 不要在每个调用点写 `instanceof`/分支。
  */
 export interface DatabaseAdapter {
+  /**
+   * 方言标识。**可选**：缺省视为 `'sqlite'`（向后兼容既有实现与测试替身）。
+   */
+  dialect?: DatabaseDialect
+
   /**
    * 执行查询（SELECT 等），返回全部结果行。
    * @param sql    参数化 SQL（? 占位符；PG 方言差异由实现屏蔽）
@@ -189,6 +219,122 @@ export interface DatabaseAdapter {
 
   /** 释放底层连接资源（进程退出/插件卸载时调用） */
   close(): void
+}
+
+/**
+ * 事务作用域内的语句执行器。
+ *
+ * 为什么事务回调**必须**拿到它、而不是继续用适配器自身的 `query`/`run`：
+ * 异步驱动的适配器背后是**连接池**，`pool.query()` 会把语句分派到任意一条空闲连接上。
+ * 若事务里继续用适配器的方法，`BEGIN` 与后续语句很可能不在同一条连接上——
+ * **事务会静默失效**（不报错，但回滚不了）。把执行器作为参数交给回调，
+ * 让"用事务的连接"成为路径最短的写法。
+ */
+export interface DatabaseExecutor {
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>
+  run(sql: string, params?: unknown[]): Promise<RunResult>
+}
+
+/**
+ * **异步**数据库适配层接口：异步驱动（如 `pg`）实现本接口。
+ *
+ * 为什么是"双轨"而不是把 {@link DatabaseAdapter} 整体改成异步：既有同步接口的消费点
+ * 遍布业务代码，整体异步化是一次大范围破坏性改动；而驱动本身的同步/异步是**实现细节**，
+ * 不应泄漏到每一个调用点。双轨 + {@link asAsync} 让"写一次代码、两种驱动都能跑"成为可能。
+ *
+ * 与同步版的差异**仅在于返回值是 Promise**，方法语义逐条对齐（含 `transaction` 的
+ * 提交/回滚语义）。
+ */
+export interface DatabaseAdapterAsync extends DatabaseExecutor {
+  /** 方言标识（异步适配器**必填**，供迁移目录选择与插件能力判断） */
+  dialect: DatabaseDialect
+
+  /** 判别式标记：`isAsyncAdapter` 据此做**结构化**判定（而非 `instanceof`） */
+  readonly kind: 'async'
+
+  migrate(directory?: string): Promise<void>
+
+  listTables(): Promise<string[]>
+
+  appliedMigrations(): Promise<string[]>
+
+  /**
+   * 事务边界：回调正常返回（resolve）则提交；回调抛错则整体回滚并向上传播异常。
+   * 实现必须保证**事务内所有语句走同一条连接**（连接池下这点尤其关键）——
+   * 回调**必须使用传入的 `tx`** 执行语句，用适配器自身的方法会落到别的连接上。
+   */
+  transaction<T>(fn: (tx: DatabaseExecutor) => Promise<T>): Promise<T>
+
+  close(): Promise<void>
+}
+
+/**
+ * 结构化判定是否为异步适配器（**不用 `instanceof`**：跨包副本/多实例下 `instanceof`
+ * 会误判，而这是插件生态里常见的情形）。
+ */
+export function isAsyncAdapter(value: unknown): value is DatabaseAdapterAsync {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Partial<DatabaseAdapterAsync>
+  return (
+    v.kind === 'async' &&
+    typeof v.query === 'function' &&
+    typeof v.run === 'function' &&
+    typeof v.listTables === 'function' &&
+    typeof v.appliedMigrations === 'function' &&
+    typeof v.transaction === 'function' &&
+    typeof v.close === 'function'
+  )
+}
+
+/** 已归一化为异步形态的适配器：`dialect` 必定可用 */
+export type AnyDatabaseAdapter = DatabaseAdapter | DatabaseAdapterAsync
+
+/**
+ * 把任意适配器归一化为**异步**形态，使消费方只写一条代码路径。
+ *
+ * - 传入异步适配器：原样返回（不额外包一层，避免事务语义被二次包装）。
+ * - 传入同步适配器：薄包装——查询/写入/migrate 用 `Promise.resolve` 提升；
+ *   `transaction` **改为 BEGIN/COMMIT/ROLLBACK 显式事务**：better-sqlite3 的
+ *   `transaction()` 只接受同步回调，若直接包一个 async 回调会在 Promise 结算前就提交，
+ *   事务形同虚设。同步驱动只有一条连接，故用显式语句同样是正确的。
+ */
+export function asAsync(adapter: AnyDatabaseAdapter): DatabaseAdapterAsync {
+  if (isAsyncAdapter(adapter)) return adapter
+  const sync = adapter
+  return {
+    kind: 'async',
+    dialect: sync.dialect ?? 'sqlite',
+    query: async <T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> =>
+      sync.query<T>(sql, params),
+    run: async (sql: string, params?: unknown[]): Promise<RunResult> => sync.run(sql, params),
+    migrate: async (directory?: string): Promise<void> => sync.migrate(directory),
+    listTables: async (): Promise<string[]> => sync.listTables(),
+    appliedMigrations: async (): Promise<string[]> => sync.appliedMigrations(),
+    transaction: async <T>(fn: (tx: DatabaseExecutor) => Promise<T>): Promise<T> => {
+      // 同步驱动只有一条连接，故把门面自身当作事务执行器交给回调——
+      // 与异步版"必须用 tx"的调用约定保持一致，业务代码无需分叉。
+      const facade: DatabaseExecutor = {
+        query: async <T2 = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T2[]> =>
+          sync.query<T2>(sql, params),
+        run: async (sql: string, params?: unknown[]): Promise<RunResult> => sync.run(sql, params),
+      }
+      sync.run('BEGIN')
+      try {
+        const result = await fn(facade)
+        sync.run('COMMIT')
+        return result
+      } catch (err) {
+        try {
+          sync.run('ROLLBACK')
+        } catch (rollbackErr) {
+          // 回滚失败不得掩盖原始错误：记日志后继续抛出原始异常
+          console.error('[core] 事务回滚失败（原始错误将照常抛出）:', rollbackErr)
+        }
+        throw err
+      }
+    },
+    close: async (): Promise<void> => sync.close(),
+  }
 }
 
 /* ================================ 常量 =================================== */

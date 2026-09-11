@@ -29,10 +29,11 @@ import { isDeepStrictEqual } from 'node:util'
 import type { Context } from 'cordis'
 import {
   CACHE_PURGE_EVENT,
+  asAsync,
   closeAfterResponse,
   normalizeRuntime,
+  type AnyDatabaseAdapter,
   type ConfigSchema,
-  type DatabaseAdapter,
   type FiberLike,
   type HttpRouterService,
   type RouteHandlerContext,
@@ -186,7 +187,8 @@ export interface PluginSnapshot {
   provides?: string
   requires: string[]
   conflictGroup?: string
-  migrations?: string
+  /** 迁移目录声明（string = 各方言通用；对象 = 按方言，与 GeeWikiMeta.migrations 同形） */
+  migrations?: string | { default?: string; postgres?: string }
   config?: Record<string, unknown>
   error?: string
   /** 来源：内置（组合根登记）/ 外部（plugins/ 目录发现） */
@@ -1110,12 +1112,16 @@ export class GeeWikiManager {
       )
     }
 
-    // 5.5 迁移控制器：插件声明迁移目录且 db 服务可用时，激活前执行（失败=阻止加载，事务已回滚）
-    if (entry.migrationsDir) {
-      const db = this.ctx.get('db') as DatabaseAdapter | undefined
-      if (db) {
+    // 5.5 迁移控制器：插件声明迁移目录且 db 服务可用时，激活前执行（失败=阻止加载，事务已回滚）。
+    // 迁移目录**按当前适配器的方言**取：先精确匹配方言键，再回退 'default'；
+    // 两者都没有 ⇒ 该插件在当前数据库下没有迁移（跳过，不阻断激活）。
+    const dbForMigration = this.ctx.get('db') as AnyDatabaseAdapter | undefined
+    if (dbForMigration && entry.migrationsDirs) {
+      const adapter = asAsync(dbForMigration)
+      const dirForDialect = entry.migrationsDirs[adapter.dialect] ?? entry.migrationsDirs['default']
+      if (dirForDialect) {
         try {
-          db.migrate(entry.migrationsDir)
+          await adapter.migrate(dirForDialect)
         } catch (err) {
           managed.error = `迁移执行失败: ${(err as Error).message}`
           throw new ManagerError(
@@ -1123,6 +1129,10 @@ export class GeeWikiManager {
             `迁移执行失败（已回滚），阻止加载 ${name}: ${(err as Error).message}`,
           )
         }
+      } else {
+        console.warn(
+          `[manager] ${name} 未声明 ${adapter.dialect} 方言的迁移目录，跳过迁移（表结构由插件自管）`,
+        )
       }
     }
 

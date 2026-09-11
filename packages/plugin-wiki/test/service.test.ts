@@ -488,3 +488,38 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+/* ---------------------- 能力边界：异步数据库必须显式拒绝 ---------------------- */
+
+/**
+ * 为什么值得单测：wiki 的 ~15 处 db 调用是**同步**写法。若拿异步适配器（PostgreSQL）
+ * 静默放行，插件会正常启动、但每个接口都读不到数据 —— "能启动但全是空的"是最难排查的
+ * 一类故障。故这里钉住"必须抛错、且错误里要给出可执行指引"。
+ */
+test('异步数据库适配器：wiki 显式拒绝并给出指引（不静默坏掉）', () => {
+  const services = new Map<string, unknown>([
+    [
+      'db',
+      {
+        kind: 'async',
+        dialect: 'postgres',
+        query: async () => [],
+        run: async () => ({ changes: 0, lastInsertRowid: 0 }),
+        migrate: async () => undefined,
+        listTables: async () => [],
+        appliedMigrations: async () => [],
+        transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
+        close: async () => undefined,
+      },
+    ],
+  ])
+  const ctx = { get: (n: string) => services.get(n) } as unknown as Context
+  assert.throws(
+    () => WikiPlugin.apply(ctx, {}),
+    (err: Error) => {
+      assert.match(err.message, /异步适配器（postgres）/, '错误里必须点明方言')
+      assert.match(err.message, /db-sqlite/, '错误里必须给出可执行的替代方案')
+      return true
+    },
+  )
+})
