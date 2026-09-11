@@ -30,6 +30,7 @@ import {
 } from '../lib/draftPlan'
 import { scrollToAnchor, settleHashAnchor } from '../lib/hashAnchor'
 import { renderMarkdownBody } from '../lib/markdownRender'
+import { projectForAudience, type PreviewAudience } from '../lib/gatedPreview'
 import {
   charCount,
   hasErrors,
@@ -79,6 +80,19 @@ function fmtTime(iso: string): string {
 
 /** 预览渲染的防抖时长（见 WikiEdit 的说明） */
 const PREVIEW_DEBOUNCE_MS = 200
+
+/**
+ * ★ P3d：编辑器预览的**视角**。
+ *
+ * 为什么需要它：作者对自己的页有编辑权 ⇒ 他在预览里**看得到全部** gated 段落。
+ * 于是"我预览里能看到"完全不能说明别人能不能看到，而块级可见性恰恰最容易判断错
+ * （页面档位会向下压制块）。这个开关让作者能直接看到"匿名访客/组织成员看到的版本"。
+ */
+const PREVIEW_AUDIENCES: ReadonlyArray<{ id: PreviewAudience; label: string; hint: string }> = [
+  { id: 'all', label: '我的视角', hint: '与你现在实际会看到的一致（含全部受限段落）' },
+  { id: 'org', label: '组织成员', hint: '登录且属于本组织的人看到的版本' },
+  { id: 'anonymous', label: '匿名访客', hint: '未登录访客看到的版本（受限段落会变成占位文案）' },
+]
 
 /** 草稿写入 localStorage 的防抖时长：比预览更长——写盘是"防丢失"，不必跟手 */
 const DRAFT_DEBOUNCE_MS = 900
@@ -1366,7 +1380,17 @@ function WikiEdit(props: {
     const t = window.setTimeout(() => setPreviewSource(content), PREVIEW_DEBOUNCE_MS)
     return () => window.clearTimeout(t)
   }, [content])
-  const previewRendered = useRenderedMarkdown(previewSource, {
+  /*
+   * ★ P3d：**预览为别的视角** —— 块级模型唯一的可用性救生圈。
+   *
+   * 为什么必须有它：`<!--gated:org-->` / `<!--gated:granted-->` 圈起来的段落，
+   * 作者自己是**看得到**的（他对自己的页有编辑权），所以"我预览里能看到"这件事
+   * 完全不能说明别人能不能看到。没有这个开关，作者只能靠脑内模拟来判断谁看得到什么 ——
+   * 而块级可见性恰恰是最容易判断错的一层（页面档位会向下压制块）。
+   */
+  const [previewAs, setPreviewAs] = useState<PreviewAudience>('all')
+  const projected = useMemo(() => projectForAudience(previewSource, previewAs), [previewSource, previewAs])
+  const previewRendered = useRenderedMarkdown(projected.markdown, {
     withCopyButtons: false,
     route,
     pages: editPageTitles,
@@ -1495,7 +1519,11 @@ function WikiEdit(props: {
 
   const slugError = fieldErrors.slug
   const titleError = fieldErrors.title
-  const previewEmpty = previewSource.trim() === ''
+  /*
+   * 空态按**投影后**的正文判断：一个只由 `granted` 区段组成的页面，在"匿名视角"下
+   * 的可读正文是空的 —— 此时该显示"（空白）"，而不是渲染出一段其实没人看得到的正文。
+   */
+  const previewEmpty = projected.markdown.trim() === ''
 
   const editSlug = isNew ? '' : origSlug !== '' ? origSlug : slug
 
@@ -1669,9 +1697,49 @@ function WikiEdit(props: {
           aria-labelledby={PREVIEW_PANE_LABEL_ID}
           className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'edit' && 'hidden xl:flex')}
         >
-          <span id={PREVIEW_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
-            预览（本地实时渲染，非最终发布稿）
-          </span>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span id={PREVIEW_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
+              预览（本地实时渲染，非最终发布稿）
+            </span>
+            {/* ★ P3d：视角切换。见 PREVIEW_AUDIENCES 的说明 —— 作者自己看得到全部，所以必须有这个开关 */}
+            <div role="group" aria-label="预览视角" className="flex items-center gap-1">
+              {PREVIEW_AUDIENCES.map((a) => (
+                <Button
+                  key={a.id}
+                  size="sm"
+                  variant={previewAs === a.id ? 'primary' : 'ghost'}
+                  aria-pressed={previewAs === a.id}
+                  title={a.hint}
+                  onClick={() => setPreviewAs(a.id)}
+                >
+                  {a.label}
+                </Button>
+              ))}
+            </div>
+            {previewAs !== 'all' && (
+              <span className="text-xs text-ink-soft">
+                {projected.gatedCount > 0
+                  ? `该视角下 ${projected.gatedCount} 段内容被遮蔽`
+                  : '该视角下没有任何内容被遮蔽'}
+              </span>
+            )}
+          </div>
+          {/*
+            标记不合法 ⇒ **保存时会被服务端拒绝**（400）。在这里就地提示，别让作者写完一大段
+            才发现。服务端对废弃标记是**显式拒绝**而不是静默忽略 —— 静默忽略会让作者以为
+            收紧了，实际按 public 暴露。
+          */}
+          {projected.invalidMarkers.length > 0 && (
+            <p
+              role="alert"
+              className="m-0 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-xs text-warn-ink"
+            >
+              正文里有 {projected.invalidMarkers.length} 处 gated 标记不合法（
+              {projected.invalidMarkers.join('、')}）—— **保存会被服务端拒绝**。只接受
+              {' '}<code>&lt;!--gated:org--&gt;</code> 与 <code>&lt;!--gated:granted--&gt;</code>，
+              且必须成对、不得嵌套。
+            </p>
+          )}
           <div className="min-h-[480px] overflow-auto rounded-md border border-line bg-surface px-5 py-4">
             {previewEmpty ? (
               <p className="m-0 text-sm text-muted">（空白）</p>

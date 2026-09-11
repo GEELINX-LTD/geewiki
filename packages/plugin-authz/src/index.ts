@@ -211,6 +211,21 @@ export const AuthzPlugin = {
     } catch (err) {
       throw new Error(`@geewiki/authz: 缺少表 page_grants —— 请确认 0012_page_acl.sql 已应用（${(err as Error).message}）`)
     }
+    /*
+     * ★ P3b：块级授权表。
+     *
+     * **必须有这条自检，不能"表不在就返回空集"** —— 见下方 `grantedBlockIds` 的说明：
+     * "没有授权"与"查不到授权表"在授权语义上是必须区分的两件事。缺表时显式失败，
+     * 而不是静默降级成"没人有任何块级权限"（那会让 `granted` 档的块对所有被授权者
+     * 也无故不可见，故障现象离根因很远）。
+     */
+    try {
+      await db.query('SELECT block_id, subject_kind, subject_id, expires_at FROM block_grants WHERE 1 = 0')
+    } catch (err) {
+      throw new Error(
+        `@geewiki/authz: 缺少表 block_grants —— 请确认 0016_block_grants.sql 已应用（${(err as Error).message}）`,
+      )
+    }
 
     /**
      * 主体守卫 —— **失败关闭的铁律**（§9 R2）。
@@ -502,21 +517,50 @@ export const AuthzPlugin = {
       },
 
       /**
-       * ★ P3a：块级授权的**唯一入口**。
+       * ★ P3b：块级授权的**唯一入口** —— 返回该主体被授予的**块 id 集合**。
        *
-       * 现在恒为空数组，因为 `block_grants` 表属 P3b（`0016_block_grants.sql`）——
-       * 在它落地之前，**不存在任何块级授权**，空数组是语义正确的结果。
-       * 检索侧因此退化为"只看 `tier` 等级分支"，与其 SQL 里的 `OR b.id IN (...)`
-       * 收在恒假分支上，行为等价。
+       * 三个必须守住的边界（前两条写在 P3a 的接口注释里，第三条是实现补充）：
        *
-       * **为什么不做"表存在就查、不存在就空"的自适应**：那会让同一份代码在不同
-       * schema 版本下走不同分支，而"没有授权"与"查不到授权表"在授权语义上是**必须
-       * 区分**的两件事（后者应当显式失败，而不是静默降级成"没人有权限"或"所有人有权限"）。
-       * P3b 落地这张表时，把本方法换成真实查询即可 —— 调用方无需改动。
+       * 1. **只返回块 id，绝不返回任何文本** —— 它唯一的消费者是检索的
+       *    `OR b.id IN (:grantedBlockIds)` 与读路径的投影，两边都只需要"是不是这块"。
+       *    返回文本会把受限内容带进这一层内存，正是 P3a 刻意避免的那类泄漏面。
+       * 2. **必须按 `expires_at` 过滤** —— 过期授权不算授权。判定时比较即可，
+       *    **不依赖后台清理任务**（清理只是回收空间，与 page_grants 同款）。
+       * 3. **不做"表存在就查、不存在就空"的自适应** —— "没有授权"与"查不到授权表"
+       *    在授权语义上是必须区分的两件事。缺表由激活期的表存在性自检显式报错。
+       *
+       * **为什么匿名与 break-glass 直接返回空集**：匿名的 `userId`/`groupIds` 都是空，
+       * 不可能持有授予；break-glass 靠 owner/admin 的**应急覆盖**直接看全文（规则 O1），
+       * 不经过授权分支。提前返回既省一次查询，也让"匿名拿到非空授权集合"这种不可能
+       * 状态无从产生 —— 它在检索里会直接变成"匿名看见了 granted 块"。
        */
       async grantedBlockIds(rawP): Promise<readonly number[]> {
-        requirePrincipal(rawP, 'grantedBlockIds')
-        return []
+        const p = requirePrincipal(rawP, 'grantedBlockIds')
+        if (p.kind !== 'user' || p.userId === null) return []
+
+        const now = new Date().toISOString()
+        const ids = new Set<number>()
+        const rows = await db.query<{ block_id: number; expires_at: string | null }>(
+          `SELECT block_id, expires_at FROM block_grants
+            WHERE subject_kind = 'user' AND subject_id = ?`,
+          [String(p.userId)],
+        )
+        const groupIds = p.groupIds.map((g) => String(g))
+        if (groupIds.length > 0) {
+          // 组授予：用 IN 一次取回（组集合来自 Principal.groupIds，已按 org 收窄）
+          const placeholders = groupIds.map(() => '?').join(',')
+          const groupRows = await db.query<{ block_id: number; expires_at: string | null }>(
+            `SELECT block_id, expires_at FROM block_grants
+              WHERE subject_kind = 'group' AND subject_id IN (${placeholders})`,
+            groupIds,
+          )
+          rows.push(...groupRows)
+        }
+        for (const r of rows) {
+          if (r.expires_at !== null && r.expires_at !== undefined && r.expires_at <= now) continue // 已过期 ⇒ 视同没有
+          ids.add(Number(r.block_id))
+        }
+        return [...ids]
       },
     }
 

@@ -239,19 +239,262 @@ export function tierFor(pageLevel: PageLevel, blockVisibility: BlockVisibility):
 }
 
 /**
+ * 库里已有的块 —— **保守重解析的输入**。
+ *
+ * `grantCount` 决定这个块"能不能被删/能不能参与合并"：有授权的块一旦被静默删除，
+ * 授权会被外键 CASCADE 一起清掉，而用户看不到任何提示（§4.2 的"审计断裂"）。
+ */
+export interface ExistingBlock {
+  id: number
+  ordinal: number
+  kind: string
+  contentHash: string
+  visibility: string
+  /** 该块上的 `block_grants` 行数（0 = 没有授权） */
+  grantCount: number
+}
+
+/** 保守重解析的冲突。`code` 用作错误码（沿用"消息前缀即错误码"的约定），路由映射成 409 */
+export class BlockSyncError extends Error {
+  constructor(
+    readonly code: 'block_merge_conflict' | 'block_grant_orphan',
+    message: string,
+  ) {
+    super(`${code}: ${message}`)
+    this.name = 'BlockSyncError'
+  }
+}
+
+/**
+ * 读该页已有块 + 每块的授权计数。
+ *
+ * 授权计数**一次查回**（`GROUP BY`），不逐块查 —— 一页几十块时逐块查会变成几十次往返。
+ * 计数只用于**决策**（能不能删/能不能合并），不参与任何内容判断，因此把数字带出来
+ * 不构成泄漏面。
+ */
+export async function readExistingBlocks(
+  db: { query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> },
+  pageId: number,
+): Promise<ExistingBlock[]> {
+  const rows = await db.query<{
+    id: number
+    ordinal: number
+    kind: string
+    content_hash: string
+    visibility: string
+  }>('SELECT id, ordinal, kind, content_hash, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal', [pageId])
+  if (rows.length === 0) return []
+  const grants = await db.query<{ block_id: number; n: number }>(
+    `SELECT g.block_id AS block_id, COUNT(*) AS n
+       FROM block_grants g JOIN blocks b ON b.id = g.block_id
+      WHERE b.page_id = ?
+      GROUP BY g.block_id`,
+    [pageId],
+  )
+  const countById = new Map<number, number>()
+  for (const g of grants) countById.set(Number(g.block_id), Number(g.n))
+  return rows.map((r) => ({
+    id: Number(r.id),
+    ordinal: Number(r.ordinal),
+    kind: r.kind,
+    contentHash: r.content_hash,
+    visibility: r.visibility,
+    grantCount: countById.get(Number(r.id)) ?? 0,
+  }))
+}
+
+/** 一个同步计划：新块各自复用哪个旧 id（`null` = 新插入）、要删哪些旧块、要从谁复制授权 */
+interface SyncPlan {
+  reuse: Array<number | null>
+  toDelete: number[]
+  copyGrantsFrom: Array<{ from: number; toIndexes: number[] }>
+}
+
+/** 最长公共子序列（按 `kind + contentHash` 匹配）—— 用来找出"原样保留"的块 */
+function lcsPairs(a: readonly string[], b: readonly string[]): Array<[number, number]> {
+  const n = a.length
+  const m = b.length
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i]![j] = a[i] === b[j] ? (dp[i + 1]![j + 1] as number) + 1 : Math.max(dp[i + 1]![j] as number, dp[i]![j + 1] as number)
+    }
+  }
+  const pairs: Array<[number, number]> = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      pairs.push([i, j])
+      i += 1
+      j += 1
+    } else if ((dp[i + 1]![j] as number) >= (dp[i]![j + 1] as number)) {
+      i += 1
+    } else {
+      j += 1
+    }
+  }
+  return pairs
+}
+
+/**
+ * 保守重解析（§4.2）。
+ *
+ * **问题**：块的身份若只用 `ordinal`，在文档开头插一段就会让所有 ordinal 后移 ⇒
+ * 所有块级授权指向错误的块。这种"静默错配"比丢失更危险。
+ *
+ * **解法**：先用 `(kind, contentHash)` 做最长公共子序列，把**原样保留**的块钉住；
+ * 剩下的"缺口"（连续未匹配的旧块段与新块段）按下面的规则成对：
+ *
+ * | 缺口形状 | 处理 |
+ * |---|---|
+ * | 旧 0 个 | 全部新插入 |
+ * | 新 0 个 | 全部删除；**其中有任一有授权 ⇒ 409 `block_grant_orphan`** |
+ * | 等长 | 按位置成对（即"纯文本编辑"，保留块 id） |
+ * | 旧 1 → 新 k>1 | **拆分**：首块复用旧 id，其余新插入，**并把旧块授权复制给它们**（安全方向） |
+ * | 旧 m>1 → 新 1 | **合并**：任一旧块有授权、或旧块之间可见性不同 ⇒ 409 `block_merge_conflict` |
+ * | 其它 | 无法可靠对齐 ⇒ 有授权则 409 `block_grant_orphan`，否则全删全插 |
+ *
+ * **等长缺口的成对为什么允许 `kind` 变化**：`kind` 相同才配对是设计文档的判据，
+ * 但严格照做会让"把一个段落改成标题"无法保存。等长成对意味着**块的数量与顺序都没变**，
+ * 这已是"纯文本编辑"的强特征。**但有一条例外**：若旧块**有授权**，则要求 `kind` 必须
+ * 相同 —— 授权在身时宁可让用户多确认一次，也不接受"授权被安到一段语义不同的内容上"。
+ *
+ * 所有拒绝都发生在**任何写入之前**（调用方拿到异常时库还没被改），
+ * 这正是"授权丢失与授权误施都要显式化"的落点。
+ */
+export function planBlockSync(
+  olds: readonly ExistingBlock[],
+  news: readonly ParsedBlock[],
+  opts: { restructure?: boolean } = {},
+): SyncPlan {
+  /*
+   * ★ `restructure`：**仅"恢复版本"路径使用**（P3c）。
+   *
+   * 为什么需要它：下面的三道守卫是为**编辑**事故设计的 —— 用户改了一段正文，
+   * 而我们无法可靠地把旧块与新块对上时，宁可拒绝保存，也不接受"授权被安到
+   * 语义不同的内容上"或"授权被静默清掉"。但**恢复版本**是另一回事：
+   * 用户显式要求回到那个状态，其中包括它当时的**块结构**；而块级授权会由
+   * 快照整体重建（不是"丢了"，是"被替换成那一刻的样子"）。
+   * 于是三道守卫在恢复路径上都不适用 —— 若仍然拦截，**恢复旧版本会被永久拒绝**。
+   *
+   * 注意它只影响"能不能改块结构"，不影响可见性判定的任何地方。
+   */
+  const restructure = opts.restructure === true
+  const plan: SyncPlan = { reuse: new Array<number | null>(news.length).fill(null), toDelete: [], copyGrantsFrom: [] }
+  const keyOf = (kind: string, hash: string): string => `${kind}\u0000${hash}`
+  const pairs = lcsPairs(
+    olds.map((o) => keyOf(o.kind, o.contentHash)),
+    news.map((n) => keyOf(n.kind, n.contentHash)),
+  )
+
+  /** 处理一段缺口：`oldFrom..oldTo`（不含）与 `newIdxs`（升序、不含） */
+  const pairGap = (oldFrom: number, oldTo: number, newIdxs: readonly number[]): void => {
+    const gapOlds = olds.slice(oldFrom, oldTo)
+    const k = gapOlds.length
+    const q = newIdxs.length
+    const grantedOlds = gapOlds.filter((o) => o.grantCount > 0)
+
+    if (k === 0) return // 全是新插入，reuse 保持 null
+    if (q === 0) {
+      if (grantedOlds.length > 0 && !restructure) {
+        throw new BlockSyncError(
+          'block_grant_orphan',
+          `不能删除已有块级授权的块（ordinal ${grantedOlds.map((o) => o.ordinal).join(', ')}）—— ` +
+            '请先撤销这些块的授权，再删除它们。静默删除会连授权一起清掉，且不留痕迹。',
+        )
+      }
+      for (const o of gapOlds) plan.toDelete.push(o.id)
+      return
+    }
+    if (k === q) {
+      // 等长 ⇒ 纯文本编辑，按位置成对
+      for (let t = 0; t < k; t += 1) {
+        const o = gapOlds[t] as ExistingBlock
+        const nIdx = newIdxs[t] as number
+        const n = news[nIdx] as ParsedBlock
+        if (o.grantCount > 0 && o.kind !== n.kind && !restructure) {
+          throw new BlockSyncError(
+            'block_grant_orphan',
+            `已授权的块（ordinal ${o.ordinal}）被改成了另一种块类型（${o.kind} → ${n.kind}）；` +
+              '无法确认它仍是同一个块，因此拒绝保存。请先撤销该块的授权再改。',
+          )
+        }
+        plan.reuse[nIdx] = o.id
+      }
+      return
+    }
+    if (k === 1 && q > 1) {
+      // 拆分：授权向两块扩散（安全方向）
+      const o = gapOlds[0] as ExistingBlock
+      plan.reuse[newIdxs[0] as number] = o.id
+      if (o.grantCount > 0) {
+        plan.copyGrantsFrom.push({ from: o.id, toIndexes: newIdxs.slice(1) })
+      }
+      return
+    }
+    if (k > 1 && q === 1) {
+      // 合并
+      const vis = new Set(gapOlds.map((o) => o.visibility))
+      if (!restructure && (grantedOlds.length > 0 || vis.size > 1)) {
+        throw new BlockSyncError(
+          'block_merge_conflict',
+          `不能把 ${k} 个块合并成一个：` +
+            (grantedOlds.length > 0
+              ? `其中 ordinal ${grantedOlds.map((o) => o.ordinal).join(', ')} 有块级授权，`
+              : '') +
+            (vis.size > 1 ? `它们的可见性不同（${[...vis].join(' / ')}），` : '') +
+            '合并会静默丢掉授权或改写可见性。请先撤销授权 / 统一可见性，再合并。',
+        )
+      }
+      plan.reuse[newIdxs[0] as number] = gapOlds[0]!.id
+      for (let t = 1; t < k; t += 1) plan.toDelete.push((gapOlds[t] as ExistingBlock).id)
+      return
+    }
+    // 形状无法可靠对齐
+    if (grantedOlds.length > 0 && !restructure) {
+      throw new BlockSyncError(
+        'block_grant_orphan',
+        `这次的改动让 ${k} 个旧块变成了 ${q} 个新块，无法确认哪一块对应哪一块，` +
+          `而其中 ordinal ${grantedOlds.map((o) => o.ordinal).join(', ')} 有块级授权。` +
+          '为避免授权被安到错误的内容上，拒绝保存。请先撤销这些块的授权。',
+      )
+    }
+    for (const o of gapOlds) plan.toDelete.push(o.id)
+  }
+
+  let prevOld = -1
+  let prevNew = -1
+  for (const [oi, ni] of pairs) {
+    pairGap(prevOld + 1, oi, rangeOf(prevNew + 1, ni))
+    plan.reuse[ni] = (olds[oi] as ExistingBlock).id
+    prevOld = oi
+    prevNew = ni
+  }
+  pairGap(prevOld + 1, olds.length, rangeOf(prevNew + 1, news.length))
+  return plan
+}
+
+function rangeOf(from: number, to: number): number[] {
+  const out: number[] = []
+  for (let i = from; i < to; i += 1) out.push(i)
+  return out
+}
+
+/**
  * ★ **唯一的块与块索引写入路径**（§9 R12）。
  *
- * 做四件事，全部在**调用方的事务里**（`tx` 必须传进来 —— 用适配器自身方法会让事务
+ * 做五件事，全部在**调用方的事务里**（`tx` 必须传进来 —— 用适配器自身方法会让事务
  * 静默失效，见 core 的注释）：
- *   1. 删掉该页的旧块
- *   2. 按解析结果插入新块（含 `tier`）
- *   3. 删掉该页在 `blocks_fts` 里的旧行、再逐块写入
- *   4. `pages.content_hash` 由调用方一并更新（本函数只管块与索引）
+ *   1. 删掉该页在 `blocks_fts` 里的旧行
+ *   2. **保守重解析**（`planBlockSync`）—— 决定哪些块复用旧 id、哪些删除、哪些新插
+ *   3. 复用旧 id 的块走 `UPDATE`，其余走 `INSERT`
+ *   4. 拆分母块的授权复制给新同胞块
+ *   5. 逐块重建 `blocks_fts`
  *
- * **为什么块索引要在这里手工维护**：`blocks_fts` 是 contentless 表，且写进去之前要算
- * `tier` —— 那依赖页面的**有效档位**（含祖先交集与发布闸门），是 `policy-service` 的
- * 业务逻辑，**不是触发器能表达的 SQL**。代价是同步保证从"数据库触发器"变成了"应用层
- * 纪律"，所以有 `GET /api/admin/search/verify` 这条一致性探针兜底。
+ * ⚠️ **为什么不能再用"删光重建"**（P3a 的写法）：`block_grants.block_id` 是
+ * `ON DELETE CASCADE`，删光重建会让块 id 全变、**授权被静默清空**。这是 P3b 必须
+ * 改掉它的唯一原因，也是"块身份必须稳定"这条设计要求的落地处（§4.2）。
  */
 export async function syncBlocksForPage(
   tx: BlockWriter,
@@ -261,6 +504,12 @@ export async function syncBlocksForPage(
     /** 页面有效档位（由调用方从 policy-service 取；取不到时传 `null` = 失败关闭） */
     pageLevel: PageLevel
     now: string
+    /**
+     * 该页**已有**的块（含授权计数）。**必填** —— 它是保守重解析的输入，
+     * 省略就等于"我不知道有没有授权"，那只能退化成删光重建 ⇒ 静默丢授权。
+     * 所以这里是强制参数，而不是"可选 + 默认空数组"。
+     */
+    existing: readonly ExistingBlock[]
     /** 注入以便测试；默认用 {@link parseBlocks} */
     parse?: (content: string) => ParsedBlock[]
     /**
@@ -286,12 +535,27 @@ export async function syncBlocksForPage(
      * 该标志只影响**检索召回**：`blocks` 与 `pages.content` 才是真源，索引随时可从
      * `blocks` 重建（PG 下本就没有索引，检索功能整体不提供 —— 由 §4.3 的方言守卫显式拒绝）。
      */
+    // ★ 必填（P3a 修复轮定的）：默认值会让"新增调用点忘了传"只在 PostgreSQL 上、
+    //   且在事务内部炸（`blocks_fts` 在那边永远不存在）—— 这是最难排查的一类缺陷。
+    //   漏传现在会在**编译期**报错。（P3c 分支上原为 `syncIndex?: boolean`，是 P3a 修复
+    //   之前的旧形态；rebase 时按语义合并为必填，**未回退** P3a 的意图。）
     syncIndex: boolean
+    /**
+     * ★ **仅"恢复版本"路径使用**（P3c）：允许本次同步改变**块结构**
+     * （合并块、删除已有授权的块）。编辑路径**绝不要**传它 ——
+     * `planBlockSync` 里那三道守卫正是用来防编辑事故的。
+     */
+    restructure?: boolean
   },
 ): Promise<ParsedBlock[]> {
-  const { pageId, content, pageLevel, now } = args
+  const { pageId, content, pageLevel, now, existing } = args
   const parse = args.parse ?? parseBlocks
   const parsed = parse(content)
+  /*
+   * **先算计划再动任何一行。** 计划阶段可能抛 `BlockSyncError`（合并/删除已授权块），
+   * 此时库里还没有任何改动 —— 调用方拿到 409 时数据是干净的。
+   */
+  const plan = planBlockSync(existing, parsed, { restructure: args.restructure === true })
 
   /*
    * ★ 顺序不能换：**先清索引、再删块行**。
@@ -303,7 +567,7 @@ export async function syncBlocksForPage(
    * 产出命中，但正文还在索引文件里，且 verify 探针的 `extra` 会非零）。
    */
   /*
-   * ★ P3a：`blocks_fts` 由 **`@geewiki/search` 的迁移**建立，而**搜索是可选插件** ——
+   * ★ `blocks_fts` 由 **`@geewiki/search` 的迁移**建立，而**搜索是可选插件** ——
    * 没装它时这张表根本不存在。块写入**不能**因此失败：那会让"保存一个页面"依赖
    * "装了检索插件"，是荒谬的耦合（server 的路由用例正是这么把它暴露出来的：
    * 保存返 500 `no such table: blocks_fts`）。
@@ -326,9 +590,41 @@ export async function syncBlocksForPage(
       warnBlocksIndexMissingOnce()
     }
   }
-  await tx.run('DELETE FROM blocks WHERE page_id = ?', [pageId])
 
-  for (const b of parsed) {
+  /** 最终块的 id 与文本，供最后重建索引 */
+  const finals: Array<{ id: number; text: string }> = []
+  const newIds: Array<number | null> = new Array<number | null>(parsed.length).fill(null)
+
+  for (let i = 0; i < parsed.length; i += 1) {
+    const b = parsed[i] as ParsedBlock
+    const reuseId = plan.reuse[i] ?? null
+    if (reuseId !== null) {
+      /*
+       * **复用旧 id** —— 这一行是"块身份稳定"的落点：`block_grants.block_id` 不变，
+       * 授权因此跨编辑存活。`tier` 一并重算（页面档位可能变了）。
+       */
+      await tx.run(
+        `UPDATE blocks
+            SET ordinal = ?, kind = ?, text = ?, visibility = ?, inherit = ?, marker = ?,
+                content_hash = ?, updated_at = ?, tier = ?
+          WHERE id = ?`,
+        [
+          b.ordinal,
+          b.kind,
+          b.text,
+          b.visibility,
+          b.inherit ? 1 : 0,
+          b.marker,
+          b.contentHash,
+          now,
+          tierFor(pageLevel, b.visibility),
+          reuseId,
+        ],
+      )
+      newIds[i] = reuseId
+      finals.push({ id: reuseId, text: b.text })
+      continue
+    }
     const res = await tx.run(
       /*
        * ★ `RETURNING id` 不是可选的：SQLite 有隐式 rowid，**PostgreSQL 没有** ——
@@ -359,7 +655,32 @@ export async function syncBlocksForPage(
     if (!Number.isFinite(blockId) || blockId <= 0) {
       throw new Error('blocks_writer_no_rowid: 插入块后拿不到 rowid，无法对齐 blocks_fts')
     }
-    if (indexEnabled) await tx.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [blockId, b.text])
+    newIds[i] = blockId
+    finals.push({ id: blockId, text: b.text })
+  }
+
+  /*
+   * 拆分产生的同胞块**继承母块的授权**（§4.2 的"安全方向"）。
+   * 放在插入之后：那时新块 id 才存在。`page_slug` 从母块行原样带过来。
+   */
+  for (const copy of plan.copyGrantsFrom) {
+    for (const idx of copy.toIndexes) {
+      const target = newIds[idx]
+      if (target === null || target === undefined) continue
+      await tx.run(
+        `INSERT INTO block_grants (block_id, page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+         SELECT ?, page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at
+           FROM block_grants WHERE block_id = ?`,
+        [target, copy.from],
+      )
+    }
+  }
+
+  /* 删除未保留的旧块（授权检查已在计划阶段做过，走到这里说明它们都没有授权） */
+  for (const id of plan.toDelete) await tx.run('DELETE FROM blocks WHERE id = ?', [id])
+
+  if (indexEnabled) {
+    for (const f of finals) await tx.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [f.id, f.text])
   }
   return parsed
 }
@@ -376,6 +697,15 @@ export type ReaderTier = 0 | 1
 
 /** 投影的输入：块的最小形状（`ParsedBlock` 与 `blocks` 表的行都满足）。 */
 export interface ProjectableBlock {
+  /**
+   * 块 id。**只有来自 `blocks` 表的行才有** —— 现场解析 `pages.content` 得到的结果
+   * （P3a 之前保存的历史页面）没有 id，因而**不可能**命中授权分支。
+   *
+   * 这是刻意的：授权钉在稳定块身份上（§4.2），而"现场解析"的 ordinal 会随编辑漂移，
+   * 拿它去对授权就是拿一个不稳定的键去查权限表。宁可少给（无 id ⇒ 只能走等级分支），
+   * 不可多给。
+   */
+  id?: number
   ordinal: number
   text: string
   visibility: BlockVisibility
@@ -403,21 +733,36 @@ export interface ProjectedContent {
  * 判据（{@link blockLevelOf}）—— 否则会出现"搜不到但读得到"（读路径漏过滤）或
  * "读得到但搜不到"（索引算错），前者是泄漏、后者是体验缺陷。
  *
- * ## 判据只看块自身的 `visibility`
+ * ## 判据只看块自身的 `visibility` + 该主体的块级授予
  *
  * 页面级可见性由 `policy-service.resolvePage` 在此之前判定完毕（`level === 'none'`
- * 早已 404）。所以到这里只需问"**这个块**对**这个读者**是否可见"。
- * `granted` 档的 `blockLevelOf` 返回 `null` ⇒ 等级分支**永不命中**，只能靠授权分支
- * （`block_grants`，属 P3b）。P3a 阶段还没有授权表，故 `granted` 块对所有人不可见 ——
- * 这是**失败关闭**，方向正确（宁可少给，不可多给）。
+ * 早已 404）。所以到这里只需问"**这个块**对**这个读者**是否可见"，两条分支：
+ *
+ * - **等级分支**：`blockLevelOf(visibility) <= reader.tier` —— 块要求的等级，读者够得着。
+ * - **授权分支**（★ P3b）：该块的 id 在 `grantedBlockIds` 里 —— **放宽方向**。
+ *   被显式授予的块对**任何**足额主体可见（匿名不可能有授予，`policy-service` 对匿名
+ *   直接返回空集）。`granted` 档的块 `blockLevelOf` 返回 `null` ⇒ 等级分支永不命中，
+ *   **只能**靠授权分支放行 —— 这是它存在的全部意义。
+ *
+ * 两条分支**必须用同一条判据**（{@link blockLevelOf}）与同一份授权集合，否则会出现
+ * "搜得到但读不到"或"读得到但搜不到"；后者（读得到但搜不到）只是体验缺陷，
+ * **前者（搜得到但读不到）是泄漏**。
  */
 export function projectBlocks(
   blocks: readonly ProjectableBlock[],
-  reader: { tier: ReaderTier; anonymous: boolean },
+  reader: { tier: ReaderTier; anonymous: boolean; grantedBlockIds?: readonly number[] },
 ): ProjectedContent {
   const out: string[] = []
   let gatedRun = 0
   let gatedCount = 0
+  /*
+   * 集合化一次，避免逐块 `includes` 退化成 O(块数 × 授权数)。
+   * 空集合走 `null` 分支：省掉每块的 Set 查询，也让"没有授权"这条最常见路径零开销。
+   */
+  const granted =
+    reader.grantedBlockIds !== undefined && reader.grantedBlockIds.length > 0
+      ? new Set(reader.grantedBlockIds)
+      : null
 
   /*
    * 连续受限块**合并成一个占位**。
@@ -438,7 +783,9 @@ export function projectBlocks(
 
   for (const b of blocks) {
     const level = blockLevelOf(b.visibility)
-    if (level !== null && level <= reader.tier) {
+    const byTier = level !== null && level <= reader.tier
+    const byGrant = granted !== null && b.id !== undefined && granted.has(b.id)
+    if (byTier || byGrant) {
       flushGated()
       out.push(b.text)
     } else {
@@ -454,6 +801,11 @@ export function projectBlocks(
 /** 本模块需要的执行器形状（`DatabaseExecutor` 的结构子集，便于测试替身）。 */
 export interface BlockWriter {
   run(sql: string, params?: readonly unknown[]): Promise<{ changes: number; lastInsertRowid: number | bigint }>
+}
+
+/** 只读侧的最小形状（`readExistingBlocks` 的入参；事务执行器与适配器都满足） */
+export interface BlockReader {
+  query<T>(sql: string, params?: readonly unknown[]): Promise<T[]>
 }
 
 /**

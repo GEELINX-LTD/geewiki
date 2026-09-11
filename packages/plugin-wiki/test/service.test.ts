@@ -29,7 +29,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
-import { asAsync, MIGRATION_TABLE, type Principal } from '@geewiki/core'
+import { anonymousPrincipal, asAsync, MIGRATION_TABLE, type Principal } from '@geewiki/core'
 import { AuthzPlugin } from '@geewiki/authz'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
@@ -56,16 +56,65 @@ const MEMBER: Principal = {
   groupIds: [],
   sessionId: null,
 }
-const INIT_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0001_init.sql')
-/** `page_grants.granted_by` 有 `REFERENCES users(id)`，故 0010 必须一并加载 */
-const IDENTITY_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0010_identity.sql')
-const ACL_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0012_page_acl.sql')
 /**
- * ★ P3a：`savePage` 现在会在**同一事务里**双写 `blocks` 与 `blocks_fts`（`syncBlocksForPage`），
- * 所以夹具必须把这两张表也建出来 —— 否则每个保存用例都会以 `no such table: blocks_fts` 挂掉。
- * 与 P1 合并时那次夹具缺口是同一类：**新迁移落地后，既有插件的测试夹具要同步**。
+ * 夹具用的**第二个**主体：无管理权、且对目标条目**没有**访问权的普通成员。
+ *
+ * 为什么需要它：申请访问的语义是"**你没权限 → 申请 → 别人批准**"，所以申请人不能是
+ * `MEMBER`（`MEMBER` 对 org 档条目天然有读权限，`already_has_access` 会把申请挡掉）。
+ * `userId` 必须在 `users` 表里真实存在 —— `access_requests.user_id` 有外键，否则插入报
+ * `FOREIGN KEY constraint failed`（报错点在 SQL 层，离"夹具缺种子"很远）。
  */
-const BLOCKS_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0015_blocks.sql')
+const APPLICANT: Principal = {
+  kind: 'user',
+  userId: 2,
+  orgId: 1,
+  orgRole: 'member',
+  groupIds: [],
+  sessionId: null,
+}
+/**
+ * 夹具用的**审批人**主体：组织 owner。
+ *
+ * 为什么审批人必须是 owner（而不能是 `MEMBER`）：`canManageVisibility` 的判据是
+ * `canEdit && (orgRole === 'member' || isAdminRole(p))`（`packages/plugin-authz/src/index.ts:379`），
+ * 而申请访问的用例**必须**把目标页设成 `private`（否则 `MEMBER` 和 `APPLICANT` 同属
+ * 组织成员、都对 `org` 档有读权限，`already_has_access` 会把申请挡掉）。页面一旦是
+ * `private`，`MEMBER` 自己也 `level === 'none'` ⇒ `canEdit` 为假 ⇒ 批不了。
+ * 只有 admin 档（owner/admin）能对 `private` 页行使 `canManageVisibility`。
+ */
+const OWNER: Principal = {
+  kind: 'user',
+  userId: 1,
+  orgId: 1,
+  orgRole: 'owner',
+  groupIds: [],
+  sessionId: null,
+}
+/**
+ * ★ 夹具的 schema 来源：**读 db-sqlite 迁移目录下的全部 `.sql`，按文件名序**。
+ *
+ * **为什么从"白名单常量"改成"读全目录"**：此前这里逐个列出 `0001 / 0010 / 0012 / 0015`，
+ * 于是每次有新迁移落地、而新表又恰好被本插件的某条路径读到，夹具就会集体报
+ * `no such table: xxx` —— 这已经发生过**三次**（P1 合并时缺 `0011_org_team.sql`、
+ * P3a 时缺 `blocks_fts`、P3b 时缺 `block_grants`）。逐次补白名单是治标；
+ * 读全目录才是治本：**新增迁移不会再破这个夹具**。
+ *
+ * 顺序与 `db.migrate()` 的 `readdirSync().sort()` **同序**（文件名前缀即依赖顺序：
+ * `0010` 建 users → `0012` 的 `page_grants.granted_by` 才引得到；`0015` 建 blocks →
+ * `0016` 的 `block_grants.block_id` 才引得到）。同款做法见
+ * `packages/plugin-oidc/test/oidc.test.ts` 与 `packages/plugin-wiki/test/slug-hierarchy.test.ts`。
+ */
+const DB_MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
+const DB_MIGRATION_PATHS = readdirSync(DB_MIGRATIONS_DIR)
+  .filter((f) => f.endsWith('.sql'))
+  .sort()
+  .map((f) => join(DB_MIGRATIONS_DIR, f))
+
+/**
+ * `blocks_fts` 属 `@geewiki/search`（SQLite 专有，见设计文档 §4.3 ★v7），
+ * **不在 db-sqlite 的迁移目录里**，故单独补一条 —— 它是 `savePage` 双写的另一半，
+ * 缺了它每个保存用例都会以 `no such table: blocks_fts` 挂掉（P3a 时正是如此）。
+ */
 const BLOCKS_FTS_SQL_PATH = join(
   import.meta.dirname,
   '..',
@@ -74,14 +123,8 @@ const BLOCKS_FTS_SQL_PATH = join(
   'migrations',
   '0002_blocks_fts.sql',
 )
-/** 夹具要建的全部 schema：顺序即依赖顺序（blocks 建在 pages 之后） */
-const SCHEMA_SQL_PATHS = [
-  INIT_SQL_PATH,
-  IDENTITY_SQL_PATH,
-  ACL_SQL_PATH,
-  BLOCKS_SQL_PATH,
-  BLOCKS_FTS_SQL_PATH,
-] as const
+/** 夹具要建的全部 schema：db-sqlite 全量迁移（按文件名序）+ search 的块索引表 */
+const SCHEMA_SQL_PATHS = [...DB_MIGRATION_PATHS, BLOCKS_FTS_SQL_PATH] as const
 
 /**
  * `node:sqlite`（Node 内置）上的 DatabaseAdapter 实现。
@@ -176,6 +219,14 @@ interface Harness {
     path: string,
     params?: Record<string, string>,
     body?: unknown,
+    /**
+     * 可选的主体覆盖。默认 `MEMBER`（已登录成员）。
+     *
+     * 为什么需要它：申请访问的语义是"**甲申请、乙批准**"，一条用例里必须能切换主体 ——
+     * 否则测不出"申请人看不到、审批人看得到"以及"批准后申请人立刻可见"。
+     * 生产里主体由 `@geewiki/auth` 的钩子填充；夹具手工驱动处理器，故在此显式传入。
+     */
+    principal?: Principal,
   ): Promise<{ status: number; body: Record<string, unknown> }>
   /** 直接取服务（顺带断言它确实被 provide 出来了） */
   svc(): WikiService
@@ -203,6 +254,24 @@ async function makeHarness(
     join(dir, 'test.db'),
     [
       ...SCHEMA_SQL_PATHS.map((p) => readFileSync(p, "utf8")),
+      /*
+       * ★ 种子一个用户。
+       *
+       * 为什么夹具需要它：`page_grants.granted_by` 与 `block_grants.granted_by` 都有
+       * `REFERENCES users(id)`，而两个授予端点都会把 `principal.userId` 写进该列。
+       * 夹具的 `MEMBER.userId = 1` 在库里必须真实存在，否则第一次授予就报
+       * `FOREIGN KEY constraint failed` —— 报错点在 SQL 层，离“夹具缺种子”这个原因很远。
+       * 生产里不会有这个问题（登录主体必然对应真实用户行）。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (1, 'member@example.com', 'Member', '2026-01-01T00:00:00Z');`,
+      /*
+       * ★ P3b：第二个用户 —— 申请访问用例里的「申请人」。
+       * `access_requests.user_id` 有 `REFERENCES users(id)`，`APPLICANT.userId = 2`
+       * 必须真实存在，否则申请插入报 `FOREIGN KEY constraint failed`。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (2, 'applicant@example.com', 'Applicant', '2026-01-01T00:00:00Z');`,
     ].join('\n'),
   )
 
@@ -275,6 +344,7 @@ async function makeHarness(
     path: string,
     params: Record<string, string> = {},
     body?: unknown,
+    principal: Principal = MEMBER,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
     const handler = routes.get(`${method} ${path}`)
     assert.ok(handler, `应已注册路由 ${method} ${path}`)
@@ -285,7 +355,19 @@ async function makeHarness(
     return new Promise((resolve, reject) => {
       const h: RouteHandlerContext = {
         req,
-        res: { once: () => {} } as unknown as ServerResponse,
+        /*
+         * `res` 替身：只实现处理器真正用到的少数成员。
+         *
+         * ★ P3c 补 `headersSent` / `setHeader`：413（快照超限）路径会经
+         * `closeAfterResponse()` 声明 `Connection: close` 并在 `finish` 时销毁请求体 ——
+         * 缺这两个成员时，那条用例会在替身上抛 `h.res.setHeader is not a function`，
+         * 报错点离"替身不完整"这个原因很远（与夹具缺种子同一类问题）。
+         */
+        res: {
+          headersSent: false,
+          setHeader: () => {},
+          once: () => {},
+        } as unknown as ServerResponse,
         url: new URL(`http://localhost${path}`),
         params,
         /*
@@ -293,8 +375,11 @@ async function makeHarness(
          * 手工驱动处理器（只跑处理器、不跑钩子），所以在这里显式给一个已登录成员。
          * 读路径**保持 public**，匿名访客拿到的是 anonymousPrincipal —— 本夹具刻意
          * 不用匿名，因为新建条目一律写成 `visibility='org'`，匿名看不到它。
+         *
+         * ★ P3b：主体可由调用方覆盖（见 `call` 的第 5 参），用于"甲申请、乙批准"这类
+         * 需要一条用例里切换身份的流程。
          */
-        principal: MEMBER,
+        principal,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)
@@ -588,6 +673,24 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
     join(dir, 'test.db'),
     [
       ...SCHEMA_SQL_PATHS.map((p) => readFileSync(p, "utf8")),
+      /*
+       * ★ 种子一个用户。
+       *
+       * 为什么夹具需要它：`page_grants.granted_by` 与 `block_grants.granted_by` 都有
+       * `REFERENCES users(id)`，而两个授予端点都会把 `principal.userId` 写进该列。
+       * 夹具的 `MEMBER.userId = 1` 在库里必须真实存在，否则第一次授予就报
+       * `FOREIGN KEY constraint failed` —— 报错点在 SQL 层，离“夹具缺种子”这个原因很远。
+       * 生产里不会有这个问题（登录主体必然对应真实用户行）。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (1, 'member@example.com', 'Member', '2026-01-01T00:00:00Z');`,
+      /*
+       * ★ P3b：第二个用户 —— 申请访问用例里的「申请人」。
+       * `access_requests.user_id` 有 `REFERENCES users(id)`，`APPLICANT.userId = 2`
+       * 必须真实存在，否则申请插入报 `FOREIGN KEY constraint failed`。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (2, 'applicant@example.com', 'Applicant', '2026-01-01T00:00:00Z');`,
     ].join('\n'),
   )
   try {
@@ -894,6 +997,603 @@ test('backlinks：wiki-service 的两个新方法与端点结果一致', async (
     assert.deepEqual(plain((await svc.backlinks('y', MEMBER))!), [{ slug: 'x', title: '甲' }])
     assert.equal((await svc.links('nope', MEMBER)), undefined)
     assert.equal((await svc.backlinks('nope', MEMBER)), undefined)
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------------------ 块级授予端点（P3b） ------------------------------ */
+
+/**
+ * 这一组钉三件事：**治理视图不泄漏正文**、**授予闭环可用**、**组合式越权口被堵住**。
+ *
+ * 第三条尤其值得单独测：只校验"页可管"与"块存在"而不校验**隶属关系**，会留下
+ * "拿 A 页的 slug 配 B 页的 blockId"的绕过（§9 R10 第 4 条引的正是这种形态）。
+ * 这类洞单看每一处校验都是对的，只有把两个参数**组合**起来才暴露。
+ */
+test('P3b：块级治理视图不返回正文，且 granted 块的 tier 为 null', async () => {
+  const h = await makeHarness()
+  try {
+    const put = await h.call(
+      'PUT',
+      '/api/pages/:slug',
+      { slug: 'bp1' },
+      { title: 'A', content: '公开段\n\n<!--gated:granted-->\n运维备注A\n<!--/gated-->' },
+    )
+    assert.equal(put.status, 200)
+
+    const list = await h.call('GET', '/api/pages/:slug/blocks', { slug: 'bp1' })
+    assert.equal(list.status, 200)
+    const blocks = list.body['blocks'] as Array<Record<string, unknown>>
+    assert.equal(blocks.length, 2)
+    for (const b of blocks) {
+      assert.ok(!('text' in b), '治理视图**不得**返回块正文（否则它是 granted 块的读取旁路）')
+    }
+    const granted = blocks.find((b) => b['visibility'] === 'granted')
+    assert.ok(granted, '应有一个 granted 块')
+    assert.equal(granted['tier'], null, 'granted 档不进等级索引 ⇒ tier 必须是 null')
+    assert.deepEqual(granted['grants'], [], '尚未授予时授权列表为空')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('P3b：块级授予闭环（授予 → 可见 → 撤销），且组合式越权口被封', async () => {
+  const h = await makeHarness()
+  try {
+    for (const slug of ['bp1', 'bp2']) {
+      const put = await h.call(
+        'PUT',
+        '/api/pages/:slug',
+        { slug },
+        { title: slug, content: `公开段\n\n<!--gated:granted-->\n备注-${slug}\n<!--/gated-->` },
+      )
+      assert.equal(put.status, 200)
+    }
+    const listOf = async (slug: string): Promise<Array<Record<string, unknown>>> => {
+      const r = await h.call('GET', '/api/pages/:slug/blocks', { slug })
+      assert.equal(r.status, 200)
+      return r.body['blocks'] as Array<Record<string, unknown>>
+    }
+    const grantedOf = async (slug: string): Promise<Record<string, unknown>> => {
+      const b = (await listOf(slug)).find((x) => x['visibility'] === 'granted')
+      assert.ok(b, `${slug} 应有一个 granted 块`)
+      return b
+    }
+
+    const a = await grantedOf('bp1')
+    const post = await h.call(
+      'POST',
+      '/api/pages/:slug/blocks/:blockId/grants',
+      { slug: 'bp1', blockId: String(a['id']) },
+      { subjectKind: 'user', subjectId: '7', role: 'viewer' },
+    )
+    assert.equal(post.status, 200)
+    assert.ok(Number(post.body['acl_revision']) >= 1, '变更后 acl_revision 必须递增（代际失效）')
+
+    const after = await grantedOf('bp1')
+    const grants = after['grants'] as Array<Record<string, unknown>>
+    assert.equal(grants.length, 1)
+    assert.equal(grants[0]?.['subjectKind'], 'user')
+    assert.equal(grants[0]?.['subjectId'], '7')
+
+    // ★ 组合式越权口：拿 bp1 的 slug（自己有管理权）配 bp2 的 blockId
+    const bBlock = await grantedOf('bp2')
+    const cross = await h.call(
+      'POST',
+      '/api/pages/:slug/blocks/:blockId/grants',
+      { slug: 'bp1', blockId: String(bBlock['id']) },
+      { subjectKind: 'user', subjectId: '9', role: 'viewer' },
+    )
+    assert.equal(cross.status, 404, '不得用 A 页的 slug 操作 B 页的块')
+    assert.deepEqual((await grantedOf('bp2'))['grants'], [], 'B 页的块不应被加上授权')
+
+    // ★ D13：角色不是授权对象
+    const badKind = await h.call(
+      'POST',
+      '/api/pages/:slug/blocks/:blockId/grants',
+      { slug: 'bp1', blockId: String(a['id']) },
+      { subjectKind: 'org_role', subjectId: 'member', role: 'viewer' },
+    )
+    assert.equal(badKind.status, 400)
+    assert.equal(badKind.body['error'], 'invalid_subject_kind')
+
+    // 撤销
+    const del = await h.call('DELETE', '/api/pages/:slug/blocks/:blockId/grants/:grantId', {
+      slug: 'bp1',
+      blockId: String(a['id']),
+      grantId: String(grants[0]?.['id']),
+    })
+    assert.equal(del.status, 200)
+    assert.deepEqual((await grantedOf('bp1'))['grants'], [])
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------ P3b：申请访问（★ 本批） ------------------ */
+
+/** 建一个 `private` 页：`APPLICANT`（普通成员）对它没有访问权，只有 admin 档能管。 */
+async function makePrivatePage(h: Harness, slug: string, content: string): Promise<void> {
+  const put = await h.call('PUT', '/api/pages/:slug', { slug }, { title: slug, content }, OWNER)
+  assert.equal(put.status, 200)
+  const vis = await h.call('PUT', '/api/pages/:slug/visibility', { slug }, { visibility: 'private' }, OWNER)
+  assert.equal(vis.status, 200)
+}
+
+test('P3b：申请访问闭环 —— 甲申请、乙批准，批准后甲**无需重新登录**即可见', async () => {
+  const h = await makeHarness()
+  try {
+    await makePrivatePage(h, 'req1', 'secret-A')
+
+    // 前置状态断言：申请人此刻**读不到**。没有这一条，"批准后能读"可能本来就是绿的（假绿）。
+    const before = await h.call('GET', '/api/pages/:slug', { slug: 'req1' }, undefined, APPLICANT)
+    assert.equal(before.status, 404, '前置状态必须是"读不到"，否则下面的"批准后可见"是假绿')
+
+    // 申请
+    const apply = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests',
+      { slug: 'req1' },
+      { message: '请给我看', role: 'viewer' },
+      APPLICANT,
+    )
+    assert.equal(apply.status, 200)
+    assert.equal(apply.body['status'], 'pending')
+    const reqId = Number(apply.body['id'])
+    assert.ok(reqId >= 1, '申请响应必须带 id（客户端要用它撤回）')
+
+    // 同一人重复申请 ⇒ 409（唯一键 (page_slug,user_id,status)）
+    const dup = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req1' }, {}, APPLICANT)
+    assert.equal(dup.status, 409)
+    assert.equal(dup.body['error'], 'already_requested')
+
+    // 已有权限的人申请 ⇒ 409（否则待审列表会被无意义条目灌满）
+    const ownerApply = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req1' }, {}, OWNER)
+    assert.equal(ownerApply.status, 409)
+    assert.equal(ownerApply.body['error'], 'already_has_access')
+
+    // 匿名不能申请（判据是"已登录的真实用户"）
+    const anon = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests',
+      { slug: 'req1' },
+      {},
+      anonymousPrincipal(),
+    )
+    assert.equal(anon.status, 401)
+
+    // 审批人看到待审列表
+    const list = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req1' }, undefined, OWNER)
+    assert.equal(list.status, 200)
+    const reqs = list.body['requests'] as Array<Record<string, unknown>>
+    assert.equal(reqs.length, 1)
+    assert.equal(Number(reqs[0]?.['userId']), 2, '申请人应是 APPLICANT')
+    assert.equal(reqs[0]?.['message'], '请给我看')
+    assert.equal(reqs[0]?.['status'], 'pending')
+
+    // 批准
+    const approve = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/approve',
+      { slug: 'req1', id: String(reqId) },
+      { role: 'viewer' },
+      OWNER,
+    )
+    assert.equal(approve.status, 200)
+    assert.ok(
+      Number(approve.body['acl_revision']) >= 1,
+      '批准必须递增 acl_revision —— 代际失效（不是 TTL）正是"无需重新登录"的机制',
+    )
+
+    // ★ 核心验收：申请人**无需重新登录**即可见（同一条会话、同一个 principal 值）
+    const after = await h.call('GET', '/api/pages/:slug', { slug: 'req1' }, undefined, APPLICANT)
+    assert.equal(after.status, 200, '批准后申请人无需重新登录即可见')
+    assert.equal(after.body['content'], 'secret-A')
+
+    // 待审列表清空（该条已不是 pending）
+    const list2 = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req1' }, undefined, OWNER)
+    assert.deepEqual(list2.body['requests'], [])
+
+    // 重复裁决 ⇒ 409（不是静默成功）
+    const again = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/approve',
+      { slug: 'req1', id: String(reqId) },
+      {},
+      OWNER,
+    )
+    assert.equal(again.status, 409)
+    assert.equal(again.body['error'], 'request_not_pending')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('P3b：拒绝 → 仍不可见且**可再次申请**；撤回仅限本人；跨页裁决 404', async () => {
+  const h = await makeHarness()
+  try {
+    await makePrivatePage(h, 'req2', 'secret-B')
+    await makePrivatePage(h, 'req3', 'secret-C')
+
+    // 甲在 req2 上申请并被拒
+    const a1 = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req2' }, {}, APPLICANT)
+    assert.equal(a1.status, 200)
+    const id1 = Number(a1.body['id'])
+    const deny = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/deny',
+      { slug: 'req2', id: String(id1) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(deny.status, 200)
+
+    // 拒绝**不动**授权 ⇒ 仍然读不到
+    const stillBlocked = await h.call('GET', '/api/pages/:slug', { slug: 'req2' }, undefined, APPLICANT)
+    assert.equal(stillBlocked.status, 404, '拒绝不应让申请人获得任何访问权')
+
+    /*
+     * ★ 唯一键含 `status` 的意义：被拒之后**可以再次申请**（情形会变）。
+     * 若唯一键只有 (page_slug,user_id)，这里会撞唯一约束而永远申请不了。
+     */
+    const again = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req2' }, {}, APPLICANT)
+    assert.equal(again.status, 200, '被拒之后必须能再次申请')
+    const id2 = Number(again.body['id'])
+    assert.notEqual(id2, id1, '应是一条新请求，而不是复用旧行')
+
+    // 撤回只能撤自己的：OWNER 撤 APPLICANT 的 ⇒ 404（不泄露"这里有一条别人的申请"）
+    const foreign = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/withdraw',
+      { slug: 'req2', id: String(id2) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(foreign.status, 404)
+    // 本人撤回 ⇒ 200
+    const own = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/withdraw',
+      { slug: 'req2', id: String(id2) },
+      undefined,
+      APPLICANT,
+    )
+    assert.equal(own.status, 200)
+    // 撤回后待审列表为空
+    const list = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req2' }, undefined, OWNER)
+    assert.deepEqual(list.body['requests'], [])
+
+    // ★ 组合式越权：拿 req2 的申请 id 去 req3 上批 —— 必须 404
+    const a3 = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req3' }, {}, APPLICANT)
+    assert.equal(a3.status, 200)
+    const id3 = Number(a3.body['id'])
+    const cross = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/approve',
+      { slug: 'req2', id: String(id3) },
+      {},
+      OWNER,
+    )
+    assert.equal(cross.status, 404, '不得用 A 页的申请 id 去批 B 页的申请')
+    // 且 req3 的申请**仍是 pending**（越权尝试不得产生副作用）
+    const list3 = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req3' }, undefined, OWNER)
+    assert.equal((list3.body['requests'] as unknown[]).length, 1)
+
+    // 非 admin 档对 private 页没有 canManageVisibility ⇒ 连列表都看不到（404，不是 403）
+    const memberList = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req3' }, undefined, MEMBER)
+    assert.equal(memberList.status, 404)
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------ P3c：块级版本与恢复（★ 本批） ------------------ */
+
+test('P3c：改权限**必须**产生新版本；恢复四位一体（正文 + 块级权限 + visibility + published_at + inherit）', async () => {
+  const h = await makeHarness()
+  try {
+    const content = '公开A\n\n<!--gated:org-->\n机密B\n<!--/gated-->'
+    const put = await h.call('PUT', '/api/pages/:slug', { slug: 'vc1' }, { title: 'V1', content }, OWNER)
+    assert.equal(put.status, 200)
+
+    const versionsOf = async (): Promise<Array<{ id: number }>> => {
+      const r = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, OWNER)
+      assert.equal(r.status, 200)
+      return r.body['versions'] as Array<{ id: number }>
+    }
+    const blocksOf = async (): Promise<Array<Record<string, unknown>>> => {
+      const r = await h.call('GET', '/api/pages/:slug/blocks', { slug: 'vc1' }, undefined, OWNER)
+      assert.equal(r.status, 200)
+      return r.body['blocks'] as Array<Record<string, unknown>>
+    }
+    /*
+     * 页面档位**没有 GET 端点**（只有 `PUT /visibility`）⇒ 用可观测行为断言档位：
+     * `org` 档普通成员读得到、`private` 档读不到。这比读一个字段更接近"用户实际看到什么"。
+     */
+    const applicantCanRead = async (): Promise<boolean> => {
+      const r = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, APPLICANT)
+      return r.status === 200
+    }
+
+    const before = { versions: (await versionsOf()).length, blocks: await blocksOf() }
+    assert.equal(await applicantCanRead(), true, '新建条目应用层默认是 org ⇒ 普通成员可读')
+    assert.equal(before.blocks.length, 2)
+    assert.equal(before.blocks[1]?.['visibility'], 'org', '受限块是 org 档')
+
+    /*
+     * ★ 只改 `visibility`、**完全不碰正文** ⇒ 必须仍产生一条新版本。
+     * 否则版本里的权限快照会与实际权限脱节，「恢复此版本」就会恢复出**错误的（可能是放宽的）权限** ——
+     * 这正是 0017 迁移里那条规则的由来。
+     */
+    const vis = await h.call(
+      'PUT',
+      '/api/pages/:slug/visibility',
+      { slug: 'vc1' },
+      { visibility: 'private' },
+      OWNER,
+    )
+    assert.equal(vis.status, 200)
+    const afterChange = await versionsOf()
+    assert.equal(
+      afterChange.length,
+      before.versions + 1,
+      '改权限**必须**产生新版本（content 不变、只有 acl_json/blocks_json 变）',
+    )
+
+    // 此刻是 private ⇒ 普通成员读不到（前置状态，防下面的"恢复后能读"假绿）
+    const blockedNow = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, APPLICANT)
+    assert.equal(blockedNow.status, 404)
+
+    /*
+     * 最新那条版本 = **改档位之前**的状态（约定："先快照旧的，再改"）⇒ 恢复它应当回到 org。
+     */
+    const restoreTarget = afterChange[0]?.id
+    assert.ok(restoreTarget, '应能取到版本 id')
+    const restore = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc1', id: String(restoreTarget) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(restore.status, 200)
+    assert.deepEqual(restore.body['warnings'], [], '新版本恢复不应有 warnings')
+
+    // ★ 四位一体之一：页面 visibility 回来了（用"普通成员又能读"作为可观测证据）
+    assert.equal(await applicantCanRead(), true, '恢复必须包含页面 visibility（回到 org ⇒ 成员可读）')
+    // ★ 之一：块级权限回来了（含 ordinal 与 visibility）
+    const restoredBlocks = await blocksOf()
+    assert.equal(restoredBlocks.length, 2)
+    assert.equal(restoredBlocks[1]?.['visibility'], 'org', '恢复必须包含块级可见性')
+    assert.equal(Number(restoredBlocks[1]?.['ordinal']), 1)
+    // ★ 之一：正文回来了
+    const detail = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, APPLICANT)
+    assert.equal(detail.status, 200, '恢复回 org 后，普通成员应当又能读到')
+    /*
+     * 注意期望值是**去掉 gated 标记**后的形态：标记是**语法**（区段分隔符），不是内容 ——
+     * `ParsedBlock.text` 的注释即此意，读路径返回的是块投影而非 `pages.content` 原文。
+     * 所以这里断言"标记被剥掉、正文在"，而不是断言与 `pages.content` 逐字相等。
+     */
+    assert.equal(detail.body['content'], '公开A\n\n机密B', '恢复必须包含正文（gated 标记按语法剥掉）')
+
+    // ★ 恢复**本身**也记一条版本 ⇒ 可逆
+    assert.equal((await versionsOf()).length, afterChange.length + 1, '恢复本身应产生一条版本（使其可逆）')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('P3c：老版本只恢复正文并带 warnings；含 granted 块的版本对 member 403；超大快照 413；非 canEdit 读历史 404', async () => {
+  const h = await makeHarness()
+  try {
+    const content = '公开A\n\n<!--gated:org-->\n机密B\n<!--/gated-->'
+    await h.call('PUT', '/api/pages/:slug', { slug: 'vc2' }, { title: 'V2', content }, OWNER)
+    const pageId = Number(
+      (h.adapter.query('SELECT id FROM pages WHERE slug = ?', ['vc2']) as Array<{ id: number }>)[0]?.id,
+    )
+    assert.ok(pageId >= 1)
+
+    /* ---- ① 老版本（blocks_json IS NULL）：只恢复正文 + warnings ---- */
+    const legacy = h.adapter.run(
+      'INSERT INTO page_versions (page_id, content, saved_at) VALUES (?, ?, ?)',
+      [pageId, '这是块级功能之前的正文', '2026-01-01T00:00:00Z'],
+    )
+    const legacyId = Number(legacy.lastInsertRowid)
+    assert.ok(legacyId >= 1)
+    const r1 = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc2', id: String(legacyId) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(r1.status, 200)
+    assert.deepEqual(
+      r1.body['warnings'],
+      ['block_acls_not_restored'],
+      '老版本恢复必须**显式告知**块级权限未恢复，绝不猜测当时的权限',
+    )
+    const afterLegacy = await h.call('GET', '/api/pages/:slug', { slug: 'vc2' }, undefined, OWNER)
+    assert.equal(afterLegacy.body['content'], '这是块级功能之前的正文')
+
+    /* ---- ② 非 canEdit 读历史 ⇒ 404（历史含 ACL 结构，投影它等于泄漏） ---- */
+    /*
+     * 用**匿名**而不是 `APPLICANT`：`APPLICANT` 是组织成员，对 `org` 档页面**本来就有
+     * `canEdit`** ⇒ 他读历史返回 200 是正确的（历史对**编辑者**开放）。要验的是
+     * "没有编辑权的人"这条闸门，所以取一个明确无编辑权的主体。
+     */
+    const anonRead = await h.call(
+      'GET',
+      '/api/pages/:slug/versions/:id',
+      { slug: 'vc2', id: String(legacyId) },
+      undefined,
+      anonymousPrincipal(),
+    )
+    assert.equal(anonRead.status, 404, '非 canEdit 一律 404（不能靠 403/404 之差探测历史）')
+
+    /* ---- ③ 含 granted 块的版本：member（rank 1）不得恢复 ⇒ 403 + blockedOrdinals ---- */
+    await h.call(
+      'PUT',
+      '/api/pages/:slug',
+      { slug: 'vc3' },
+      { title: 'V3', content: '公开\n\n<!--gated:granted-->\n仅授权可见\n<!--/gated-->' },
+      OWNER,
+    )
+    // 触发一次权限变更以留下含 granted 块的版本
+    await h.call('PUT', '/api/pages/:slug/visibility', { slug: 'vc3' }, { visibility: 'org' }, OWNER)
+    const v3versions = await h.call('GET', '/api/pages/:slug', { slug: 'vc3' }, undefined, OWNER)
+    const v3id = (v3versions.body['versions'] as Array<{ id: number }>)[0]?.id
+    assert.ok(v3id, 'vc3 应有版本')
+    const asMember = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc3', id: String(v3id) },
+      undefined,
+      MEMBER,
+    )
+    assert.equal(asMember.status, 403, '含 granted 块的版本：普通 member 不得恢复')
+    const blocked = (asMember.body['details'] as Record<string, unknown>)['blockedOrdinals'] as number[]
+    assert.deepEqual(blocked, [1], '应列出违规块的 ordinal')
+    // owner 可以（admin 档 rank 2）
+    const asOwner = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc3', id: String(v3id) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(asOwner.status, 200, 'owner 属 admin 档，应能恢复含 granted 块的版本')
+
+    /* ---- ④ 超大快照 ⇒ 413（不是截断） ---- */
+    const huge = JSON.stringify([{ o: 0, k: 'paragraph', t: 'x'.repeat(1_100_000), v: 'public', i: 1, m: null }])
+    const bigRow = h.adapter.run(
+      'INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)',
+      [pageId, 'x', '2026-01-01T00:00:00Z', huge, '{"visibility":"org","inherit":1,"published_at":null,"page_grants":[],"block_grants":[]}'],
+    )
+    const bigId = Number(bigRow.lastInsertRowid)
+    const r4 = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc2', id: String(bigId) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(r4.status, 413, '快照超限必须显式 413，绝不能截断后恢复出残缺正文')
+    assert.equal(r4.body['error'], 'snapshot_too_large')
+  } finally {
+    h.dispose()
+  }
+})
+
+/*
+ * ------------------ P3c 恢复路径的 tier 扇出（★ 独立审查查出的 Critical） ------------------
+ *
+ * 恢复会写 `pages` 的**档位列**（`visibility` / `inherit` / `published_at`），因而会改掉本页的
+ * **有效档位**；而子孙的 `blocks.tier` 是**物化派生列**（`pageLevelOf` 只决定本页）。
+ * 漏掉扇出的后果是**内容泄漏级**：把祖先从 public **恢复成 private** 后，子页的读路径已 404，
+ * 但它的 `tier` 仍是旧值 `0` ⇒ **匿名 `/api/search` 仍命中并吐出正文片段**；
+ * 反方向（放宽）则退化为"搜不到但读得到"。
+ *
+ * **为什么既有用例抓不到**：它们只断言被恢复的那一页本身，没有子页。
+ * 这里断言**子页的 `blocks.tier`** —— 它是检索判定的直接输入，也是根因所在。
+ */
+test('P3c：恢复祖先的档位必须重算子孙的 blocks.tier（否则读路径已 404 而检索仍吐正文）', async () => {
+  const h = await makeHarness()
+  try {
+    const tierOf = (slug: string): unknown => {
+      const rows = h.adapter.query<{ tier: unknown }>(
+        'SELECT b.tier AS tier FROM blocks b JOIN pages p ON p.id = b.page_id WHERE p.slug = ? ORDER BY b.ordinal',
+        [slug],
+      )
+      assert.ok(rows.length > 0, `${slug} 应有块行`)
+      return rows[0]?.['tier']
+    }
+    const setVis = async (slug: string, body: Record<string, unknown>): Promise<void> => {
+      const r = await h.call('PUT', '/api/pages/:slug/visibility', { slug }, body, OWNER)
+      assert.equal(r.status, 200, `${slug} 设可见性 ${JSON.stringify(body)} 应成功`)
+    }
+
+    /* ---- ① 造出「祖先曾是 private」的那个版本快照 ---- */
+    // 建页 ⇒ 应用层默认 org
+    assert.equal(
+      (await h.call('PUT', '/api/pages/:slug', { slug: 'anc' }, { title: 'A', content: '祖先正文' }, OWNER)).status,
+      200,
+    )
+    // org → private（这一步快照的是 org）
+    await setVis('anc', { visibility: 'private' })
+    /*
+     * private → public + 已发布：**这一步快照的是 private 状态**（约定"先快照旧的，再改"）。
+     * 下面要恢复的就是它 ⇒ 恢复后祖先应当回到 private。
+     */
+    await setVis('anc', { visibility: 'public', published: true })
+
+    const privateVersionId = h.adapter.query<{ id: number }>(
+      `SELECT v.id AS id FROM page_versions v JOIN pages p ON p.id = v.page_id
+        WHERE p.slug = ? AND v.acl_json LIKE '%"visibility":"private"%' ORDER BY v.id`,
+      ['anc'],
+    )[0]?.id
+    assert.ok(privateVersionId, '应存在一条 visibility=private 的版本快照（前置）')
+
+    /* ---- ② 子页 public + 已发布 ⇒ 有效档位 public ⇒ tier 0（匿名可搜） ---- */
+    assert.equal(
+      (
+        await h.call(
+          'PUT',
+          '/api/pages/:slug',
+          { slug: 'anc/child' },
+          { title: 'C', content: '子页公开正文 CHILDMARK' },
+          OWNER,
+        )
+      ).status,
+      200,
+    )
+    await setVis('anc/child', { visibility: 'public', published: true })
+    assert.equal(
+      tierOf('anc/child'),
+      0,
+      '前置：祖先与子页都是 public + 已发布 ⇒ 子页 tier 应为 0（匿名可搜）—— 先证明前置，否则"变 null"可能是假绿',
+    )
+
+    /* ---- ③ 把祖先恢复到 private ⇒ 子页的读路径与检索**必须同时**被遮蔽 ---- */
+    const restore = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'anc', id: String(privateVersionId) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(
+      restore.status,
+      200,
+      `恢复应成功；实际响应: ${JSON.stringify(restore.body)}（node 的 assert 对 null/undefined 打印为空，故显式带上响应体）`,
+    )
+    // 数组必须用 deepEqual：`assert.equal` 比的是引用，`[] == []` 恒为假
+    assert.deepEqual(restore.body['warnings'], [], '新版本恢复不应有 warnings')
+
+    // 读路径：祖先变 private ⇒ 子页对匿名 404
+    const anonRead = await h.call(
+      'GET',
+      '/api/pages/:slug',
+      { slug: 'anc/child' },
+      undefined,
+      anonymousPrincipal(),
+    )
+    assert.equal(anonRead.status, 404, '祖先恢复成 private 后，子页读路径应对匿名 404')
+
+    // ★ 检索判定的直接输入：子孙的 tier 必须跟着变成 null
+    assert.equal(
+      tierOf('anc/child'),
+      null,
+      '★ 恢复必须重算子孙 tier：否则读路径 404 而匿名检索仍按旧档位命中并吐正文（内容泄漏级）',
+    )
+
+    /* ---- ④ 扇出的可观测性：必须回传"确实重算了子孙"而不是沉默 ---- */
+    assert.equal(restore.body['index_tiers_resync_failed'], false, '扇出不应失败')
+    assert.ok(
+      Number(restore.body['index_tiers_resynced']) >= 1,
+      '应至少重算 1 个子孙（0 与"扇出失败"是两件处置不同的事，故两者都要断言）',
+    )
   } finally {
     h.dispose()
   }

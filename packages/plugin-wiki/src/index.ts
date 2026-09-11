@@ -33,11 +33,15 @@ import {
 import { extractLinkTargets } from './links.js'
 import {
   BlockParseError,
+  BlockSyncError,
   parseBlocks,
   projectBlocks,
+  readExistingBlocks,
   sha256Hex,
   syncBlocksForPage,
   tierFor,
+  type BlockKind,
+  type BlockReader,
   type BlockTier,
   type BlockVisibility,
   type ParsedBlock,
@@ -69,6 +73,17 @@ interface PolicyServiceLike {
     slug: string,
     self?: { visibility: string; inherit: number | boolean; published_at: string | null },
   ): Promise<0 | 1 | null>
+  /**
+   * ★ P3b：该主体被**显式授予**的块 id 集合（`block_grants`）。
+   *
+   * **可选**：P3b 之前的策略实现没有这个方法。缺它时**按空集处理**（失败关闭：
+   * 被授予的 `granted` 块对该主体不可见，而不是"猜一个更宽的可见性"）。
+   * 后者才是危险的 —— `granted` 档存在的意义就是"默认谁都不能看"。
+   *
+   * 约定（与 `authz` 接口注释一致）：**只返回 id，绝不返回文本**；且必须已按
+   * `expires_at` 过滤掉过期授予。匿名主体应返回空集。
+   */
+  grantedBlockIds?(principal: Principal): Promise<readonly number[]>
 }
 
 interface PageAccessLike {
@@ -311,23 +326,40 @@ export const manifest: GeeWikiManifest = {
  */
 async function projectPageContent(
   db: { query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> },
-  args: { pageId: number; content: string; principal: Principal },
+  args: { pageId: number; content: string; principal: Principal; grantedBlockIds?: readonly number[] },
 ): Promise<{ text: string; gatedCount: number }> {
-  const rows = await db.query<{ ordinal: number; text: string; visibility: string }>(
-    'SELECT ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
+  /*
+   * ★ P3b：**必须把 `id` 一起取出来**。授权分支是拿块 id 去查的
+   * （`block_grants.block_id`），少了这一列，被授予的 `granted` 块会**对授权者也
+   * 不可见** —— 症状是"授权明明写进去了却看不到"，而且不报任何错。
+   */
+  const rows = await db.query<{ id: number; ordinal: number; text: string; visibility: string }>(
+    'SELECT id, ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
     [args.pageId],
   )
   const blocks =
     rows.length > 0
       ? rows.map((r) => ({
+          // 块 id 必须原样带过去 —— 它是授权分支唯一的键
+          id: Number(r.id),
           ordinal: r.ordinal,
           text: r.text,
           visibility: r.visibility as BlockVisibility,
         }))
-      : parseBlocks(args.content)
+      : /*
+         * 现场解析的降级路径：**没有块 id** ⇒ 授权分支必然落空
+         * （见 `ProjectableBlock.id` 的说明 —— 拿会漂移的 ordinal 去查权限表是错的）。
+         * 也就是说，**P3a 之前保存、且尚未被回填的历史页面里，`granted` 块对被授权者
+         * 也不可见**，直到该页被重新保存为止。方向是失败关闭。
+         */
+        parseBlocks(args.content)
   const anonymous = args.principal.kind === 'anonymous'
   const tier: ReaderTier = anonymous ? 0 : 1
-  return projectBlocks(blocks, { tier, anonymous })
+  return projectBlocks(blocks, {
+    tier,
+    anonymous,
+    grantedBlockIds: args.grantedBlockIds ?? [],
+  })
 }
 
 interface PageRow {
@@ -580,6 +612,24 @@ export const WikiPlugin = {
     }
 
     /**
+     * ★ P3b：该主体被显式授予的**块 id 集合**（读路径与检索共用的唯一入口）。
+     *
+     * **失败关闭，方向与 `pageLevelOf` 一致**：策略层没实现该方法、或它抛错 ⇒ **空集**。
+     * 空集的后果是"被授予的 `granted` 块对该主体也不可见"（**少给**），
+     * 而绝不是"所有块都可见"（**多给**）。前者是可用性问题，后者是泄漏 ——
+     * 两害相权，只能取前者。
+     */
+    const grantedBlockIdsOf = async (p: Principal): Promise<readonly number[]> => {
+      try {
+        const svc = policy()
+        if (typeof svc.grantedBlockIds !== 'function') return []
+        return await svc.grantedBlockIds(p)
+      } catch {
+        return []
+      }
+    }
+
+    /**
      * 页面的**有效检索等级** —— `blocks.tier` 的输入（§4.3）。
      *
      * **失败关闭**：策略层不可用、没实现该方法、或它抛错 ⇒ 一律 `null`。
@@ -656,6 +706,12 @@ export const WikiPlugin = {
         pageId: page.id,
         content: page.content,
         principal,
+        /*
+         * ★ P3b：授权集合与**投影**必须来自同一次策略调用 —— 否则会出现"判定用了
+         * 这份授权、渲染用了另一份"的窗口（缓存与并发下尤其明显，而且这种不一致
+         * 恰好会以"某次请求多显示一段"的形式出现，最难复现）。
+         */
+        grantedBlockIds: await grantedBlockIdsOf(principal),
       })
       const versions = await adb.query<{ id: number; saved_at: string }>(
         `SELECT id, saved_at FROM page_versions WHERE page_id = ? ORDER BY id DESC LIMIT ?`,
@@ -874,6 +930,12 @@ export const WikiPlugin = {
                   content: r.content,
                   pageLevel,
                   now,
+                  /*
+                   * 回填的选中条件就是"这一页**还没有任何块行**"（`NOT EXISTS (SELECT 1
+                   * FROM blocks …)`），故已有块必然是空的 —— 传 `[]` 是**由判据保证**的，
+                   * 不是"图省事省略"。
+                   */
+                  existing: [],
                   syncIndex: blocksIndexSupported,
                 })
                 // `content_hash` 由调用方一并维护（syncBlocksForPage 只管块与索引）——
@@ -958,6 +1020,12 @@ export const WikiPlugin = {
             content: input.content,
             pageLevel: level,
             now,
+            /*
+             * 新建分支：这一行刚插进去，库里不可能有它的块。
+             * 传 `[]` 而不是省略 —— `existing` 是**必填**参数，正是为了让"没考虑
+             * 已有块"这件事在编译期就暴露，而不是运行期静默走删光重建（丢授权）。
+             */
+            existing: [],
             syncIndex: blocksIndexSupported,
           })
           await rebuildLinks(tx, slug, input.content)
@@ -965,12 +1033,19 @@ export const WikiPlugin = {
         }
         // 幂等保存：标题与正文均未变化 → 不更新 updated_at、不写历史
         if (existing.title === input.title && existing.content === input.content) return 'unchanged'
-        // 快照旧正文到版本历史，再更新页面
-        await tx.run('INSERT INTO page_versions (page_id, content, saved_at) VALUES (?, ?, ?)', [
-          existing.id,
-          existing.content,
-          now,
-        ])
+        /*
+         * 快照旧正文到版本历史，再更新页面。
+         *
+         * ★ P3c：**连同权限一起快照**（块集合 + 页面级 ACL + 授予）。理由：本次保存
+         * 也可能改变**块级可见性**（正文里的 `<!--gated:…-->` 标记一改，块的 visibility
+         * 就变），所以只存正文的话，「恢复此版本」会把当时的正文配上现在的权限 ——
+         * 可能放宽。快照取的是**此刻**（更新之前）的块，正是"变更前状态"。
+         */
+        const snap = await versionSnapshotOf(tx, existing.id)
+        await tx.run(
+          `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)`,
+          [existing.id, existing.content, now, snap.blocksJson, snap.aclJson],
+        )
         await tx.run('UPDATE pages SET title = ?, content = ?, updated_at = ?, content_hash = ? WHERE id = ?', [
           input.title,
           input.content,
@@ -987,6 +1062,12 @@ export const WikiPlugin = {
           content: input.content,
           pageLevel: await pageLevelOf(slug),
           now,
+          /*
+           * ★ P3b：**必须读已有块**（含每块的授权计数），否则保守重解析无从谈起，
+           * 只能退化成"删光重建"⇒ `block_grants` 被外键 CASCADE 静默清空。
+           * 走 `tx` 而不是 `adb`：同一事务、同一连接，读到的就是这次保存将要改的那一份。
+           */
+          existing: await readExistingBlocks(tx as unknown as BlockReader, existing.id),
           syncIndex: blocksIndexSupported,
         })
         // 出链随正文重建（同一事务内，故正文与索引不会不一致）
@@ -1155,17 +1236,27 @@ export const WikiPlugin = {
       }),
     )
 
-    /* ---------- GET /api/pages/:slug/versions/:id：读取历史版本正文 ---------- */
+    /* ---------- GET /api/pages/:slug/versions/:id：读取历史版本快照 ---------- */
+    /*
+     * ★ P3c：**非 `canEdit` 一律 404**（不是 403、不是裁剪）。
+     *
+     * 为什么不是"投影历史"：历史行里含 `blocks_json` / `acl_json` —— 那是**权限结构本身**
+     * （哪些块被单独收紧过、谁被授予过）。把它按当前主体裁剪等于把 ACL 结构暴露给
+     * 本来读不到它的人；而"哪一段被刻意收紧过"本身就是敏感信息。
+     * 所以历史**只对能编辑该页的人开放**，其他人一律 404（与"不存在"同形，不泄露存在性）。
+     */
     cleanups.push(
       router.register('GET', '/api/pages/:slug/versions/:id', async (h) => {
-        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [h.params.slug]))[0]
-        if (!page) {
-          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${h.params.slug}` })
+        const slug = h.params.slug ?? ''
+        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        const access = page ? await policy().resolvePage(requirePrincipal(h), slug) : null
+        if (!page || !access || !access.canEdit) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
         const version = (
-          await adb.query<{ id: number; content: string; saved_at: string }>(
-            'SELECT id, content, saved_at FROM page_versions WHERE id = ? AND page_id = ?',
+          await adb.query<{ id: number; content: string; saved_at: string; blocks_json: string | null; acl_json: string | null }>(
+            'SELECT id, content, saved_at, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
             [Number(h.params.id), page.id],
           )
         )[0]
@@ -1173,8 +1264,292 @@ export const WikiPlugin = {
           h.json(404, { ok: false, error: 'not_found', message: `版本不存在: ${h.params.id}` })
           return
         }
-        h.json(200, { id: version.id, content: version.content, saved_at: version.saved_at })
+        h.json(200, {
+          id: version.id,
+          content: version.content,
+          saved_at: version.saved_at,
+          // 老版本这两列为 NULL ⇒ 调用方据此提示"该版本早于块级权限功能"
+          blocks: version.blocks_json === null ? null : (JSON.parse(version.blocks_json) as unknown),
+          acl: version.acl_json === null ? null : (JSON.parse(version.acl_json) as unknown),
+        })
       }),
+    )
+
+    /* ---------- POST /api/pages/:slug/versions/:id/restore：恢复某个版本（★ P3c） ---------- */
+    /*
+     * ★ **恢复是四位一体**：正文 + 块级权限 + 页面 `visibility` + `published_at` + `inherit`。
+     * 只恢复正文会把"当时的正文"配上"现在的权限" —— 可能把本该受限的内容**放开**
+     * （这正是 `0017_version_blocks.sql` 那条规则的由来）。
+     *
+     * ★ 恢复**本身也产生一条版本**（记变更前的状态）⇒ 恢复是可逆的：再恢复一次就能退回来。
+     *
+     * ★ 块的重建**走唯一写入路径** `syncBlocksForPage`，但经它的 `parse` 注入点喂入
+     * **快照里的块**而不是重新解析正文。这样同时满足两件事：
+     *   - R12（不得绕过写入路径，否则 `blocks_fts` 与 `blocks` 漂移）；
+     *   - 忠实恢复"当时那组块"（解析器若在这期间升过级，重新解析会得到不同的块）。
+     * 反过来，"删光重建"是**不可接受**的：`block_grants.block_id` 是 `ON DELETE CASCADE`，
+     * 删光会让块 id 全变、**授权被静默清空**（见 `blocks.ts` 的说明）。
+     */
+    const MAX_SNAPSHOT_BYTES = 1_000_000
+
+    /** 块级可见性对应的"读者等级"：`granted` 不属于任何等级，只有 admin 覆盖能触及它。 */
+    const requiredRankOfBlock = (v: string): number => (v === 'granted' ? 2 : v === 'org' ? 1 : 0)
+
+    /** 主体的读者等级。owner/admin 记 2（与 D14 的应急可见一致），member/viewer 记 1，其余 0。 */
+    const readerRankOf = (p: Principal): number => {
+      if (p.kind === 'break-glass') return 2
+      if (p.orgRole === 'owner' || p.orgRole === 'admin') return 2
+      return p.orgRole !== null ? 1 : 0
+    }
+
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/versions/:id/restore', async (h) => {
+        const slug = h.params.slug ?? ''
+        // 恢复会改写**权限** ⇒ 用 requireManage（canManageVisibility），不是普通 canEdit
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const versionId = Number(h.params.id)
+        if (!Number.isInteger(versionId) || versionId < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const row = (
+          await adb.query<{ id: number; content: string; blocks_json: string | null; acl_json: string | null }>(
+            'SELECT id, content, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
+            [versionId, page.id],
+          )
+        )[0]
+        if (!row) {
+          h.json(404, { ok: false, error: 'not_found', message: `版本不存在: ${h.params.id}` })
+          return
+        }
+        /*
+         * 快照体积上限：`blocks_json` 是整页块的文本，理论上可以很大。
+         * 超限**显式 413**而不是截断 —— 截断等于恢复出一份残缺的正文。
+         */
+        if (row.blocks_json !== null && Buffer.byteLength(row.blocks_json, 'utf8') > MAX_SNAPSHOT_BYTES) {
+          closeAfterResponse(h)
+          h.json(413, {
+            ok: false,
+            error: 'snapshot_too_large',
+            message: `该版本的块快照过大（上限 ${MAX_SNAPSHOT_BYTES} 字节）`,
+          })
+          return
+        }
+
+        const now = new Date().toISOString()
+        const actorId = guard.principal.userId
+
+        /*
+         * 老版本（`blocks_json IS NULL`，早于块级权限功能）：**只恢复正文**，绝不猜测当时的权限。
+         * 猜错的后果正是"把本该受限的内容放开" —— 宁可少恢复，不可猜。
+         */
+        if (row.blocks_json === null || row.acl_json === null) {
+          const revision = await adb.transaction(async (tx) => {
+            await snapshotAclVersion(tx, slug) // 恢复前记一条 ⇒ 本次恢复可逆
+            await tx.run('UPDATE pages SET content = ?, content_hash = ?, updated_at = ? WHERE id = ?', [
+              row.content,
+              sha256Hex(row.content),
+              now,
+              page.id,
+            ])
+            await syncBlocksForPage(tx, {
+              pageId: Number(page.id),
+              content: row.content,
+              pageLevel: await pageLevelOf(slug),
+              now,
+              existing: await readExistingBlocks(tx, Number(page.id)),
+              // ★ rebase 收尾：P3a 把 `syncIndex` 改成必填后，P3c 新增的恢复路径也必须显式传
+              //   （否则 PG 上会去写不存在的 `blocks_fts` ⇒ 整个恢复事务失败）
+              syncIndex: blocksIndexSupported,
+              // ★ 恢复是"显式回到那个状态"，可能改变块结构 ⇒ 放行编辑路径那三道守卫
+              restructure: true,
+            })
+            return bumpAclRevision(tx, slug)
+          })
+          void writeAuditLog(adb, {
+            action: 'acl.change',
+            targetKind: 'page',
+            targetId: slug,
+            actorId,
+            after: { restored_version: versionId, block_acls_restored: false },
+          }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+          h.json(200, {
+            ok: true,
+            slug,
+            restored: versionId,
+            acl_revision: revision,
+            warnings: ['block_acls_not_restored'],
+          })
+          return
+        }
+
+        let snapshotBlocks: Array<{ o: number; k: string; t: string; v: string; i: number; m: string | null }>
+        let acl: {
+          visibility: string
+          inherit: number
+          published_at: string | null
+          page_grants: Array<{ k: string; s: string; r: string; e: string | null }>
+          block_grants: Array<{ o: number; k: string; s: string; r: string; e: string | null }>
+        }
+        try {
+          snapshotBlocks = JSON.parse(row.blocks_json) as typeof snapshotBlocks
+          acl = JSON.parse(row.acl_json) as typeof acl
+        } catch {
+          h.json(500, { ok: false, error: 'corrupt_snapshot', message: '该版本的快照无法解析' })
+          return
+        }
+        if (
+          !Array.isArray(snapshotBlocks) ||
+          !Array.isArray(acl.page_grants) ||
+          !Array.isArray(acl.block_grants)
+        ) {
+          h.json(500, { ok: false, error: 'corrupt_snapshot', message: '该版本的快照结构不完整' })
+          return
+        }
+
+        /*
+         * ★ 逐块可见性校验（§8.2 P3c）：恢复者必须"看得见"该版本里的**每一个块**。
+         * 否则一个只能看到 `org` 档的编辑者就能把含 `granted` 块的旧版本恢复回来 ——
+         * 版本恢复于是成了绕过"granted 默认谁都不能看"的写入通道。
+         * 回报 `details.blockedOrdinals` 便于调用方定位是哪几段。
+         */
+        const readerRank = readerRankOf(guard.principal)
+        const blockedOrdinals = snapshotBlocks
+          .filter((b) => requiredRankOfBlock(String(b.v)) > readerRank)
+          .map((b) => Number(b.o))
+        if (blockedOrdinals.length > 0) {
+          h.json(403, {
+            ok: false,
+            error: 'forbidden',
+            message: '该版本含有你无权触及的内容块，无法恢复',
+            details: { reason: 'blocked_blocks', blockedOrdinals },
+          })
+          return
+        }
+
+        const revision = await adb.transaction(async (tx) => {
+          // ① 恢复前先记一条版本 ⇒ 恢复可逆
+          await snapshotAclVersion(tx, slug)
+          // ② 页面级 ACL + 正文
+          await tx.run(
+            `UPDATE pages SET content = ?, content_hash = ?, updated_at = ?, visibility = ?, inherit = ?, published_at = ?
+              WHERE id = ?`,
+            [
+              row.content,
+              sha256Hex(row.content),
+              now,
+              acl.visibility,
+              acl.inherit === 1 ? 1 : 0,
+              acl.published_at,
+              page.id,
+            ],
+          )
+          // ③ 块集合：注入快照块（走唯一写入路径；块身份由保守重解析维持 ⇒ 授权不会因 id 全变而丢失）
+          const parsed: ParsedBlock[] = snapshotBlocks.map((b) => ({
+            ordinal: Number(b.o),
+            kind: String(b.k) as BlockKind,
+            text: String(b.t),
+            visibility: String(b.v) as BlockVisibility,
+            inherit: Number(b.i) === 1,
+            marker: b.m ?? null,
+            contentHash: sha256Hex(String(b.t)),
+          }))
+          await syncBlocksForPage(tx, {
+            pageId: Number(page.id),
+            content: row.content,
+            /*
+             * ★ `self` 传**恢复后**的档位：策略层读的是它自己的连接，看不到本事务里
+             * 尚未提交的 `UPDATE pages` —— 不传 `self` 就会按**旧**档位算 tier，
+             * 于是恢复完的块 tier 全是错的（检索判定随之错误）。
+             */
+            pageLevel: await pageLevelOf(slug, {
+              visibility: acl.visibility,
+              inherit: acl.inherit === 1 ? 1 : 0,
+              published_at: acl.published_at,
+            }),
+            now,
+            existing: await readExistingBlocks(tx, Number(page.id)),
+            parse: () => parsed,
+            // ★ rebase 收尾：同上，`syncIndex` 在 P3a 修复后是必填
+            syncIndex: blocksIndexSupported,
+            /*
+             * ★ 同上：恢复可能改变块结构（快照里的块数与当前不同），
+             * 而 `restructure` 只放行"改结构"，不触及任何可见性判定。
+             */
+            restructure: true,
+          })
+          // ④ 授予：整体替换为快照里的那一组。"恢复权限"必须包含授予 ——
+          //    否则旧版本是私有的、而当前的 page_grants 仍然生效 ⇒ 恢复出的权限**更宽**。
+          await tx.run('DELETE FROM page_grants WHERE page_slug = ?', [slug])
+          for (const g of acl.page_grants) {
+            await tx.run(
+              `INSERT INTO page_grants (page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [slug, String(g.k), String(g.s), String(g.r), actorId, now, g.e ?? null],
+            )
+          }
+          await tx.run('DELETE FROM block_grants WHERE page_slug = ?', [slug])
+          for (const g of acl.block_grants) {
+            // 按 ordinal 找回重建后的块 id（快照按 ordinal 引用块，正是为了这一刻）
+            const b = (
+              await tx.query<{ id: number }>('SELECT id FROM blocks WHERE page_id = ? AND ordinal = ?', [
+                page.id,
+                Number(g.o),
+              ])
+            )[0]
+            if (!b) continue
+            await tx.run(
+              `INSERT INTO block_grants (block_id, page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [Number(b.id), slug, String(g.k), String(g.s), String(g.r), actorId, now, g.e ?? null],
+            )
+          }
+          return bumpAclRevision(tx, slug)
+        })
+
+        /*
+         * ★ 恢复也会改**祖先的档位**，因而必须与档位端点一样做子孙扇出。
+         *
+         * 上面的 `UPDATE pages ... visibility = ?, inherit = ?, published_at = ?` 会把本页的
+         * 有效档位改掉，而**子孙的 `blocks.tier` 是物化派生列**（`pageLevelOf` 只影响本页）。
+         * 漏掉扇出的后果是内容泄漏级：把祖先从 public **恢复成 private** 后，子页的读路径
+         * 已 404，但它的 `blocks.tier` 仍是旧值 0 ⇒ **匿名 `/api/search` 仍命中并吐出正文片段**；
+         * 反方向（放宽）则退化为"搜不到但读得到"。
+         *
+         * 放在提交**之后**：`pageLevelOf` 走策略层（另一条连接），PG 的 MVCC 下读不到本事务
+         * 未提交的那次 UPDATE ⇒ 放进事务里会按**旧**档位算，等于没修。
+         * 失败不回滚已提交的恢复（那是用户要的结果），但由 `resyncDescendantsReporting`
+         * 升级成响应字段 + 审计行 —— "重算了 0 个子孙"与"扇出整个失败"是两件处置不同的事。
+         */
+        const resync = await resyncDescendantsReporting(slug)
+
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'page',
+          targetId: slug,
+          actorId,
+          after: { restored_version: versionId, block_acls_restored: true, acl_revision: revision },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, {
+          ok: true,
+          slug,
+          restored: versionId,
+          acl_revision: revision,
+          warnings: [],
+          // 子孙块被重算的条数（0 = 没有子孙）
+          index_tiers_resynced: resync.resynced,
+          // ★ 与上面那个 0 区分开：true 表示**扇出抛错、一个都没算**（内容泄漏级）
+          index_tiers_resync_failed: resync.failed,
+          ...(resync.error === undefined ? {} : { index_tiers_resync_error: resync.error }),
+        })
+      }, { access: 'user' }),
     )
 
     /* ---------- PUT /api/pages/:slug：upsert（保存时先快照旧正文，幂等：内容未变不产生新历史） ----------
@@ -1232,6 +1607,18 @@ export const WikiPlugin = {
             h.json(400, { ok: false, error: err.code, message: err.message })
             return
           }
+          /*
+           * ★ P3b：保守重解析的冲突 ⇒ **409**（不是 400，也不是 500）。
+           *
+           * 语义是"请求本身没错，但与资源的当前状态冲突"：作者想删/合并一个**已有块级
+           * 授权的块**，而那会静默丢掉授权（§4.2）。解决办法是用户先去撤销授权再改 ——
+           * 所以是"冲突"而非"请求非法"。两个错误码：`block_merge_conflict` /
+           * `block_grant_orphan`。
+           */
+          if (err instanceof BlockSyncError) {
+            h.json(409, { ok: false, error: err.code, message: err.message })
+            return
+          }
           throw err
         }
         const { outcome, version, indexTiersResync } = result
@@ -1286,7 +1673,11 @@ export const WikiPlugin = {
      * 1. **不泄露存在性** —— `level === 'none'` 一律 404（不是 403）：无权看的人
      *    也不该通过"403 vs 404"知道它存在。
      * 2. **每次 ACL 变更都递增 `acl_revision`**（全局行 + 该条目自己的列）——
-     *    策略层据此做代际失效；**绝不用 TTL**（TTL 必然产生"撤销后仍可见"的窗口）。
+     *    它是一个**版本标记与观测信号**（响应里回传，便于发现"变更没生效"）。
+     *    ⚠️ **不要写成"策略层据此做代际失效"**：判定层（`packages/plugin-authz`）**没有任何
+     *    决策缓存**，每个请求现查库（`loadVisibilityIndex()` 有四处调用点），所以变更天然立即生效、
+     *    并没有"失效"这个动作。真正被禁止的是**给判定加 TTL 缓存**
+     *    （TTL 必然产生"撤销后仍可见"的窗口）。
      * 3. **审计不含正文**（`before`/`after` 只放档位与授权元数据）。
      */
     const VISIBILITIES = ['private', 'org', 'public'] as const
@@ -1300,6 +1691,114 @@ export const WikiPlugin = {
       await tx.run('UPDATE pages SET acl_revision = acl_revision + 1 WHERE slug = ?', [slug])
       const row = (await tx.query<{ revision: number }>('SELECT revision FROM acl_revision WHERE id = 1'))[0]
       return Number(row?.revision ?? 0)
+    }
+
+    /**
+     * 某页当前的**版本快照载荷**：块集合 + 页面级 ACL + 例外授予。
+     *
+     * ★ **为什么把「授予」也放进快照**（而不只是 visibility/inherit/published_at）：
+     * 「恢复此版本」若只恢复档位、不恢复授予，就会出现**放宽**事故 —— 旧版本里这条是私有的，
+     * 但**当前**的 `page_grants` 仍然生效，恢复后那些被授予者依然能看 ⇒ 恢复出来的权限比
+     * 该版本实际拥有的**更宽**。这正是 `0017_version_blocks.sql` 里那条规则要防的事：
+     * 版本快照与「恢复」必须覆盖同一组事实，否则两者脱节。
+     *
+     * 块级授予按 **`ordinal`** 引用而不是块 id：恢复时块会被整体重建，id 不保证延续，
+     * 而 `ordinal` 在 `blocks_json` 里就是块的身份，两边能对上。
+     */
+    const versionSnapshotOf = async (
+      tx: DatabaseExecutor,
+      pageId: number,
+    ): Promise<{ blocksJson: string; aclJson: string }> => {
+      const blocks = await tx.query<{
+        ordinal: number
+        kind: string
+        text: string
+        visibility: string
+        inherit: number
+        marker: string | null
+      }>(
+        'SELECT ordinal, kind, text, visibility, inherit, marker FROM blocks WHERE page_id = ? ORDER BY ordinal',
+        [pageId],
+      )
+      const page = (
+        await tx.query<{ visibility: string; inherit: number; published_at: string | null }>(
+          'SELECT visibility, inherit, published_at FROM pages WHERE id = ?',
+          [pageId],
+        )
+      )[0]
+      const pageGrants = await tx.query<{
+        subject_kind: string
+        subject_id: string
+        role: string
+        expires_at: string | null
+      }>(
+        `SELECT subject_kind, subject_id, role, expires_at FROM page_grants
+          WHERE page_slug = (SELECT slug FROM pages WHERE id = ?) ORDER BY id`,
+        [pageId],
+      )
+      const blockGrants = await tx.query<{
+        ordinal: number
+        subject_kind: string
+        subject_id: string
+        role: string
+        expires_at: string | null
+      }>(
+        `SELECT b.ordinal AS ordinal, g.subject_kind, g.subject_id, g.role, g.expires_at
+           FROM block_grants g JOIN blocks b ON b.id = g.block_id
+          WHERE b.page_id = ? ORDER BY b.ordinal, g.id`,
+        [pageId],
+      )
+      return {
+        blocksJson: JSON.stringify(
+          blocks.map((b) => ({
+            o: Number(b.ordinal),
+            k: b.kind,
+            t: b.text,
+            v: b.visibility,
+            i: Number(b.inherit),
+            m: b.marker,
+          })),
+        ),
+        aclJson: JSON.stringify({
+          visibility: page?.visibility ?? 'private',
+          inherit: Number(page?.inherit ?? 1),
+          published_at: page?.published_at ?? null,
+          page_grants: pageGrants.map((g) => ({
+            k: g.subject_kind,
+            s: g.subject_id,
+            r: g.role,
+            e: g.expires_at,
+          })),
+          block_grants: blockGrants.map((g) => ({
+            o: Number(g.ordinal),
+            k: g.subject_kind,
+            s: g.subject_id,
+            r: g.role,
+            e: g.expires_at,
+          })),
+        }),
+      }
+    }
+
+    /**
+     * 记一条**权限版本**：`content` 保持当前正文，只有 `blocks_json` / `acl_json` 变化。
+     *
+     * 由**每一条改权限的路径**调用（改档位、页面授予、块级授予；随正文保存而变的块级
+     * 可见性由 `savePage` 那条版本覆盖），理由见 `0017_version_blocks.sql`。
+     *
+     * 记的是**变更前**的状态 —— 与 `savePage` 的既有约定一致（"先快照旧的，再改"），
+     * 于是"版本 N = 变更 N 之前的状态"，恢复版本 N 得到的就是那一刻。
+     */
+    const snapshotAclVersion = async (tx: DatabaseExecutor, slug: string): Promise<void> => {
+      const page = (
+        await tx.query<{ id: number; content: string }>('SELECT id, content FROM pages WHERE slug = ?', [slug])
+      )[0]
+      if (!page) return
+      const snap = await versionSnapshotOf(tx, Number(page.id))
+      await tx.run(
+        `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)`,
+        [Number(page.id), page.content, new Date().toISOString(), snap.blocksJson, snap.aclJson],
+      )
     }
 
     /**
@@ -1496,6 +1995,12 @@ export const WikiPlugin = {
         }
 
         const revision = await adb.transaction(async (tx) => {
+          /*
+           * ★ P3c：**改档位也必须产生一条版本**（记的是变更前的状态）。
+           * 若只恢复正文、不恢复权限，「恢复此版本」会把当时的正文配上现在的权限 ——
+           * 结果可能是把本该受限的内容放开（见 0017 迁移的说明）。
+           */
+          await snapshotAclVersion(tx, slug)
           await tx.run('UPDATE pages SET visibility = ?, inherit = ?, published_at = ? WHERE slug = ?', [
             nextVisibility,
             nextInherit,
@@ -1653,6 +2158,8 @@ export const WikiPlugin = {
          * 把"改角色"伪装成"新授予"，审计会失真。
          */
         const revision = await adb.transaction(async (tx) => {
+          // ★ P3c：授予变更也要产生版本（否则恢复旧版本时，当前授予仍在 ⇒ 恢复出的权限更宽）
+          await snapshotAclVersion(tx, slug)
           const existing = (
             await tx.query<{ id: number; role: string; expires_at: string | null }>(
               'SELECT id, role, expires_at FROM page_grants WHERE page_slug = ? AND subject_kind = ? AND subject_id = ?',
@@ -1701,6 +2208,8 @@ export const WikiPlugin = {
             [id, slug],
           ))[0]
           if (!removed) return null
+          // ★ P3c：撤销授予同样产生版本 —— **放在存在性检查之后**，否则 404 也会写出一条无意义的版本
+          await snapshotAclVersion(tx, slug)
           await tx.run('DELETE FROM page_grants WHERE id = ? AND page_slug = ?', [id, slug])
           const rev = await bumpAclRevision(tx, slug)
           return { rev, removed }
@@ -1718,6 +2227,646 @@ export const WikiPlugin = {
         }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
 
         h.json(200, { ok: true, slug, removed: id, acl_revision: revision.rev })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- 申请访问（★ P3b，§8.2 P3b 第 6 条） ---------- */
+    /*
+     * 一等流程：无权用户不必去找管理员私聊 —— 403 页与受限块的占位文案上都应有入口。
+     *
+     * 与授权的区别（别混）：`page_grants` / `block_grants` 是**已生效的授予**；
+     * `access_requests` 是**待裁决的请求**，批准后才落一条授予。分开存是因为"请求"有
+     * 生命周期（pending/approved/denied/withdrawn）与裁决人，"授予"只有生效/过期两态。
+     *
+     * ★ 本端点的判据是「**是不是已登录的真实用户**」，**不是**「能不能读」——
+     * 它服务的恰恰是"读不到"的人，所以**绝不能**在入口处做读权限检查。
+     *
+     * ⚠️ 一个已知的 UX 缺口（记录在案，不在本次修）：详情读路径对**所有**主体一律返回
+     * 404，而非设计文档 §2.3 写的"匿名 404 / 已登录 403" —— 见 `getPage` 的注释与
+     * 本文件 :1268-1269：区分 404 与 403 就等于提供了一个存在性探测接口。这个选择更严，
+     * 但**代价是"申请访问"失去了自然触发点**（用户拿到 404 时分不清"无权"与"不存在"）。
+     * 因此申请入口必须由前端在**已知 slug** 的拒绝态页面/受限块占位文案上提供
+     * （§8.2 P3b 第 6 条），不能指望读路径给出 403。
+     */
+    const MAX_REQUEST_MESSAGE = 500
+
+    /** 读 JSON 对象请求体；失败时已写出响应并返回 null（空体视作 `{}`，见 readBody）。 */
+    const readObjectBody = async (h: RouteHandlerContext): Promise<Record<string, unknown> | null> => {
+      let raw: unknown
+      try {
+        raw = await readBody(h)
+      } catch (err) {
+        const message = (err as Error).message
+        if (message.startsWith('payload_too_large')) {
+          closeAfterResponse(h)
+          h.json(413, { ok: false, error: 'payload_too_large', message })
+          return null
+        }
+        h.json(400, { ok: false, error: 'invalid_body', message })
+        return null
+      }
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        h.json(400, { ok: false, error: 'invalid_body', message: '请求体须为 JSON 对象' })
+        return null
+      }
+      return raw as Record<string, unknown>
+    }
+
+    /** 校验 `role` / `expiresAt` 两个可选字段；不合法时已写出响应并返回 null。 */
+    const readGrantFields = (
+      h: RouteHandlerContext,
+      body: Record<string, unknown>,
+      allowed: readonly string[],
+    ): { role: string; expiresAt: string | null } | null => {
+      const unknown = Object.keys(body).filter((k) => !allowed.includes(k))
+      if (unknown.length > 0) {
+        h.json(400, { ok: false, error: 'invalid_body', message: `未知字段: ${unknown.join(', ')}` })
+        return null
+      }
+      const role = body['role'] === undefined ? 'viewer' : body['role']
+      if (typeof role !== 'string' || !(GRANT_ROLES as readonly string[]).includes(role)) {
+        h.json(400, { ok: false, error: 'invalid_role', message: `role 须为 ${GRANT_ROLES.join(' | ')} 之一` })
+        return null
+      }
+      const raw = body['expiresAt'] === undefined ? null : body['expiresAt']
+      if (raw !== null && typeof raw !== 'string') {
+        h.json(400, { ok: false, error: 'invalid_expires_at', message: 'expiresAt 须为 ISO 时间字符串或 null' })
+        return null
+      }
+      return { role, expiresAt: raw }
+    }
+
+    /*
+     * 提交申请：落一条 `pending`。
+     *
+     * 唯一键是 `(page_slug, user_id, status)`（见 0014 迁移），它同时满足两件事：
+     *   - 同一人**不会**积压多条 pending（否则审批人会重复点、重复落授予）；
+     *   - 被拒绝之后**可以再次申请**（情形会变），因为那时 status 已经是 `denied`。
+     * 这里**先查后插**（为了给出干净的 409 与可判别错误码），**同时**捕获唯一约束冲突
+     * 兜住并发窗口 —— 唯一索引才是数据库层的最终保证，先查只是为了让常见路径的报错友好。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests', async (h) => {
+        const slug = h.params.slug ?? ''
+        const principal = h.principal
+        if (!principal || principal.kind !== 'user' || principal.userId === null) {
+          h.json(401, { ok: false, error: 'unauthorized', message: '请先登录后再申请访问' })
+          return
+        }
+        if (!isValidSlug(slug)) {
+          h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+          return
+        }
+        const body = await readObjectBody(h)
+        if (!body) return
+        const fields = readGrantFields(h, body, ['message', 'role'])
+        if (!fields) return
+        const rawMessage = body['message']
+        if (rawMessage !== undefined && rawMessage !== null && typeof rawMessage !== 'string') {
+          h.json(400, { ok: false, error: 'invalid_message', message: 'message 须为字符串' })
+          return
+        }
+        const message =
+          typeof rawMessage === 'string' && rawMessage.trim().length > 0 ? rawMessage.trim() : null
+        if (message !== null && message.length > MAX_REQUEST_MESSAGE) {
+          h.json(400, {
+            ok: false,
+            error: 'invalid_message',
+            message: `message 过长（上限 ${MAX_REQUEST_MESSAGE} 字符）`,
+          })
+          return
+        }
+
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        // 已经有权限就不必申请（否则待审列表会被这类无意义条目灌满）
+        const access = await policy().resolvePage(principal, slug)
+        if (access.level !== 'none') {
+          h.json(409, { ok: false, error: 'already_has_access', message: '你已有该条目的访问权限，无需申请' })
+          return
+        }
+        const pending = (
+          await adb.query<{ id: number }>(
+            `SELECT id FROM access_requests WHERE page_slug = ? AND user_id = ? AND status = 'pending'`,
+            [slug, principal.userId],
+          )
+        )[0]
+        if (pending) {
+          h.json(409, { ok: false, error: 'already_requested', message: '你已提交过申请，请等待处理' })
+          return
+        }
+
+        const now = new Date().toISOString()
+        let created: number
+        try {
+          /*
+           * ★ `RETURNING id` 不是可选的：SQLite 有隐式 rowid，**PostgreSQL 没有** ——
+           * PG 适配器的 `lastInsertRowid` 只在 SQL 里写了 `RETURNING id` 时才非 0。
+           * 本仓既有插件（plugin-auth ×3 / plugin-org / plugin-wiki 的 blocks 写入）都遵守这条。
+           */
+          const res = await adb.run(
+            `INSERT INTO access_requests (page_slug, user_id, message, status, created_at)
+             VALUES (?, ?, ?, 'pending', ?) RETURNING id`,
+            [slug, principal.userId, message, now],
+          )
+          created = Number(res.lastInsertRowid)
+        } catch (err) {
+          const text = (err as Error).message
+          // 并发窗口：两个请求同时通过了上面的先查。唯一索引是最终保证 —— 认得出就报 409。
+          if (/UNIQUE constraint failed|duplicate key value/i.test(text)) {
+            h.json(409, { ok: false, error: 'already_requested', message: '你已提交过申请，请等待处理' })
+            return
+          }
+          throw err
+        }
+        // 返回 `id`：客户端要用它来撤回自己的申请（撤回端点按 id 定位）
+        h.json(200, { ok: true, slug, id: created, status: 'pending', requestedRole: fields.role })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- GET /api/pages/:slug/access-requests：待审列表（需可管理可见性） ---------- */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/access-requests', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const rows = await adb.query<{
+          id: number
+          user_id: number
+          message: string | null
+          status: string
+          created_at: string
+          decided_at: string | null
+        }>(
+          `SELECT id, user_id, message, status, created_at, decided_at
+             FROM access_requests WHERE page_slug = ? AND status = 'pending'
+            ORDER BY created_at DESC, id DESC LIMIT 200`,
+          [slug],
+        )
+        h.json(200, {
+          ok: true,
+          slug,
+          requests: rows.map((r) => ({
+            id: Number(r.id),
+            userId: Number(r.user_id),
+            // 自由文本：原样回传，**由展示端负责转义**（迁移注释已注明这是唯一承载用户
+            // 自由文本的列）。这里不截断 —— 长度在上游写入时已限死。
+            message: r.message,
+            status: r.status,
+            createdAt: r.created_at,
+            decidedAt: r.decided_at,
+          })),
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/access-requests/:id/approve：批准并落授予 ---------- */
+    /*
+     * 批准 = **一条 `page_grants` + `acl_revision++`**。被批准者**无需重新登录即可见**，
+     * 原因是**判定层没有任何决策缓存**（`packages/plugin-authz` 每个请求现查库），
+     * **不是**因为 `acl_revision` 触发了什么失效 —— 它只是版本标记与观测信号。
+     * ⚠️ 反过来说：**一旦给判定层加了 TTL 缓存，这条性质就会失效**（§4.5 明令不要那样做）。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests/:id/approve', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const body = await readObjectBody(h)
+        if (!body) return
+        const fields = readGrantFields(h, body, ['role', 'expiresAt'])
+        if (!fields) return
+
+        const now = new Date().toISOString()
+        const actorId = guard.principal.userId
+        const outcome = await adb.transaction(async (tx) => {
+          // 带上 page_slug 条件：防止用 A 页的申请 id 去批准 B 页（越权改他人授权）
+          const req = (
+            await tx.query<{ id: number; user_id: number; status: string }>(
+              'SELECT id, user_id, status FROM access_requests WHERE id = ? AND page_slug = ?',
+              [id, slug],
+            )
+          )[0]
+          if (!req) return null
+          if (req.status !== 'pending') return { conflict: req.status } as const
+          // ★ P3c：批准等同于"新增一条 page_grant" ⇒ 同样必须产生版本
+          await snapshotAclVersion(tx, slug)
+          const subjectId = String(Number(req.user_id))
+          // 幂等 upsert（与 POST /grants 同款）：先查后写，避免把"改角色"伪装成"新授予"
+          const existing = (
+            await tx.query<{ id: number }>(
+              'SELECT id FROM page_grants WHERE page_slug = ? AND subject_kind = ? AND subject_id = ?',
+              [slug, 'user', subjectId],
+            )
+          )[0]
+          if (existing) {
+            await tx.run('UPDATE page_grants SET role = ?, expires_at = ? WHERE id = ?', [
+              fields.role,
+              fields.expiresAt,
+              existing.id,
+            ])
+          } else {
+            await tx.run(
+              `INSERT INTO page_grants (page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, 'user', ?, ?, ?, ?, ?)`,
+              [slug, subjectId, fields.role, actorId, now, fields.expiresAt],
+            )
+          }
+          await tx.run(`UPDATE access_requests SET status = 'approved', decided_by = ?, decided_at = ? WHERE id = ?`, [
+            actorId,
+            now,
+            id,
+          ])
+          const rev = await bumpAclRevision(tx, slug)
+          return { conflict: null, requesterId: Number(req.user_id), rev } as const
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `申请不存在: ${id}` })
+          return
+        }
+        if (outcome.conflict !== null) {
+          h.json(409, {
+            ok: false,
+            error: 'request_not_pending',
+            message: `该申请已是 ${outcome.conflict} 状态，无法再次裁决`,
+          })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}:user:${outcome.requesterId}`,
+          actorId,
+          after: { role: fields.role, expires_at: fields.expiresAt, via: 'access_request', request_id: id },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, {
+          ok: true,
+          slug,
+          approved: id,
+          userId: outcome.requesterId,
+          role: fields.role,
+          acl_revision: outcome.rev,
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/access-requests/:id/deny：拒绝 ---------- */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests/:id/deny', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const now = new Date().toISOString()
+        const actorId = guard.principal.userId
+        const outcome = await adb.transaction(async (tx) => {
+          const req = (
+            await tx.query<{ id: number; status: string }>(
+              'SELECT id, status FROM access_requests WHERE id = ? AND page_slug = ?',
+              [id, slug],
+            )
+          )[0]
+          if (!req) return null
+          if (req.status !== 'pending') return { conflict: req.status } as const
+          // 拒绝**不**动 acl_revision：没有任何授权的增减，判定结果不变
+          await tx.run(`UPDATE access_requests SET status = 'denied', decided_by = ?, decided_at = ? WHERE id = ?`, [
+            actorId,
+            now,
+            id,
+          ])
+          return { conflict: null } as const
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `申请不存在: ${id}` })
+          return
+        }
+        if (outcome.conflict !== null) {
+          h.json(409, {
+            ok: false,
+            error: 'request_not_pending',
+            message: `该申请已是 ${outcome.conflict} 状态，无法再次裁决`,
+          })
+          return
+        }
+        h.json(200, { ok: true, slug, denied: id })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/access-requests/:id/withdraw：撤回自己的申请 ---------- */
+    /*
+     * 撤回**不需要** `canManageVisibility` —— 那会要求申请人先有管理权，自相矛盾。
+     * 判据是"这条申请是不是你自己的"。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests/:id/withdraw', async (h) => {
+        const slug = h.params.slug ?? ''
+        const principal = h.principal
+        if (!principal || principal.kind !== 'user' || principal.userId === null) {
+          h.json(401, { ok: false, error: 'unauthorized', message: '请先登录' })
+          return
+        }
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const now = new Date().toISOString()
+        const outcome = await adb.transaction(async (tx) => {
+          const req = (
+            await tx.query<{ id: number; user_id: number; status: string }>(
+              'SELECT id, user_id, status FROM access_requests WHERE id = ? AND page_slug = ?',
+              [id, slug],
+            )
+          )[0]
+          // 不是自己的申请 ⇒ 与"不存在"同样回 404（不泄露"这里有一条别人的申请"）
+          if (!req || Number(req.user_id) !== principal.userId) return null
+          if (req.status !== 'pending') return { conflict: req.status } as const
+          await tx.run(`UPDATE access_requests SET status = 'withdrawn', decided_at = ? WHERE id = ?`, [now, id])
+          return { conflict: null } as const
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `申请不存在: ${id}` })
+          return
+        }
+        if (outcome.conflict !== null) {
+          h.json(409, {
+            ok: false,
+            error: 'request_not_pending',
+            message: `该申请已是 ${outcome.conflict} 状态，无法撤回`,
+          })
+          return
+        }
+        h.json(200, { ok: true, slug, withdrawn: id })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- GET /api/pages/:slug/blocks：块级治理视图（★ P3b） ---------- */
+    /*
+     * ★ **刻意不返回 `text`**。
+     *
+     * 这是治理面板的数据源（"这一页哪些块被单独收紧过、谁被授予了"），不是阅读界面 ——
+     * 而受限块的正文按定义就不该出现在这里。一旦带上 `text`，这个端点立刻变成
+     * "只要 canManageVisibility 就能读到所有 `granted` 块正文"的旁路，而 `granted`
+     * 档的语义恰恰是"默认谁都不能看"（§2.2）。要读正文请走详情页，那里有完整投影。
+     */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/blocks', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const rows = await adb.query<{
+          id: number
+          ordinal: number
+          kind: string
+          visibility: string
+          inherit: number
+          marker: string | null
+          tier: number | null
+        }>(
+          `SELECT b.id, b.ordinal, b.kind, b.visibility, b.inherit, b.marker, b.tier
+             FROM blocks b WHERE b.page_id = ? ORDER BY b.ordinal`,
+          [page.id],
+        )
+        const grants = await adb.query<{
+          id: number
+          block_id: number
+          subject_kind: string
+          subject_id: string
+          role: string
+          granted_at: string
+          expires_at: string | null
+        }>(
+          `SELECT g.id, g.block_id, g.subject_kind, g.subject_id, g.role, g.granted_at, g.expires_at
+             FROM block_grants g JOIN blocks b ON b.id = g.block_id
+            WHERE b.page_id = ? ORDER BY g.id`,
+          [page.id],
+        )
+        const byBlock = new Map<number, typeof grants>()
+        for (const g of grants) {
+          const list = byBlock.get(Number(g.block_id)) ?? []
+          list.push(g)
+          byBlock.set(Number(g.block_id), list)
+        }
+        h.json(200, {
+          ok: true,
+          slug,
+          blocks: rows.map((b) => ({
+            id: Number(b.id),
+            ordinal: Number(b.ordinal),
+            kind: b.kind,
+            visibility: b.visibility,
+            inherit: Number(b.inherit) === 1,
+            marker: b.marker,
+            /** `null` = 该块不属于任何读者等级（`granted` 档，只能靠授权放行） */
+            tier: b.tier === null ? null : Number(b.tier),
+            grants: (byBlock.get(Number(b.id)) ?? []).map((g) => ({
+              id: Number(g.id),
+              subjectKind: g.subject_kind,
+              subjectId: g.subject_id,
+              role: g.role,
+              grantedAt: g.granted_at,
+              expiresAt: g.expires_at,
+            })),
+          })),
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/blocks/:blockId/grants：块级例外授予 ---------- */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/blocks/:blockId/grants', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const blockId = Number(h.params.blockId)
+        if (!Number.isInteger(blockId) || blockId < 1) {
+          h.json(400, { ok: false, error: 'invalid_block_id', message: 'blockId 须为正整数' })
+          return
+        }
+        let body: Record<string, unknown>
+        try {
+          body = (await readBody(h)) as Record<string, unknown>
+        } catch (err) {
+          const message = (err as Error).message
+          if (message.startsWith('payload_too_large')) {
+            closeAfterResponse(h)
+            h.json(413, { ok: false, error: 'payload_too_large', message })
+            return
+          }
+          h.json(400, { ok: false, error: 'invalid_body', message })
+          return
+        }
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+          h.json(400, { ok: false, error: 'invalid_body', message: '请求体须为 JSON 对象' })
+          return
+        }
+        const unknown = Object.keys(body).filter(
+          (k) => k !== 'subjectKind' && k !== 'subjectId' && k !== 'role' && k !== 'expiresAt',
+        )
+        if (unknown.length > 0) {
+          h.json(400, { ok: false, error: 'invalid_body', message: `未知字段: ${unknown.join(', ')}` })
+          return
+        }
+        const subjectKind = body['subjectKind']
+        if (typeof subjectKind !== 'string' || !(SUBJECT_KINDS as readonly string[]).includes(subjectKind)) {
+          // ★ D13：块级与页面级**完全同构** —— 同样明确拒绝 `org_role`
+          h.json(400, {
+            ok: false,
+            error: 'invalid_subject_kind',
+            message: `subjectKind 须为 ${SUBJECT_KINDS.join(' | ')} 之一（角色不是授权对象，见 D13）`,
+          })
+          return
+        }
+        const subjectId = body['subjectId']
+        if (typeof subjectId !== 'string' || subjectId.length === 0 || subjectId.length > 128) {
+          h.json(400, { ok: false, error: 'invalid_subject_id', message: 'subjectId 须为非空字符串（≤128 字符）' })
+          return
+        }
+        const role = body['role']
+        if (typeof role !== 'string' || !(GRANT_ROLES as readonly string[]).includes(role)) {
+          h.json(400, { ok: false, error: 'invalid_role', message: `role 须为 ${GRANT_ROLES.join(' | ')} 之一` })
+          return
+        }
+        const expiresAt = body['expiresAt'] === undefined || body['expiresAt'] === null ? null : body['expiresAt']
+        if (expiresAt !== null && typeof expiresAt !== 'string') {
+          h.json(400, { ok: false, error: 'invalid_expires_at', message: 'expiresAt 须为 ISO 时间字符串或 null' })
+          return
+        }
+
+        const now = new Date().toISOString()
+        const grantedBy = guard.principal.userId
+        const outcome = await adb.transaction(async (tx) => {
+          /*
+           * ★ **必须校验块确实属于该页**（而不是分别校验"页可管"与"块存在"）。
+           *
+           * 只查 `blocks WHERE id = ?` 会留下一个组合式越权口：拿 A 页的 slug（自己有
+           * 管理权）配 B 页的 blockId，就能给别人的块加授权。这类"父 ID + 子 ID 组合"
+           * 的绕过在真实产品里出现过（设计文档 §9 R10 第 4 条引的正是这种形态）。
+           */
+          const block = (
+            await tx.query<{ id: number; visibility: string }>(
+              `SELECT b.id, b.visibility FROM blocks b JOIN pages p ON p.id = b.page_id
+                WHERE b.id = ? AND p.slug = ?`,
+              [blockId, slug],
+            )
+          )[0]
+          if (!block) return null
+          // ★ P3c：块级授予同样产生版本 —— 放在校验之后，避免 404 也写出版本
+          await snapshotAclVersion(tx, slug)
+          // 幂等 upsert（同页面级：先查后写，避免把"改角色"伪装成"新授予"）
+          const existing = (
+            await tx.query<{ id: number }>(
+              'SELECT id FROM block_grants WHERE block_id = ? AND subject_kind = ? AND subject_id = ?',
+              [blockId, subjectKind, subjectId],
+            )
+          )[0]
+          if (existing) {
+            await tx.run('UPDATE block_grants SET role = ?, expires_at = ? WHERE id = ?', [role, expiresAt, existing.id])
+          } else {
+            await tx.run(
+              `INSERT INTO block_grants (block_id, page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [blockId, slug, subjectKind, subjectId, role, grantedBy, now, expiresAt],
+            )
+          }
+          return { rev: await bumpAclRevision(tx, slug), blockVisibility: block.visibility }
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `块不存在于本页: ${blockId}` })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}#block:${blockId}:${subjectKind}:${subjectId}`,
+          actorId: grantedBy,
+          after: { role, expires_at: expiresAt },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, {
+          ok: true,
+          slug,
+          blockId,
+          subjectKind,
+          subjectId,
+          role,
+          expiresAt,
+          acl_revision: outcome.rev,
+          /*
+           * 把该块**自身声明**的档位回给调用方。规则 B1（§2.3）说"块只能比页面更窄、
+           * 不能更宽"，所以当这个块是 `public`/`org`、而页面本身更窄时，授权**不会**
+           * 让它突破页面上限 —— 前端据此提示"实际可见性由页面决定"，而不是让用户
+           * 以为授权没生效。这里只回声明值，不回算出的有效值（那个由读路径判定）。
+           */
+          block_visibility: outcome.blockVisibility,
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- DELETE /api/pages/:slug/blocks/:blockId/grants/:grantId：撤销块级授予 ---------- */
+    cleanups.push(
+      router.register('DELETE', '/api/pages/:slug/blocks/:blockId/grants/:grantId', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const blockId = Number(h.params.blockId)
+        const grantId = Number(h.params.grantId)
+        if (!Number.isInteger(blockId) || blockId < 1 || !Number.isInteger(grantId) || grantId < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'blockId 与 grantId 须为正整数' })
+          return
+        }
+        const outcome = await adb.transaction(async (tx) => {
+          // 同样带上"块属于本页"的条件，防止拿别的页的 id 组合操作（同 POST 的越权口）
+          const owned = (
+            await tx.query<{ id: number }>(
+              `SELECT b.id FROM blocks b JOIN pages p ON p.id = b.page_id WHERE b.id = ? AND p.slug = ?`,
+              [blockId, slug],
+            )
+          )[0]
+          if (!owned) return null
+          const removed = (
+            await tx.query<{ id: number; subject_kind: string; subject_id: string; role: string }>(
+              'SELECT id, subject_kind, subject_id, role FROM block_grants WHERE id = ? AND block_id = ?',
+              [grantId, blockId],
+            )
+          )[0]
+          if (!removed) return null
+          // ★ P3c：撤销块级授予同样产生版本（放在存在性检查之后）
+          await snapshotAclVersion(tx, slug)
+          await tx.run('DELETE FROM block_grants WHERE id = ? AND block_id = ?', [grantId, blockId])
+          return { rev: await bumpAclRevision(tx, slug), removed }
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `授权不存在: ${grantId}` })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}#block:${blockId}:${outcome.removed.subject_kind}:${outcome.removed.subject_id}`,
+          actorId: guard.principal.userId,
+          before: { role: outcome.removed.role },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, { ok: true, slug, blockId, removed: grantId, acl_revision: outcome.rev })
       }, { access: 'user' }),
     )
 
