@@ -21,6 +21,7 @@ import type { Context } from 'cordis'
 import Schema from 'schemastery'
 import {
   asAsync,
+  auditIpHash,
   closeAfterResponse,
   writeAuditLog,
   type AnyDatabaseAdapter,
@@ -727,6 +728,38 @@ export const WikiPlugin = {
       (await adb.query<{ slug: string }>('SELECT slug FROM pages WHERE slug = ?', [slug])).length > 0
 
     /**
+     * ★ P4：记录一次**越权尝试**（`access.denied`）。这是它的**唯一出口**。
+     *
+     * **只在"页面存在、但对该主体不可见"时调用**。这条判据不能省 —— 对外两条路径都返回
+     * 404（§2.3 要求匿名一律 404、不泄露存在性），但在**服务端内部**两者分得清：
+     * 「请求了不存在的页」只是普通 404，「请求了存在但无权看的页」才是越权尝试。
+     * 把前者也记进来只会把有用信号淹没在噪声里。
+     *
+     * **为什么要与权限变更分开**（§8.2 P4 第 4 条）：`access.denied` 是**安全事件**（要告警），
+     * `acl.change` 之类是**合规记录**（要留存）。两类混在一个视图里，"有人在探测权限边界"
+     * 会被"某人改了可见性"稀释掉。它们在 `GET /api/admin/audit` 里分属不同 `view`。
+     *
+     * **记什么**：slug（排障时可直接复现，且与其它 `target_kind='page'` 的审计行同口径）、
+     * 主体种类、原因码、IP 哈希（只存哈希，不留原文）。
+     * **不记什么**：请求体、正文、查询串 —— 与 `before/after` 不含正文的红线一致。
+     */
+    const recordAccessDenied = (
+      h: RouteHandlerContext,
+      slug: string,
+      reason: string,
+      p: Principal,
+    ): void => {
+      void writeAuditLog(adb, {
+        action: 'access.denied',
+        targetKind: 'page',
+        targetId: slug,
+        actorId: p.userId ?? null,
+        actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+        after: { reason, principalKind: p.kind },
+      }).catch((e: unknown) => console.error('[@geewiki/wiki] 越权尝试的审计写入失败:', e))
+    }
+
+    /**
      * 引用了 `slug` 的页面（反向链接）。
      *
      * 用 `JOIN pages` 取标题，于是**指向不存在页面的行不会出现**（不可能有标题）。
@@ -1146,9 +1179,17 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('GET', '/api/pages/:slug', async (h) => {
         // 路由段存在即为字符串；`?? ''` 仅为类型收窄（无匹配行 → 404，与既有行为一致）
-        const page = await getPage(h.params.slug ?? '', requirePrincipal(h))
+        const slug = h.params.slug ?? ''
+        const p = requirePrincipal(h)
+        const page = await getPage(slug, p)
         if (!page) {
-          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${h.params.slug}` })
+          /*
+           * ★ P4：对外仍是 404（不泄露存在性），但**内部区分**两种情形 ——
+           * 只有"页存在但无权看"才是越权尝试，才记 `access.denied`。
+           * 记录失败不影响响应：审计是旁路，不能让它的故障把 404 变成 500。
+           */
+          if (await pageExists(slug)) recordAccessDenied(h, slug, 'no_read_access', p)
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
         h.json(200, page)
@@ -1745,7 +1786,10 @@ export const WikiPlugin = {
          */
         const p = requirePrincipal(h)
         const target = await policy().resolvePage(p, slug)
-        if (target.level === 'none' || !(await pageExists(slug))) {
+        // ★ P4：先取存在性（原先靠 `||` 短路跳过这一步）—— 它是区分"不存在"与"越权尝试"的唯一依据
+        const exists = await pageExists(slug)
+        if (target.level === 'none' || !exists) {
+          if (exists) recordAccessDenied(h, slug, 'no_read_access', p)
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
@@ -1760,7 +1804,10 @@ export const WikiPlugin = {
         // 与 backlinks 同理：目标页不可见时一律 404，不给出存在性差异
         const p = requirePrincipal(h)
         const target = await policy().resolvePage(p, slug)
-        if (target.level === 'none' || !(await pageExists(slug))) {
+        // 与 backlinks 同理：先取存在性，再区分"不存在"与"越权尝试"
+        const exists = await pageExists(slug)
+        if (target.level === 'none' || !exists) {
+          if (exists) recordAccessDenied(h, slug, 'no_read_access', p)
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }

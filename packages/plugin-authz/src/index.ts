@@ -630,6 +630,167 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
 `,
         )
       })
+
+      /*
+       * ---------- GET /api/admin/audit：审计查询（★ P4） ----------
+       *
+       * `view` 把**两类记录分开**（§8.2 P4 第 4 条）：越权尝试属于**安全事件**（要告警），
+       * 权限变更属于**合规记录**（要留存）。混在一个视图里，"有人在探测权限边界"会被
+       * "某人改了可见性"稀释掉，而两者的处置完全不同。
+       *
+       * **为什么用显式白名单而不是"排除法"**：排除法会把将来新增的每个动作**默认**归进
+       * acl 视图；白名单则让未分类的动作**只出现在 `all` 里** —— 漏分类是**可见的**，
+       * 而不是悄悄进了错误的视图。安全事件被误分类的代价远高于多维护一个集合。
+       */
+      const SECURITY_ACTIONS = new Set([
+        'access.denied', // 越权尝试（"页存在但无权看"）；由 @geewiki/wiki 独家写入
+        'access.admin_override', // owner/admin 应急可见：特权访问，要复查
+        'access.break_glass', // 应急令牌：特权访问，要复查
+        'login.fail',
+        'login.rate_limited',
+      ])
+      const ACL_ACTIONS = new Set([
+        'acl.change',
+        'acl.resync_failed',
+        'page.publish',
+        'identity.link',
+        'identity.unlink',
+        'user.create',
+        'user.setup',
+        'password.change',
+        'rollback',
+        'meltdown',
+        'none',
+        'admin.resync_tiers',
+        'admin.verify_blocks',
+        'admin.verify_search',
+        'org.group.add_member',
+        'org.group.create',
+        'org.group.delete',
+        'org.group.remove_member',
+        'org.invitation.accept',
+        'org.invitation.create',
+        'org.invitation.redeem',
+        'org.invitation.revoke',
+        'org.member.remove',
+        'org.member.set_role',
+      ])
+
+      /** 单页上限：审计表是 append-only 且无上界增长（§9 R16 的邻域），不给上限等于给了一个全表下载口 */
+      const AUDIT_PAGE_MAX = 200
+
+      interface AuditRow {
+        id: number
+        at: string
+        actor_id: number | null
+        actor_ip_hash: string | null
+        action: string
+        target_kind: string
+        target_id: string
+        before_json: string | null
+        after_json: string | null
+        request_id: string | null
+      }
+
+      const parseAuditJson = (s: string | null): unknown => {
+        if (s === null || s === '') return null
+        try {
+          return JSON.parse(s) as unknown
+        } catch {
+          // 不抛：一条损坏的审计行不该让整个查询失败。显式标注而不是静默当成 null
+          return { _unparseable: true }
+        }
+      }
+
+      router.register(
+        'GET',
+        '/api/admin/audit',
+        async (h: RouteHandlerContext) => {
+          const q = h.url.searchParams
+          const view = q.get('view') ?? 'all'
+          if (view !== 'all' && view !== 'acl' && view !== 'security') {
+            h.json(400, {
+              ok: false,
+              error: 'invalid_view',
+              message: 'view 须为 all | acl | security 之一',
+            })
+            return
+          }
+
+          const where: string[] = []
+          const params: unknown[] = []
+          if (view === 'acl' || view === 'security') {
+            const names = [...(view === 'acl' ? ACL_ACTIONS : SECURITY_ACTIONS)]
+            where.push(`action IN (${names.map(() => '?').join(', ')})`)
+            params.push(...names)
+          }
+          for (const [key, column] of [
+            ['action', 'action'],
+            ['targetKind', 'target_kind'],
+            ['targetId', 'target_id'],
+          ] as const) {
+            const v = q.get(key)
+            if (v !== null && v !== '') {
+              where.push(`${column} = ?`)
+              params.push(v)
+            }
+          }
+          const since = q.get('since')
+          if (since !== null && since !== '') {
+            where.push('at >= ?')
+            params.push(since)
+          }
+          const until = q.get('until')
+          if (until !== null && until !== '') {
+            where.push('at <= ?')
+            params.push(until)
+          }
+          const sql = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
+
+          const rawLimit = Number(q.get('limit') ?? AUDIT_PAGE_MAX)
+          const limit = Number.isFinite(rawLimit)
+            ? Math.min(Math.max(1, Math.trunc(rawLimit)), AUDIT_PAGE_MAX)
+            : AUDIT_PAGE_MAX
+          const rawOffset = Number(q.get('offset') ?? 0)
+          const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0
+
+          const countRows = await db.query<{ n: number | string }>(
+            `SELECT COUNT(*) AS n FROM audit_log${sql}`,
+            params,
+          )
+          // PG 的 COUNT(*) 返回字符串，必须强转（否则 "1" + 1 → "11"）
+          const total = Number(countRows[0]?.n ?? 0)
+          const rows = await db.query<AuditRow>(
+            `SELECT id, at, actor_id, actor_ip_hash, action, target_kind, target_id,
+                    before_json, after_json, request_id
+               FROM audit_log${sql}
+              ORDER BY at DESC, id DESC
+              LIMIT ? OFFSET ?`,
+            [...params, limit, offset],
+          )
+
+          h.json(200, {
+            ok: true,
+            view,
+            total,
+            limit,
+            offset,
+            entries: rows.map((r) => ({
+              id: r.id,
+              at: r.at,
+              actorId: r.actor_id,
+              actorIpHash: r.actor_ip_hash,
+              action: r.action,
+              targetKind: r.target_kind,
+              targetId: r.target_id,
+              before: parseAuditJson(r.before_json),
+              after: parseAuditJson(r.after_json),
+              requestId: r.request_id,
+            })),
+          })
+        },
+        { access: 'admin' },
+      )
     }
 
     const unprovide = ctx.provide('policy-service', svc)
