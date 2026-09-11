@@ -1,6 +1,5 @@
 /* ============ GeeWiki Web 全局样式 ============ */
 
-
 * { box-sizing: border-box; }
 
 html, body, #root { height: 100%; }
@@ -14,21 +13,18 @@ body {
   line-height: 1.6;
 }
 
-
-
 .page { display: flex; flex-direction: column; gap: 14px; }
 
 .page-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .page-head h1 { font-size: 20px; margin: 0; }
 .page-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
-.spacer { flex: 1; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .err-text { color: var(--err); }
 
 /* ---------- 通知 ---------- */
 
-.notice { font-size: 13px; padding: 5px 12px; border-radius: 8px; }
+.notice { font-size: 13px; padding: 5px 12px; border-radius: var(--radius-md); }
 .notice.ok { background: var(--gw-ok-bg); color: var(--gw-ok-ink); border: 1px solid var(--gw-ok-line); }
 .notice.err { background: var(--gw-danger-bg); color: var(--gw-danger-ink); border: 1px solid var(--gw-danger-line); max-width: 560px; overflow-wrap: anywhere; }
 
@@ -36,13 +32,13 @@ body {
 
 .btn {
   border: 1px solid var(--line); background: var(--panel); color: var(--ink);
-  padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  padding: 7px 14px; border-radius: var(--radius-md); cursor: pointer; font-size: 13px;
   display: inline-flex; align-items: center; gap: 6px;
   transition: background 0.12s, border-color 0.12s;
 }
 .btn:hover:not(:disabled) { border-color: var(--gw-line-strong); background: var(--gw-surface-hover); }
 .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-.btn.small { padding: 4px 10px; font-size: 12px; border-radius: 6px; }
+.btn.small { padding: 4px 10px; font-size: 12px; border-radius: var(--radius-sm); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .btn.primary:hover:not(:disabled) { background: var(--gw-accent-hover); }
 .btn.danger { background: var(--gw-surface); border-color: var(--gw-danger-line); color: var(--err); }
@@ -63,62 +59,24 @@ body {
 .table th { font-size: 12px; color: var(--muted); font-weight: 600; border-bottom-color: var(--line); white-space: nowrap; }
 .table tr:last-child td { border-bottom: 0; }
 .table .empty { text-align: center; color: var(--muted); padding: 26px 0; }
-tr.clickable { cursor: pointer; }
-tr.clickable:hover td { background: var(--gw-surface-sunken); }
-.title-cell { font-weight: 600; }
-.row-error td { background: var(--gw-danger-bg); }
 
 /* ---------- 徽章 ---------- */
 
 .badge {
   display: inline-block; font-size: 11px; line-height: 1; padding: 4px 8px;
-  border-radius: 999px; border: 1px solid transparent; white-space: nowrap;
+  border-radius: var(--radius-full); border: 1px solid transparent; white-space: nowrap;
 }
 .badge-active { background: var(--gw-ok-bg); color: var(--gw-ok-ink); border-color: var(--gw-ok-line); }
 .badge-inactive { background: var(--gw-surface-hover); color: var(--gw-ink-muted); border-color: var(--gw-line); }
-.badge-error { background: var(--gw-danger-bg); color: var(--gw-danger-ink); border-color: var(--gw-danger-line); }
 .badge-base { background: var(--gw-accent-soft); color: var(--gw-accent-soft-ink); border-color: var(--gw-accent-soft-line); }
-.badge-session { background: var(--gw-accent-soft); color: var(--gw-accent-soft-ink); border-color: var(--gw-accent-soft-line); }
-.badge-hot { background: var(--gw-warn-bg); color: var(--gw-warn-ink); border-color: var(--gw-warn-line); }
 .badge-cold { background: var(--gw-surface-hover); color: var(--gw-ink-muted); border-color: var(--gw-line); }
 
 .chip {
   font-size: 11px; background: var(--gw-surface-hover); color: var(--gw-ink-soft); padding: 2px 7px;
-  border-radius: 6px; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  border-radius: var(--radius-sm); font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
 }
-.chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .empty { color: var(--muted); text-align: center; padding: 14px; }
 h2 + .empty { padding: 8px; }
-
-/* ---------- 统计条 ---------- */
-
-
-/* ---------- 配置编辑器 ---------- */
-
-
-/* ---------- 会话面板 ---------- */
-
-
-/* ---------- 外部插件发现期问题（GET /api/plugins 的 issues） ---------- */
-
-
-/* ---------- 插件界面（入口表 skipped，GET /api/plugins/ui） ----------
-   与上面的"发现期问题"刻意用**不同色系**区分：那一类是"整个插件没加载进来"（黄=警告），
-   这一类是"插件在、但它的前端界面没出现"（红=故障，典型症状是发布漏带 dist/）。 */
-
-
-/* 正常的那一类（未启用 / 本就无前端界面）：折叠 + 弱化，别让噪声淹没真正的故障 */
-
-/* 插件名：等宽 + 浅底，便于在成片中文里一眼认出标识符 */
-
-/* ---------- 依赖阻止停用（409 has_dependents）：保护性拦截，不是失败 ---------- */
-
-
-
-/* ---------- 依赖图 ---------- */
-
-
-
 
 /* ---------- Wiki 正文 ---------- */
 
@@ -143,7 +101,7 @@ h2 + .empty { padding: 8px; }
  * 颜色 + 下划线（不只靠颜色区分，WCAG 1.4.1）、hover、focus-visible、以及 missing 变体。
  */
 .md-body pre {
-  background: var(--gw-header-bg); color: var(--gw-header-ink); padding: 12px 14px; border-radius: 8px;
+  background: var(--gw-header-bg); color: var(--gw-header-ink); padding: 12px 14px; border-radius: var(--radius-md);
   overflow-x: auto; font-size: 13px;
 }
 .md-body code { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; }
@@ -153,52 +111,19 @@ h2 + .empty { padding: 8px; }
 .md-body table { border-collapse: collapse; margin: 0.6em 0; }
 .md-body th, .md-body td { border: 1px solid var(--line); padding: 5px 12px; }
 .md-body hr { border: 0; border-top: 1px solid var(--line); margin: 1.4em 0; }
-
-.detail-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.md-title { margin: 0.2em 0 0.4em !important; }
-.page-detail { gap: 16px; }
 .page-detail > .md-body {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   box-shadow: var(--shadow); padding: 26px 32px;
 }
-
-/* ---------- 版本历史 ---------- */
-
-.history-card { margin-top: 4px; }
-.version-preview {
-  margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
-}
-.version-preview-head {
-  display: flex; justify-content: space-between; align-items: center;
-  background: var(--gw-surface-sunken); padding: 7px 14px; font-size: 13px; border-bottom: 1px solid var(--line);
-}
 .version-preview .md-body { padding: 14px 18px; max-height: 360px; overflow: auto; }
-
-/* ---------- 编辑页 ---------- */
-
-.page-edit { gap: 14px; }
-.edit-form {
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  box-shadow: var(--shadow); padding: 20px 24px; display: flex; flex-direction: column; gap: 16px;
-  min-height: 420px;
-}
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field > span { font-size: 12px; color: var(--muted); font-weight: 600; }
 .field input {
-  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-size: 14px;
+  border: 1px solid var(--line); border-radius: var(--radius-md); padding: 8px 12px; font-size: 14px;
   outline: none; width: 100%; background: var(--gw-surface);
 }
 .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 12%); }
 .field.grow { flex: 1; }
-.md-editor {
-  border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 14px;
-  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; line-height: 1.7;
-  resize: vertical; min-height: 300px; outline: none; background: var(--gw-surface); width: 100%;
-}
-.md-editor:focus { border-color: var(--accent); }
-.preview-box { border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; background: var(--gw-surface); overflow: auto; }
-.edit-footer { font-size: 12px; padding: 0 4px; }
-
 
 /*
   页脚只作为 app-footer 插槽的宿主：没有插件贡献界面（data-count="0"）时整条不占位，
@@ -206,13 +131,6 @@ h2 + .empty { padding: 8px; }
   `:has()` 不被支持时退化为"空横条可见"，不影响功能。
 */
 .app-footer:has(> .slot-outlet[data-count='0']:only-child) { display: none; }
-
-
-
-/* ---------- 插件配置表单（SchemaForm：由 configSchema 自动生成） ---------- */
-
-.badge-builtin { background: var(--gw-surface-hover); color: var(--gw-ink-soft); border-color: var(--gw-line); margin-left: 6px; }
-.badge-external { background: var(--gw-ok-bg); color: var(--gw-ok-ink); border-color: var(--gw-ok-line); margin-left: 6px; }
 
 .schema-form { display: flex; flex-direction: column; gap: 10px; }
 .schema-field { display: flex; flex-direction: column; gap: 4px; }
@@ -222,14 +140,14 @@ h2 + .empty { padding: 8px; }
 .schema-field input[type='number'],
 .schema-field select,
 .schema-field textarea {
-  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 6px 8px;
   font-size: 13px; font-family: inherit; background: var(--gw-surface); outline: none;
   resize: vertical; width: 100%; box-sizing: border-box;
 }
 .schema-field input:focus, .schema-field select:focus, .schema-field textarea:focus { border-color: var(--accent); }
 .schema-checkbox { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .schema-group {
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-md); padding: 10px 12px;
   display: flex; flex-direction: column; gap: 10px; margin: 0;
 }
 .schema-group legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
@@ -239,15 +157,9 @@ h2 + .empty { padding: 8px; }
 .schema-json { display: flex; flex-direction: column; gap: 4px; }
 .schema-errors { margin-top: 2px; }
 
-/* 冲突组替换确认（管理台：启用撞上同组已激活插件时的顶替确认） */
-
-/* ---------- 检索与 AI 问答（宿主原生 UI） ---------- */
-
-.wiki-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-
 .search-form, .ask-form { display: flex; gap: 8px; align-items: center; flex: 1; min-width: 260px; }
 .search-input, .ask-input {
-  flex: 1; min-width: 200px; border: 1px solid var(--line); border-radius: 8px;
+  flex: 1; min-width: 200px; border: 1px solid var(--line); border-radius: var(--radius-md);
   padding: 7px 12px; font-size: 14px; background: var(--gw-surface); color: var(--ink);
 }
 .search-input:focus, .ask-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 12%); outline: none; }
@@ -278,9 +190,7 @@ h2 + .empty { padding: 8px; }
 .ask-answer-plain { white-space: pre-wrap; line-height: 1.75; overflow-wrap: anywhere; }
 
 /* 降级提示条：信息性，不用 error 配色淹没结果 */
-.ask-degraded { border-radius: 8px; padding: 8px 12px; font-size: 13px; }
-.ask-degraded-info { background: var(--gw-accent-soft); border: 1px solid var(--gw-accent-soft-line); color: var(--gw-accent-soft-ink); }
-.ask-degraded-warn { background: var(--gw-warn-bg); border: 1px solid var(--gw-warn-line); color: var(--gw-warn-ink); }
+.ask-degraded { border-radius: var(--radius-md); padding: 8px 12px; font-size: 13px; }
 
 .ask-sources { display: flex; flex-direction: column; gap: 6px; }
 .ask-sources h3 { margin: 0; font-size: 13px; color: var(--muted); }

@@ -61,7 +61,6 @@ import {
   LoadingState,
   Skeleton,
   SkeletonTable,
-  Spinner,
 } from '../ui'
 import { cn } from '../ui/cn'
 
@@ -530,13 +529,28 @@ function WikiList(props: {
                   */
                   <tr
                     key={p.slug}
-                    className="cursor-pointer transition-colors duration-150 hover:bg-hover"
+                    className="group cursor-pointer transition-colors duration-150 hover:bg-hover"
                     onClick={() => onOpen(p.slug)}
                   >
                     <td className="border-b border-line px-3 py-2.5 align-top font-semibold">
+                      {/*
+                        链接的"可辨识性"与正文链接（`.md-body a`）**保持一致**：常驻细下划线、
+                        悬停加粗。理由（实测 + 规范，不是主观偏好）：
+                        - WCAG 2.2 · 1.4.1「不能只靠颜色」的**充分技术 G183**（
+                          https://www.w3.org/WAI/WCAG21/Techniques/general/G183 ）规定：链接若
+                          **仅靠颜色**与周围文字区分，则链接文字与周围文字的对比度须 ≥3:1。
+                          实测本项目 `--gw-accent`(#2563eb) 对正文色 `--gw-ink`(#1c2733)
+                          = **2.93:1**，**低于**该门槛；而 Wikipedia 的链接蓝(#3366cc)刻意调成
+                          3.01:1 正是为了卡这条线。既然我们的链接色达不到 3:1，就**必须**给出
+                          非颜色的线索——下划线是最直接的（G183 也把下划线列为推荐做法）。
+                        - 同一产品里正文链接有下划线、列表标题没有，会让用户学不到统一的规则
+                          （目标里的"视觉系统与一致性"）。
+                        - 噪声顾虑（表格里全是下划线会吵）用**行级悬停**缓解：`tr` 是 `group`，
+                          鼠标落在行内任意位置都会加强下划线，让"整行可点"的暗示浮现出来。
+                      */}
                       <a
                         href={`#/wiki/${encodeURIComponent(p.slug)}`}
-                        className="gw-focus-ring rounded-sm py-1 text-accent hover:underline"
+                        className="gw-focus-ring rounded-sm py-1 text-accent underline decoration-1 underline-offset-2 hover:text-accent-hover hover:decoration-2 group-hover:decoration-2"
                       >
                         {p.title}
                       </a>
@@ -848,6 +862,11 @@ function WikiDetail(props: {
     hasError: loadError !== null,
     isEmpty: false,
   })
+  /*
+    ⚠️ 必须在下面的任何 early return 之前调用（hook 顺序不能随分支改变，否则 React 抛 #310）。
+    慢请求提示与列表/管理台/依赖图同款，避免同一个产品里两种加载反馈。
+  */
+  const slowDetail = useSlowHint(detailState === 'loading')
   if (detailState === 'error') {
     const view = describeError(loadError)
     const crumbs = <Breadcrumb slug={slug} title={slug} pages={siblings} />
@@ -883,13 +902,47 @@ function WikiDetail(props: {
     从而不必在下面十几处用非空断言。
   */
   if (page === null) {
+    /*
+      骨架与真实详情页**同构**（面包屑行 → 元信息 + 操作按钮行 → 正文卡片 → 上/下一篇），
+      而不是一叠等高条。理由见 `ui/Skeleton.tsx` 的注释：骨架必须与最终尺寸一致，
+      否则数据到达时照样布局跳动（CLS），骨架屏就白做了。
+      加载反馈统一走 `LoadingState`（role="status" + aria-live + aria-busy + 慢请求文案），
+      与列表页/管理台/依赖图一致；此前这里是裸 `aria-busy` + 一个多余的 Spinner。
+    */
     return (
-      <div className="flex flex-col gap-4" aria-busy="true">
+      <LoadingState slow={slowDetail} label="正在加载页面…">
+        {/* 面包屑：`知识库 › 标题` */}
         <Skeleton className="h-4 w-48" />
-        <Skeleton className="h-8 w-2/3" />
-        <Skeleton className="h-40 w-full" />
-        <Spinner label="正在加载页面" />
-      </div>
+
+        {/* 操作条：左侧「版本 vN」徽标 + 更新时间，右侧编辑/删除按钮 */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Skeleton className="h-5 w-20" />
+          <Skeleton className="h-4 w-40" />
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Skeleton className="h-8 w-20" />
+            <Skeleton className="h-8 w-20" />
+          </div>
+        </div>
+
+        {/* 正文卡片：标题 + 若干**不等宽**段落行 + 一个代码块占位 */}
+        <div className="rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
+          <Skeleton className="h-7 w-1/2" />
+          <div className="mt-6 flex flex-col gap-2.5">
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-11/12" />
+            <Skeleton className="h-4 w-4/5" />
+            <Skeleton className="mt-3 h-16 w-full" />
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-2/3" />
+          </div>
+        </div>
+
+        {/* 上一篇 / 下一篇：窄屏堆叠、宽屏两列（与真实布局同一断点） */}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      </LoadingState>
     )
   }
 
@@ -1367,14 +1420,42 @@ function WikiEdit(props: {
     setPendingDraft(null)
   }
 
+  /*
+    ⚠️ 必须在下面的任何 early return 之前调用（hook 顺序不能随分支改变，否则 React 抛 #310）。
+  */
+  const slowEdit = useSlowHint(loading)
+
   if (loading) {
+    /*
+      与详情页同款：骨架与真实编辑页同构（面包屑 → 标题 + 操作按钮 → 字段 → 编辑面板），
+      而不是一叠等高条；加载反馈统一走 `LoadingState`。
+    */
     return (
-      <div className="flex flex-col gap-4" aria-busy="true">
+      <LoadingState slow={slowEdit} label="正在加载页面…">
+        {/* 面包屑 */}
         <Skeleton className="h-4 w-48" />
-        <Skeleton className="h-8 w-1/3" />
-        <Skeleton className="h-[420px] w-full" />
-        <Spinner label="正在加载页面" />
-      </div>
+
+        {/* 操作条：左侧「编辑页面」标题，右侧保存/取消 */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Skeleton className="h-7 w-32" />
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Skeleton className="h-8 w-20" />
+            <Skeleton className="h-8 w-20" />
+          </div>
+        </div>
+
+        {/* 标题字段：标签 + 输入框 */}
+        <div className="flex flex-col gap-1.5">
+          <Skeleton className="h-4 w-12" />
+          <Skeleton className="h-10 w-full" />
+        </div>
+
+        {/* 编辑面板：宽屏左编辑/右预览两栏（与真实分屏同一断点） */}
+        <div className="grid gap-3 lg:grid-cols-2">
+          <Skeleton className="h-[420px] w-full" />
+          <Skeleton className="hidden h-[420px] w-full lg:block" />
+        </div>
+      </LoadingState>
     )
   }
 
