@@ -108,6 +108,21 @@ export interface WikiPageDetail {
   version: number
   /** 最近版本历史（条数受 config.recentVersions 限制，按 id 倒序） */
   versions: { id: number; saved_at: string }[]
+  /**
+   * ★ P2：当前主体对这条目的**能力**，供前端条件化渲染按钮。
+   *
+   * **前端隐藏只是体验，不是安全** —— 服务端在写路径上另有强制（§9 R10 反模式 5）。
+   * 之所以要下发：否则界面会对每个访客都显示"编辑/删除"，点下去才 401/403，
+   * 那是把权限做成了猜谜。
+   */
+  capabilities: { canEdit: boolean; canDelete: boolean; canManageVisibility: boolean }
+  /**
+   * ★ P2：可见性档位。**只在有管理权时下发** —— 它是"谁能看"的结构信息，
+   * 普通读者不需要它，管理面板才需要回填。
+   */
+  visibility?: 'private' | 'org' | 'public'
+  inherit?: boolean
+  published?: boolean
 }
 
 export interface WikiSaveInput {
@@ -235,6 +250,15 @@ interface PageRow {
   content: string
   created_at: string
   updated_at: string
+  /*
+   * ★ P2 的可见性列（`0012_page_acl.sql`）。声明为可选：`getPage` 里有一条
+   * `SELECT id, title, content FROM pages` 的窄查询（只取判定所需的最小列），
+   * 用它构造的行**没有**这几列 —— 标成必填会让那条查询的返回值类型说谎。
+   * 用到它们的地方（详情响应）走的是 `SELECT *`。
+   */
+  visibility?: string
+  inherit?: number | boolean
+  published_at?: string | null
 }
 
 /**
@@ -517,6 +541,19 @@ export const WikiPlugin = {
         // 响应里的 version 就成了字符串——契约悄悄变化，且只在 PG 这一种驱动下发生。
         version: Number(totalVersions.n) + 1,
         versions: versions.map((v) => ({ id: v.id, saved_at: v.saved_at })),
+        capabilities: {
+          canEdit: access.canEdit,
+          canDelete: access.canDelete,
+          canManageVisibility: access.canManageVisibility,
+        },
+        // 档位只在有管理权时下发（见接口注释）：普通读者不需要，管理面板才要回填
+        ...(access.canManageVisibility
+          ? {
+              visibility: page.visibility as 'private' | 'org' | 'public',
+              inherit: page.inherit === 1 || page.inherit === true,
+              published: page.published_at !== null,
+            }
+          : {}),
       }
       const projected = access.project(detail)
       if (projected === detail) return detail

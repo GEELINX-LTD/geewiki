@@ -450,6 +450,12 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
         updated_at: (await svc.get('via-http', MEMBER))?.updated_at,
         version: 1,
         versions: [],
+        // ★ P2：详情新增能力标志；MEMBER 对该条目有管理权，故档位字段一并下发。
+        // 新建条目默认 `org`（应用层显式写），未发布。
+        capabilities: { canEdit: true, canDelete: true, canManageVisibility: true },
+        visibility: 'org',
+        inherit: true,
+        published: false,
       },
       '端点写入的内容，服务应逐字段读到',
     )
@@ -459,13 +465,18 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
     const detail = await h.call('GET', '/api/pages/:slug', { slug: 'via-svc' })
     assert.equal(detail.status, 200)
     assert.deepEqual(Object.keys(detail.body).sort(), [
+      // ★ P2：详情新增能力标志与档位字段（有管理权时才带档位）
+      'capabilities',
       'content',
       'created_at',
+      'inherit',
+      'published',
       'slug',
       'title',
       'updated_at',
       'version',
       'versions',
+      'visibility',
     ])
     assert.equal(detail.body['content'], 'v1')
     assert.equal(detail.body['version'], 1)
