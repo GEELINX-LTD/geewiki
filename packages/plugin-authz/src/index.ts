@@ -656,6 +656,14 @@ export const AuthzPlugin = {
           setHeader.call(h.res, 'cache-control', CACHE_SITEMAP)
           setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
         }
+        /*
+         * ⚠️ `/p/<slug>` 这个前缀**只是本端点的数据形态，不保证可解析**：全仓没有注册任何
+         * `/p/...` 路由（真实读路径是 `/api/pages/:slug`；门户链接用 `/#/wiki/<slug>`）。
+         * 本端点在 D4 下**不给爬虫、只给运维做集合差核对**（见上方注释），`<loc>` 的唯一消费者
+         * 是运维脚本 —— 而**核对请走真实读路径** `/api/pages/:slug`（见
+         * `packages/plugin-authz/test/e2e-p4.sh` 阶段 I 的 I1），不要照 `<loc>` 去请求：
+         * 那会落进 serveStatic 的 SPA fallback、拿到 index.html + 200，看起来"可访问"。
+         */
         const urls = slugs.map((s) => `  <url><loc>/p/${esc(s)}</loc></url>`).join('\n')
         h.res.end(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset>\n${urls}\n</urlset>\n`)
       })
@@ -959,6 +967,14 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
           const publishedAt = self.published_at ?? null
 
           // ---- 来源 2：祖先链（逐级、如实） ----
+          /*
+           * ⚠️ `tightens` 必须拿**累计档位**（runningRank）做基准，而不是拿**本条页面的档位**：
+           * 后者会把"本来就已经被更近的祖先收到同一档、删掉它也不改变结果"的祖先也标成收紧了。
+           * 反例：`c`=public、`a/b`=org、`a`=org —— 两条祖先的档位都高于 `c`，但真正起作用的是
+           * 更近的 `a/b`，`a` 只是重复。与 `effectiveRank` 里那句 `rank = Math.max(rank, …)`
+           * 逐级累积是同一个口径。
+           */
+          let runningRank = rankOf(self.visibility)
           const ancestors: Record<string, unknown>[] = []
           let broken = false
           for (const anc of ancestorsOf(slug)) {
@@ -986,11 +1002,14 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
               })
               continue
             }
+            const ancRank = rankOf(row.visibility)
+            const tightens = ancRank > runningRank
+            if (tightens) runningRank = ancRank
             ancestors.push({
               slug: anc,
               visibility: row.visibility,
               inherit: true,
-              effect: rankOf(row.visibility) > rankOf(self.visibility) ? 'tightens' : 'no_effect',
+              effect: tightens ? 'tightens' : 'no_effect',
             })
           }
 

@@ -190,11 +190,34 @@ check "H5 组织角色那条只标相关、不标生效（生效与否取决于�
 check "H6 应急覆盖那条同样只标相关" "false/true" \
   "$(echo "$EX" | field 'sources.adminOverride.effective')/$(echo "$EX" | field 'sources.adminOverride.relevant')"
 check "H7 无授予时 grants.effective=false" "false" "$(echo "$EX" | field 'sources.grants.effective')"
+# ★ H8 原先是**恒真的**，这里必须说明为什么改：原先它用 `$JAR_G`（owner）去读，而 owner 读任何
+#   **存在**的页都会被 D14 应急覆盖放行（`decideNormally` 落空 ⇒ `isAdminRole` ⇒ O1 升为 full）——
+#   把授予删掉照样 200，于是"授予排在祖先收紧之前"这条排序**零覆盖**。
+#   改成用**非管理员的组织成员**读：他不在 O1 之内，200 只可能来自授予。
+#   成员账号走「管理员发邀请 → `/api/org/invitations/redeem` 自助开户」这条路
+#   （`/api/auth/setup` 是一次性的，系统里没有其它创建第二个用户的途径）；邮箱取自邀请本身，
+#   注册者无法自选。redeem **不建会话**（会话属于身份域），故开户后再自己登录一次。
+GRANTEE='grantee@example.com'
+GI="$(curl -s -b "$JAR_G" -X POST "http://127.0.0.1:$PORT/api/org/invitations" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d "{\"email\":\"$GRANTEE\",\"orgRole\":\"viewer\"}")"
+GT="$(echo "$GI" | field 'token')"
+check_ge "H7b 反空洞：拿到邀请令牌" 20 "$(printf '%s' "$GT" | wc -c)"
+curl -s -X POST "http://127.0.0.1:$PORT/api/org/invitations/redeem" -H 'content-type: application/json' \
+  -d "{\"token\":\"$GT\",\"password\":\"correct-horse-battery\"}" >/dev/null
+JAR_M="$TMP/jar-member.txt"
+curl -s -c "$JAR_M" -X POST "http://127.0.0.1:$PORT/api/auth/login" -H 'content-type: application/json' \
+  -H 'x-gw-csrf: 1' -d "{\"email\":\"$GRANTEE\",\"password\":\"correct-horse-battery\"}" >/dev/null
+MID="$(curl -s -b "$JAR_M" "http://127.0.0.1:$PORT/api/auth/me" | field 'user.id')"
+# 反空洞：id 必须真的取到，否则下面的授予会打到一个空 subjectId 上、H8 以"看起来对"的方式失败
+check_ge "H7c 反空洞：拿到非管理员成员的 userId" 1 "${MID:-0}"
+# 前置：未被授予时读不到 —— 这一条同时证明了"他不是靠 O1 进来的"（否则这里就会是 200）
+check "H7d 前置：该成员未被授予时读不到（他不在 D14 应急覆盖之内）" "404" \
+  "$(code_of -b "$JAR_M" "http://127.0.0.1:$PORT/api/pages/hx%2Fpub")"
 # 显式授予 ⇒ 它就是"明确指名的例外"，应当恢复可见
 curl -s -b "$JAR_G" -X POST "http://127.0.0.1:$PORT/api/pages/hx%2Fpub/grants" -H 'content-type: application/json' \
-  -H 'x-gw-csrf: 1' -d '{"subjectKind":"user","subjectId":"1","role":"viewer"}' >/dev/null
-check "H8 显式授予后被授权者恢复可见（授予排在祖先收紧之前）" "200" \
-  "$(code_of -b "$JAR_G" "http://127.0.0.1:$PORT/api/pages/hx%2Fpub")"
+  -H 'x-gw-csrf: 1' -d "{\"subjectKind\":\"user\",\"subjectId\":\"$MID\",\"role\":\"viewer\"}" >/dev/null
+check "H8 显式授予后**非管理员被授权者**恢复可见（授予排在祖先收紧之前）" "200" \
+  "$(code_of -b "$JAR_M" "http://127.0.0.1:$PORT/api/pages/hx%2Fpub")"
 check "H9 此时 grants.effective=true" "true" "$(adm '/api/admin/access-explain?slug=hx%2Fpub' | field 'sources.grants.effective')"
 check "H10 需要 slug 参数" "400" "$(code_of -H "x-gw-admin-token: $TOKEN" "http://127.0.0.1:$PORT/api/admin/access-explain")"
 check "H11 页面不存在时如实 404（不编造"可能是红链"）" "404" \
@@ -228,8 +251,15 @@ while IFS= read -r s; do
   [[ "$(code_of "http://127.0.0.1:$PORT/api/pages/$enc")" == "200" ]] || BAD_READ=$((BAD_READ + 1))
 done <<< "$SLUGS_IN_MAP"
 check "I1 sitemap 广告的每一条都真的匿名读得到（独立 oracle，必须 0）" "0" "$BAD_READ"
-check "I2 进程内核对也报一致" "true" "$(adm '/api/admin/sitemap-audit' | field 'consistent')"
-check "I3 且如实标注 sameSource（不夸大成"两条独立来源的差集"）" "true" \
+# ⚠️ I2/I3 **不是验证**，只是"如实标注"的回归钉子，请勿把它们读成核对通过：
+#   进程内的 `sitemap-audit` 拿 sitemap 广告集合去撞的，是**与 sitemap 生成器同一套规则**
+#   算出来的可见集合（`buildAccess` → `decideNormally`）⇒ 差集**结构性恒空**，它报 consistent
+#   是必然的，把可见性写坏它照样报 true。**真正有信息量的是上面的 I1** —— 它取自
+#   `/sitemap.xml` 的 slug 再**逐条真去匿名读一次**（另一条 HTTP 路径），这才是独立 oracle。
+#   I2/I3 钉住的是"端点仍如实自报 sameSource=true、没有把它夸大成两条独立来源的差集"。
+check "I2 [非验证·仅标注] 进程内核对恒报一致（同源 ⇒ 必然为空，不构成核对）" "true" \
+  "$(adm '/api/admin/sitemap-audit' | field 'consistent')"
+check "I3 [非验证·仅标注] 端点如实自报 sameSource=true（没夸大成独立差集）" "true" \
   "$(adm '/api/admin/sitemap-audit' | field 'sameSource')"
 check "I4 sitemap 自身 no-store（否则运维核对到的是缓存副本）" "1" \
   "$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/sitemap.xml" | grep -ci 'cache-control: no-store')"
@@ -239,8 +269,15 @@ echo
 echo "=== 阶段 J：清缓存指引（§5.10）==="
 CP="$(adm '/api/admin/cache-plan')"
 check "J1 指出唯一可被共享缓存的是门户" "/portal" "$(echo "$CP" | grep -o '"path":"[^"]*"' | head -1 | cut -d'"' -f4)"
-check "J2 复述的缓存串与门户实际响应头一致" "1" \
-  "$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/portal" | grep -c 'max-age=60, s-maxage=300')"
+# ★ J2 原先**名不副实**：它只 grep 门户的真实响应头里有没有那串，**从不与端点复述的值比对**——
+#   于是"复述串与实际不一致"这种情况它照绿（两边各自独立地"看起来对"）。改成真比对：
+#   取门户实际的 `cache-control` 头，与 `sharedCacheable[0].cacheControl` 逐字相等。
+PORTAL_CC="$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/portal" \
+  | grep -i '^cache-control:' | sed 's/^[Cc]ache-[Cc]ontrol:[[:space:]]*//' | tr -d '\r')"
+# 反空洞：两边都不能是空串（否则"都空"也会相等而假绿）
+check_ge "J2a 反空洞：门户确实带 cache-control 头" 1 "$(printf '%s' "$PORTAL_CC" | wc -c)"
+check "J2 端点复述的缓存串与门户**实际**响应头逐字一致" "$PORTAL_CC" \
+  "$(echo "$CP" | field 'sharedCacheable.0.cacheControl')"
 check "J3 明说 sitemap 无需清理" "1" "$(echo "$CP" | grep -c '/sitemap.xml')"
 check "J4 近期有 ACL 变更 ⇒ 建议清缓存" "true" "$(echo "$CP" | field 'purgeRecommended')"
 check "J5 非 admin 不得调用" "401" "$(code_of "http://127.0.0.1:$PORT/api/admin/cache-plan")"

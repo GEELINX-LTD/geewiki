@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { RefreshCw, ShieldAlert, Trash2, ScrollText, LogOut } from 'lucide-react'
 import {
   api,
+  type AccessExplainResponse,
   type AuditEntry,
   type CachePlanResponse,
   type SessionEntry,
@@ -9,6 +10,7 @@ import {
 } from '../api'
 import { Button } from '../ui/Button'
 import { Badge } from '../ui/Badge'
+import { Input } from '../ui/Input'
 import { Card, CardBody, CardHeader } from '../ui/Card'
 import { describeError, type ErrorView } from '../lib/errorText'
 
@@ -44,6 +46,9 @@ export function OpsPage(): ReactNode {
   const [cachePlan, setCachePlan] = useState<CachePlanResponse | null>(null)
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState<ErrorView | null>(null)
+  // 反向展开（§8.1 P4）：排障时按 slug 现查，不随刷新自动加载
+  const [slug, setSlug] = useState('')
+  const [explain, setExplain] = useState<AccessExplainResponse | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
   const load = useCallback(async (): Promise<void> => {
@@ -160,6 +165,114 @@ export function OpsPage(): ReactNode {
         security,
       )}
       {auditTable('权限变更（合规记录）', '要留存：谁在什么时候改了哪条可见性', acl)}
+
+      <Card>
+        <CardHeader
+          title="反向展开「谁能看这条」"
+          description="排障用：列三条来源，并标注哪条**真的在起作用**。不做递归，响应也不含正文"
+        />
+        <CardBody>
+          <form
+            className="flex flex-wrap items-end gap-3"
+            onSubmit={(e) => {
+              e.preventDefault()
+              void run('explain', async () => {
+                const r = await api.accessExplain(slug.trim())
+                setExplain(r)
+                return `已展开 ${r.slug}`
+              })
+            }}
+          >
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <label htmlFor="ops-explain-slug" className="text-sm text-muted-foreground">
+                条目 slug
+              </label>
+              <Input
+                id="ops-explain-slug"
+                value={slug}
+                placeholder="例如 a/b"
+                onChange={(e) => setSlug(e.target.value)}
+              />
+            </div>
+            <Button type="submit" size="sm" disabled={busy !== '' || slug.trim() === ''}>
+              展开
+            </Button>
+          </form>
+
+          {explain === null ? (
+            <p className="mt-3 text-sm text-muted-foreground">输入一个 slug 后展开。</p>
+          ) : (
+            <div className="mt-3 flex flex-col gap-2">
+              <p className="text-sm text-muted-foreground">
+                {`有效档位 rank=${explain.positionalRank}　匿名：${explain.reach.anonymous}（${explain.reach.anonymousReason}）　组织成员：${explain.reach.orgMember}`}
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="text-xs text-muted-foreground">
+                    <tr>
+                      <th className="py-1 pr-3 font-medium">来源</th>
+                      <th className="py-1 pr-3 font-medium">对象</th>
+                      <th className="py-1 pr-3 font-medium">生效/相关</th>
+                      <th className="py-1 pr-3 font-medium">说明</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="border-t border-border/60">
+                      <td className="py-1.5 pr-3">直接授予</td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {`页 ${explain.sources.grants.pages.length} / 块 ${explain.sources.grants.blocks.length}`}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {String(explain.sources.grants.effective)}
+                      </td>
+                      <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                        {explain.sources.grants.blockGrantsAvailable
+                          ? '块级授权表可用'
+                          : '块级授权表不可用'}
+                      </td>
+                    </tr>
+                    {explain.sources.ancestors.map((a) => (
+                      <tr key={a.slug} className="border-t border-border/60">
+                        <td className="py-1.5 pr-3">祖先链</td>
+                        <td className="py-1.5 pr-3 font-mono text-xs">{a.slug}</td>
+                        <td className="py-1.5 pr-3 font-mono text-xs">{a.effect}</td>
+                        <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                          {a.reason ??
+                            `${a.visibility ?? ''}${a.inherit === false ? '（断链）' : ''}`}
+                        </td>
+                      </tr>
+                    ))}
+                    <tr className="border-t border-border/60">
+                      <td className="py-1.5 pr-3">组织角色</td>
+                      <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                        {explain.sources.orgRole.rule}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {`${String(explain.sources.orgRole.effective)}/${String(explain.sources.orgRole.relevant)}`}
+                      </td>
+                      <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                        生效与否取决于看的人，故只标相关
+                      </td>
+                    </tr>
+                    <tr className="border-t border-border/60">
+                      <td className="py-1.5 pr-3">应急覆盖</td>
+                      <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                        {explain.sources.adminOverride.rule}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {`${String(explain.sources.adminOverride.effective)}/${String(explain.sources.adminOverride.relevant)}`}
+                      </td>
+                      <td className="py-1.5 pr-3 text-xs text-muted-foreground">
+                        owner/admin 恒可看（D14），同样只标相关
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </CardBody>
+      </Card>
 
       <Card>
         <CardHeader

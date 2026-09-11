@@ -94,3 +94,19 @@ test('App：审计入口与其余运维入口**同一判据**（不新开能力�
   )
   assert.match(app, /active === 'audit'\) body = <OpsPage \/>/, 'audit 路由必须分派到 OpsPage')
 })
+
+/*
+ * 反向展开的界面入口。
+ *
+ * 这条守卫的存在理由：`api.accessExplain` 曾经**定义好了却没有任何调用者** ——
+ * 端点能用、界面进不去，等价于这个能力对运维不存在。源码级断言"有调用者"是最省的钉子，
+ * 因为"定义了但没人用"恰恰是类型检查与构建都不会报的那类问题。
+ */
+test('OpsPage：反向展开有真实界面入口（否则 api.accessExplain 定义了也没人能用）', () => {
+  const calls = ops.match(/api\.accessExplain\(/g) ?? []
+  assert.ok(calls.length >= 1, 'OpsPage 必须真的调用 api.accessExplain（不能只 import 类型）')
+  // 反空洞：确认它是被表单提交触发的，而不是某处顺手写了一句不会执行到的调用
+  assert.match(ops, /onSubmit=\{/, '应有一个表单提交入口')
+  assert.match(ops, /htmlFor="ops-explain-slug"/, 'Input 必须配 <label htmlFor>（Input 原语的无障碍要求）')
+  assert.match(ops, /id="ops-explain-slug"/, 'label 的 htmlFor 必须能对应到输入框的 id')
+})
