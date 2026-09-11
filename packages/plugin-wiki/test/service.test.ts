@@ -20,15 +20,16 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
+import { MIGRATION_TABLE } from '@geewiki/core'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
 /* ------------------------------ 夹具 ------------------------------ */
@@ -49,6 +50,15 @@ class NodeSqliteAdapter implements DatabaseAdapter {
     this.db = new DatabaseSync(filename)
     // 真实迁移脚本（多语句）一次执行；表结构与生产完全一致
     this.db.exec(schemaSql)
+    // 迁移登记表（与 db-sqlite 同名同构）：schemaSql 已建好 db-sqlite 的内容，
+    // 故登记为"已应用"，wiki 的自带迁移才会被当作增量应用。
+    this.db.exec(`CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
+      name TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )`)
+    const seed = this.db.prepare(`INSERT OR IGNORE INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`)
+    // 只登记本夹具实际执行过的那一个脚本（本文件只加载 0001_init.sql）
+    seed.run(basename(INIT_SQL_PATH), new Date().toISOString())
   }
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
@@ -60,9 +70,25 @@ class NodeSqliteAdapter implements DatabaseAdapter {
     return { changes: Number(r.changes), lastInsertRowid: r.lastInsertRowid as number | bigint }
   }
 
-  /** wiki 插件不调用迁移控制器（表由 db-sqlite 建立），故显式不实现而非伪装成功 */
-  migrate(): void {
-    throw new Error('本夹具不实现 migrate（@geewiki/wiki 不调用它）')
+  /**
+   * 与 db-sqlite 同语义的迁移执行：按文件名序应用**未登记**的脚本，每个脚本一个事务。
+   * wiki 现在会应用自己的迁移（`page_links`），故夹具必须真的会迁移。
+   */
+  migrate(directory?: string): void {
+    if (!directory) throw new Error('本夹具需要显式迁移目录（wiki 传的是 WIKI_MIGRATIONS_DIR）')
+    const applied = new Set(this.appliedMigrations())
+    for (const name of readdirSync(directory)
+      .filter((f) => f.endsWith('.sql'))
+      .sort()) {
+      if (applied.has(name)) continue
+      const sql = readFileSync(join(directory, name), 'utf8')
+      this.transaction(() => {
+        this.db.exec(sql)
+        this.db
+          .prepare(`INSERT INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`)
+          .run(name, new Date().toISOString())
+      })
+    }
   }
 
   listTables(): string[] {
@@ -72,7 +98,7 @@ class NodeSqliteAdapter implements DatabaseAdapter {
   }
 
   appliedMigrations(): string[] {
-    return []
+    return this.query<{ name: string }>(`SELECT name FROM ${MIGRATION_TABLE} ORDER BY name`).map((r) => r.name)
   }
 
   transaction<T>(fn: () => T): T {
@@ -522,4 +548,120 @@ test('异步数据库适配器：wiki 显式拒绝并给出指引（不静默坏
       return true
     },
   )
+})
+
+
+/* =====================================================================
+ * 反向链接（page_links）：抽取 → 存储 → 端点 的完整链路
+ *
+ * 抽取纯函数的边界用例在 links.test.ts；这里守的是**存储与端点语义**：
+ * 重建而非追加、删除无遗留、404 语义。
+ * =================================================================== */
+
+/** 参数化路由按**模式**登记（`/api/pages/:slug`），故 path 传模式、实参走 params */
+const P = '/api/pages/:slug'
+
+/**
+ * `node:sqlite` 返回的行是 **null 原型对象**，而 `assert.deepEqual`（strict）会比较原型，
+ * 故断言前转成普通对象。生产路径经 `JSON.stringify` 不受影响，这里纯属测试比较细节。
+ */
+const plain = <T,>(rows: T[]): T[] => rows.map((r) => ({ ...r }))
+
+test('backlinks：保存时按正文重建出链；改掉正文后旧边消失（重建而非追加）', async () => {
+  const h = makeHarness()
+  try {
+    await h.call('PUT', P, { slug: 'src' }, { title: '源页', content: '见 [甲](/wiki/a1) 与 [[a2]]' })
+    await h.call('PUT', P, { slug: 'a1' }, { title: '甲页', content: '甲' })
+    await h.call('PUT', P, { slug: 'a2' }, { title: '乙页', content: '乙' })
+
+    const out1 = await h.call('GET', `${P}/links`, { slug: 'src' })
+    assert.equal(out1.status, 200)
+    assert.deepEqual(
+      (out1.body['links'] as { slug: string }[]).map((l) => l.slug),
+      ['a1', 'a2'],
+    )
+    assert.deepEqual(plain((await h.call('GET', `${P}/backlinks`, { slug: 'a1' })).body['backlinks'] as {
+      slug: string
+      title: string
+    }[]), [{ slug: 'src', title: '源页' }])
+
+    // 改掉正文：不再指向 a1
+    await h.call('PUT', P, { slug: 'src' }, { title: '源页', content: '只链 [[a2]]' })
+    assert.deepEqual(
+      (await h.call('GET', `${P}/backlinks`, { slug: 'a1' })).body['backlinks'],
+      [],
+      '改掉出链后旧边必须被清掉',
+    )
+    assert.deepEqual(plain((await h.call('GET', `${P}/backlinks`, { slug: 'a2' })).body['backlinks'] as {
+      slug: string
+      title: string
+    }[]), [{ slug: 'src', title: '源页' }])
+  } finally {
+    h.dispose()
+  }
+})
+
+test('backlinks：删除页面时两侧都清（不留遗留边）', async () => {
+  const h = makeHarness()
+  try {
+    await h.call('PUT', P, { slug: 'p' }, { title: '引用方', content: '[目标](/wiki/t)' })
+    await h.call('PUT', P, { slug: 't' }, { title: '目标页', content: '目标' })
+
+    // 删引用方 → 目标的反向链接空
+    await h.call('DELETE', P, { slug: 'p' })
+    assert.deepEqual((await h.call('GET', `${P}/backlinks`, { slug: 't' })).body['backlinks'], [])
+
+    // 重建引用方；再删目标 → 引用方的出链也应空（目标侧的边被清）
+    await h.call('PUT', P, { slug: 'p' }, { title: '引用方', content: '[目标](/wiki/t)' })
+    await h.call('DELETE', P, { slug: 't' })
+    assert.deepEqual((await h.call('GET', `${P}/links`, { slug: 'p' })).body['links'], [])
+  } finally {
+    h.dispose()
+  }
+})
+
+test('backlinks：指向尚未创建的页面是合法的（title 为 null）', async () => {
+  const h = makeHarness()
+  try {
+    await h.call('PUT', P, { slug: 'host' }, { title: '宿主', content: '[未来页](/wiki/ghost)' })
+    assert.deepEqual(
+      plain((await h.call('GET', `${P}/links`, { slug: 'host' })).body['links'] as {
+        slug: string
+        title: string | null
+      }[]),
+      [{ slug: 'ghost', title: null }],
+    )
+    // ghost 不存在 → 其 backlinks 是 404（"页面不存在"与"存在但没人链接"必须可区分）
+    assert.equal((await h.call('GET', `${P}/backlinks`, { slug: 'ghost' })).status, 404)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('backlinks：不存在的页面返回 404，与详情端点同语义', async () => {
+  const h = makeHarness()
+  try {
+    for (const suffix of ['/backlinks', '/links']) {
+      const r = await h.call('GET', `${P}${suffix}`, { slug: 'nope' })
+      assert.equal(r.status, 404, `${suffix} 应为 404`)
+      assert.equal(r.body['error'], 'not_found')
+    }
+  } finally {
+    h.dispose()
+  }
+})
+
+test('backlinks：wiki-service 的两个新方法与端点结果一致', async () => {
+  const h = makeHarness()
+  try {
+    await h.call('PUT', P, { slug: 'x' }, { title: '甲', content: '[乙](/wiki/y)' })
+    await h.call('PUT', P, { slug: 'y' }, { title: '乙', content: '乙' })
+    const svc = h.svc()
+    assert.deepEqual(plain(svc.links('x')!), [{ slug: 'y', title: '乙' }])
+    assert.deepEqual(plain(svc.backlinks('y')!), [{ slug: 'x', title: '甲' }])
+    assert.equal(svc.links('nope'), undefined)
+    assert.equal(svc.backlinks('nope'), undefined)
+  } finally {
+    h.dispose()
+  }
 })

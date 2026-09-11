@@ -15,9 +15,25 @@
  * 方法集与上述四个端点一一对应，两者**共用同一份内部实现**（listPages/getPage/
  * savePage/deletePage），故同一入参下结果逐字段一致。
  */
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
 import { closeAfterResponse, isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
+import { extractLinkTargets } from './links.js'
+
+/**
+ * 本插件自带迁移目录（`page_links` 表）。
+ *
+ * **为什么在 `apply` 里自己跑 `db.migrate()`，而不是靠 `manifest.geewiki.migrations`**：
+ * 内置插件的迁移目录是在组合根 `defaultRegistry()` 里**硬编码**的
+ * （见 `packages/server/src/index.ts` 各条目的 `migrationsDirs`），manifest 的那个字段
+ * 只对**外部**插件（走 discovery）生效。本插件的表此前一直由 db-sqlite 的 `0001` 建立，
+ * 故当时 `migrations` 是 `undefined`；新增 `page_links` 时若走注册表路径就需要改 server，
+ * 而自己应用同样安全：`db.migrate()` 以 `_migrations` 表去重，天然幂等、可重放。
+ * 该常量已导出，将来若把迁移目录上移到注册表，直接引用它即可（重复应用无害）。
+ */
+export const WIKI_MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations')
 
 export interface WikiConfig {
   /** 页面详情中返回的最近版本历史条数上限 */
@@ -69,6 +85,23 @@ export interface WikiSaveResult {
   version: number
 }
 
+/** 反向链接项：**引用**了某页的页面（对应 GET /api/pages/:slug/backlinks 的单项） */
+export interface WikiBacklink {
+  slug: string
+  title: string
+}
+
+/**
+ * 正向链接项：某页正文里**指向**的目标。
+ *
+ * `title` 为 `null` 表示目标页面**尚不存在**（先写引用、后建页面是正常用法，
+ * 与 wiki 的"红链"语义一致），这正是本表 `target_slug` 不加外键的原因。
+ */
+export interface WikiOutlink {
+  slug: string
+  title: string | null
+}
+
 /**
  * `wiki-service` 服务契约（本插件经 `ctx.provide('wiki-service', svc)` 提供）。
  *
@@ -86,6 +119,8 @@ export interface WikiSaveResult {
  *   get()    ↔ GET    /api/pages/:slug
  *   save()   ↔ PUT    /api/pages/:slug
  *   remove() ↔ DELETE /api/pages/:slug
+ *   backlinks() ↔ GET /api/pages/:slug/backlinks
+ *   links()     ↔ GET /api/pages/:slug/links
  *
  * 入参非法时抛错（而非静默返回空值）：`message` 以 `<code>: ` 开头，`code` 与端点的
  * 400/413 错误码同源（`invalid_slug` / `invalid_title` / `content_too_large`）。
@@ -99,6 +134,10 @@ export interface WikiService {
   save(slug: string, input: WikiSaveInput): WikiSaveResult
   /** 删除页面及其全部版本历史；返回是否确实删除（false 对应端点 404） */
   remove(slug: string): boolean
+  /** 引用了该页的页面（按标题、slug 稳定排序）；页面不存在时返回 `undefined`（对应端点 404） */
+  backlinks(slug: string): WikiBacklink[] | undefined
+  /** 该页正文指向的目标（含尚未创建的页面，其 title 为 null）；同理 `undefined` 对应 404 */
+  links(slug: string): WikiOutlink[] | undefined
 }
 
 export const manifest: GeeWikiManifest = {
@@ -112,7 +151,11 @@ export const manifest: GeeWikiManifest = {
     // 依赖边由管理器按 provides 解析（deps.ts resolveDependency）
     requires: ['http-service', 'database-provider'],
     conflictGroup: undefined,
-    migrations: undefined, // 表结构由 db-sqlite 的 0001 迁移建立（本插件在 db 之后激活）
+    // 页面/版本历史两张表由 db-sqlite 的 0001 迁移建立（本插件在 db 之后激活）。
+    // 本插件**自己**的迁移（page_links）不在此声明：内置插件的迁移目录在组合根
+    // `defaultRegistry()` 里硬编码，manifest 该字段只对外部插件生效；
+    // 故由 `apply()` 直接调用 `db.migrate(WIKI_MIGRATIONS_DIR)`，见该常量注释。
+    migrations: undefined,
     runtime: {
       supportsHotReload: true, // 无内部状态：可安全热插拔
       requiresCachePurge: false,
@@ -292,6 +335,18 @@ export const WikiPlugin = {
     const cleanups: (() => void)[] = []
 
     /* ---------------------------------------------------------------------
+     * 迁移与反向链接回填
+     *
+     * `page_links` 是本插件**自己的**表，故在此应用自带迁移（理由见 WIKI_MIGRATIONS_DIR）。
+     * 用 `appliedMigrations()` 的前后差判断"这次是否真的应用了新脚本"——只有真应用了才回填，
+     * 于是回填**恰好发生一次**（老库升级时），新装的库因 pages 为空而是空操作，
+     * 后续每次启动都直接跳过（不会重复扫描全部正文）。
+     * ------------------------------------------------------------------- */
+    const migrationsBefore = new Set(db.appliedMigrations())
+    db.migrate(WIKI_MIGRATIONS_DIR)
+    const justAppliedMigration = db.appliedMigrations().some((name) => !migrationsBefore.has(name))
+
+    /* ---------------------------------------------------------------------
      * 内部实现（端点与 wiki-service **共用**，单一真源）
      * 下面四个函数是全部业务语义所在；HTTP 处理器只负责参数解析/状态码翻译，
      * 服务方法只负责入参校验后转发——两条路径因此不可能行为漂移。
@@ -344,6 +399,60 @@ export const WikiPlugin = {
       }
     }
 
+    /* ---------------- 反向链接索引（page_links 的读写） ---------------- */
+
+    /**
+     * 重建某页的出链（**必须在调用方的事务内调用**，故本函数自身不开事务）。
+     *
+     * 语义是"重建"而非"追加"：先删该页全部出行，再按当前正文重插。
+     * 这样删掉正文里的链接后，旧边会被一并清掉——若只追加，反向链接会永远累积陈旧边。
+     */
+    const rebuildLinks = (slug: string, content: string): void => {
+      db.run('DELETE FROM page_links WHERE source_slug = ?', [slug])
+      for (const target of extractLinkTargets(content, isValidSlug)) {
+        db.run('INSERT INTO page_links (source_slug, target_slug) VALUES (?, ?)', [slug, target])
+      }
+    }
+
+    /** 页面是否存在（比 getPage 轻：不取正文、不取版本历史） */
+    const pageExists = (slug: string): boolean =>
+      db.query<{ slug: string }>('SELECT slug FROM pages WHERE slug = ?', [slug]).length > 0
+
+    /**
+     * 引用了 `slug` 的页面（反向链接）。
+     *
+     * 用 `JOIN pages` 取标题，于是**指向不存在页面的行不会出现**（不可能有标题）。
+     * 排序 `title, slug`：标题做主序便于阅读，`slug` 是不能省的次级键——
+     * 同名页面（或中文标题的同一码点序）下顺序才不会由查询计划决定。
+     */
+    const listBacklinks = (slug: string): WikiBacklink[] =>
+      db.query<WikiBacklink>(
+        `SELECT p.slug AS slug, p.title AS title
+           FROM page_links l JOIN pages p ON p.slug = l.source_slug
+          WHERE l.target_slug = ? ORDER BY p.title, p.slug`,
+        [slug],
+      )
+
+    /** 该页正文指向的目标；`LEFT JOIN` 让"尚未创建的目标"也返回（title 为 null） */
+    const listOutlinks = (slug: string): WikiOutlink[] =>
+      db.query<WikiOutlink>(
+        `SELECT l.target_slug AS slug, p.title AS title
+           FROM page_links l LEFT JOIN pages p ON p.slug = l.target_slug
+          WHERE l.source_slug = ? ORDER BY l.target_slug`,
+        [slug],
+      )
+
+    /** 老库升级时一次性回填（恰好一次；理由见上面迁移段落） */
+    const backfillLinks = (): void => {
+      const rows = db.query<{ slug: string; content: string }>('SELECT slug, content FROM pages')
+      db.transaction(() => {
+        db.run('DELETE FROM page_links')
+        for (const r of rows) rebuildLinks(r.slug, r.content)
+      })
+      console.log(`[@geewiki/wiki] 反向链接已回填: ${rows.length} 个页面`)
+    }
+    if (justAppliedMigration) backfillLinks()
+
     /**
      * upsert：保存前把旧正文快照进 page_versions（版本即历史）。
      * 幂等：标题与正文均未变化时既不更新 updated_at、也不写历史。
@@ -361,6 +470,7 @@ export const WikiPlugin = {
             now,
             now,
           ])
+          rebuildLinks(slug, input.content)
           return 'created'
         }
         // 幂等保存：标题与正文均未变化 → 不更新 updated_at、不写历史
@@ -377,6 +487,8 @@ export const WikiPlugin = {
           now,
           existing.id,
         ])
+        // 出链随正文重建（同一事务内，故正文与索引不会不一致）
+        rebuildLinks(slug, input.content)
         return 'updated'
       })
       const version =
@@ -387,13 +499,22 @@ export const WikiPlugin = {
       return { outcome, version }
     }
 
-    /** 删除页面及其版本历史；返回是否确实删除（版本历史此处显式删除以防实现差异） */
+    /**
+     * 删除页面及其版本历史；返回是否确实删除（版本历史此处显式删除以防实现差异）。
+     *
+     * `page_links` **两侧都清**：该页作为源的出行（它自己没了）与作为目标的入行
+     * （引用它的页面此时指向一个不存在的 slug，属悬挂边）。
+     * 代价（刻意取舍，已登记）：若之后重建同名页面，原先指向它的反向链接不会自动回来，
+     * 需引用方重新保存一次。选择"清两侧"是为了让索引与"页面存在"这一事实保持一致，
+     * 不让索引里长期留有指向已删页面的边。
+     */
     const deletePage = (slug: string): boolean =>
       db.transaction(() => {
         const page = db.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
         if (!page) return false
         db.run('DELETE FROM page_versions WHERE page_id = ?', [page.id])
         db.run('DELETE FROM pages WHERE id = ?', [page.id])
+        db.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
         return true
       })
 
@@ -405,7 +526,7 @@ export const WikiPlugin = {
       }
     }
 
-    /** 服务实例：契约见 {@link WikiService}（方法集与四个端点一一对应） */
+    /** 服务实例：契约见 {@link WikiService}（方法集与六个端点一一对应） */
     const svc: WikiService = {
       list: () => {
         assertLive()
@@ -424,6 +545,14 @@ export const WikiPlugin = {
         assertLive()
         assertValidSlug(slug)
         return deletePage(slug)
+      },
+      backlinks: (slug) => {
+        assertLive()
+        return pageExists(slug) ? listBacklinks(slug) : undefined
+      },
+      links: (slug) => {
+        assertLive()
+        return pageExists(slug) ? listOutlinks(slug) : undefined
       },
     }
 
@@ -515,11 +644,49 @@ export const WikiPlugin = {
       }),
     )
 
+    /* ---------- GET /api/pages/:slug/backlinks：谁链接了本页 ---------- */
+    /*
+     * 响应信封用 `{ ok: true, slug, backlinks }`：本插件**较早**的读端点（列表/详情/版本）
+     * 直接返回裸对象或 `{ pages }`，并没有 `ok`；但从"对外契约"的角度看，写端点
+     * （PUT/DELETE）与全仓的 `{ ok:false, error, message }` 错误形状都以 `ok` 为准，
+     * 新端点带上 `ok` 既与错误形状对称，也**纯属可加字段**——只读 `backlinks` 的调用方
+     * 不受影响，故取兼容性更好的一侧。
+     *
+     * 页面不存在 → 404（而不是 200 空数组）：与 `GET /api/pages/:slug` 同一语义。
+     * 否则"页面不存在"与"存在但没人链接"会被压成同一个响应，调用方无法区分，
+     * 而这两种情况的界面处理明显不同（前者该显示"页面不存在"，后者该显示"暂无反向链接"）。
+     */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/backlinks', (h) => {
+        const slug = h.params.slug ?? ''
+        if (!pageExists(slug)) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        h.json(200, { ok: true, slug, backlinks: listBacklinks(slug) })
+      }),
+    )
+
+    /* ---------- GET /api/pages/:slug/links：本页指向了谁（出链） ---------- */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/links', (h) => {
+        const slug = h.params.slug ?? ''
+        if (!pageExists(slug)) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        h.json(200, { ok: true, slug, links: listOutlinks(slug) })
+      }),
+    )
+
     // 真正创建 cordis 服务：manifest 的 provides 只是依赖图 token，不会建服务。
     // 两者名字**必须一致**（'wiki-service'），否则消费方 ctx.get 拿到 undefined。
     const unprovide = ctx.provide('wiki-service', svc)
 
-    console.log('[@geewiki/wiki] 已激活: GET /api/pages, GET/PUT/DELETE /api/pages/:slug, wiki-service 服务')
+    console.log(
+      '[@geewiki/wiki] 已激活: GET /api/pages, GET/PUT/DELETE /api/pages/:slug, ' +
+        'GET /api/pages/:slug/{backlinks,links}, wiki-service 服务',
+    )
     return () => {
       // 先立"已卸载"标志：此后任何仍持有 svc 引用的调用都会显式报错而非返回空结果
       disposed = true

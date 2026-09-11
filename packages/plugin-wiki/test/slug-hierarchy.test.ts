@@ -33,6 +33,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
+import { MIGRATION_TABLE } from '@geewiki/core'
 import {
   SLUG_HINT,
   SLUG_MAX_DEPTH,
@@ -62,6 +63,14 @@ class NodeSqliteAdapter implements DatabaseAdapter {
   constructor(filename: string, schemaSql: string) {
     this.db = new DatabaseSync(filename)
     this.db.exec(schemaSql)
+    // 迁移登记表（与 db-sqlite 建的同名同构）；schemaSql 已把 db-sqlite 的脚本内容建好，
+    // 故把它们登记为"已应用"——这样 wiki 的自带迁移才会被当作**增量**应用。
+    this.db.exec(`CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
+      name TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )`)
+    const seed = this.db.prepare(`INSERT OR IGNORE INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`)
+    for (const m of readAllMigrations()) seed.run(m.name, new Date().toISOString())
   }
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
@@ -73,8 +82,27 @@ class NodeSqliteAdapter implements DatabaseAdapter {
     return { changes: Number(r.changes), lastInsertRowid: r.lastInsertRowid as number | bigint }
   }
 
-  migrate(): void {
-    throw new Error('本夹具不实现 migrate（@geewiki/wiki 不调用它）')
+  /**
+   * 与 db-sqlite 同语义的迁移执行：按文件名序应用**未登记**的脚本，每个脚本一个事务。
+   *
+   * 这里不再是"显式不实现"：wiki 现在会应用**自己**的迁移（`page_links`），
+   * 故夹具必须真的会迁移，否则测的就不是真实路径了。
+   */
+  migrate(directory?: string): void {
+    if (!directory) throw new Error('本夹具需要显式迁移目录（wiki 传的是 WIKI_MIGRATIONS_DIR）')
+    const applied = new Set(this.appliedMigrations())
+    for (const name of readdirSync(directory)
+      .filter((f) => f.endsWith('.sql'))
+      .sort()) {
+      if (applied.has(name)) continue
+      const sql = readFileSync(join(directory, name), 'utf8')
+      this.transaction(() => {
+        this.db.exec(sql)
+        this.db
+          .prepare(`INSERT INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`)
+          .run(name, new Date().toISOString())
+      })
+    }
   }
 
   listTables(): string[] {
@@ -84,7 +112,7 @@ class NodeSqliteAdapter implements DatabaseAdapter {
   }
 
   appliedMigrations(): string[] {
-    return []
+    return this.query<{ name: string }>(`SELECT name FROM ${MIGRATION_TABLE} ORDER BY name`).map((r) => r.name)
   }
 
   transaction<T>(fn: () => T): T {
