@@ -176,6 +176,22 @@ importers:
         specifier: ^22.0.0
         version: 22.20.1
 
+  packages/plugin-org:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
   packages/plugin-search:
     dependencies:
       '@geewiki/core':
@@ -240,6 +256,9 @@ importers:
       '@geewiki/openai':
         specifier: workspace:*
         version: link:../plugin-openai
+      '@geewiki/org':
+        specifier: workspace:*
+        version: link:../plugin-org
       '@geewiki/postgres':
         specifier: workspace:*
         version: link:../db-postgres

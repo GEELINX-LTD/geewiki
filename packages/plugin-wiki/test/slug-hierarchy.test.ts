@@ -430,9 +430,38 @@ test('0002 迁移：建出排序索引、可重复执行（幂等）、且与查
       `迁移目录应含 0002，实际 ${JSON.stringify(migrations.map((m) => m.name))}`,
     )
 
-    // 逐文件执行（与 db.migrate() 同序）；0002 的 IF NOT EXISTS 允许重放
+    // 逐文件执行（与 db.migrate() 同序）。
+    //
+    // ★ 重放保证分两类，**分开断言而不是一律跳过**（P2 给 pages 加列时引入）：
+    //
+    //   - 只含 `CREATE ... IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` 的文件，
+    //     重放必须**不抛错**（原有的强断言，逐字保留）。
+    //   - 含 `ALTER TABLE ... ADD COLUMN` 的文件**在 SQLite 上无法重放** ——
+    //     SQLite 没有 `ADD COLUMN IF NOT EXISTS`，纯 SQL 表达不出"列不存在才加"。
+    //     这不是疏忽，而是方言的能力边界：0010 当初把新列内联进新建表的
+    //     CREATE TABLE 从而绕开了它，而 0012 给**既有表** pages 加列绕不开。
+    //     生产幂等性由 `_migrations` 控制器提供（已应用的文件不再执行），
+    //     所以这里**把这个限制钉死**：第一次必须成功，第二次必须抛
+    //     `duplicate column name` —— 哪天有人误以为它能重放，这条断言会红。
+    const isReplayable = (sql: string) => !/\bADD\s+COLUMN\b/i.test(sql)
     for (const m of migrations) db.exec(m.sql)
-    for (const m of migrations) db.exec(m.sql) // 重放：不得抛错
+
+    for (const m of migrations.filter((x) => isReplayable(x.sql))) {
+      db.exec(m.sql) // 重放：不得抛错
+    }
+
+    const notReplayable = migrations.filter((x) => !isReplayable(x.sql))
+    assert.ok(
+      notReplayable.length > 0,
+      'P2 起应存在含 ADD COLUMN 的迁移（0012_page_acl.sql）；若为空说明这条断言失去了对象',
+    )
+    for (const m of notReplayable) {
+      assert.throws(
+        () => db.exec(m.sql),
+        /duplicate column name/i,
+        `${m.name} 含 ALTER TABLE ADD COLUMN，在 SQLite 上**应当**无法重放（已知方言边界，非缺陷）`,
+      )
+    }
 
     const indexes = db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pages'`)

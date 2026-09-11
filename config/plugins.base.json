@@ -3,6 +3,7 @@
     { "name": "@geewiki/db-sqlite" },
     { "name": "@geewiki/http" },
     { "name": "@geewiki/auth" },
+    { "name": "@geewiki/org" },
     { "name": "@geewiki/wiki" },
     { "name": "@geewiki/search" }
   ]

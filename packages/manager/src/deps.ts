@@ -33,17 +33,50 @@ export interface RegisteredPlugin {
   dir?: string
 }
 
-/** 把 requires 列表项解析为具体插件：先按插件名、再按 provides 服务标识 */
-export function resolveDependency(registry: readonly RegisteredPlugin[], dep: string): RegisteredPlugin | undefined {
-  return registry.find((p) => p.name === dep) ?? registry.find((p) => p.manifest.geewiki.provides === dep)
+/**
+ * 把 requires 列表项解析为具体插件：先按插件名、再按 provides 服务标识。
+ *
+ * ★ 同一声明可能被**多个插件**满足（最典型的是 `database-provider`：`@geewiki/db-sqlite`
+ * 与 `@geewiki/postgres` 都提供它，而它们互斥、同时只会启用一个）。此时"第一个注册的"
+ * 并不是正确答案 —— 它可能是**没启用的那一个**。
+ *
+ * 这个坑真实发生过（P2 在 PostgreSQL 上验收时炸出来）：PG 部署下 `directDependencies`
+ * 把 `database-provider` 解析成排在 registry 前面的 `@geewiki/db-sqlite`，而它并未启用
+ * ⇒ `topologicalOrder` 里 `present.has(dep)` 为假 ⇒ **auth 与 postgres 之间根本没有排序
+ * 约束**，两者退化成按字母序激活。于是 `@geewiki/auth`（a 在 p 前）先于
+ * `@geewiki/postgres` 激活，`ctx.get('db')` 拿到 undefined，插件激活失败并只留下一句
+ * 含糊的"数据库服务不可用"；而 `@geewiki/wiki` 因为 w 排在 p 之后侥幸躲过。
+ * 这类"靠字母序碰巧正确"的缺陷极难定位，所以修在根上：
+ * **优先取真正在（启用/激活）集合里的那个 provider**。
+ *
+ * @param prefer 可选的"候选集合"（已启用或已激活的插件名）。命中时优先返回集合内的匹配项；
+ *               集合内无匹配则退回原来的"第一个匹配"，使单 provider 场景的行为逐字不变。
+ */
+export function resolveDependency(
+  registry: readonly RegisteredPlugin[],
+  dep: string,
+  prefer?: ReadonlySet<string>,
+): RegisteredPlugin | undefined {
+  const byName = registry.find((p) => p.name === dep)
+  if (byName) return byName
+  const providers = registry.filter((p) => p.manifest.geewiki.provides === dep)
+  if (prefer) {
+    const enabled = providers.find((p) => prefer.has(p.name))
+    if (enabled) return enabled
+  }
+  return providers[0]
 }
 
 /** 插件直接依赖的插件名列表（经 requires 解析） */
-export function directDependencies(registry: readonly RegisteredPlugin[], name: string): string[] {
+export function directDependencies(
+  registry: readonly RegisteredPlugin[],
+  name: string,
+  prefer?: ReadonlySet<string>,
+): string[] {
   const entry = registry.find((p) => p.name === name)
   if (!entry) return []
   return (entry.manifest.geewiki.requires ?? [])
-    .map((dep) => resolveDependency(registry, dep)?.name)
+    .map((dep) => resolveDependency(registry, dep, prefer)?.name)
     .filter((n): n is string => !!n)
 }
 
@@ -65,7 +98,7 @@ export function topologicalOrder(registry: readonly RegisteredPlugin[], enabled:
     }
     visited.set(name, 0)
     stack.push(name)
-    for (const dep of directDependencies(registry, name)) {
+    for (const dep of directDependencies(registry, name, present)) {
       if (present.has(dep)) visit(dep)
     }
     stack.pop()
@@ -89,7 +122,7 @@ export function collectDependents(
   const dependents: string[] = []
   for (const other of activeNames) {
     if (other === name) continue
-    if (directDependencies(registry, other).includes(name)) dependents.push(other)
+    if (directDependencies(registry, other, activeNames).includes(name)) dependents.push(other)
   }
   return dependents.sort()
 }

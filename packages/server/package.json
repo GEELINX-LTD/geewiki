@@ -23,6 +23,7 @@
     "@geewiki/llm": "workspace:*",
     "@geewiki/manager": "workspace:*",
     "@geewiki/openai": "workspace:*",
+    "@geewiki/org": "workspace:*",
     "@geewiki/postgres": "workspace:*",
     "@geewiki/search": "workspace:*",
     "@geewiki/wiki": "workspace:*",
