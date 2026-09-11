@@ -3,8 +3,8 @@
  *
  * 测试策略（沿用 @geewiki/auth 的 test/auth.test.ts 的思路：真实数据库 + 真实 SQL +
  * 真实 HTTP，只有路由服务用替身）：
- * - **真实 SQLite**（Node 22 内置 `node:sqlite`），直接执行 db-sqlite 的真实迁移文件
- *   `0010_identity.sql` / `0013_audit.sql`（读真文件，不抄 DDL）；
+ * - **真实 SQLite**（Node 22 内置 `node:sqlite`），直接执行 db-sqlite 的**全部真实迁移文件**
+ *   （读真文件，不抄 DDL）。**刻意不做"只挑几个"的白名单**，理由见下方 `allMigrations()`；
  * - **真实 mock IdP**：一个监听 127.0.0.1 的 `node:http` 服务，提供发现文档、JWKS 与
  *   token 端点，用 `node:crypto` 真签 RS256。**不用打桩的 fetch** —— 那样会把
  *   "发现文档解析 / JWKS 构造公钥 / 表单编码" 这些真正容易写错的环节跳过。
@@ -19,7 +19,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
 import { createHash, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -53,10 +53,25 @@ import { OidcClient } from '../src/client.js'
 type Jwk = Record<string, unknown>
 
 const MIGRATION_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
-const AUTH_MIGRATIONS = ['0010_identity.sql', '0013_audit.sql']
+
+/**
+ * 本夹具应用的迁移 = db-sqlite 迁移目录下的**全部** `.sql`，与 `db.migrate()` 的
+ * `readdirSync().sort()` 同序（同 `packages/plugin-wiki/test/slug-hierarchy.test.ts`）。
+ *
+ * **为什么不用白名单**：这里原先写死 `['0010_identity.sql', '0013_audit.sql']`，于是 P2 把
+ * `@geewiki/auth` 的 `resolveOrgRole` 接成真查 `org_members` 之后，本夹具自建的库缺
+ * `0011_org_team.sql` 建的表，**8 个用例以 `no such table: org_members` 集体失败**。
+ * 那是**夹具与迁移集的集成缺口**（生产不受影响 —— 迁移控制器会跑全量迁移），但排查成本不低。
+ *
+ * 改成"全量 + 按文件名序"之后，**以后再加迁移不会重演**：只要新迁移能在
+ * `0001 → 0002 → 0010 → 0011 → 0012 → 0013` 这条链上跑通，它就自动被本夹具覆盖。
+ */
+const MIGRATIONS = readdirSync(MIGRATION_DIR)
+  .filter((f) => f.endsWith('.sql'))
+  .sort()
 
 function loadSchema(): string {
-  return AUTH_MIGRATIONS.map((f) => readFileSync(join(MIGRATION_DIR, f), 'utf8')).join('\n')
+  return MIGRATIONS.map((f) => readFileSync(join(MIGRATION_DIR, f), 'utf8')).join('\n')
 }
 
 class NodeSqliteAdapter implements DatabaseAdapter {
@@ -72,7 +87,7 @@ class NodeSqliteAdapter implements DatabaseAdapter {
     const seed = this.db.prepare(
       `INSERT OR IGNORE INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`,
     )
-    for (const name of AUTH_MIGRATIONS) seed.run(name, new Date().toISOString())
+    for (const name of MIGRATIONS) seed.run(name, new Date().toISOString())
   }
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
