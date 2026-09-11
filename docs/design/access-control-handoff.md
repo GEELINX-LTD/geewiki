@@ -92,10 +92,14 @@ PORT=46401 bash packages/plugin-authz/test/e2e-p2.sh     # 34/34（SQLite）
 
 见 §8.1 P4 行与 §5.12。
 
-## ★ 开工前必须先定的一件事
+## ★ 规格内部的一处顺序冲突（已裁定）
 
 `§8.2` 的 **P3a 验收标准要用 `GET /api/admin/{search,blocks}/verify`**，而 `§8.1` 把这两个端点划给了 **P4**。
-→ 要么把端点提前到 P3a，要么那条验收在 P3a 内无法执行。**先定这个，再开工 P3a。**
+
+**裁定：这两个端点提前到 P3a 实现。** 理由 —— 它们是 P3a 引入的分层索引与双写的一致性探针
+（`search/verify` 比对 `blocks` 与 `blocks_fts`，`blocks/verify` 比对 `pages.content_hash` 与由 blocks 重算的哈希），
+**没有它们就无法验收 P3a 自己**；P4 只是复用它们做运维闭环。这是工程顺序问题，不是产品决策。
+（P3a 的提交信息里记录了这个裁定及其理由。）
 
 ## 已知陷阱（下一任必看）
 
