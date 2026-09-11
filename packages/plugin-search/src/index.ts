@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import { isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type Principal, type RouteHandlerContext } from '@geewiki/core'
+import { asAsync, isAsyncAdapter, writeAuditLog, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type Principal, type RouteHandlerContext } from '@geewiki/core'
 
 /* ============================== 配置 ============================== */
 
@@ -844,6 +844,140 @@ export const SearchPlugin = {
           hits: result.hits,
         })
       }),
+    )
+
+    /* ---------- GET /api/admin/search/verify：块索引一致性探针 ---------- */
+    /*
+     * 设计文档 §8.2 的 P3a 验收第 3 条（编排者裁定：该端点从 P4 提前到 P3a —— 没有它
+     * 就无法验收 P3a 自身）。
+     *
+     * ## 它为什么必须存在
+     *
+     * `blocks_fts` 是 contentless 表且**没有触发器**：tier 重算依赖页面有效档位（含祖先
+     * 交集与发布闸门），不是触发器能表达的 SQL，所以同步责任落在应用层（见
+     * `rebuildBlocksIndex` 与 `@geewiki/wiki` 的 `syncBlocksForPage`）。
+     * **纪律没有编译期约束**，故必须有探针兜底：任何绕过写入路径、或"块有而索引空"的
+     * 窗口，都会在这里以非零 `missing` / `extra` 显式报出。
+     *
+     * ## 四项检查
+     *
+     *   1. `missing` —— `blocks` 里有、索引里没有（**检索会少召回**）
+     *   2. `extra`  —— 索引里有、`blocks` 里没有（**索引孤儿**：块已删、文本还在索引文件里）
+     *   3. `tier_mismatch` —— `blocks.tier IS NULL` 的条数是否等于 `visibility='granted'` 的条数
+     *      （§8.2 P3a 第 10 条。不等说明 `tier` 算错了：要么该 `NULL` 的没 `NULL`，
+     *      要么不该 `NULL` 的成了 `NULL`。）
+     *   4. `sample_misses` —— 抽样若干块，从文本里取一段 ≥3 字符的 token 用 `MATCH` 反查，
+     *      确认**索引真的能命中这些行**。前三项只比行数，行数对而词元全丢的可能性它挡不住。
+     *
+     * ## 索引表不存在时
+     *
+     * 那是"**索引缺失**"而不是"漂移"（搜索是可选插件；`blocks_fts` 由本插件的迁移建立）。
+     * 此时 `missing` / `extra` 无意义，如实给 `null` 并标 `index: 'absent'`，
+     * 而不是拿 `missing = 全部块数` 去冒充一个吓人的数字。
+     */
+    cleanups.push(
+      router.register(
+        'GET',
+        '/api/admin/search/verify',
+        (h: RouteHandlerContext) => {
+          const principal = h.principal
+          if (!principal) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息' })
+            return
+          }
+
+          /*
+           * 从块文本里取第一段 ≥3 字符的连续字母/数字/CJK —— 那是 trigram 索引的**最小
+           * 可匹配单元**。短于 3 字符的查询在 `MATCH` 下恒为空（已实测：2 字查询返回空集），
+           * 故抽样必须从这里取，不能拿整个块文本或随便一段字符去试。
+           */
+          const firstTokenRun = (text: string): string | null => {
+            const m = /[\p{L}\p{N}]{3,}/u.exec(text)
+            return m ? m[0].slice(0, 12) : null
+          }
+
+          // PG 的 `COUNT(*)` 返回的是**字符串**，必须强转（§9 R8）
+          const countOf = (sql: string): number => Number(db.query<{ n: unknown }>(sql)[0]?.n ?? 0)
+
+          const blocks = countOf('SELECT COUNT(*) AS n FROM blocks')
+          const tierNull = countOf('SELECT COUNT(*) AS n FROM blocks WHERE tier IS NULL')
+          const granted = countOf("SELECT COUNT(*) AS n FROM blocks WHERE visibility = 'granted'")
+
+          let indexPresent = true
+          try {
+            db.query('SELECT 1 FROM blocks_fts LIMIT 1')
+          } catch {
+            indexPresent = false
+          }
+
+          const VERIFY_SAMPLE_SIZE = 20
+          let missing: number | null = null
+          let extra: number | null = null
+          let sampled = 0
+          let sampleMisses = 0
+          const missSamples: number[] = []
+
+          if (indexPresent) {
+            missing = countOf(
+              'SELECT COUNT(*) AS n FROM blocks b WHERE NOT EXISTS (SELECT 1 FROM blocks_fts f WHERE f.rowid = b.id)',
+            )
+            extra = countOf(
+              'SELECT COUNT(*) AS n FROM blocks_fts f WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.id = f.rowid)',
+            )
+            const rows = db.query<{ id: number; text: string }>(
+              'SELECT id, text FROM blocks ORDER BY id LIMIT ?',
+              [VERIFY_SAMPLE_SIZE],
+            )
+            for (const r of rows) {
+              const token = firstTokenRun(r.text)
+              if (!token) continue
+              sampled += 1
+              const hits = db.query<{ rowid: number }>('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', [
+                toFtsPhrase(token),
+              ])
+              if (!hits.some((x) => Number(x.rowid) === Number(r.id))) {
+                sampleMisses += 1
+                if (missSamples.length < 5) missSamples.push(Number(r.id))
+              }
+            }
+          }
+
+          const payload = {
+            ok: true as const,
+            index: indexPresent ? ('present' as const) : ('absent' as const),
+            blocks,
+            missing,
+            extra,
+            tier_null: tierNull,
+            granted,
+            tier_mismatch: tierNull !== granted,
+            sampled,
+            sample_misses: sampleMisses,
+            miss_samples: missSamples,
+          }
+
+          // 审计：只记计数，**不含正文**
+          // `writeAuditLog` 的 `AuditExecutor` 是**异步**形态（`run` 返回 Promise），
+          // 而本插件是同步适配器 ⇒ 用 `asAsync()` 包一层（与 plugin-wiki 的 `adb` 同源）。
+          void writeAuditLog(asAsync(db), {
+            action: 'admin.verify_search',
+            targetKind: 'system',
+            targetId: 'blocks_fts',
+            actorId: principal.userId,
+            after: {
+              index: payload.index,
+              blocks,
+              missing,
+              extra,
+              tier_mismatch: payload.tier_mismatch,
+              sample_misses: sampleMisses,
+            },
+          }).catch((err: unknown) => console.error('[@geewiki/search] 审计写入失败:', err))
+
+          h.json(200, payload)
+        },
+        { access: 'admin' },
+      ),
     )
 
     // 真正创建 cordis 服务：manifest 的 provides 只是依赖图 token，不会建服务。

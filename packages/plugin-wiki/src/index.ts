@@ -37,6 +37,7 @@ import {
   sha256Hex,
   syncBlocksForPage,
   type BlockVisibility,
+  type ParsedBlock,
   type PageLevel,
   type ReaderTier,
 } from './blocks.js'
@@ -1451,6 +1452,161 @@ export const WikiPlugin = {
         }
         h.json(200, { ok: true, slug, links: await listOutlinks(slug, p) })
       }),
+    )
+
+    /* ---------- GET /api/admin/blocks/verify：块与正文的双写一致性探针 ---------- */
+    /*
+     * 设计文档 §8.2 的 P3a 验收第 3 条（编排者裁定：该端点从 P4 提前到 P3a —— 没有它
+     * 就无法验收 P3a 自身）。
+     *
+     * ## 它为什么必须存在
+     *
+     * P3a 把块索引的同步保证从"数据库触发器"换成了"**应用层纪律**"（`blocks_fts` 是
+     * contentless 表，且写入前要算 `tier`，那不是触发器能表达的 SQL）。纪律没有编译期
+     * 约束，所以必须有探针兜底：**任何绕过 `syncBlocksForPage` 的写入路径都会在这里
+     * 以非零 `mismatched` 显式报出**，而不是静默地让检索少召回或让遮蔽失效。
+     *
+     * ## 比对两件事，任一不符即计入 `mismatched`
+     *
+     *   1. `pages.content_hash` 是否等于 `sha256Hex(pages.content)`（正文自身的自洽性）
+     *   2. `blocks` 行是否与**重新解析 `pages.content` 的结果**逐字段一致
+     *      （`ordinal` / `kind` / `text` / `visibility` / `inherit` / `marker` / `content_hash`）
+     *
+     * ## 为什么"不可解析"单独计数而不算漂移
+     *
+     * 遗留正文里的旧标记（`<!--gated:role=editor-->`）会让 `parseBlocks` 抛
+     * `BlockParseError`。那是**内容问题**（作者需要改文档），不是"双写漂移"问题。
+     * 混进 `mismatched` 会让这个探针失去"**应恒为 0**"这个可断言的语义 —— 而一个
+     * "平时就非零"的探针等于没有探针。故它单列 `unparseable` 并在 `samples` 里点名。
+     *
+     * 返回里带 `samples`（最多 10 条 slug + 原因）是为了**可排障**：只有计数的话，
+     * 拿到 `mismatched: 3` 的人无从下手。它是 admin 端点，slug 不算敏感。
+     */
+    cleanups.push(
+      router.register(
+        'GET',
+        '/api/admin/blocks/verify',
+        async (h) => {
+          const principal = h.principal
+          if (!principal) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息' })
+            return
+          }
+
+          /*
+           * 分批扫描（keyset 分页），不把整库正文读进内存 —— 大库上这条端点也要能跑完。
+           * 每批只发两条查询：取该批页面、取该批页面的全部块。
+           */
+          const BATCH = 500
+          const MAX_SAMPLES = 10
+          let cursor = 0
+          let checked = 0
+          let mismatched = 0
+          let unparseable = 0
+          const samples: { slug: string; reason: string }[] = []
+
+          for (;;) {
+            const pages = await adb.query<{
+              id: number
+              slug: string
+              content: string
+              content_hash: string | null
+            }>('SELECT id, slug, content, content_hash FROM pages WHERE id > ? ORDER BY id LIMIT ?', [
+              cursor,
+              BATCH,
+            ])
+            if (pages.length === 0) break
+            const last = pages[pages.length - 1]
+            if (!last) break
+            cursor = last.id
+            checked += pages.length
+
+            const ids = pages.map((p) => p.id)
+            const placeholders = ids.map(() => '?').join(', ')
+            const rows = await adb.query<{
+              page_id: number
+              ordinal: number
+              kind: string
+              text: string
+              visibility: string
+              inherit: number | boolean
+              marker: string | null
+              content_hash: string
+            }>(
+              `SELECT page_id, ordinal, kind, text, visibility, inherit, marker, content_hash
+                 FROM blocks WHERE page_id IN (${placeholders}) ORDER BY page_id, ordinal`,
+              ids,
+            )
+            const byPage = new Map<number, typeof rows>()
+            for (const r of rows) {
+              const bucket = byPage.get(r.page_id)
+              if (bucket) bucket.push(r)
+              else byPage.set(r.page_id, [r])
+            }
+
+            for (const p of pages) {
+              const reasons: string[] = []
+              if (p.content_hash !== sha256Hex(p.content)) reasons.push('content_hash 与正文不符')
+
+              let expected: ParsedBlock[]
+              try {
+                expected = parseBlocks(p.content)
+              } catch (err) {
+                unparseable += 1
+                if (samples.length < MAX_SAMPLES) {
+                  samples.push({
+                    slug: p.slug,
+                    reason: `正文不可解析: ${err instanceof Error ? err.message : String(err)}`,
+                  })
+                }
+                continue
+              }
+
+              const stored = byPage.get(p.id) ?? []
+              if (stored.length !== expected.length) {
+                reasons.push(`块数不符（库 ${stored.length} / 解析 ${expected.length}）`)
+              } else {
+                for (let i = 0; i < expected.length; i += 1) {
+                  const e = expected[i]
+                  const s = stored[i]
+                  if (!e || !s) break
+                  const same =
+                    s.ordinal === e.ordinal &&
+                    s.kind === e.kind &&
+                    s.text === e.text &&
+                    s.visibility === e.visibility &&
+                    Number(s.inherit) === (e.inherit ? 1 : 0) &&
+                    (s.marker ?? null) === (e.marker ?? null) &&
+                    s.content_hash === e.contentHash
+                  if (!same) {
+                    reasons.push(`第 ${i} 个块与正文不符`)
+                    break
+                  }
+                }
+              }
+
+              if (reasons.length > 0) {
+                mismatched += 1
+                if (samples.length < MAX_SAMPLES) samples.push({ slug: p.slug, reason: reasons.join('；') })
+              }
+            }
+
+            if (pages.length < BATCH) break
+          }
+
+          // 审计：只记计数，**不含正文**（`redactForAudit` 还有一道兜底）
+          void writeAuditLog(adb, {
+            action: 'admin.verify_blocks',
+            targetKind: 'system',
+            targetId: 'blocks',
+            actorId: principal.userId,
+            after: { checked, mismatched, unparseable },
+          }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+          h.json(200, { ok: true, checked, mismatched, unparseable, samples })
+        },
+        { access: 'admin' },
+      ),
     )
 
     // 真正创建 cordis 服务：manifest 的 provides 只是依赖图 token，不会建服务。
