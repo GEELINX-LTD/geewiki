@@ -23,6 +23,7 @@ import {
   breakGlassPrincipal,
   type GeeWikiManifest,
   type HttpRouterService,
+  type Principal,
   type RouteHandlerContext,
 } from '@geewiki/core'
 import type { RegisteredPlugin } from '@geewiki/manager'
@@ -241,10 +242,19 @@ test('use()：钩子拒绝即短路（处理器不执行），注销后恢复', 
   try {
     const denied = await fetch(base(h, '/api/t/public'))
     assert.equal(denied.status, 403)
-    const body = (await denied.json()) as { ok: boolean; error: string; message: string }
+    const body = (await denied.json()) as {
+      ok: boolean
+      error: string
+      message: string
+      details?: { access?: string }
+    }
     assert.equal(body.ok, false)
     assert.equal(body.error, 'forbidden')
     assert.equal(body.message, '被钩子拒绝')
+    // 信封形状必须与闸门的拒绝一致（**含 `details.access`**）：同类失败两种形状会让前端
+    // 文案与告警匹配规则漂移。这条断言覆盖的是 **runHooks 的拒绝路径** ——
+    // 与下面那个走 gateThenInvoke 的 403 用例是**两条不同的代码路径**，不能互相替代。
+    assert.equal(body.details?.access, 'public', '钩子拒绝的信封应与闸门拒绝同形（含 details.access）')
   } finally {
     off()
     off() // 幂等：重复注销不抛错
@@ -327,6 +337,53 @@ test('use()：钩子可以替换 principal —— 闸门读的是 h.principal（
     }
   })
   assert.equal(handlerCalls, 1)
+})
+
+test("use()：kind:'user' 但角色不足 ⇒ 403 forbidden（P1 首个真实 403 的回归保护）", async () => {
+  const h = await server()
+  handlerCalls = 0
+  // 为什么这里**必须**配置令牌（与本文件其余用例相反）：judgeAccess 里
+  // "没有凭据来源 ⇒ 503" 的检查排在匿名/角色检查**之前**，所以未配置令牌时
+  // 任何非 public 端点都先撞上 503，403 分支根本走不到。配置令牌才是 403 的适用前提。
+  await withEnvToken(ADMIN_TOKEN, async () => {
+    // 动机：P0 阶段 src/ 里不存在 kind:'user' 的主体（用户表属 P1），
+    // 于是 judgeAccess 的 403 分支既不可达、也零覆盖。这里经 use() 钩子造出一个
+    // "已认证但权限不足"的主体，把该分支钉成断言，P1 接真实会话时就有回归保护。
+    const viewer: Principal = {
+      kind: 'user',
+      userId: 7,
+      orgId: 1,
+      orgRole: 'viewer',
+      groupIds: [],
+      sessionId: 'test-session',
+    }
+    const off = h.router.use?.((h2) => {
+      h2.principal = viewer
+      return { ok: true }
+    })
+    try {
+      // 对照：同一主体在 user 级端点上**应当放行** ⇒ 证明下面的 403 来自"角色不足"，
+      // 而不是"user 主体一律被拒"（否则这个用例对 403 分支其实没有区分力）。
+      const userLevel = await fetch(base(h, '/api/t/user'))
+      assert.equal(userLevel.status, 200, 'user 级端点：已认证即可，不看角色')
+      assert.equal(((await userLevel.json()) as { principal: string }).principal, 'user')
+
+      const res = await fetch(base(h, '/api/t/admin'), { method: 'POST' })
+      assert.equal(res.status, 403, '已认证但角色不足应是 403（不是 401，也不是 503）')
+      const body = (await res.json()) as {
+        ok: boolean
+        error: string
+        message: string
+        details?: { access?: string }
+      }
+      assert.equal(body.ok, false)
+      assert.equal(body.error, 'forbidden')
+      assert.equal(body.details?.access, 'admin', '错误信封形状应与闸门的拒绝一致（含 details.access）')
+    } finally {
+      off?.()
+    }
+  })
+  assert.equal(handlerCalls, 1, '只有 user 级那次应进入处理器；403 那次不得触达处理器')
 })
 
 /* --------------------- 5. 静态层交接不受钩子影响 --------------------- */

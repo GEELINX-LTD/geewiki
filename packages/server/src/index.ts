@@ -622,6 +622,17 @@ class HttpRouter implements HttpRouterService {
    *
    * 未配置令牌 ⇒ **直接匿名，即使请求带了令牌头也一样**——
    * 这是"未设置环境变量即整条通道禁用"的落点，也是 P0-5 的验收点。
+   *
+   * TODO(p1): 接入会话查询后**必须改为异步**，签名对齐设计文档 §2.4 的
+   * `principalFromRequest(req): Promise<Principal>`。P0 保持同步是合理的——
+   * 凭据来源只有环境变量 + 常量时间比较，没有任何跨 IO 的查询。
+   *
+   * 改造时注意两处连带影响（不要只把本方法加上 `async` 就以为完事）：
+   * 1. 本方法在 dispatch 里是**无条件**调用的（在 `hooks.length === 0` 分支之外），
+   *    因此一旦异步化，**默认（无钩子）路径也会变成异步**，`hooks.length === 0` 那条
+   *    全同步快路径需要一并重做——它现在的注释承诺"既有的同步返回语义逐字不变"。
+   * 2. 异步接缝已经留好：`runHooks` 是 async 通路，`dispatch` 的返回类型已放宽为
+   *    `boolean | Promise<boolean>`，`createServer` 调用点也已适配。
    */
   private resolvePrincipal(req: IncomingMessage): Principal {
     const expected = envAdminToken()
@@ -657,7 +668,14 @@ class HttpRouter implements HttpRouterService {
       }
       const denial = verdictDenial(raw)
       if (denial) {
-        h.json(denial.status, { ok: false, error: denial.code, message: denial.message })
+        // 错误信封与 gateThenInvoke 的拒绝**保持同一形状**（含 details.access）：
+        // 同为"拒绝"，两处形状不一致会让前端文案与告警匹配规则产生漂移。
+        h.json(denial.status, {
+          ok: false,
+          error: denial.code,
+          message: denial.message,
+          details: { access: route.access },
+        })
         this.exitHandler(state)
         return true
       }

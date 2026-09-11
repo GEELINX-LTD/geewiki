@@ -1611,7 +1611,12 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
       fail(h, err)
     }
   })
-  router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()), { access: 'admin' })
+  // 刻意保持 public：P0 的契约是"读端点行为与改动前完全一致"（设计文档 §8.1 P0 行），
+  // 读路径裁剪统一留给 P2。这里**不是"暂缓收紧"，而是收紧会直接弄坏管理台首屏**：
+  // AdminPage 用 Promise.all([api.plugins(), api.session(), api.slots().catch(() => null)]) 取数，
+  // 三个里只有 api.session() 没有 .catch()，它一旦 401/503 就整体 reject ⇒ 插件列表根本不渲染。
+  // （packages/web 在 P0 不得改动，前端测试又全部 mock 掉了 api 模块，故此回归不会有测试变红。）
+  router.register('GET', '/api/session', (h) => ok(h, manager.sessionState()), { access: 'public' })
   router.register('POST', '/api/plugins/:name/enable', async (h) => {
     try {
       const name = h.params['name']
