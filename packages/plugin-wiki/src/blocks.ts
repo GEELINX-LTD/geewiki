@@ -263,6 +263,25 @@ export async function syncBlocksForPage(
     now: string
     /** 注入以便测试；默认用 {@link parseBlocks} */
     parse?: (content: string) => ParsedBlock[]
+    /**
+     * 是否同步 `blocks_fts`。默认 `true`（保持既有调用点的行为与既有测试不变）。
+     *
+     * ★ **PostgreSQL 下必须传 `false`**，理由不是"省一步"，而是**不能靠捕获异常来跳过**：
+     *
+     *   1. `blocks_fts` 是 FTS5 表，由 `@geewiki/search` 的**SQLite 专有**迁移建立
+     *      （设计文档 §4.3 ★v7）⇒ PG 上它**永远不存在**；
+     *   2. PG 的错误文案是 `relation "blocks_fts" does not exist`，与 SQLite 的
+     *      `no such table: blocks_fts` **不同** —— 只匹配后者会让错误被重新抛出，
+     *      于是一次 `DELETE` 失败就毁掉整个写块事务（**实测：PG 下 `blocks` 恒为 0 条，
+     *      整个块模型不可用**）；
+     *   3. 就算把两种文案都匹配上，**PG 也不行**：任一语句报错后事务进入 aborted 状态，
+     *      后续语句一律失败 ⇒ "捕获后继续"这条路径在 PG 上根本不成立。
+     *
+     * 所以判据必须**在事务之外按方言得出**（调用方从适配器拿 `dialect`），而不是试错。
+     * 该标志只影响**检索召回**：`blocks` 与 `pages.content` 才是真源，索引随时可从
+     * `blocks` 重建（PG 下本就没有索引，检索功能整体不提供 —— 由 §4.3 的方言守卫显式拒绝）。
+     */
+    syncIndex?: boolean
   },
 ): Promise<ParsedBlock[]> {
   const { pageId, content, pageLevel, now } = args
@@ -288,22 +307,35 @@ export async function syncBlocksForPage(
    * 这只影响检索召回，不影响正确性 —— `blocks` 与 `pages.content` 才是真源，
    * 索引任何时候都能从 `blocks` 重建，差异由 `GET /api/admin/search/verify` 显式报出。
    */
-  let indexEnabled = true
-  try {
-    await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    // 只吞"表不存在"这一种；其它错误照抛（别把真故障伪装成"搜索没装"）
-    if (!/no such table: blocks_fts/.test(msg)) throw err
-    indexEnabled = false
-    warnBlocksIndexMissingOnce()
+  let indexEnabled = args.syncIndex ?? true
+  if (indexEnabled) {
+    try {
+      await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      // 只吞"表不存在"这一种；其它错误照抛（别把真故障伪装成"搜索没装"）。
+      // 注意这条路径**只对 SQLite 有意义**：PG 下 `syncIndex` 应为 false，
+      // 因为那边的事务一旦报错就 aborted，"捕获后继续"不成立（见参数说明）。
+      if (!/no such table:\s*blocks_fts/i.test(msg)) throw err
+      indexEnabled = false
+      warnBlocksIndexMissingOnce()
+    }
   }
   await tx.run('DELETE FROM blocks WHERE page_id = ?', [pageId])
 
   for (const b of parsed) {
     const res = await tx.run(
+      /*
+       * ★ `RETURNING id` 不是可选的：SQLite 有隐式 rowid，**PostgreSQL 没有** ——
+       * PG 适配器的 `lastInsertRowid` 只在 SQL 里写了 `RETURNING id` 时才非 0，
+       * 否则恒为 0（见 `packages/db-postgres/src/index.ts:237-238` 的注释）。
+       * 少了它，块会以 `page_id = 0` 插入 ⇒ 外键直接报
+       * `insert or update on table "blocks" violates foreign key constraint "blocks_page_id_fkey"`
+       * ⇒ **PG 上每一个新建/保存页面的请求都 500**（实测如此）。
+       * 本仓既有插件（plugin-auth / plugin-org）都遵守这条约定。
+       */
       `INSERT INTO blocks (page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, created_at, updated_at, tier)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
       [
         pageId,
         b.ordinal,

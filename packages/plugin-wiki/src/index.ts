@@ -32,10 +32,13 @@ import {
 } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
 import {
+  BlockParseError,
   parseBlocks,
   projectBlocks,
   sha256Hex,
   syncBlocksForPage,
+  tierFor,
+  type BlockTier,
   type BlockVisibility,
   type ParsedBlock,
   type PageLevel,
@@ -473,6 +476,16 @@ export const WikiPlugin = {
      * **事务静默失效**（不报错但回滚不了）。`rebuildLinks` 因此把 `tx` 作为首参。
      */
     const adb = asAsync(db)
+    /*
+     * `blocks_fts` 只在 SQLite 下存在（FTS5 是 SQLite 专有对象，见设计文档 §4.3 ★v7）。
+     *
+     * ★ 判据必须在这里**按方言**得出，而不是在写块时靠捕获异常去试。实测过的教训：
+     * PG 的错误文案是 `relation "blocks_fts" does not exist`（不是 SQLite 的
+     * `no such table:`），只匹配后者会让错误被抛出 ⇒ **每一次写块都失败、`blocks` 恒为
+     * 0 条、整个块模型在 PG 上不可用**；而就算把两种文案都匹配上也不行 —— PG 的事务
+     * 一旦报错就进入 aborted 状态，后续语句一律失败，"捕获后继续"在那条路上不成立。
+     */
+    const blocksIndexSupported = db.dialect === 'sqlite'
     const router = ctx.get('http') as HttpRouterService | undefined
     if (!router) throw new Error('@geewiki/wiki: http 路由服务不可用（@geewiki/http 未激活）')
     const recentLimit = config.recentVersions ?? 10
@@ -794,30 +807,75 @@ export const WikiPlugin = {
     const backfillBlocks = async (): Promise<void> => {
       const BATCH = 200
       let done = 0
+      let skipped = 0
+      /*
+       * ★ keyset 游标（`p.id > ?`）是**必须的**，不是优化。
+       *
+       * 查询条件是"还没有 blocks 行的页面"。一旦某页被跳过（下面 try/catch 的分支），
+       * 它下次仍然满足该条件 ⇒ 若没有游标，下一轮会把**同一页**再选出来 ⇒
+       * **在本轮激活里无限循环**。带上游标后，无论成功还是跳过，循环都严格向前推进；
+       * 跳过的页面留给**下一次启动**再试（判据仍是数据现状，天然幂等）。
+       */
+      let cursor = 0
       try {
         for (;;) {
           const rows = await adb.query<{ id: number; slug: string; content: string }>(
             `SELECT p.id, p.slug, p.content FROM pages p
-              WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.page_id = p.id)
+              WHERE p.id > ? AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.page_id = p.id)
               ORDER BY p.id LIMIT ?`,
-            [BATCH],
+            [cursor, BATCH],
           )
           if (rows.length === 0) break
           for (const r of rows) {
-            const now = new Date().toISOString()
-            // 逐条一个事务：单条失败不影响同批其它条目，中断后重启能从"还没有块的行"续上
-            const pageLevel = await pageLevelOf(r.slug)
-            await adb.transaction(async (tx) => {
-              await syncBlocksForPage(tx, { pageId: r.id, content: r.content, pageLevel, now })
-              // `content_hash` 由调用方一并维护（syncBlocksForPage 只管块与索引）——
-              // 它是一致性探针 `/api/admin/blocks/verify` 的比对基准，不回填会让存量页面恒报不一致
-              await tx.run('UPDATE pages SET content_hash = ? WHERE id = ?', [sha256Hex(r.content), r.id])
-            })
+            cursor = r.id
+            /*
+             * ★ 单条失败**只跳过这一条**。
+             *
+             * 本函数的注释一直写着"逐条一个事务：单条失败不影响同批其它条目"，但当初
+             * try/catch 在循环**外面** ⇒ 一个页面失败就中止整轮。代价不只是"少回填几条"：
+             * 失败的那页**仍然没有 blocks 行** ⇒ 下次启动再次被选中、再次失败，
+             * **它之后的所有存量页面永远回填不到**（块级遮蔽与检索对这些页面整体失效）。
+             *
+             * 最典型的触发源是**遗留正文里的旧标记**（`<!--gated:role=editor-->`）——
+             * `parseBlocks` 会显式拒绝它（那是刻意的，不是 bug），于是它成了"合法的新写入
+             * 拒了、非法的旧内容卡住回填"这个组合。内容问题该由作者改，不该阻塞其余页面。
+             */
+            try {
+              const now = new Date().toISOString()
+              const pageLevel = await pageLevelOf(r.slug)
+              await adb.transaction(async (tx) => {
+                await syncBlocksForPage(tx, {
+                  pageId: r.id,
+                  content: r.content,
+                  pageLevel,
+                  now,
+                  syncIndex: blocksIndexSupported,
+                })
+                // `content_hash` 由调用方一并维护（syncBlocksForPage 只管块与索引）——
+                // 它是一致性探针 `/api/admin/blocks/verify` 的比对基准，不回填会让存量页面恒报不一致
+                await tx.run('UPDATE pages SET content_hash = ? WHERE id = ?', [sha256Hex(r.content), r.id])
+              })
+              done += 1
+            } catch (err) {
+              skipped += 1
+              if (skipped <= 5) {
+                console.warn(
+                  `[@geewiki/wiki] 存量块回填跳过一页（${r.slug}）—— 该页正文无法解析或写入失败；` +
+                    '`/api/admin/blocks/verify` 会把这类页面作为 unparseable 报出。原因:',
+                  err instanceof Error ? err.message : err,
+                )
+              }
+            }
           }
-          done += rows.length
           if (rows.length < BATCH) break
         }
         if (done > 0) console.log(`[@geewiki/wiki] 存量条目已回填块: ${done} 条`)
+        if (skipped > 0) {
+          console.warn(
+            `[@geewiki/wiki] 存量块回填跳过 ${skipped} 页（正文含已废弃标记或写入失败）—— ` +
+              '这些页面的块级遮蔽与检索暂不生效，修正正文后重启即可补齐',
+          )
+        }
       } catch (err) {
         console.warn(
           `[@geewiki/wiki] 存量条目的块回填失败（已回填 ${done} 条后中断）—— 不回填只影响存量内容的` +
@@ -847,8 +905,14 @@ export const WikiPlugin = {
            * 而若把 DDL 默认改成 'org'，则导入脚本/第三方插件的插入路径会意外公开内容。
            */
           const ins = await tx.run(
+            /*
+             * ★ `RETURNING id` 不是可选的：SQLite 有隐式 rowid，**PostgreSQL 没有** ——
+             * PG 下不写 `RETURNING id` 时 `lastInsertRowid` 恒为 0，于是紧接着写块会用
+             * `page_id = 0` 撞外键，**每一个新建页面的请求都 500**（实测）。
+             * 见 `packages/db-postgres/src/index.ts:237-238`。
+             */
             `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, acl_revision, content_hash)
-             VALUES (?, ?, ?, ?, ?, 'org', 1, 0, ?)`,
+             VALUES (?, ?, ?, ?, ?, 'org', 1, 0, ?) RETURNING id`,
             [slug, input.title, input.content, now, now, sha256Hex(input.content)],
           )
           const pageId = Number(ins.lastInsertRowid)
@@ -869,6 +933,7 @@ export const WikiPlugin = {
             content: input.content,
             pageLevel: level,
             now,
+            syncIndex: blocksIndexSupported,
           })
           await rebuildLinks(tx, slug, input.content)
           return 'created'
@@ -897,6 +962,7 @@ export const WikiPlugin = {
           content: input.content,
           pageLevel: await pageLevelOf(slug),
           now,
+          syncIndex: blocksIndexSupported,
         })
         // 出链随正文重建（同一事务内，故正文与索引不会不一致）
         await rebuildLinks(tx, slug, input.content)
@@ -1066,7 +1132,27 @@ export const WikiPlugin = {
           h.json(400, { ok: false, error: 'invalid_body', message })
           return
         }
-        const { outcome, version } = await savePage(slug, save)
+        let result: WikiSaveResult
+        try {
+          result = await savePage(slug, save)
+        } catch (err) {
+          /*
+           * 正文里的块标记不合法（旧标记 `role=*`、未知档位、`gated` 区段未闭合、代码围栏
+           * 未闭合…）是**用户输入问题**，不是服务器故障 —— 必须映射成 400 + 机器码，
+           * 而不是让它冒到 `dispatch` 的统一 catch 变成 **500**。
+           *
+           * 500 的代价是具体的：① 它把"作者写错了"混进"服务出故障"的告警与监控；
+           * ② 调用方拿不到 `gated_marker_removed` 这类**可判别**的错误码，只能去正则匹配
+           * 一句中文；③ 而"显式拒绝"的价值恰恰在于作者能立刻知道**为什么**被拒。
+           * `BlockParseError.code` 就是为此存在的（沿用仓库"消息前缀即错误码"的约定）。
+           */
+          if (err instanceof BlockParseError) {
+            h.json(400, { ok: false, error: err.code, message: err.message })
+            return
+          }
+          throw err
+        }
+        const { outcome, version } = result
         h.json(200, { ok: true, slug, title: save.title, outcome, version })
       }, { access: 'user' }),
     )
@@ -1111,6 +1197,60 @@ export const WikiPlugin = {
       await tx.run('UPDATE pages SET acl_revision = acl_revision + 1 WHERE slug = ?', [slug])
       const row = (await tx.query<{ revision: number }>('SELECT revision FROM acl_revision WHERE id = 1'))[0]
       return Number(row?.revision ?? 0)
+    }
+
+    /**
+     * 把某一页**全部块**的 `tier` 重算为 `tierFor(level, 该块自身的 visibility)`。
+     *
+     * 为什么要复用 `tierFor` 而不是在 SQL 里重写一遍：`tier` 的语义（"页面压上限、
+     * 块只能更窄"，以及 `granted ⇒ NULL`）**只有一处真源**。在 SQL 里再写一份
+     * （哪怕是等价的 `CASE WHEN`）必然漂移，而漂移的后果是检索的可见性判定错误。
+     */
+    const applyTierToPageBlocks = async (
+      tx: DatabaseExecutor,
+      pageId: number,
+      level: PageLevel,
+    ): Promise<number> => {
+      const rows = await tx.query<{ id: number; visibility: string }>(
+        'SELECT id, visibility FROM blocks WHERE page_id = ?',
+        [pageId],
+      )
+      for (const r of rows) {
+        await tx.run('UPDATE blocks SET tier = ? WHERE id = ?', [
+          tierFor(level, r.visibility as BlockVisibility),
+          r.id,
+        ])
+      }
+      return rows.length
+    }
+
+    /**
+     * 重算**子孙页面**的 `blocks.tier` —— §9 R13 所说的"tier 重算扇出"。
+     *
+     * 祖先的 `visibility` / `inherit` 一变，整棵子树的**有效档位**都跟着变，而 `tier`
+     * 是检索的唯一依据 ⇒ 不重算就等于"收紧没生效"。层级在本仓就是 slug 前缀
+     * （`SLUG_MAX_DEPTH = 8`），与策略层的判定同一口径，故这里按前缀取子树。
+     *
+     * ⚠️ **必须在调用方的事务提交之后跑**：`pageLevelOf` 走策略层（另一条连接），
+     * PG 下看不到未提交的祖先改动，在事务内算会拿到**旧**祖先值 —— 那正是本函数
+     * 要修的东西。故它自己开一个事务。
+     *
+     * 返回被重算的块数（0 表示该页没有子孙）。
+     */
+    const resyncDescendantTiers = async (slug: string): Promise<number> => {
+      const prefix = `${slug}/`
+      // 按前缀在 JS 侧筛，而不是 `slug LIKE 'a/%'`：slug 允许 `.` `_` `-`，
+      // 而 LIKE 里的 `_` 是通配符 —— 用它得再引入 ESCAPE，多一处能写错的地方。
+      const all = await adb.query<{ id: number; slug: string }>('SELECT id, slug FROM pages')
+      const targets = all.filter((p) => p.slug.startsWith(prefix))
+      if (targets.length === 0) return 0
+      return adb.transaction(async (tx) => {
+        let touched = 0
+        for (const p of targets) {
+          touched += await applyTierToPageBlocks(tx, p.id, await pageLevelOf(p.slug))
+        }
+        return touched
+      })
     }
 
     /**
@@ -1228,8 +1368,45 @@ export const WikiPlugin = {
             nextPublished,
             slug,
           ])
+          /*
+           * ★ 本页块的 `tier` **必须在同一事务里重算**。
+           *
+           * `tier` 是检索的唯一依据，而它此前只在 `syncBlocksForPage`（保存正文）时按
+           * **当时的**页面档位算过一次 —— 于是"发布"只改 `published_at`、不重算 `tier`，
+           * 页面在检索里就仍是旧档位。**这个缺陷实测复现过，且是内容泄漏级的**：
+           * 创建（默认 org，tier=1）→ 发布为 public → **重新保存**（此时页面已 public，
+           * tier 重算成 0）→ 收回成 org，此时 `tier` 仍是 0 ⇒ **匿名在 `/api/search`
+           * 里命中该页、并拿到高亮片段（正文内容）**，而同一时刻读路径是 404。
+           * 读路径安全、检索路径泄漏 —— 正是"两条路必须用同一条判据"要防的事。
+           *
+           * 用 `self` 传新档位而不是让它去查库：那一行刚刚在本事务里被改过，而策略层
+           * 走另一条连接（PG 下看不到未提交的改动）⇒ 不传就会拿到**旧**档位，
+           * 等于没修。
+           */
+          const row = (await tx.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+          if (row) {
+            const level = await pageLevelOf(slug, {
+              visibility: nextVisibility,
+              inherit: nextInherit,
+              published_at: nextPublished,
+            })
+            await applyTierToPageBlocks(tx, row.id, level)
+          }
           return bumpAclRevision(tx, slug)
         })
+
+        /*
+         * 祖先的档位会传导到整棵子树（§9 R13）。放在提交**之后**：
+         * `pageLevelOf` 走策略层，PG 下读不到本事务里未提交的那次 UPDATE。
+         */
+        let resynced = 0
+        try {
+          resynced = await resyncDescendantTiers(slug)
+        } catch (err) {
+          // 不回滚已提交的档位变更：那是用户要的结果。tier 的偏差由
+          // `GET /api/admin/blocks/verify` 的 tier 检查显式报出，不靠静默。
+          console.warn('[@geewiki/wiki] 子孙块的 tier 重算失败（检索可能仍按旧档位）:', err)
+        }
 
         // 审计：只记档位与发布状态，**不含正文**
         void writeAuditLog(adb, {
@@ -1248,6 +1425,8 @@ export const WikiPlugin = {
           inherit: nextInherit === 1,
           published_at: nextPublished,
           acl_revision: revision,
+          // 子孙块被重算的条数（0 = 没有子孙）。让调用方能观测扇出是否真的发生了。
+          index_tiers_resynced: resynced,
         })
       }, { access: 'user' }),
     )
@@ -1503,7 +1682,20 @@ export const WikiPlugin = {
           let checked = 0
           let mismatched = 0
           let unparseable = 0
+          let tierMismatched = 0
+          let tierChecked = 0
           const samples: { slug: string; reason: string }[] = []
+          // tier 的样本**单独一份**：两类不一致必须各自可数、可看，混在一份里就分不出
+          // "块与正文漂移"和"tier 算错"了 —— 而这两者的修法完全不同。
+          const tierSamples: { slug: string; reason: string }[] = []
+
+          /*
+           * tier 检查需要页面**有效档位**（含祖先交集与发布闸门），那只在策略层算得出来。
+           * 策略服务缺席时跳过这一项并如实标出 —— 而不是把"算不了"报成"不一致"。
+           */
+          const policyReady = Boolean(
+            (ctx.get('policy-service') as PolicyServiceLike | undefined)?.effectiveIndexLevel,
+          )
 
           for (;;) {
             const pages = await adb.query<{
@@ -1532,8 +1724,9 @@ export const WikiPlugin = {
               inherit: number | boolean
               marker: string | null
               content_hash: string
+              tier: number | null
             }>(
-              `SELECT page_id, ordinal, kind, text, visibility, inherit, marker, content_hash
+              `SELECT page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, tier
                  FROM blocks WHERE page_id IN (${placeholders}) ORDER BY page_id, ordinal`,
               ids,
             )
@@ -1585,6 +1778,33 @@ export const WikiPlugin = {
                 }
               }
 
+              /*
+               * ★ tier 一致性检查。
+               *
+               * 上面两项只比"块 ↔ 正文"，**完全看不到 `tier`** —— 而 `tier` 是检索的
+               * 唯一依据。`tier` 算错（或不重算）时，块与正文可以完全一致而检索结果
+               * 是错的。这个缺陷真实发生过：改页面可见性后 `tier` 不重算，
+               * 于是"public → org 的收紧"在检索里不生效 ⇒ **匿名能搜到并拿到正文片段**，
+               * 而同刻读路径是 404。故它是本探针不可省的一项。
+               */
+              if (policyReady) {
+                const level = await pageLevelOf(p.slug)
+                for (const s of stored) {
+                  tierChecked += 1
+                  const want = tierFor(level, s.visibility as BlockVisibility)
+                  if ((s.tier ?? null) !== (want ?? null)) {
+                    tierMismatched += 1
+                    if (tierSamples.length < MAX_SAMPLES) {
+                      tierSamples.push({
+                        slug: p.slug,
+                        reason: `块 ordinal=${s.ordinal} 的 tier 不符（库 ${String(s.tier)} / 应为 ${String(want)}）`,
+                      })
+                    }
+                    break
+                  }
+                }
+              }
+
               if (reasons.length > 0) {
                 mismatched += 1
                 if (samples.length < MAX_SAMPLES) samples.push({ slug: p.slug, reason: reasons.join('；') })
@@ -1600,10 +1820,23 @@ export const WikiPlugin = {
             targetKind: 'system',
             targetId: 'blocks',
             actorId: principal.userId,
-            after: { checked, mismatched, unparseable },
+            after: { checked, mismatched, unparseable, tierMismatched, tierChecked },
           }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
 
-          h.json(200, { ok: true, checked, mismatched, unparseable, samples })
+          h.json(200, {
+            ok: true,
+            checked,
+            mismatched,
+            unparseable,
+            // 独立的两个计数：`mismatched` 是"块 ↔ 正文"漂移，`tierMismatched` 是
+            // "tier ↔ 有效档位"不符。两者**必须都为 0**，且**互不包含** ——
+            // 混成一个数就看不出是哪一类，而这两类的修法完全不同。
+            tier_checked: tierChecked,
+            tier_mismatched: tierMismatched,
+            tier_check_skipped: !policyReady,
+            samples,
+            tier_samples: tierSamples,
+          })
         },
         { access: 'admin' },
       ),
