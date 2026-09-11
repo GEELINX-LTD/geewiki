@@ -6,8 +6,20 @@
 
 ## 一句话状态
 
-**`main` = `ae323a2`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）。**
-**P3a 的 2 条 Critical 泄漏已修复并做了红-绿自检，正等复审；P3b 基本完成；P3c / P3d / P4 未完成。**
+**`main` = `975fa61`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）/ P3a（块模型与分层检索）。**
+**P3b 基本完成（含申请访问闭环）；P3c / P3d / P4 未完成。**
+
+### ★ 合并后的验证基线（`main` = `975fa61`）
+
+`pnpm typecheck` exit 0（17 包）；`pnpm test` **843 例 / 843 通过 / 0 失败**；`pnpm build` exit 0；
+五条 e2e **共 245 项断言零失败**：`e2e-p1` 38、`e2e-p15` 44、`e2e-p2-org` 44、`e2e-p2` 34、`e2e-p3a`(SQLite) 85。
+
+### ★ 下一步：P3bcd 的 rebase
+
+`feat/p3bcd-block-acl` **堆叠在 P3a 之上但基点仍是旧的 `289f0b4`**，现需 rebase 到含 P3a 修复的 `main`。
+两者都改 `packages/plugin-wiki/src/index.ts`（P3a 补子孙 tier 重算与 `resyncDescendantsReporting`；
+P3b 改保守重解析、写入路径与授予/申请访问端点）⇒ **冲突需按语义合并**：P3a 的扇出调用必须保留，
+P3b 的块身份保留逻辑也必须保留，**不要二选一**。
 
 ### ★ P3a 修复轮（4 个提交 `a3d72b7` / `1d608a6` / `dee82cd` / `e941da5`）
 
@@ -107,8 +119,13 @@ feat/p2-m5-frontend-ia              均已合入，worktree .wt-p0/.wt-p1/.wt-p1
    "**宽松度**"（越大越宽松），而 `tier` 列是"**限制等级**"（`b.tier <= :readerTier`，**越小越公开**）
    ⇒ 同一语义必须是 **`max`**。写反会让"页面 org + 块 public"的块拿到 tier 0，**匿名在搜索里就能搜到它**。
    以代码的 `effectiveIndexLevel` / `packages/plugin-authz` 的 `RANK_*` 为准（`RANK_PUBLIC=0 / RANK_ORG=1 / RANK_PRIVATE=2`，越右越窄）。
-   **★ 这条错误已扩散到代码注释里**：`packages/plugin-search/migrations/0002_blocks_fts.sql` 的注释也照抄了 `min`，
-   已在提交 `1d608a6` 订正为 `max` 并写明两套刻度方向相反。**回写文档时要查是否还有第三处。**
+   **★ 这条错误已扩散到代码注释里，且共 4 处、只修了 1 处**：
+   - ✅ 已修：`packages/plugin-search/migrations/0002_blocks_fts.sql:60-62`（提交 `1d608a6`，现在写着
+     "用 `tier` 的刻度写就是 **`max`**"并解释了照文档写会让"页面 org + 块 public"的块拿到 `tier = 0`）
+   - ❌ **未修的三处**：`packages/db-sqlite/src/migrations/0015_blocks.sql:41`、同文件 `:53`、
+     `packages/db-postgres/migrations/0015_blocks.sql:29` —— 都还写着 `min(块档位, 页面有效档位)`。
+     **风险**：后来的人读注释会以为实现写错了，去"修正"成 `min` ⇒ **直接造出泄漏**。
+   - 参照：`packages/plugin-wiki/src/blocks.ts:224` 有一处**解释正确**的注释（说明为什么这里是 `max`）。
 2. **§3.6 的迁移落点是错的**：文档说写 `plugin-wiki/migrations/`，但 `@geewiki/wiki` 的迁移目录**只声明了 sqlite**
    ⇒ 照文档写，**PG 部署下 `blocks` 表根本不会被建出来**。实际落在 db 包、两侧成对。
 3. **§9 R9（约 1558 行）写错**：把 `navOrder.test.ts（导航合并）` 列为"P2 必然触碰"——
