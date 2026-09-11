@@ -15,6 +15,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createServer, request, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -322,6 +323,8 @@ async function makeHarness(
   const policyService = {
     visibleSlugs: (_principal: Principal, _q?: { levels?: readonly string[] }): Promise<string[]> =>
       Promise.resolve(db.query<{ slug: string }>('SELECT slug FROM pages ORDER BY slug').map((r) => r.slug)),
+    /** ★ P3a：真实的 `@geewiki/search` 现在要这个（块级授权分支）；P3a 阶段恒空 */
+    grantedBlockIds: (_principal: Principal): Promise<readonly number[]> => Promise.resolve([]),
   }
 
   const services = new Map<string, unknown>([
@@ -363,6 +366,33 @@ async function makeHarness(
         '2024-01-01T00:00:00.000Z',
         '2024-01-01T00:00:00.000Z',
       ])
+      /*
+       * ★ P3a：检索只读 `blocks`（`pages.content` 已从检索路径移除）。本夹具装配的是
+       * **真实** `SearchPlugin`，故必须同时建块与块索引 —— 否则检索恒 0 命中，
+       * 流式用例会以"看起来像功能坏了"的方式红掉（与上面 policy-service 那条注释同理）。
+       */
+      const row = db.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
+      if (!row) return
+      db.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [row.id])
+      db.run('DELETE FROM blocks WHERE page_id = ?', [row.id])
+      const res = db.run(
+        `INSERT INTO blocks (page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, created_at, updated_at, tier)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          row.id,
+          0,
+          'paragraph',
+          content,
+          'public',
+          1,
+          null,
+          createHash('sha256').update(content).digest('hex'),
+          '2024-01-01T00:00:00.000Z',
+          '2024-01-01T00:00:00.000Z',
+          0,
+        ],
+      )
+      db.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [Number(res.lastInsertRowid), content])
     },
     close: async () => {
       router.closeStreams()

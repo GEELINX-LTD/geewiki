@@ -13,6 +13,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -141,6 +142,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
         db.query<{ slug: string }>('SELECT slug FROM pages ORDER BY slug').map((r) => r.slug),
       )
     },
+    /** ★ P3a：真实的 `@geewiki/search` 现在要这个（块级授权分支）；P3a 阶段恒空 */
+    grantedBlockIds: (_principal: Principal): Promise<readonly number[]> => Promise.resolve([]),
   }
 
   const services = new Map<string, unknown>([
@@ -194,10 +197,34 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     })
   }
 
+  /**
+   * ★ P3a：写 `pages` 的同时维护 `blocks` 与 `blocks_fts`（与 plugin-search 的夹具同理）。
+   *
+   * 本夹具装配的是**真实的 `@geewiki/search`**，而它现在只读 `blocks` ——
+   * `pages.content` 已从检索路径整体移除（它含未裁剪全文，是 §5.6 点名的泄漏源）。
+   * 夹具若仍只写 `pages`，`retrieve()` 会恒返回 0 命中，RAG 的每条用例都会连带失败。
+   *
+   * 这里用"整页一个块"的最小实现，理由同 plugin-search：本包测的是 **RAG 装配与降级**，
+   * 不是 Markdown 解析。
+   */
+  const writeBlocks = (pageId: number, content: string): void => {
+    db.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])
+    db.run('DELETE FROM blocks WHERE page_id = ?', [pageId])
+    if (content === '') return
+    const at = '2024-01-01T00:00:00.000Z'
+    const res = db.run(
+      `INSERT INTO blocks (page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, created_at, updated_at, tier)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [pageId, 0, 'paragraph', content, 'public', 1, null, createHash('sha256').update(content).digest('hex'), at, at, 0],
+    )
+    db.run('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)', [Number(res.lastInsertRowid), content])
+  }
+
   const putPage = (slug: string, title: string, content: string, updatedAt = '2024-01-01T00:00:00.000Z'): void => {
     const existing = db.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
     if (existing) {
       db.run('UPDATE pages SET title = ?, content = ?, updated_at = ? WHERE id = ?', [title, content, updatedAt, existing.id])
+      writeBlocks(existing.id, content)
       return
     }
     db.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
@@ -207,6 +234,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
       updatedAt,
       updatedAt,
     ])
+    const created = db.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
+    if (created) writeBlocks(created.id, content)
   }
 
   return {
@@ -393,12 +422,19 @@ test('截断：perSourceChars 限制单条正文长度', async () => {
     const body = await askOk(h.post({ q: '插件化' }))
     assert.equal(body.sources[0]?.used, true)
     // 通过纯函数验证：同一命中在 50 字预算下的选中文本长度不超过 50
-    const hits = [{ slug: 'kb-1', title: '长文', snippet: '', score: 1, updated_at: 'x' }]
-    const sel = selectSources(hits, new Map([['kb-1', `插件化${'长'.repeat(500)}`]]), {
-      maxSourcesInContext: 6,
-      perSourceChars: 50,
-      totalContextChars: 6000,
-    })
+    // ★ P3a：命中与内容都改成了块级形态（`SearchHit.blocks` / `ContentView`）
+    const longText = `插件化${'长'.repeat(500)}`
+    const blocks = [{ ordinal: 0, kind: 'paragraph', text: longText }]
+    const hits = [{ slug: 'kb-1', title: '长文', snippet: '', blocks, gatedCount: 0, score: 1, updated_at: 'x' }]
+    const sel = selectSources(
+      hits,
+      new Map([['kb-1', { text: longText, blocks, gatedCount: 0, maxVisibleTier: 0 }]]),
+      {
+        maxSourcesInContext: 6,
+        perSourceChars: 50,
+        totalContextChars: 6000,
+      },
+    )
     assert.equal(sel.selected[0]?.text.length, 50, '单条正文应被截到 perSourceChars')
   } finally {
     h.dispose()

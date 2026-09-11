@@ -88,6 +88,33 @@ export interface PolicyService {
   resolvePages(p: Principal, slugs: readonly string[]): Promise<Map<string, PageAccess>>
   /** **唯一允许被 list / search / backlinks / RAG / portal / sitemap 复用的出口** */
   visibleSlugs(p: Principal, q?: VisibleQuery): Promise<string[]>
+  /**
+   * 页面的**有效检索等级** —— **与主体无关**（检索索引是全体共用的，不能按人算）。
+   *
+   * 返回 `0`（匿名可见）/ `1`（组织内可见）/ `null`（没有任何等级能看）。
+   * 供块级索引的 `blocks.tier` 计算使用（设计文档 §4.3）。
+   *
+   * `self` 用于**页面行尚未提交**的场景（新建条目时，写入方在自己的事务里刚 INSERT，
+   * 而本方法走的是另一条连接 —— PG 下看不到未提交的行，会误判成"页面不存在"）。
+   * 传入后它**只覆盖该 slug 自身那一行**，祖先链仍按库里的真实状态算。
+   */
+  effectiveIndexLevel(slug: string, self?: PageVisRow): Promise<0 | 1 | null>
+  /**
+   * ★ P3a：本主体**被显式授权**的块 id 集合 —— `granted` 档块的唯一入口。
+   *
+   * 为什么必须有它：`granted` 档的 `blocks.tier` 写 `NULL`，于是**永远不会被等级分支
+   * 命中**（`NULL <= ?` 恒不成立，失败关闭）。要让这类块可检索，只能在检索 SQL 里
+   * 加一个显式的授权分支，而那个集合的**判定必须来自这里**（单点）——
+   * 检索插件若自己查 `block_grants`，就等于造出第二套授权规则，迟早漂移。
+   *
+   * **P3a 阶段恒返回空数组**：`block_grants` 表属 **P3b**（`0016_block_grants.sql`），
+   * 在它落地之前不存在任何块级授权。返回空数组是**语义正确**的，不是占位 TODO：
+   * 没有授权 = 没有块能被授权分支放行。SQL 侧因此退化为"只看等级分支"。
+   *
+   * ⚠️ 实现 P3b 时必须遵守的边界：本方法只返回**块 id**，不返回任何文本；
+   * 且必须按 `expires_at` 过滤（过期的授权不算授权）。
+   */
+  grantedBlockIds(p: Principal): Promise<readonly number[]>
 }
 
 /* ============================== 档位序 ============================== */
@@ -391,6 +418,46 @@ export const AuthzPlugin = {
         return access
       },
 
+      /**
+       * 页面的有效检索等级（与主体无关）—— 供块级索引的 `blocks.tier` 计算使用。
+       *
+       * **与 {@link buildAccess} 的判定同源**：同一条 `effectiveRank`（含祖先交集与
+       * `inherit=false` 截链）+ 同一个发布闸门，只是把"某个主体能不能看"换成
+       * "哪个读者等级能看"。这样索引里的等级与判定的结论不会各自漂移。
+       *
+       *   - `rank === RANK_ORG`    ⇒ `1`（组织成员可见；**组织内可见不要求发布**，
+       *                              理由见 buildAccess 里那段：D8 把存量条目回填成 org
+       *                              而 published_at 保持 NULL，若要求发布则升级当天全站
+       *                              条目对组织成员也不可见）
+       *   - `rank === RANK_PUBLIC` ⇒ 已发布 ? `0` : `null`
+       *                              （**发布闸门只约束 public 档** ⇒ 未发布的 public 页面
+       *                               没有任何等级能看 ⇒ null，匿名搜索不得命中）
+       *   - 其余（`RANK_PRIVATE` / 未知取值 / 页面不存在）⇒ `null`
+       *
+       * **失败关闭**：算不出来一律 `null`。写进 `blocks.tier` 的后果是"该块不被等级分支
+       * 命中"（搜不到），而不是"被所有人搜到"。这条取舍由 `tier IS NULL` 计数探针兜住
+       * （见 GET /api/admin/search/verify）。
+       */
+      async effectiveIndexLevel(slug: string, self?: PageVisRow): Promise<0 | 1 | null> {
+        const index = await loadVisibilityIndex()
+        if (self) {
+          // 只覆盖自身那一行（调用方刚 INSERT、还没提交，另一条连接看不到）。
+          // 祖先链仍按库里的真实状态算 —— 覆盖整条链就等于让调用方自己发明规则。
+          index.set(slug, {
+            slug,
+            visibility: self.visibility,
+            inherit: self.inherit === true || Number(self.inherit) === 1 ? 1 : 0,
+            published_at: self.published_at ?? null,
+          })
+        }
+        const row = index.get(slug)
+        if (!row) return null
+        const rank = effectiveRank(slug, index)
+        if (rank === RANK_ORG) return 1
+        if (rank === RANK_PUBLIC) return row.published_at !== null ? 0 : null
+        return null
+      },
+
       async resolvePages(rawP, slugs) {
         const p = requirePrincipal(rawP, 'resolvePages')
         const index = await loadVisibilityIndex()
@@ -432,6 +499,24 @@ export const AuthzPlugin = {
           if (levels.has(access.level)) out.push(slug)
         }
         return out
+      },
+
+      /**
+       * ★ P3a：块级授权的**唯一入口**。
+       *
+       * 现在恒为空数组，因为 `block_grants` 表属 P3b（`0016_block_grants.sql`）——
+       * 在它落地之前，**不存在任何块级授权**，空数组是语义正确的结果。
+       * 检索侧因此退化为"只看 `tier` 等级分支"，与其 SQL 里的 `OR b.id IN (...)`
+       * 收在恒假分支上，行为等价。
+       *
+       * **为什么不做"表存在就查、不存在就空"的自适应**：那会让同一份代码在不同
+       * schema 版本下走不同分支，而"没有授权"与"查不到授权表"在授权语义上是**必须
+       * 区分**的两件事（后者应当显式失败，而不是静默降级成"没人有权限"或"所有人有权限"）。
+       * P3b 落地这张表时，把本方法换成真实查询即可 —— 调用方无需改动。
+       */
+      async grantedBlockIds(rawP): Promise<readonly number[]> {
+        requirePrincipal(rawP, 'grantedBlockIds')
+        return []
       },
     }
 
