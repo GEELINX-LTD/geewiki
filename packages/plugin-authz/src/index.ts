@@ -718,6 +718,7 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'org.group.remove_member',
         'org.invitation.accept',
         'org.invitation.create',
+        'org.invitation.purge',
         'org.invitation.redeem',
         'org.invitation.revoke',
         'org.member.remove',
