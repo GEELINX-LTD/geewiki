@@ -100,7 +100,7 @@ function NodeRow(props: {
             aria-current={isActive ? 'page' : undefined}
             onClick={() => onOpen(node.page?.slug ?? '')}
             className={cn(
-              'gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-[13px]',
+              'gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-note',
               isActive ? 'font-semibold text-accent-ink' : inPath ? 'text-ink' : 'text-ink-soft',
               'hover:underline',
             )}
@@ -118,7 +118,7 @@ function NodeRow(props: {
             aria-expanded={isOpen}
             title={`分组「${groupLabel.text}」——尚无同名页面，名称取自路径`}
             className={cn(
-              'gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-left text-[13px] font-medium text-ink-soft',
+              'gw-focus-ring min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-left text-note font-medium text-ink-soft',
               groupLabel.kind === 'segment' && 'font-mono text-xs',
             )}
           >

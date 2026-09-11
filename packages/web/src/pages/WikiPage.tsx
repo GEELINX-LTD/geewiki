@@ -388,7 +388,7 @@ function WikiList(props: {
           </span>
         )}
         {queryNotice !== '' && (
-          <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink">
+          <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-note text-danger-ink">
             {queryNotice}
           </span>
         )}
@@ -556,7 +556,7 @@ function WikiList(props: {
                       </a>
                     </td>
                     <td className="border-b border-line px-3 py-2.5 align-top">
-                      <code className="rounded-sm bg-hover px-1.5 py-0.5 font-mono text-[11px] text-ink-soft">
+                      <code className="rounded-sm bg-hover px-1.5 py-0.5 font-mono text-2xs text-ink-soft">
                         {p.slug}
                       </code>
                     </td>
@@ -615,7 +615,7 @@ function Breadcrumb({
   const intermediate = intermediateCrumbCount(crumbs)
 
   return (
-    <nav aria-label="面包屑" className="min-w-0 text-[13px]">
+    <nav aria-label="面包屑" className="min-w-0 text-note">
       <ol className="m-0 flex list-none flex-wrap items-center gap-x-1.5 gap-y-1 p-0">
         {crumbs.map((c, i) => (
           <li
@@ -967,12 +967,12 @@ function WikiDetail(props: {
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {notice !== '' && (
-            <span className="rounded-md border border-ok-line bg-ok-bg px-3 py-1 text-[13px] text-ok-ink">
+            <span className="rounded-md border border-ok-line bg-ok-bg px-3 py-1 text-note text-ok-ink">
               {notice}
             </span>
           )}
           {err !== '' && (
-            <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink">
+            <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-note text-danger-ink">
               {err}
             </span>
           )}
@@ -1101,7 +1101,7 @@ function WikiDetail(props: {
             {versionContent && (
               <CardBody className="border-t border-line bg-sunken">
                 <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                  <p className="m-0 text-[13px] font-medium text-ink">
+                  <p className="m-0 text-note font-medium text-ink">
                     v{versionContent.label} 快照预览
                     <span className="ml-2 font-normal text-muted">{fmtTime(versionContent.saved_at)}</span>
                   </p>
@@ -1483,7 +1483,7 @@ function WikiEdit(props: {
           {err !== '' && (
             <span
               role="alert"
-              className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink"
+              className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-note text-danger-ink"
             >
               {err}
             </span>

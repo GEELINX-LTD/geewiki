@@ -42,7 +42,7 @@ export function ErrorNotice({
       role={role}
       title={raw === '' ? undefined : raw}
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-[13px] text-danger-ink',
+        'inline-flex items-center gap-1.5 rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-note text-danger-ink',
         className,
       )}
     >

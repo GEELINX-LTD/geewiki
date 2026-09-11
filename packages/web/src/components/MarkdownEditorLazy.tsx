@@ -27,7 +27,7 @@ function FallbackEditor(props: MarkdownEditorProps): ReactNode {
       disabled={props.disabled}
       placeholder={props.placeholder}
       spellCheck={false}
-      className="font-mono text-[13px] leading-relaxed"
+      className="font-mono text-note leading-relaxed"
       style={{ minHeight: props.minHeight ?? '420px' }}
       onChange={(e) => props.onChange(e.target.value)}
       onKeyDown={(e) => {

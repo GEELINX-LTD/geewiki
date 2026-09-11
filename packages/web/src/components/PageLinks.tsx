@@ -55,11 +55,11 @@ function LinkItem({ ref: linkRef }: { ref: PageLinkRef }): ReactNode {
       >
         {refLabel(linkRef)}
       </a>
-      <span className="font-mono text-[11px] text-muted">{linkRef.slug}</span>
+      <span className="font-mono text-2xs text-muted">{linkRef.slug}</span>
       {missing && (
         <>
-          <span className="text-[11px] text-muted">（目标页面不存在）</span>
-          <a href={missingNewPageHref()} className="text-[11px] text-accent underline underline-offset-2">
+          <span className="text-2xs text-muted">（目标页面不存在）</span>
+          <a href={missingNewPageHref()} className="text-2xs text-accent underline underline-offset-2">
             新建该页
           </a>
         </>

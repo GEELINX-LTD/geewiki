@@ -79,7 +79,7 @@ export function DialogContent({
 
 /** 供需要自定义关闭按钮的场景复用（保持与 DialogContent 一致的样式） */
 export const dialogCloseClass = cn(
-  'inline-flex h-8 items-center rounded-md border border-line px-3.5 text-[13px]',
+  'inline-flex h-8 items-center rounded-md border border-line px-3.5 text-note',
   'text-ink hover:bg-hover',
   focusRing,
 )

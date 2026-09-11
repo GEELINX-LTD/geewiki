@@ -346,7 +346,7 @@ export function CommandPalette({
                   {/* 分组标题不是选项：listbox 的直接子元素只允许 option/group */}
                   <div
                     role="presentation"
-                    className="px-4 pt-2 pb-1 text-[11px] font-medium tracking-wide text-muted"
+                    className="px-4 pt-2 pb-1 text-2xs font-medium tracking-wide text-muted"
                   >
                     {group.label}
                   </div>
@@ -397,7 +397,7 @@ export function CommandPalette({
           )}
 
           {/* 快捷键提示：命令面板的惯例，也让"上下键可用"这件事被发现 */}
-          <div className="flex items-center gap-3 border-t border-line px-4 py-2 text-[11px] text-muted">
+          <div className="flex items-center gap-3 border-t border-line px-4 py-2 text-2xs text-muted">
             <span className="flex items-center gap-1">
               <Kbd>↑</Kbd>
               <Kbd>↓</Kbd>
@@ -429,7 +429,7 @@ function Kbd({ children }: { children: ReactNode }): ReactNode {
     <kbd
       className={cn(
         'inline-flex h-4 min-w-4 items-center justify-center rounded-xs border border-line',
-        'bg-sunken px-1 font-sans text-[10px] leading-none text-muted',
+        'bg-sunken px-1 font-sans text-3xs leading-none text-muted',
       )}
     >
       {children}

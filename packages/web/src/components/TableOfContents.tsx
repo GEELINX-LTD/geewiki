@@ -48,7 +48,7 @@ function TocNav({ entries, activeId, route }: TocNavProps): ReactNode {
               aria-current={active ? 'location' : undefined}
               className={cn(
                 'block border-l-2 py-1 pr-2 pl-2.5 leading-snug transition-colors duration-150',
-                e.level === 3 ? 'text-xs' : 'text-[13px]',
+                e.level === 3 ? 'text-xs' : 'text-note',
                 active
                   ? 'border-accent font-semibold text-accent'
                   : 'border-line text-muted hover:border-line-strong hover:text-ink',
@@ -83,7 +83,7 @@ export function TableOfContents({
       <details className="rounded-lg border border-line bg-surface xl:hidden" data-gw-no-toc>
         <summary
           className={cn(
-            'flex cursor-pointer items-center gap-2 px-3 py-2 text-[13px] font-medium text-ink',
+            'flex cursor-pointer items-center gap-2 px-3 py-2 text-note font-medium text-ink',
             focusRing,
           )}
         >

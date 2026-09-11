@@ -80,7 +80,7 @@ function FlowNode({ data, selected }: NodeProps): ReactNode {
     >
       <Handle type="target" position={Position.Left} />
       {/* 全名放 tooltip 与详情对话框，节点上只显示可读名（信息不丢，只是不挤在图上） */}
-      <div className="text-[13px] leading-snug font-medium break-normal text-ink" title={d.fullName}>
+      <div className="text-note leading-snug font-medium break-normal text-ink" title={d.fullName}>
         <BreakableLabel text={d.label} />
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-1">
@@ -126,7 +126,7 @@ function FlowEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targ
       <EdgeLabelRenderer>
         <div
           style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
-          className="pointer-events-none absolute z-[1] rounded-md border border-line bg-surface px-1.5 py-0.5 text-[11px] whitespace-nowrap text-ink-soft opacity-0 shadow-sm transition-opacity group-hover:opacity-100"
+          className="pointer-events-none absolute z-[1] rounded-md border border-line bg-surface px-1.5 py-0.5 text-2xs whitespace-nowrap text-ink-soft opacity-0 shadow-sm transition-opacity group-hover:opacity-100"
         >
           {d.from} 被 {d.to} 依赖
         </div>

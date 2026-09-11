@@ -100,8 +100,17 @@
   --gw-header-hover: rgb(255 255 255 / 8%);
   --gw-header-active: rgb(255 255 255 / 14%);
 
-  /* 字体栈：中文优先落到系统黑体，等宽用于标识符与代码 */
-  --gw-font-sans: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  /* 字体栈：中文优先落到系统黑体，等宽用于标识符与代码。
+   *
+   * 为什么把 Linux 的 CJK 字体**放在 system-ui 之后**（而不是之前）：
+   * 本机实测 `fc-match sans-serif` → `NotoSans-Regular.ttf`（**仅拉丁**），
+   * `fc-match "sans-serif:lang=zh"` 也仍解析到它 ⇒ 中文此前只能靠**浏览器逐字回退**
+   * 兜底（截图里中文能显示，但字面来源不确定）。补上 `Noto Sans CJK SC` 让 Linux 上的
+   * 中文有确定来源。**刻意排在 system-ui 之后**：否则拉丁字母也会改由 Noto Sans CJK 的
+   * 拉丁字形渲染（其度量与 Noto Sans 不同），会在 Linux 上造成无谓的排版位移。
+   * `Source Han Sans SC` / `WenQuanYi Micro Hei` 覆盖另两种常见的 Linux 中文字体。 */
+  --gw-font-sans: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system,
+    'Noto Sans CJK SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei', sans-serif;
   --gw-font-mono: ui-monospace, 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
 }
 
@@ -292,6 +301,30 @@
   --font-sans: var(--gw-font-sans);
   --font-mono: var(--gw-font-mono);
 
+  /*
+   * 字号刻度 —— **全站字号的唯一真源**，`text-<名>` 工具类由此生成。
+   *
+   * 为什么需要它：Tailwind 默认刻度是 12/14/16/18/20/24…（xs/sm/base/lg/xl/2xl），
+   * 而本产品实际用到 10 / 11 / 13 / 19px 四档，无处可落，于是散落成 `text-[13px]`
+   * 这类**任意值工具类**（实测 32 处：13px×15、11px×14、10px×2、19px×1）。任意值等于
+   * 把 px 换个地方写、不受刻度管辖，故本批把它们收编为具名档位。
+   *
+   * ⚠️ 与 Tailwind 同名的档位（xs/sm/base/lg/xl/2xl）**刻意不在此重定义**——那会静默
+   * 改变已在用的 76 个 `text-xs` 与 25 个 `text-sm`，属无谓回归。本表只补缺档。
+   *
+   * 为什么用 rem 而不是 px：rem 相对**根**字号，用户调大浏览器默认字号时整站文字随之
+   * 放大（WCAG 2.2 SC 1.4.4 Resize Text 要求文本可放大到 200% 而不丢失内容）。在默认
+   * 16px 根字号下，下列值与原先的 px 逐一相等 ⇒ **视觉零变化**。
+   *
+   * ⚠️ 刻意**不**为这些档位配对 `--text-*-line-height`：原先的 `text-[13px]` 只设字号、
+   * 行高继承；配上行高会改变现有排版。需要独立行高处请显式写 `leading-*`。
+   */
+  --text-3xs: 0.625rem; /* 10px — 极小辅助文字 */
+  --text-2xs: 0.6875rem; /* 11px — 徽标 / 标签 */
+  --text-note: 0.8125rem; /* 13px — 按钮、通知、代码、密排正文 */
+  --text-md: 0.9375rem; /* 15px — 卡片标题（Tailwind 无 md 档，故补） */
+  --text-wordmark: 1.1875rem; /* 19px — 仅品牌字标（顶栏 GeeWiki 字样） */
+
   /* 圆角阶 */
   --radius-xs: 4px;
   --radius-sm: 6px;
@@ -321,9 +354,21 @@
 }
 
 /*
- * 间距刻度：显式定义（Tailwind 默认已有 0.25rem 基准的刻度，这里只补产品需要的
- * 具名档位，避免与默认刻度重名冲突）。
- * 行高/字号走 Tailwind 默认的 text-* 刻度（已足够密），故不再重复声明。
+ * 间距刻度：**不需要新建一整套档位**，Tailwind v4 的 `--spacing` 是单个动态乘数
+ * （本地实测 `node_modules/tailwindcss/theme.css`：`--spacing: 0.25rem`），因此
+ * `p-1.5` / `gap-3.5` / `p-1.25` 都能算出来——构建产物里可实证：
+ *   `.gap-3\.5{gap:calc(var(--spacing) * 3.5)}`、`.px-2\.5{padding-inline:calc(var(--spacing) * 2.5)}`
+ * 即 4px 栅格上的任意倍数都可用（含 5px = 1.25、7px = 1.75 这类非整数倍）。
+ * 手写 CSS 里同理可用 `calc(var(--spacing) * N)` 落到同一栅格。
+ *
+ * 故这里只补三个**产品语义**档位（不是刻度，是具名尺寸）：
+ *   --spacing-gutter  外壳左右内边距
+ *   --spacing-header  顶栏高度（跳过链接与 sticky 定位都要用它）
+ *   --spacing-measure 正文行宽（66~72ch 的中值，可读性硬指标）
+ *
+ * 行高：不设全局刻度。`body` 的 1.6 与正文的 1.7 均已满足 WCAG 2.2 SC 1.4.12
+ * 的「行距至少为字号的 1.5 倍」；W3C《中文排版需求》(clreq) 亦只要求「基字尺寸
+ * 1.5 倍以上」，故中文无需额外抬高。
  */
 @theme {
   --spacing-gutter: 22px; /* 外壳左右内边距，与既有 styles.css 的 22px 对齐 */

@@ -120,7 +120,7 @@ function DetailRow({ label, children }: { label: string; children: ReactNode }):
 /** 单色小标签（技术细节里的 token / 路径） */
 function Chip({ children }: { children: ReactNode }): ReactNode {
   return (
-    <code className="mr-1 inline-block rounded-xs border border-line bg-sunken px-1.5 py-0.5 font-mono text-[11px] text-ink-soft">
+    <code className="mr-1 inline-block rounded-xs border border-line bg-sunken px-1.5 py-0.5 font-mono text-2xs text-ink-soft">
       {children}
     </code>
   )
@@ -508,7 +508,7 @@ export function AdminPage(): ReactNode {
               {issues.map((issue, i) => (
                 <li key={`${issue.code}:${issue.dir}:${i}`}>
                   <Chip>{issue.code}</Chip>
-                  <span className="font-mono text-[11px] text-muted">{issue.dir}</span>
+                  <span className="font-mono text-2xs text-muted">{issue.dir}</span>
                   <div className="text-xs text-danger-ink">{issue.message}</div>
                 </li>
               ))}
@@ -705,7 +705,7 @@ export function AdminPage(): ReactNode {
                   <span className="text-sm text-ink">{labelOf(e.name)}</span>
                   <Badge tone="accent">{LAYER_HUMAN.session}</Badge>
                   {e.config && Object.keys(e.config).length > 0 && (
-                    <code className="font-mono text-[11px] text-muted">{JSON.stringify(e.config)}</code>
+                    <code className="font-mono text-2xs text-muted">{JSON.stringify(e.config)}</code>
                   )}
                 </li>
               ))}
@@ -737,7 +737,7 @@ export function AdminPage(): ReactNode {
                     <span className="text-ink-soft">{labelOf(e.name)}</span>
                     <Badge tone="neutral">{LAYER_HUMAN.base}</Badge>
                     {e.config && Object.keys(e.config).length > 0 && (
-                      <code className="font-mono text-[11px] text-muted">{JSON.stringify(e.config)}</code>
+                      <code className="font-mono text-2xs text-muted">{JSON.stringify(e.config)}</code>
                     )}
                   </li>
                 ))}

@@ -20,10 +20,15 @@
  *  3. **旧类 > theme**：不可能冲突（theme 层只放变量声明）。
  *
  * 文件分工：
- *   - `tokens.css`       —— 设计 token（`@theme` + 深浅两套语义色）
+ *   - `tokens.css`       —— 设计 token（`@theme` + 深浅两套语义色 + 字号刻度）
  *   - `styles.css`       —— 旧样式，整体收进 `@layer legacy`（未迁移页面仍依赖它）
- *   - `legacy-bridge.css` —— 无层的旧变量→新 token 桥接，让旧页面白得深色模式
+ *   - `focus.css`        —— 焦点环（显式 outline，见该文件说明）
  *   - `markdown.css`     —— 正文阅读体验（标题锚点、代码块复制按钮、分屏），components 层
+ *
+ * 注：原先还有一个 `legacy-bridge.css`（把 `--bg`/`--panel`/`--ink` 等旧变量名映射到新
+ * token）。本批把 `styles.css` 里最后 45 处旧变量引用全部改为直接引新 token 后，全仓对这
+ * 13 个旧名的引用数**均为 0**（含 plugins/、fixtures/、public/ 的核实），该桥接文件已成
+ * 纯死代码，故连同其 @import 一并删除——少一层间接就少一处「同一件事两个真源」。
  */
 
 @layer theme, base, components, legacy, utilities;
@@ -32,6 +37,5 @@
 @import './tokens.css';
 /* 旧样式在 src/styles.css（上一层），整体收进 legacy 层 */
 @import '../styles.css' layer(legacy);
-@import './legacy-bridge.css';
 @import './focus.css';
 @import './markdown.css';

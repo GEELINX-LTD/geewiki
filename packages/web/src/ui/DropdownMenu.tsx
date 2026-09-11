@@ -90,7 +90,7 @@ export function DropdownMenuSeparator({ className }: { className?: string }): Re
 
 export function DropdownMenuLabel({ children }: { children: ReactNode }): ReactNode {
   return (
-    <Menu.Label className="px-2.5 pt-1.5 pb-1 text-[11px] font-medium tracking-wide text-muted uppercase">
+    <Menu.Label className="px-2.5 pt-1.5 pb-1 text-2xs font-medium tracking-wide text-muted uppercase">
       {children}
     </Menu.Label>
   )

@@ -224,9 +224,9 @@ export function App(): ReactNode {
           <span aria-hidden="true" className="self-center text-accent">
             <BookText className="size-5" />
           </span>
-          <span className="text-[19px] leading-none font-bold tracking-[0.3px] text-white">GeeWiki</span>
+          <span className="text-wordmark leading-none font-bold tracking-[0.3px] text-white">GeeWiki</span>
           {/* 副标题在窄屏隐藏：空间不足时优先保留品牌与导航 */}
-          <span className="ml-1 hidden text-[11px] text-header-mute lg:inline">
+          <span className="ml-1 hidden text-2xs text-header-mute lg:inline">
             AI-Native 插件化知识库
           </span>
         </a>
@@ -250,7 +250,7 @@ export function App(): ReactNode {
               >
                 <MonitorSmartphone className="size-4" aria-hidden="true" />
                 管理
-                <span aria-hidden="true" className="text-[10px] opacity-70">
+                <span aria-hidden="true" className="text-3xs opacity-70">
                   ▾
                 </span>
               </button>
