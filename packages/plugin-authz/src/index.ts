@@ -596,6 +596,16 @@ export const AuthzPlugin = {
      * 忽略了 `no-store`，`Vary` 也保证不会把匿名渲染结果喂给登录用户
      * （web cache deception —— 这是唯一防线，不是可选项）。
      */
+    /**
+     * 门户类响应的缓存串 —— **提成常量**，供下面的运维端点如实复述。
+     * 若在运维端点里再硬编码一份副本，两份必然漂移，而漂移的后果是
+     * "运维按提示清了一个并不存在的缓存、真正共享缓存的那条却没清"。
+     */
+    const CACHE_PORTAL_ANON = 'public, max-age=60, s-maxage=300'
+    const CACHE_PORTAL_PRIVATE = 'private, no-store'
+    /** sitemap 刻意 `no-store`：它现在是运维的泄漏核对工具，不该被任何中间缓存留存 */
+    const CACHE_SITEMAP = 'no-store, private'
+
     const setPortalHeaders = (h: RouteHandlerContext, contentType: string): void => {
       const setHeader = h.res?.setHeader
       // 测试替身可能没有 setHeader：那是夹具的能力问题，不该让请求失败
@@ -604,7 +614,7 @@ export const AuthzPlugin = {
       setHeader.call(
         h.res,
         'cache-control',
-        hasSessionCookie(h) ? 'private, no-store' : 'public, max-age=60, s-maxage=300',
+        hasSessionCookie(h) ? CACHE_PORTAL_PRIVATE : CACHE_PORTAL_ANON,
       )
       setHeader.call(h.res, 'vary', 'Cookie')
       setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
@@ -643,7 +653,7 @@ export const AuthzPlugin = {
         const setHeader = h.res?.setHeader
         if (typeof setHeader === 'function') {
           setHeader.call(h.res, 'content-type', 'application/xml; charset=utf-8')
-          setHeader.call(h.res, 'cache-control', 'no-store, private')
+          setHeader.call(h.res, 'cache-control', CACHE_SITEMAP)
           setHeader.call(h.res, 'x-robots-tag', X_ROBOTS_TAG)
         }
         const urls = slugs.map((s) => `  <url><loc>/p/${esc(s)}</loc></url>`).join('\n')
@@ -712,6 +722,8 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'admin.session_revoke',
         'admin.grants_purge',
         'admin.access_explain',
+        'admin.verify_sitemap',
+        'admin.cache_plan',
         'org.group.add_member',
         'org.group.create',
         'org.group.delete',
@@ -1080,6 +1092,151 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
             actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
             after: { positionalRank: rank, anonymous: anon.level, orgMember: orgMemberCanSee },
           }).catch((e: unknown) => console.error('[@geewiki/authz] 反向展开的审计写入失败:', e))
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- GET /api/admin/sitemap-audit：sitemap 与「匿名可读」的交叉核对（★ P4b） ----------
+       *
+       * §5.12 把 `sitemap.xml` 的定位从"给爬虫"改成"**给运维做泄漏核对**"：与匿名可见集合
+       * 做集合差必须为空。但这里有一个**必须如实说明**的事实：
+       *
+       * ⚠️ `sitemap.xml` 是**由 `anonymousVisible()` 直接生成的**（同一个出口），所以拿它去和
+       * 自己的来源做差**恒为空 —— 那是个空洞断言**（永远绿，且不提供任何信息）。
+       * 真正有信息量的核对是拿**广告集合**去撞**另一条独立路径**：逐条按**读路径的判定**
+       * （`decideNormally` + 真实的 `anonymousPrincipal()`）重算一遍。两条路一旦不一致，
+       * "列表说它公开、读路径却拒绝"就暴露出来了。
+       *
+       * 因此本端点报**两个方向**：
+       *   - `unreadable`：被广告却**匿名读不到** —— 泄漏方向，必须为空
+       *   - `omitted`：匿名**读得到**却没被广告 —— 一致性方向，说明两个出口漂移了
+       *
+       * 并显式回 `sameSource: true`，让看的人**不会把这个端点误当成"两条独立来源的差集"**。
+       *
+       * ⚠️ 代价：`omitted` 那一遍要遍历全部页面（判定是纯内存的，不再查库），
+       * 库很大时这条端点是 O(N) —— 它是**排障工具**，不是每请求都跑的东西。
+       */
+      router.register(
+        'GET',
+        '/api/admin/sitemap-audit',
+        async (h: RouteHandlerContext) => {
+          const index = await loadVisibilityIndex()
+          const advertised = await anonymousVisible()
+          const advertisedSet = new Set(advertised)
+          const anonCanRead = (slug: string): { level: string; reason: string } => {
+            const self = index.get(slug)
+            if (self === undefined) return { level: 'missing', reason: 'page_missing' }
+            const d = decideNormally(
+              effectiveRank(slug, index),
+              self.published_at ?? null,
+              undefined,
+              anonymousPrincipal(),
+            )
+            return { level: d.level, reason: d.reason }
+          }
+
+          const unreadable: Record<string, unknown>[] = []
+          for (const slug of advertised) {
+            const r = anonCanRead(slug)
+            if (r.level !== 'full') unreadable.push({ slug, reason: r.reason })
+          }
+
+          const omitted: string[] = []
+          for (const slug of index.keys()) {
+            if (advertisedSet.has(slug)) continue
+            if (anonCanRead(slug).level === 'full') omitted.push(slug)
+          }
+
+          h.json(200, {
+            ok: true,
+            // ⚠️ 广告集合与匿名可见集合**同源** ⇒ 这两者之间的"集合差"恒空、无信息量；
+            // 有信息量的是下面两个方向（广告 vs **读路径判定**）
+            sameSource: true,
+            advertisedCount: advertised.length,
+            unreadable,
+            omitted,
+            consistent: unreadable.length === 0,
+          })
+
+          void writeAuditLog(db, {
+            action: 'admin.verify_sitemap',
+            targetKind: 'sitemap',
+            targetId: 'sitemap.xml',
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: {
+              advertisedCount: advertised.length,
+              unreadable: unreadable.length,
+              omitted: omitted.length,
+            },
+          }).catch((e: unknown) => console.error('[@geewiki/authz] sitemap 核对的审计写入失败:', e))
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- GET /api/admin/cache-plan：权限收紧后的清缓存指引（★ P4b，§5.10） ----------
+       *
+       * 为什么需要它：门户 `/portal` 对**匿名**响应允许共享缓存（`s-maxage=300`），所以
+       * "收紧某条可见性"之后，CDN 上可能还留着**旧的匿名渲染结果**。那不是判定错误
+       * （判定每请求现查库、收紧立即生效），而是**缓存里的陈旧副本**。
+       *
+       * 本端点如实复述**实际的缓存串**（取自与设置响应头**同一个常量**，不是另抄一份），
+       * 并报出自 `since` 以来的 ACL 变更类审计条数 —— 让"要不要清、清哪一条"有依据。
+       *
+       * ⚠️ 它**不**自己去清缓存：本进程看不见 CDN。这里给的是**依据与目标**。
+       */
+      router.register(
+        'GET',
+        '/api/admin/cache-plan',
+        async (h: RouteHandlerContext) => {
+          const sinceRaw = h.url.searchParams.get('since')
+          const since =
+            sinceRaw !== null && sinceRaw !== ''
+              ? sinceRaw
+              : new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+          const rows = await db.query<{ action: string; n: number | string }>(
+            `SELECT action, COUNT(*) AS n FROM audit_log
+              WHERE at >= ?
+                AND action IN ('acl.change','page.publish','rollback','admin.resync_tiers')
+              GROUP BY action ORDER BY n DESC`,
+            [since],
+          )
+          const events = rows.map((r) => ({ action: r.action, count: Number(r.n) }))
+          const eventCount = events.reduce((a, e) => a + e.count, 0)
+          h.json(200, {
+            ok: true,
+            since,
+            events,
+            eventCount,
+            purgeRecommended: eventCount > 0,
+            sharedCacheable: [
+              {
+                path: '/portal',
+                cacheControl: CACHE_PORTAL_ANON,
+                vary: 'Cookie',
+                note: '仅**匿名**响应可被共享缓存；带任何 cookie 时走 private, no-store',
+              },
+            ],
+            notSharedCacheable: [
+              { path: '/sitemap.xml', cacheControl: CACHE_SITEMAP },
+              { path: '/api/*', cacheControl: '（未设共享缓存头，默认不可共享缓存）' },
+            ],
+            targets: ['/portal'],
+            note:
+              '判定每请求现查库，收紧**立即生效**；需要处理的是共享缓存里的旧匿名渲染。' +
+              'sitemap 是 no-store，无需清理。',
+          })
+
+          void writeAuditLog(db, {
+            action: 'admin.cache_plan',
+            targetKind: 'cache',
+            targetId: 'portal',
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: { since, eventCount },
+          }).catch((e: unknown) => console.error('[@geewiki/authz] 清缓存指引的审计写入失败:', e))
         },
         { access: 'admin' },
       )
