@@ -14,20 +14,13 @@
  */
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { ArrowUpRight, Link2 } from 'lucide-react'
-import { api, type OutLinksResponse, type PageLinkRef } from '../api'
-import { Card, CardBody, CardHeader, EmptyState, ErrorState, LoadingState, Skeleton, cn } from '../ui'
+import { api, type OutLinksResponse } from '../api'
+import { Card, CardBody, CardHeader, EmptyState, ErrorState, LoadingState, Skeleton } from '../ui'
 import { resolveAreaState } from '../lib/areaState'
 import { describeError } from '../lib/errorText'
-import { MISSING_LINK_ATTR, MISSING_LINK_CLASS } from '../lib/linkPlan'
-import {
-  backlinkSummary,
-  isMissingRef,
-  missingHint,
-  missingNewPageHref,
-  refHref,
-  refLabel,
-} from '../lib/pageLinksPlan'
+import { backlinkSummary, isHiddenRef, isMissingRef } from '../lib/pageLinksPlan'
 import { useSlowHint } from '../lib/useSlowHint'
+import { PageLinkItem } from './PageLinkItem'
 
 interface LinksData {
   backlinks: { slug: string; title: string }[]
@@ -38,34 +31,6 @@ interface LinksState {
   loading: boolean
   error: unknown
   data: LinksData | null
-}
-
-/** 单个链接项。红链（目标不存在）加弱化属性与说明，与正文链接的标记语义保持一致。 */
-function LinkItem({ ref: linkRef }: { ref: PageLinkRef }): ReactNode {
-  const missing = isMissingRef(linkRef)
-  return (
-    <li className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
-      <a
-        href={refHref(linkRef.slug)}
-        className={cn(
-          'text-sm underline underline-offset-2',
-          missing ? MISSING_LINK_CLASS : 'text-accent hover:text-accent-hover',
-        )}
-        {...(missing ? { [MISSING_LINK_ATTR]: '', title: missingHint(linkRef.slug) } : {})}
-      >
-        {refLabel(linkRef)}
-      </a>
-      <span className="font-mono text-2xs text-muted">{linkRef.slug}</span>
-      {missing && (
-        <>
-          <span className="text-2xs text-muted">（目标页面不存在）</span>
-          <a href={missingNewPageHref()} className="text-2xs text-accent underline underline-offset-2">
-            新建该页
-          </a>
-        </>
-      )}
-    </li>
-  )
 }
 
 export function PageLinks({ slug }: { slug: string }): ReactNode {
@@ -148,7 +113,7 @@ export function PageLinks({ slug }: { slug: string }): ReactNode {
           ) : (
             <ul className="m-0 flex list-none flex-col gap-2 p-0">
               {data.backlinks.map((item) => (
-                <LinkItem key={item.slug} ref={item} />
+                <PageLinkItem key={item.slug} item={item} />
               ))}
             </ul>
           )}
@@ -161,16 +126,24 @@ export function PageLinks({ slug }: { slug: string }): ReactNode {
           <CardHeader
             title="本页引用了"
             description={
-              data.links.some(isMissingRef)
-                ? '其中有的目标页面还不存在（已标出）'
-                : `共 ${data.links.length} 个站内链接`
+              /*
+                三种"没有标题"要分别说：不存在（红链，可创建）／存在但无权查看（**别去创建**）／
+                存在且有标题（正常）。把第二类归进第一类，就会引导用户创建重复页面。
+              */
+              data.links.some(isMissingRef) && data.links.some(isHiddenRef)
+                ? '其中有的目标页面不存在、有的存在但无权查看（均已标出）'
+                : data.links.some(isMissingRef)
+                  ? '其中有的目标页面还不存在（已标出）'
+                  : data.links.some(isHiddenRef)
+                    ? '其中有的目标页面存在但无权查看（已标出）'
+                    : `共 ${data.links.length} 个站内链接`
             }
             actions={<ArrowUpRight className="size-4 text-muted" aria-hidden="true" />}
           />
           <CardBody>
             <ul className="m-0 flex list-none flex-col gap-2 p-0">
               {data.links.map((item) => (
-                <LinkItem key={item.slug} ref={item} />
+                <PageLinkItem key={item.slug} item={item} />
               ))}
             </ul>
           </CardBody>

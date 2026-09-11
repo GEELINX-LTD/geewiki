@@ -245,11 +245,22 @@ export interface PageDetail extends PageSummary {
 }
 
 /**
- * 站内链接引用。出链里 `title === null` 表示**目标页面不存在**（即「红链」，先写引用后建页的正常用法）。
+ * 站内链接引用。
+ *
+ * ⚠️ **判"目标在不在"要看 `exists`，不要看 `title === null`**：`title` 只是 `LEFT JOIN`
+ * 的副产物。后端按主体算出的事实是 `exists`：
+ * - `true`     → 目标存在且你看得到
+ * - `false`    → 目标不存在（「红链」，先写引用后建页的正常用法）
+ * - `'hidden'` → 目标**存在但你看不到**（匿名主体拿不到这个值 —— 见 `PageLinks` 的说明）
+ * - 缺失       → 反向链接没有这个字段（服务端已按可见性过滤过）
+ *
+ * `'hidden'` 与 `false` 必须分开渲染：把"存在但你看不到"显示成"不存在"，用户会去
+ * **创建一个已存在的页面** ⇒ 脏数据 + 错误引导（设计文档 §5.5）。
  */
 export interface PageLinkRef {
   slug: string
   title: string | null
+  exists?: boolean | 'hidden'
 }
 
 /** `GET /api/pages/:slug/backlinks` —— 谁引用了本页。 */
