@@ -6,8 +6,9 @@
 
 ## 一句话状态
 
-**`main` = `975fa61`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）/ P3a（块模型与分层检索）。**
-**P3b 基本完成（含申请访问闭环）；P3c / P3d / P4 未完成。**
+**`main` = `d3a82a7`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）/ P3a（块模型与分层检索）。**
+**P3b + P3c + P3d 已完成并 rebase 到 main（分支 `feat/p3bcd-block-acl`，tip `d03be06`，等审查）。**
+**P4 已实现主体（分支 `feat/p4-audit-ops`，4 个提交），六条验收标准均已满足。**
 
 ### ★ 合并后的验证基线（`main` = `975fa61`）
 
@@ -107,11 +108,51 @@ feat/p2-m5-frontend-ia              均已合入，worktree .wt-p0/.wt-p1/.wt-p1
 被 `ON DELETE CASCADE` **静默清空** ⇒ P3b **必须**改写入路径。两个阶段各自看自己那一半都对，
 **缺陷只存在于交界处**——这是"必须做跨阶段 e2e"的实证。
 
-## P4 未开始
+## P4 状态（分支 `feat/p4-audit-ops`，worktree `.wt-p4`，基线 `d3a82a7`）
 
-规格见 §8.1 的 P4 行与 §5.12。注意：原属 P4 的两个 verify 端点
-（`GET /api/admin/{search,blocks}/verify`）**已由编排者裁定提前到 P3a 实现**（它们是 P3a 分层索引与双写的一致性探针，
-缺它们无法验收 P3a 自身）。
+**已实现（4 个提交）**：
+
+- `03c47f0` **越权尝试记录 + 审计查询**。`access.denied` 此前在 `AuditEntry` 的文档注释里被列为
+  预期动作但**从未被写入**；现由 `packages/plugin-wiki/src/index.ts` 的 `recordAccessDenied` 独家写入，
+  三处调用点（详情路由 404 分支、backlinks、links）。
+  **关键判据：只在"页面存在、但对该主体不可见"时记录** —— 对外两条路径都返回 404（§2.3 不泄露存在性），
+  但服务端内部分得清：「请求了不存在的页」只是普通 404，「请求了存在但无权看的页」才是越权尝试。
+  `GET /api/admin/audit`（`access: admin`）用 `view` 把两类**分开**：`acl`（权限/配置变更，合规记录要留存）、
+  `security`（越权尝试与特权访问，安全事件要告警）、`all`。
+  **用显式白名单而非排除法** —— 排除法会把将来新增的动作默认归进 acl 视图；白名单让未分类的动作
+  只出现在 `all` 里，漏分类是**可见的**。支持 action / targetKind / targetId / since / until 过滤，limit 上限 200。
+- `3ce534d` **会话管理**：`GET /api/admin/sessions`（列出，带 `active|expired|revoked` 综合状态）、
+  `POST /api/admin/sessions/:id/revoke`（定点吊销）、`POST /api/admin/users/:userId/sessions/revoke`（批量）。
+  服务端吊销写 `revoked_at`；**`token_hash` 连哈希都不出接口**；重复吊销幂等**且不重复写审计**。
+- `391aece` / `96780a1` **e2e `packages/plugin-authz/test/e2e-p4.sh`（37 项断言，全通过）+ 过期授权回收端点**
+  `POST /api/admin/grants/purge`（**只做空间回收** —— 失效在判定时就发生；只在真回收了才写审计）。
+
+**两条源码级守卫**（`packages/plugin-authz/test/audit-appendonly.test.ts`，由 `pnpm test` 覆盖）：
+`audit_log` 无 UPDATE/DELETE（§8.2 P4 第 2 条）、`page_versions` 无保留策略清理（第 6 条）。
+**做过红-绿自检**（探针 → 变红 → 删除 → 复绿）。
+
+★★ **第 6 条按字面与既有合法代码冲突，已按真实意图落为"白名单 + 锚定"**：验收原文是
+"代码中无删除 `page_versions` 行的路径"，但 `deletePage` 本来就要删掉**被删页自己的**版本 ——
+那是页面生命周期级联，与 D11 反对的"保留策略清理"是两回事。按字面写会让守卫与既有代码冲突、
+然后被人放宽，那等于没有守卫。现判据：只允许一处，且必须锚定在 `deletePage` 内。
+
+**★ 三处"断言自己会骗人"的实例（本阶段踩到两次，值得记住）**：
+① e2e 的 C1 第一版把四个 `grep -o | wc -l` 的结果**拼成字符串**再比 "4"（得到 "1111"），永不可能通过；
+② 阶段 G 第一版造了两条 `subjectId` 相同的授予，而授予端点**按主体幂等 upsert** ⇒ 第二条覆盖第一条、
+库里没有过期行、`purge` 恒返回 `expired=0` 也照样"通过"；
+③ 阶段 G 还漏了"阶段 E 结尾批量吊销了所有会话 ⇒ `$JAR` 已失效"，会以"看起来对"的方式失败。
+
+**已满足的验收标准**：第 1 条（ACL 变更入审计且不含正文）、第 2 条（守卫）、第 3 条（到期判定即时生效，
+回收只是回收）、第 4 条（越权记录 + 两视图分开）、第 5 条（两个 verify 端点，P3a 已交付）、第 6 条（守卫）。
+
+**未做（诚实列出）**：
+- **反向展开**（"谁能看这条"：直接授予 / 祖先链收紧 / 组织角色覆盖三条来源）—— 设计 §8.1 P4 行有此项
+- **运维动作**：门户缓存清理提示（`s-maxage=300` ⇒ 收紧后需"清缓存 + 请求重新抓取"，§5.12）、
+  `/sitemap.xml` 与匿名可见集合做集合差的核对入口、组织站点级设置接到界面
+- `invitations.expires_at` 的回收（本轮只做了 `page_grants`；`invitations` 在 `packages/plugin-org`）
+- **前端界面**：审计页与会话管理页都**只有后端端点**，未接界面
+- PG 上验了审计闭环、两视图分离、会话列表；`grants/purge` 未在 PG 上跑（它与会话端点一样是纯 SQL，
+  但 **PG 的 `COUNT(*)` 返回字符串**这一点在两条端点上都必须 `Number()` 强转，已在代码里处理）
 
 ## ★★ 待回写的设计文档更正（**累积清单，不要丢**）
 
