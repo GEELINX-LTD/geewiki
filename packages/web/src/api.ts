@@ -232,6 +232,16 @@ export interface PageDetail extends PageSummary {
   content: string
   created_at: string
   versions: VersionMeta[]
+  /**
+   * ★ P2：当前主体对这条目的能力。**前端据此隐藏按钮只是体验，不是安全** ——
+   * 服务端在写路径上另有强制（前端隐藏永远不能当判定用）。之所以要下发：
+   * 对每个人都显示"编辑/删除"、点下去才 401/403，等于把权限做成了猜谜。
+   */
+  capabilities: { canEdit: boolean; canDelete: boolean; canManageVisibility: boolean }
+  /** ★ P2：档位字段**只在有管理权时**由服务端下发（普通读者不需要，管理面板才要回填） */
+  visibility?: 'private' | 'org' | 'public'
+  inherit?: boolean
+  published?: boolean
 }
 
 /**

@@ -31,6 +31,7 @@ import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AdminPage } from './pages/AdminPage'
 import { DeniedPage } from './pages/DeniedPage'
+import { NotFoundPage } from './pages/NotFoundPage'
 import { GraphPage } from './pages/GraphPage'
 import { LoginPage } from './pages/LoginPage'
 import { SetupPage } from './pages/SetupPage'
@@ -126,7 +127,14 @@ export function App(): ReactNode {
   const route = useRoute()
   const root = route.split('/')[0] ?? 'wiki'
   const known = [WIKI_ITEM, ...ADMIN_NAV].some((t) => t.id === root) || isAuthRoute(root)
-  const active = known ? root : 'wiki'
+  /*
+   * ★ P2：未知路由不再**静默回落**到知识库。
+   *
+   * 静默回落的坏处不是"少一个页面"，而是掩盖了越权访问与拼错路由：访问 `#/typo`
+   * 会看到一个正常的知识库首页，用户永远不知道自己走错了；排障时也无法区分
+   * "访问不到"与"不存在"。空路由（`#/`）仍按知识库处理 —— 那是产品的根入口。
+   */
+  const active = known ? root : route === '' ? 'wiki' : 'notfound'
 
   /** 路由级基线标题；详情页拿到页面数据后会覆盖成真实标题（见 WikiDetail） */
   useDocumentTitle(titleForRoute(route === '' ? 'wiki' : route))
@@ -206,6 +214,7 @@ export function App(): ReactNode {
   else if (active === 'login') body = <LoginPage />
   else if (active === 'setup') body = <SetupPage />
   else if (active === 'denied') body = <DeniedPage />
+  else if (active === 'notfound') body = <NotFoundPage />
   else body = <GraphPage />
 
   const adminActive = ADMIN_NAV.some((t) => t.id === active)

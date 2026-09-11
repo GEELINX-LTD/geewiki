@@ -984,18 +984,27 @@ function WikiDetail(props: {
               {err}
             </span>
           )}
-          <Button
-            variant="danger"
-            size="sm"
-            icon={<Trash2 className="size-3.5" />}
-            onClick={remove}
-            disabled={restoring}
-          >
-            删除
-          </Button>
-          <Button variant="primary" size="sm" icon={<Pencil className="size-3.5" />} onClick={onEdit}>
-            编辑
-          </Button>
+          {/*
+            ★ P2：按钮按**服务端下发的能力**条件渲染。
+            这里隐藏只是体验，安全判定在服务端（写路径另有强制）—— 把隐藏当判定
+            是本设计通篇点名的反模式。
+          */}
+          {page.capabilities.canDelete && (
+            <Button
+              variant="danger"
+              size="sm"
+              icon={<Trash2 className="size-3.5" />}
+              onClick={remove}
+              disabled={restoring}
+            >
+              删除
+            </Button>
+          )}
+          {page.capabilities.canEdit && (
+            <Button variant="primary" size="sm" icon={<Pencil className="size-3.5" />} onClick={onEdit}>
+              编辑
+            </Button>
+          )}
         </div>
       </div>
 
