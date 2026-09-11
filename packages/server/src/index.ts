@@ -50,6 +50,7 @@ import { AuthPlugin, manifest as authManifest } from '@geewiki/auth'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
+import { OidcPlugin, manifest as oidcManifest } from '@geewiki/oidc'
 import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
 import { POSTGRES_MIGRATIONS_DIR, PostgresPlugin, manifest as postgresManifest } from '@geewiki/postgres'
@@ -1404,6 +1405,14 @@ export function defaultRegistry(
     // 与 @geewiki/llm / @geewiki/ai 同形态：**只登记、不写进默认基础层清单**（已注册未启用）——
     // 它需要外部提供凭据才有意义，且与其它 provider 互斥，属于"按需显式启用"的插件。
     { name: '@geewiki/openai', manifest: openAiManifest as GeeWikiManifest, module: OpenAiPlugin, source: 'builtin' },
+    // OIDC / 企业 SSO adapter：只往 auth-service 注册一条 provider 并把 /api/auth/oidc/* 两条
+    // 路由挂上，故**无 provides**；requires 点名 auth-service（账号策略与 provider 注册表都在那里）、
+    // http-service、database-provider（协议环节的失败要落 audit_log）。
+    // conflictGroup 'oidc-provider'：与将来的第二个 IdP adapter 同组互斥。
+    // 与 @geewiki/llm / @geewiki/ai / @geewiki/openai 同形态：**只登记、不写进默认基础层清单**
+    // （已注册但未启用）—— 它需要外部 IdP 才有意义。未启用时 /api/auth/oidc/* 根本不存在（404），
+    // 本地密码通道完全不受影响（这是"无外部依赖 / 离线可用"承诺的落点）。
+    { name: '@geewiki/oidc', manifest: oidcManifest as GeeWikiManifest, module: OidcPlugin, source: 'builtin' },
   ]
 }
 

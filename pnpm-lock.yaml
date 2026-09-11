@@ -157,6 +157,25 @@ importers:
         specifier: ^22.0.0
         version: 22.20.1
 
+  packages/plugin-oidc:
+    dependencies:
+      '@geewiki/auth':
+        specifier: workspace:*
+        version: link:../plugin-auth
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
   packages/plugin-openai:
     dependencies:
       '@geewiki/core':
@@ -237,6 +256,9 @@ importers:
       '@geewiki/manager':
         specifier: workspace:*
         version: link:../manager
+      '@geewiki/oidc':
+        specifier: workspace:*
+        version: link:../plugin-oidc
       '@geewiki/openai':
         specifier: workspace:*
         version: link:../plugin-openai
