@@ -1485,3 +1485,116 @@ test('P3c：老版本只恢复正文并带 warnings；含 granted 块的版本�
     h.dispose()
   }
 })
+
+/*
+ * ------------------ P3c 恢复路径的 tier 扇出（★ 独立审查查出的 Critical） ------------------
+ *
+ * 恢复会写 `pages` 的**档位列**（`visibility` / `inherit` / `published_at`），因而会改掉本页的
+ * **有效档位**；而子孙的 `blocks.tier` 是**物化派生列**（`pageLevelOf` 只决定本页）。
+ * 漏掉扇出的后果是**内容泄漏级**：把祖先从 public **恢复成 private** 后，子页的读路径已 404，
+ * 但它的 `tier` 仍是旧值 `0` ⇒ **匿名 `/api/search` 仍命中并吐出正文片段**；
+ * 反方向（放宽）则退化为"搜不到但读得到"。
+ *
+ * **为什么既有用例抓不到**：它们只断言被恢复的那一页本身，没有子页。
+ * 这里断言**子页的 `blocks.tier`** —— 它是检索判定的直接输入，也是根因所在。
+ */
+test('P3c：恢复祖先的档位必须重算子孙的 blocks.tier（否则读路径已 404 而检索仍吐正文）', async () => {
+  const h = await makeHarness()
+  try {
+    const tierOf = (slug: string): unknown => {
+      const rows = h.adapter.query<{ tier: unknown }>(
+        'SELECT b.tier AS tier FROM blocks b JOIN pages p ON p.id = b.page_id WHERE p.slug = ? ORDER BY b.ordinal',
+        [slug],
+      )
+      assert.ok(rows.length > 0, `${slug} 应有块行`)
+      return rows[0]?.['tier']
+    }
+    const setVis = async (slug: string, body: Record<string, unknown>): Promise<void> => {
+      const r = await h.call('PUT', '/api/pages/:slug/visibility', { slug }, body, OWNER)
+      assert.equal(r.status, 200, `${slug} 设可见性 ${JSON.stringify(body)} 应成功`)
+    }
+
+    /* ---- ① 造出「祖先曾是 private」的那个版本快照 ---- */
+    // 建页 ⇒ 应用层默认 org
+    assert.equal(
+      (await h.call('PUT', '/api/pages/:slug', { slug: 'anc' }, { title: 'A', content: '祖先正文' }, OWNER)).status,
+      200,
+    )
+    // org → private（这一步快照的是 org）
+    await setVis('anc', { visibility: 'private' })
+    /*
+     * private → public + 已发布：**这一步快照的是 private 状态**（约定"先快照旧的，再改"）。
+     * 下面要恢复的就是它 ⇒ 恢复后祖先应当回到 private。
+     */
+    await setVis('anc', { visibility: 'public', published: true })
+
+    const privateVersionId = h.adapter.query<{ id: number }>(
+      `SELECT v.id AS id FROM page_versions v JOIN pages p ON p.id = v.page_id
+        WHERE p.slug = ? AND v.acl_json LIKE '%"visibility":"private"%' ORDER BY v.id`,
+      ['anc'],
+    )[0]?.id
+    assert.ok(privateVersionId, '应存在一条 visibility=private 的版本快照（前置）')
+
+    /* ---- ② 子页 public + 已发布 ⇒ 有效档位 public ⇒ tier 0（匿名可搜） ---- */
+    assert.equal(
+      (
+        await h.call(
+          'PUT',
+          '/api/pages/:slug',
+          { slug: 'anc/child' },
+          { title: 'C', content: '子页公开正文 CHILDMARK' },
+          OWNER,
+        )
+      ).status,
+      200,
+    )
+    await setVis('anc/child', { visibility: 'public', published: true })
+    assert.equal(
+      tierOf('anc/child'),
+      0,
+      '前置：祖先与子页都是 public + 已发布 ⇒ 子页 tier 应为 0（匿名可搜）—— 先证明前置，否则"变 null"可能是假绿',
+    )
+
+    /* ---- ③ 把祖先恢复到 private ⇒ 子页的读路径与检索**必须同时**被遮蔽 ---- */
+    const restore = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'anc', id: String(privateVersionId) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(
+      restore.status,
+      200,
+      `恢复应成功；实际响应: ${JSON.stringify(restore.body)}（node 的 assert 对 null/undefined 打印为空，故显式带上响应体）`,
+    )
+    // 数组必须用 deepEqual：`assert.equal` 比的是引用，`[] == []` 恒为假
+    assert.deepEqual(restore.body['warnings'], [], '新版本恢复不应有 warnings')
+
+    // 读路径：祖先变 private ⇒ 子页对匿名 404
+    const anonRead = await h.call(
+      'GET',
+      '/api/pages/:slug',
+      { slug: 'anc/child' },
+      undefined,
+      anonymousPrincipal(),
+    )
+    assert.equal(anonRead.status, 404, '祖先恢复成 private 后，子页读路径应对匿名 404')
+
+    // ★ 检索判定的直接输入：子孙的 tier 必须跟着变成 null
+    assert.equal(
+      tierOf('anc/child'),
+      null,
+      '★ 恢复必须重算子孙 tier：否则读路径 404 而匿名检索仍按旧档位命中并吐正文（内容泄漏级）',
+    )
+
+    /* ---- ④ 扇出的可观测性：必须回传"确实重算了子孙"而不是沉默 ---- */
+    assert.equal(restore.body['index_tiers_resync_failed'], false, '扇出不应失败')
+    assert.ok(
+      Number(restore.body['index_tiers_resynced']) >= 1,
+      '应至少重算 1 个子孙（0 与"扇出失败"是两件处置不同的事，故两者都要断言）',
+    )
+  } finally {
+    h.dispose()
+  }
+})

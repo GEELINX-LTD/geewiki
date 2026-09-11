@@ -1513,6 +1513,22 @@ export const WikiPlugin = {
           return bumpAclRevision(tx, slug)
         })
 
+        /*
+         * ★ 恢复也会改**祖先的档位**，因而必须与档位端点一样做子孙扇出。
+         *
+         * 上面的 `UPDATE pages ... visibility = ?, inherit = ?, published_at = ?` 会把本页的
+         * 有效档位改掉，而**子孙的 `blocks.tier` 是物化派生列**（`pageLevelOf` 只影响本页）。
+         * 漏掉扇出的后果是内容泄漏级：把祖先从 public **恢复成 private** 后，子页的读路径
+         * 已 404，但它的 `blocks.tier` 仍是旧值 0 ⇒ **匿名 `/api/search` 仍命中并吐出正文片段**；
+         * 反方向（放宽）则退化为"搜不到但读得到"。
+         *
+         * 放在提交**之后**：`pageLevelOf` 走策略层（另一条连接），PG 的 MVCC 下读不到本事务
+         * 未提交的那次 UPDATE ⇒ 放进事务里会按**旧**档位算，等于没修。
+         * 失败不回滚已提交的恢复（那是用户要的结果），但由 `resyncDescendantsReporting`
+         * 升级成响应字段 + 审计行 —— "重算了 0 个子孙"与"扇出整个失败"是两件处置不同的事。
+         */
+        const resync = await resyncDescendantsReporting(slug)
+
         void writeAuditLog(adb, {
           action: 'acl.change',
           targetKind: 'page',
@@ -1521,7 +1537,18 @@ export const WikiPlugin = {
           after: { restored_version: versionId, block_acls_restored: true, acl_revision: revision },
         }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
 
-        h.json(200, { ok: true, slug, restored: versionId, acl_revision: revision, warnings: [] })
+        h.json(200, {
+          ok: true,
+          slug,
+          restored: versionId,
+          acl_revision: revision,
+          warnings: [],
+          // 子孙块被重算的条数（0 = 没有子孙）
+          index_tiers_resynced: resync.resynced,
+          // ★ 与上面那个 0 区分开：true 表示**扇出抛错、一个都没算**（内容泄漏级）
+          index_tiers_resync_failed: resync.failed,
+          ...(resync.error === undefined ? {} : { index_tiers_resync_error: resync.error }),
+        })
       }, { access: 'user' }),
     )
 
@@ -1646,7 +1673,11 @@ export const WikiPlugin = {
      * 1. **不泄露存在性** —— `level === 'none'` 一律 404（不是 403）：无权看的人
      *    也不该通过"403 vs 404"知道它存在。
      * 2. **每次 ACL 变更都递增 `acl_revision`**（全局行 + 该条目自己的列）——
-     *    策略层据此做代际失效；**绝不用 TTL**（TTL 必然产生"撤销后仍可见"的窗口）。
+     *    它是一个**版本标记与观测信号**（响应里回传，便于发现"变更没生效"）。
+     *    ⚠️ **不要写成"策略层据此做代际失效"**：判定层（`packages/plugin-authz`）**没有任何
+     *    决策缓存**，每个请求现查库（`loadVisibilityIndex()` 有四处调用点），所以变更天然立即生效、
+     *    并没有"失效"这个动作。真正被禁止的是**给判定加 TTL 缓存**
+     *    （TTL 必然产生"撤销后仍可见"的窗口）。
      * 3. **审计不含正文**（`before`/`after` 只放档位与授权元数据）。
      */
     const VISIBILITIES = ['private', 'org', 'public'] as const
@@ -2394,9 +2425,10 @@ export const WikiPlugin = {
 
     /* ---------- POST /api/pages/:slug/access-requests/:id/approve：批准并落授予 ---------- */
     /*
-     * 批准 = **一条 `page_grants` + `acl_revision++`**。后者是"被批准者无需重新登录即可见"
-     * 的关键：判定单点按 `acl_revision` 做代际失效（§4.5，**不是 TTL**），所以版本一涨，
-     * 该主体的下一次判定立刻走新结果，不需要他重新登录、也不需要等任何过期窗口。
+     * 批准 = **一条 `page_grants` + `acl_revision++`**。被批准者**无需重新登录即可见**，
+     * 原因是**判定层没有任何决策缓存**（`packages/plugin-authz` 每个请求现查库），
+     * **不是**因为 `acl_revision` 触发了什么失效 —— 它只是版本标记与观测信号。
+     * ⚠️ 反过来说：**一旦给判定层加了 TTL 缓存，这条性质就会失效**（§4.5 明令不要那样做）。
      */
     cleanups.push(
       router.register('POST', '/api/pages/:slug/access-requests/:id/approve', async (h) => {
