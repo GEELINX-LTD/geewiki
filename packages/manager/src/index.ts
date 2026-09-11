@@ -47,11 +47,13 @@ export {
   listPluginDirs,
   loadExternalPlugins,
   parsePluginManifest,
+  resolveMigrationsDirs,
   resolvePluginEntry,
   scanPluginDirs,
   type DiscoveryIssue,
   type DiscoveryOptions,
   type DiscoveryResult,
+  type MigrationsHooks,
   type PluginDirScan,
 } from './discovery.js'
 import {

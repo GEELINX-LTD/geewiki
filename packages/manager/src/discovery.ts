@@ -66,6 +66,68 @@ export class DiscoveryError extends Error {
   }
 }
 
+/** `resolveMigrationsDirs` 的告警/问题出口（缺省静默，便于自检等无副作用的调用方复用） */
+export interface MigrationsHooks {
+  /** 非致命告警（迁移目录不存在等） */
+  warn?: (message: string) => void
+  /** 记一条 issue（符号链接越界等）；缺省仅告警 */
+  onIssue?: (issue: { code: 'invalid_plugin_path'; dir: string; message: string }) => void
+}
+
+/**
+ * 解析清单的 `geewiki.migrations` → **按方言的绝对目录表**（纯函数，无 IO 之外的副作用）。
+ *
+ * **这是内建插件与外部插件共用的唯一一套解析规则**——此前内建插件的迁移目录是在组合根里
+ * 各自硬编码的，同一个事实有两个真源，manifest 里写的 `migrations` 对内置插件根本不生效
+ * （新增内建插件时容易漏写，且两处不一致时没有任何测试能发现）。
+ *
+ * 支持两种写法，与清单规范一致：
+ * - `string` —— 通用目录，键为 `'default'`（所有方言共用）；
+ * - `{ default?, postgres? }` —— 按方言分别指定。
+ *
+ * @param manifest 已解析的插件清单（取 `manifest.geewiki.migrations`）
+ * @param dir      插件根目录（迁移目录的相对路径基准），绝对路径
+ * @returns 方言 → 绝对目录；未声明或全部无效时返回 `undefined`
+ * @throws DiscoveryError code=invalid_plugin_path 迁移目录越出插件目录（拒绝路径穿越）
+ */
+export function resolveMigrationsDirs(
+  manifest: Pick<GeeWikiManifest, 'name' | 'geewiki'>,
+  dir: string,
+  hooks: MigrationsHooks = {},
+): Record<string, string> | undefined {
+  const warn = hooks.warn ?? (() => {})
+  const migrationsDirs: Record<string, string> = {}
+  const declaredMigrations = manifest.geewiki.migrations
+  const migrationVariants: Array<[string, string]> =
+    typeof declaredMigrations === 'string'
+      ? [['default', declaredMigrations]]
+      : declaredMigrations
+        ? Object.entries(declaredMigrations).filter(
+            (entry): entry is [string, string] => typeof entry[1] === 'string',
+          )
+        : []
+  for (const [dialectKey, rel] of migrationVariants) {
+    const abs = resolve(dir, rel)
+    if (!isInsideDir(dir, abs)) {
+      throw new DiscoveryError(
+        'invalid_plugin_path',
+        `迁移目录 "${rel}"（${dialectKey}）越出插件目录（拒绝路径穿越）`,
+      )
+    }
+    if (!existsSync(abs)) {
+      warn(`[manager:discovery] ${manifest.name}: 迁移目录不存在，已忽略（${dialectKey}）: ${abs}`)
+    } else if (!isInsideDirReal(dir, abs)) {
+      // 符号链接越界：只忽略该迁移目录并记 issue，不因此拒绝整个插件
+      const message = `迁移目录 "${rel}"（${dialectKey}）的真实路径越出插件目录（拒绝符号链接穿越），已忽略该迁移目录`
+      hooks.onIssue?.({ code: 'invalid_plugin_path', dir, message })
+      warn(`[manager:discovery] ${manifest.name}: ${message}`)
+    } else {
+      migrationsDirs[dialectKey] = abs
+    }
+  }
+  return Object.keys(migrationsDirs).length > 0 ? migrationsDirs : undefined
+}
+
 /* --------------------------- 纯函数（可单测） --------------------------- */
 
 /** 候选入口文件名（按优先级） */
@@ -267,37 +329,11 @@ export async function loadExternalPlugins(options: DiscoveryOptions): Promise<Di
       }
 
       // 迁移目录：声明则必须位于插件目录内；不存在仅告警（该插件自管表结构）。
-      // 支持 string（通用）与 { default?, postgres? }（按方言）两种写法，逐个变体做同样的
-      // 路径安全校验——**安全校验不能被"新写法"绕过**。
-      const migrationsDirs: Record<string, string> = {}
-      const declaredMigrations = manifest.geewiki.migrations
-      const migrationVariants: Array<[string, string]> =
-        typeof declaredMigrations === 'string'
-          ? [['default', declaredMigrations]]
-          : declaredMigrations
-            ? Object.entries(declaredMigrations).filter(
-                (entry): entry is [string, string] => typeof entry[1] === 'string',
-              )
-            : []
-      for (const [dialectKey, rel] of migrationVariants) {
-        const abs = resolve(dir, rel)
-        if (!isInsideDir(dir, abs)) {
-          throw new DiscoveryError(
-            'invalid_plugin_path',
-            `迁移目录 "${rel}"（${dialectKey}）越出插件目录（拒绝路径穿越）`,
-          )
-        }
-        if (!existsSync(abs)) {
-          warn(`[manager:discovery] ${manifest.name}: 迁移目录不存在，已忽略（${dialectKey}）: ${abs}`)
-        } else if (!isInsideDirReal(dir, abs)) {
-          // 符号链接越界：只忽略该迁移目录并记 issue，不因此拒绝整个插件
-          const message = `迁移目录 "${rel}"（${dialectKey}）的真实路径越出插件目录（拒绝符号链接穿越），已忽略该迁移目录`
-          result.issues.push({ code: 'invalid_plugin_path', dir, message })
-          warn(`[manager:discovery] ${manifest.name}: ${message}`)
-        } else {
-          migrationsDirs[dialectKey] = abs
-        }
-      }
+      // 解析规则与**内建插件**共用同一实现（resolveMigrationsDirs），避免两套规则漂移。
+      const migrationsDirs = resolveMigrationsDirs(manifest, dir, {
+        warn,
+        onIssue: (issue) => result.issues.push({ code: issue.code, dir: issue.dir, message: issue.message }),
+      })
 
       const imported: unknown = await import(pathToFileURL(entryAbs).href)
       const mod = ((imported as { default?: unknown }).default ?? imported) as {
@@ -314,7 +350,8 @@ export async function loadExternalPlugins(options: DiscoveryOptions): Promise<Di
         name: manifest.name,
         manifest: { name: manifest.name, version: manifest.version, geewiki: manifest.geewiki },
         module: mod as RegisteredPlugin['module'],
-        migrationsDirs: Object.keys(migrationsDirs).length > 0 ? migrationsDirs : undefined,
+        // resolveMigrationsDirs 已保证"无有效目录 ⇒ undefined"，这里直接透传
+        migrationsDirs,
         source: 'external',
         dir,
       })

@@ -12,6 +12,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { existsSync, readFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -39,13 +40,14 @@ import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
 import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
 import { POSTGRES_MIGRATIONS_DIR, PostgresPlugin, manifest as postgresManifest } from '@geewiki/postgres'
-import { WikiPlugin, manifest as wikiManifest } from '@geewiki/wiki'
+import { WikiPlugin, WIKI_MIGRATIONS_DIR, manifest as wikiManifest } from '@geewiki/wiki'
 import {
   PluginManagerPlugin,
   loadExternalPlugins,
   pluginUiNameFromSegments,
   pluginUiRootsFor,
   removeCrashMarker,
+  resolveMigrationsDirs,
   writeCrashMarker,
   type DiscoveryIssue,
   type RegisteredPlugin,
@@ -815,6 +817,58 @@ export function httpRegistryEntry(
   }
 }
 
+/**
+ * 从绝对迁移目录**向上**找到所属插件包的根（以 `package.json` 的 `name` 与清单名一致为准）。
+ *
+ * 为什么不用 `require.resolve('@geewiki/<pkg>/package.json')`：四个插件包的 `exports` 都只映射
+ * `'.'`，实测该写法与裸 specifier 解析**均 MODULE_NOT_FOUND**（ESM-only 的 `.ts` 入口也无法经
+ * CJS 解析）。向上走查是纯文件系统操作，不依赖解析器，且**不依赖仓库目录布局**。
+ *
+ * @returns 包根绝对路径；找不到匹配的 package.json 时 `undefined`
+ */
+export function packageRootOf(dir: string, expectedName: string): string | undefined {
+  let cur = resolve(dir)
+  for (let i = 0; i < 6; i++) {
+    const pkgFile = join(cur, 'package.json')
+    if (existsSync(pkgFile)) {
+      try {
+        const parsed = JSON.parse(readFileSync(pkgFile, 'utf8')) as { name?: unknown }
+        if (parsed.name === expectedName) return cur
+      } catch {
+        // package.json 不可解析：继续向上找，不因它中断启动
+      }
+    }
+    const up = resolve(cur, '..')
+    if (up === cur) break
+    cur = up
+  }
+  return undefined
+}
+
+/**
+ * 求得一个内建插件条目的迁移目录表——**与外部插件同一套解析规则**：
+ *
+ * 1. 先从插件包导出的绝对目录向上定位**包根**；
+ * 2. 用 `resolveMigrationsDirs` 解析 `manifest.geewiki.migrations`（相对包根的路径）——
+ *    **manifest 是声明的真源**，解析结果即注册表使用的值；
+ * 3. 仅当 manifest 尚未声明该字段时，才回退到调用方给出的绝对目录（注册表**补充**缺口）。
+ *
+ * 于是"manifest 写的 migrations 对内建插件不生效"这一缺陷被消除；两处不一致不会再被静默容忍
+ * ——`test/builtin-migrations.test.ts` 用真实磁盘上的包根交叉核对，并钉住回退清单。
+ *
+ * @param manifest 插件清单（声明来源）
+ * @param fallback 回退的绝对目录（仅 manifest 未声明时使用）
+ */
+export function builtinMigrations(
+  manifest: GeeWikiManifest,
+  fallback: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> | undefined {
+  const dirs = Object.values(fallback)
+  const root = dirs.length === 1 ? packageRootOf(dirs[0] as string, manifest.name) : undefined
+  const declared = root ? resolveMigrationsDirs(manifest, root, { warn: (m) => console.warn(m) }) : undefined
+  return declared ?? fallback
+}
+
 /** 内置插件注册表（default registry：服务器引导时注册的全部可管插件） */
 export function defaultRegistry(
   webDist: string | null,
@@ -826,7 +880,8 @@ export function defaultRegistry(
       name: '@geewiki/db-sqlite',
       manifest: dbSqliteManifest as GeeWikiManifest,
       module: SqliteDbPlugin,
-      migrationsDirs: { sqlite: DB_SQLITE_MIGRATIONS_DIR },
+      // 声明在 manifest.geewiki.migrations（'./src/migrations'）；此处给出的绝对目录仅作回退
+      migrationsDirs: builtinMigrations(dbSqliteManifest as GeeWikiManifest, { sqlite: DB_SQLITE_MIGRATIONS_DIR }),
       source: 'builtin',
     },
     // PostgreSQL：与 sqlite 同属 database-provider 冲突组 ⇒ 同组互斥自动生效。
@@ -835,7 +890,8 @@ export function defaultRegistry(
       name: '@geewiki/postgres',
       manifest: postgresManifest,
       module: PostgresPlugin,
-      migrationsDirs: { postgres: POSTGRES_MIGRATIONS_DIR },
+      // 该包的 manifest 尚未声明 migrations ⇒ 这里给出绝对目录作为回退（测试会钉住这份清单）
+      migrationsDirs: builtinMigrations(postgresManifest, { postgres: POSTGRES_MIGRATIONS_DIR }),
       source: 'builtin',
     },
     { ...httpRegistryEntry(webDist, defaults, pluginUiRoots), source: 'builtin' },
@@ -854,10 +910,20 @@ export function defaultRegistry(
       name: '@geewiki/search',
       manifest: searchManifest as GeeWikiManifest,
       module: SearchPlugin,
-      migrationsDirs: { sqlite: SEARCH_MIGRATIONS_DIR },
+      // 声明在 manifest.geewiki.migrations（'./migrations'）；此处给出的绝对目录仅作回退
+      migrationsDirs: builtinMigrations(searchManifest as GeeWikiManifest, { sqlite: SEARCH_MIGRATIONS_DIR }),
       source: 'builtin',
     },
-    { name: '@geewiki/wiki', manifest: wikiManifest as GeeWikiManifest, module: WikiPlugin, source: 'builtin' },
+    {
+      name: '@geewiki/wiki',
+      manifest: wikiManifest as GeeWikiManifest,
+      module: WikiPlugin,
+      // 该包的 manifest 显式写了 `migrations: undefined`（它原本在 apply() 里自行 migrate）；
+      // 这里由**管理器代迁**：两者幂等共存（db.migrate() 以 _migrations 去重、逐脚本单事务）。
+      // 插件侧自调的移除留待后续批次（本批不可改 plugin-wiki）。
+      migrationsDirs: builtinMigrations(wikiManifest as GeeWikiManifest, { sqlite: WIKI_MIGRATIONS_DIR }),
+      source: 'builtin',
+    },
     // AI 问答（检索增强问答的检索-only 形态）：提供 ai-service。
     // requires 点名 search-service 与 llm-service 两个**服务**（不是插件名），故管理器会保证
     // 检索与模型契约层先激活；**没有模型也能用**——无 provider 时降级为检索结果 + 抽取式摘要，
