@@ -317,17 +317,25 @@ if [[ "$PG_MODE" == "1" ]]; then
   skip "H：同上（需直接改 SQLite 文件）"
 else
   stop_server
-  node_db 'const D=require("better-sqlite3");const db=new D(process.argv[1]);db.prepare("UPDATE blocks SET tier = 0 WHERE tier = 1").run();process.stdout.write(String(db.prepare("SELECT COUNT(*) n FROM blocks WHERE tier=0").get().n))' > "$TMP/corrupted"
-  check_ge "H1 已人为把若干块的 tier 改错" "$(cat "$TMP/corrupted")" 1
+  # ★ 两处假绿在这里被修掉（审查指出）：
+  #   ① 原实现断言的是"此刻 `tier = 0` 的行数" —— 只要库里本就存在**合法的** `tier = 0` 块
+  #      （例如已发布的公开页），即便那条 UPDATE 一行都没改到也会 ≥1 ⇒ 前置断言假绿。
+  #      改为按 `run()` 返回的 **`changes`（实际改动行数）** 断言。
+  #   ② 还原时用 `UPDATE ... SET tier = 1 WHERE tier = 0` —— 只在"此刻所有块恰好都该是
+  #      tier=1"时才正确，否则会把本来就该是 0 的块也改成 1（把测试污染成另一种不一致）。
+  #      改为**记录确切行 id**、按记录逐行还原。
+  node_db 'const D=require("better-sqlite3");const fs=require("node:fs");const p=process.argv[1];const db=new D(p);const ids=db.prepare("SELECT id FROM blocks WHERE tier = 1").all().map(r=>r.id);fs.writeFileSync(process.argv[2],JSON.stringify(ids));const info=db.prepare("UPDATE blocks SET tier = 0 WHERE tier = 1").run();process.stdout.write(JSON.stringify({tier1:ids.length,changed:info.changes}))' "$TMP/tierbak.json" > "$TMP/body"
+  check_ge "H0 前置：确实存在 tier=1 的块可供改错（否则本阶段是空转）" "$(field tier1)" 1
+  check_ge "H1 已人为把若干块的 tier 改错（按**实际改动行数**计，而非此刻 tier=0 的行数）" "$(field changed)" 1
   start_server
   sess GET /api/admin/blocks/verify >/dev/null
   check_ge "H2 探针报出 tier_mismatched>0（证明它不是摆设）" "$(field tier_mismatched)" 1
   check "H2b 而块↔正文那一项仍然为 0（两类不一致能分开看）" "0" "$(field mismatched)"
   stop_server
-  node_db 'const D=require("better-sqlite3");const db=new D(process.argv[1]);db.prepare("UPDATE blocks SET tier = 1 WHERE tier = 0").run()' >/dev/null
+  node_db 'const D=require("better-sqlite3");const fs=require("node:fs");const p=process.argv[1];const db=new D(p);const ids=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));const st=db.prepare("UPDATE blocks SET tier = 1 WHERE id = ?");db.transaction(()=>{for(const id of ids) st.run(id)})()' "$TMP/tierbak.json"
   start_server
   sess GET /api/admin/blocks/verify >/dev/null
-  check "H3 修回后探针恢复 0" "0" "$(field tier_mismatched)"
+  check "H3 按记录逐行还原后探针恢复 0" "0" "$(field tier_mismatched)"
 fi
 
 echo
@@ -353,6 +361,55 @@ else
   sess GET /api/admin/blocks/verify >/dev/null
   check "I5 回填后 blocks/verify 仍全 0（回填写出了一致的块与 tier）" "0" "$(field mismatched)"
   check "I5b 回填后 tier_mismatched 仍为 0" "0" "$(field tier_mismatched)"
+fi
+
+echo
+echo "=== 阶段 K：tier 扇出的另外两条顺序 —— 新建祖先 / 删除断链点 ==="
+# 为什么必须有这一段：阶段 G **只覆盖"改档位"**这一个顺序。审查实测复现了两条同类泄漏，
+# 而当时的 e2e 是**全绿**的 —— 因为 G 走的是唯一做了扇出的那条路径。
+# 两条都先断言"前置状态是能读到"，否则后面的"遮蔽了"可能是假绿（本来就读不到）。
+if [[ "$PG_MODE" == "1" ]]; then
+  skip "K：直接读写 SQLite 文件核对 tier，PG 下需另写 psql 路径（未做）"
+else
+  # ---- K1：**新建祖先**——新页成为已有页的祖先，子孙有效档位被收紧，而它们的 tier 不会自己变 ----
+  #
+  # ⚠️ 标记为什么要比查询串**长**：检索响应里有 `query: q`（**回显查询串**），
+  #    所以"整串 grep 查询词"必然命中 —— 那是假阳性，不是泄漏。这里用
+  #    查询 `KKK777` + 内容标记 `KKK777LEAK`：回显的只是前者，后者只可能来自泄漏。
+  KID='KKK777'
+  KLK="${KID}LEAK"
+  put_page k1/child "子页正文 $KLK" >/dev/null
+  check "K1 子页设为 public + 已发布 → 200" "200" "$(set_vis k1/child '{"visibility":"public","published":true}')"
+  check "K2 前置：此刻匿名**读得到**子页（否则后面的 404 可能是假绿）" "200" "$(anon "/api/pages/k1%2Fchild")"
+  check_ge "K3 前置：此刻匿名**搜得到**子页（唯一词命中）" "$(anon "/api/search?q=$KID" | field total)" 1
+  # ★ 新建父页（默认 org）—— 它成为子页的祖先
+  put_page k1 "父页正文" >/dev/null
+  check "K4 匿名读子页被遮蔽（404）" "404" "$(anon "/api/pages/k1%2Fchild")"
+  anon "/api/search?q=$KID" >/dev/null
+  cp "$TMP/body" "$TMP/k1.search"
+  check "K5 匿名搜**同时**被遮蔽（total=0）" "0" "$(field total)"
+  check_absent "K6 且检索响应体里不含内容标记（不是只改了计数）" "$TMP/k1.search" "$KLK"
+
+  # ---- K2：**删除断链点**——更上层更严的祖先重新开始压制子孙 ----
+  # 策略层 `effectiveRank` 对"祖先不存在"是 continue、对"inherit !== 1"才是 break；
+  # 那个不对称是**刻意的语义**，要验的是"档位变了，物化的 tier 要跟着变"。
+  DID='DDD999'
+  DLK="${DID}LEAK"
+  put_page k2 "父页正文" >/dev/null
+  put_page k2/mid "断链点" >/dev/null
+  put_page k2/mid/deep "深层正文 $DLK" >/dev/null
+  check "K7 父页设为 private → 200" "200" "$(set_vis k2 '{"visibility":"private"}')"
+  check "K8 断链点设为 public + 已发布 + **inherit=false** → 200" "200" "$(set_vis k2/mid '{"visibility":"public","published":true,"inherit":false}')"
+  check "K9 深层页设为 public + 已发布 → 200" "200" "$(set_vis k2/mid/deep '{"visibility":"public","published":true}')"
+  check "K10 前置：此刻匿名**读得到**深层页（断链生效）" "200" "$(anon "/api/pages/k2%2Fmid%2Fdeep")"
+  check_ge "K11 前置：此刻匿名**搜得到**深层页" "$(anon "/api/search?q=$DID" | field total)" 1
+  # ★ 删掉断链点 ⇒ 更上层那条 private 重新开始压制
+  check "K12 删除断链点 → 200" "200" "$(sess DELETE "/api/pages/$(urlenc 'k2/mid')")"
+  check "K13 匿名读深层页被遮蔽（404）" "404" "$(anon "/api/pages/k2%2Fmid%2Fdeep")"
+  anon "/api/search?q=$DID" >/dev/null
+  cp "$TMP/body" "$TMP/k2.search"
+  check "K14 匿名搜**同时**被遮蔽（total=0）" "0" "$(field total)"
+  check_absent "K15 且检索响应体里不含内容标记" "$TMP/k2.search" "$DLK"
 fi
 
 echo
