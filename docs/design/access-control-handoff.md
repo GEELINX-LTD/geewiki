@@ -6,8 +6,31 @@
 
 ## 一句话状态
 
-**`main` = `953f41d`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）。**
-**P3a 实现完成但经审查判定不可合并（2 条 Critical 泄漏，修复中）；P3b 基本完成；P3c / P3d / P4 未完成。**
+**`main` = `ae323a2`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）。**
+**P3a 的 2 条 Critical 泄漏已修复并做了红-绿自检，正等复审；P3b 基本完成；P3c / P3d / P4 未完成。**
+
+### ★ P3a 修复轮（4 个提交 `a3d72b7` / `1d608a6` / `dee82cd` / `e941da5`）
+
+- **C1/C2 已修**：`savePage` create 分支（`packages/plugin-wiki/src/index.ts:1001`）与 `deletePage`（`:1057`）
+  各调一次 `resyncDescendantsReporting(slug)`；档位端点（`:1522`）也改用它。
+- **扇出保留在提交之后，而非塞进同一事务** —— 实现者给出的理由（我判断成立）：
+  `pageLevelOf` 走策略层（**另一条连接**读 `pages`），**PG 的 MVCC 下看不到本事务未提交的插入/删除**；
+  不会死锁，但会**读到旧值，等于没修**。因此改为把失败**升级为一等可观测信号**：
+  `ResyncReport{resynced, failed, error?}` + 审计 `acl.resync_failed` + 响应字段
+  `index_tiers_resync_failed` / `index_tiers_resync_error`，与 `index_tiers_resynced` 并列
+  —— **让"重算了 0 个子孙"与"扇出整个失败"可区分**。泄露窗口是毫秒级；真正的风险是**失败后永久泄漏**，后者已解决。
+- **红-绿自检（最硬的证据）**：临时禁用两处扇出 ⇒ `K5/K6/K14/K15` 全红，`K6` 报响应体里出现 `KKK777LEAK`、
+  `K15` 报 `DDD999LEAK`（通过 71 / 失败 4）；恢复后全绿。
+- **★ 又抓到第三个 PG 专有缺陷（内容级）**：`deletePage` 里的 `DELETE FROM blocks_fts ...` **没有方言守卫**
+  ⇒ **PostgreSQL 上删除任何页面都返回 500 且页面删不掉**（PG 事务一旦报错即 aborted、整体回滚）。
+  `blocksIndexSupported` 在回填与 `savePage` 都用了，唯独这里漏了。**此前从未被发现，是因为 e2e 的阶段
+  G/H/I/K 靠直读 SQLite 文件核对 tier、在 PG 下整体跳过** ⇒ `deletePage` 在 PG 上从没被端到端跑到过。
+  已修，并新增**方言中立阶段 L** 覆盖扇出的 HTTP 可见面。
+- **e2e 加固**：新增阶段 K（两条扇出顺序，含"先证明前置状态可读"的反假绿断言）；修正 H 阶段两处假绿
+  （H1 原按"`tier=0` 的行数"断言 ⇒ 库里有合法 tier=0 块即假绿，改为按 `run()` 的 `changes` 并加 H0 前置；
+  H3 原还原语句只在"所有块恰好都该是 1"时正确，改为按记录逐行还原）。
+- **验收**：`pnpm test` 823/0；`e2e-p3a.sh` SQLite **85/0/0**、真 PG 15（新库 `geewiki_e2e_final`）**32/0/7 跳过**；
+  跨阶段四条 38/44/44/34 全零失败。
 
 ## 对照最初的四项需求
 
@@ -84,6 +107,8 @@ feat/p2-m5-frontend-ia              均已合入，worktree .wt-p0/.wt-p1/.wt-p1
    "**宽松度**"（越大越宽松），而 `tier` 列是"**限制等级**"（`b.tier <= :readerTier`，**越小越公开**）
    ⇒ 同一语义必须是 **`max`**。写反会让"页面 org + 块 public"的块拿到 tier 0，**匿名在搜索里就能搜到它**。
    以代码的 `effectiveIndexLevel` / `packages/plugin-authz` 的 `RANK_*` 为准（`RANK_PUBLIC=0 / RANK_ORG=1 / RANK_PRIVATE=2`，越右越窄）。
+   **★ 这条错误已扩散到代码注释里**：`packages/plugin-search/migrations/0002_blocks_fts.sql` 的注释也照抄了 `min`，
+   已在提交 `1d608a6` 订正为 `max` 并写明两套刻度方向相反。**回写文档时要查是否还有第三处。**
 2. **§3.6 的迁移落点是错的**：文档说写 `plugin-wiki/migrations/`，但 `@geewiki/wiki` 的迁移目录**只声明了 sqlite**
    ⇒ 照文档写，**PG 部署下 `blocks` 表根本不会被建出来**。实际落在 db 包、两侧成对。
 3. **§9 R9（约 1558 行）写错**：把 `navOrder.test.ts（导航合并）` 列为"P2 必然触碰"——
@@ -96,8 +121,12 @@ feat/p2-m5-frontend-ia              均已合入，worktree .wt-p0/.wt-p1/.wt-p1
 6. **`snippet()` 是静默失败**：设计写"不可用"，实测是**返回 `null` 而不报错**（我已用真 probe 验过）。
 7. **§8.2 的 P2 验收标准 1–14 全是后端项**，没有前端 IA 条目 ⇒ M5 工作**没有设计文档层面的验收标准**。
 8. **§4.3 低估了 P3a 的方言成本**：文档说"块模型与读路径裁剪两部分仍可两方言落地"——
-   在这三个 PG 缺陷修掉之前那句话不成立（见下）。建议补一句：*"块模型的 PG 可用性依赖 `RETURNING id`
-   与索引表存在的方言判定，二者都不由类型系统保证，必须有真方言 e2e 兜底。"*
+   在这**三个** PG 缺陷修掉之前那句话不成立：① 写块靠捕获异常判"`blocks_fts` 不存在"，只匹配 SQLite 的
+   `no such table:`（PG 文案是 `relation "blocks_fts" does not exist`）⇒ 每次写块都失败；② 缺 `RETURNING id`
+   ⇒ PG 报 `violates foreign key constraint "blocks_page_id_fkey" / Key (page_id)=(0) is not present`；
+   ③ **`deletePage` 里的 `DELETE FROM blocks_fts` 没有方言守卫 ⇒ PG 上删除任何页面返回 500 且删不掉**。
+   建议补一句：*"块模型的 PG 可用性依赖 `RETURNING id`、索引表存在的方言判定、以及每一处 `blocks_fts` 语句的
+   方言守卫——**这三点都不由类型系统保证，必须有真方言 e2e 兜底**。"*
 9. **`blocks_fts` 只索引块文本** ⇒ **FTS 路不再按标题匹配**（LIKE 路仍匹配）。这是 §4.3 SQL 形态的直接后果，
    已有断言钉住。建议写进文档。
 10. **`系统状态`（服务健康/DB 方言/表清单）随 `管理 ▾` 下沉为管理员专属**——文档里 `grep 系统状态|服务健康`
