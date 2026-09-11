@@ -1806,6 +1806,386 @@ export const WikiPlugin = {
       }, { access: 'user' }),
     )
 
+    /* ---------- 申请访问（★ P3b，§8.2 P3b 第 6 条） ---------- */
+    /*
+     * 一等流程：无权用户不必去找管理员私聊 —— 403 页与受限块的占位文案上都应有入口。
+     *
+     * 与授权的区别（别混）：`page_grants` / `block_grants` 是**已生效的授予**；
+     * `access_requests` 是**待裁决的请求**，批准后才落一条授予。分开存是因为"请求"有
+     * 生命周期（pending/approved/denied/withdrawn）与裁决人，"授予"只有生效/过期两态。
+     *
+     * ★ 本端点的判据是「**是不是已登录的真实用户**」，**不是**「能不能读」——
+     * 它服务的恰恰是"读不到"的人，所以**绝不能**在入口处做读权限检查。
+     *
+     * ⚠️ 一个已知的 UX 缺口（记录在案，不在本次修）：详情读路径对**所有**主体一律返回
+     * 404，而非设计文档 §2.3 写的"匿名 404 / 已登录 403" —— 见 `getPage` 的注释与
+     * 本文件 :1268-1269：区分 404 与 403 就等于提供了一个存在性探测接口。这个选择更严，
+     * 但**代价是"申请访问"失去了自然触发点**（用户拿到 404 时分不清"无权"与"不存在"）。
+     * 因此申请入口必须由前端在**已知 slug** 的拒绝态页面/受限块占位文案上提供
+     * （§8.2 P3b 第 6 条），不能指望读路径给出 403。
+     */
+    const MAX_REQUEST_MESSAGE = 500
+
+    /** 读 JSON 对象请求体；失败时已写出响应并返回 null（空体视作 `{}`，见 readBody）。 */
+    const readObjectBody = async (h: RouteHandlerContext): Promise<Record<string, unknown> | null> => {
+      let raw: unknown
+      try {
+        raw = await readBody(h)
+      } catch (err) {
+        const message = (err as Error).message
+        if (message.startsWith('payload_too_large')) {
+          closeAfterResponse(h)
+          h.json(413, { ok: false, error: 'payload_too_large', message })
+          return null
+        }
+        h.json(400, { ok: false, error: 'invalid_body', message })
+        return null
+      }
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        h.json(400, { ok: false, error: 'invalid_body', message: '请求体须为 JSON 对象' })
+        return null
+      }
+      return raw as Record<string, unknown>
+    }
+
+    /** 校验 `role` / `expiresAt` 两个可选字段；不合法时已写出响应并返回 null。 */
+    const readGrantFields = (
+      h: RouteHandlerContext,
+      body: Record<string, unknown>,
+      allowed: readonly string[],
+    ): { role: string; expiresAt: string | null } | null => {
+      const unknown = Object.keys(body).filter((k) => !allowed.includes(k))
+      if (unknown.length > 0) {
+        h.json(400, { ok: false, error: 'invalid_body', message: `未知字段: ${unknown.join(', ')}` })
+        return null
+      }
+      const role = body['role'] === undefined ? 'viewer' : body['role']
+      if (typeof role !== 'string' || !(GRANT_ROLES as readonly string[]).includes(role)) {
+        h.json(400, { ok: false, error: 'invalid_role', message: `role 须为 ${GRANT_ROLES.join(' | ')} 之一` })
+        return null
+      }
+      const raw = body['expiresAt'] === undefined ? null : body['expiresAt']
+      if (raw !== null && typeof raw !== 'string') {
+        h.json(400, { ok: false, error: 'invalid_expires_at', message: 'expiresAt 须为 ISO 时间字符串或 null' })
+        return null
+      }
+      return { role, expiresAt: raw }
+    }
+
+    /*
+     * 提交申请：落一条 `pending`。
+     *
+     * 唯一键是 `(page_slug, user_id, status)`（见 0014 迁移），它同时满足两件事：
+     *   - 同一人**不会**积压多条 pending（否则审批人会重复点、重复落授予）；
+     *   - 被拒绝之后**可以再次申请**（情形会变），因为那时 status 已经是 `denied`。
+     * 这里**先查后插**（为了给出干净的 409 与可判别错误码），**同时**捕获唯一约束冲突
+     * 兜住并发窗口 —— 唯一索引才是数据库层的最终保证，先查只是为了让常见路径的报错友好。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests', async (h) => {
+        const slug = h.params.slug ?? ''
+        const principal = h.principal
+        if (!principal || principal.kind !== 'user' || principal.userId === null) {
+          h.json(401, { ok: false, error: 'unauthorized', message: '请先登录后再申请访问' })
+          return
+        }
+        if (!isValidSlug(slug)) {
+          h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+          return
+        }
+        const body = await readObjectBody(h)
+        if (!body) return
+        const fields = readGrantFields(h, body, ['message', 'role'])
+        if (!fields) return
+        const rawMessage = body['message']
+        if (rawMessage !== undefined && rawMessage !== null && typeof rawMessage !== 'string') {
+          h.json(400, { ok: false, error: 'invalid_message', message: 'message 须为字符串' })
+          return
+        }
+        const message =
+          typeof rawMessage === 'string' && rawMessage.trim().length > 0 ? rawMessage.trim() : null
+        if (message !== null && message.length > MAX_REQUEST_MESSAGE) {
+          h.json(400, {
+            ok: false,
+            error: 'invalid_message',
+            message: `message 过长（上限 ${MAX_REQUEST_MESSAGE} 字符）`,
+          })
+          return
+        }
+
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        // 已经有权限就不必申请（否则待审列表会被这类无意义条目灌满）
+        const access = await policy().resolvePage(principal, slug)
+        if (access.level !== 'none') {
+          h.json(409, { ok: false, error: 'already_has_access', message: '你已有该条目的访问权限，无需申请' })
+          return
+        }
+        const pending = (
+          await adb.query<{ id: number }>(
+            `SELECT id FROM access_requests WHERE page_slug = ? AND user_id = ? AND status = 'pending'`,
+            [slug, principal.userId],
+          )
+        )[0]
+        if (pending) {
+          h.json(409, { ok: false, error: 'already_requested', message: '你已提交过申请，请等待处理' })
+          return
+        }
+
+        const now = new Date().toISOString()
+        let created: number
+        try {
+          /*
+           * ★ `RETURNING id` 不是可选的：SQLite 有隐式 rowid，**PostgreSQL 没有** ——
+           * PG 适配器的 `lastInsertRowid` 只在 SQL 里写了 `RETURNING id` 时才非 0。
+           * 本仓既有插件（plugin-auth ×3 / plugin-org / plugin-wiki 的 blocks 写入）都遵守这条。
+           */
+          const res = await adb.run(
+            `INSERT INTO access_requests (page_slug, user_id, message, status, created_at)
+             VALUES (?, ?, ?, 'pending', ?) RETURNING id`,
+            [slug, principal.userId, message, now],
+          )
+          created = Number(res.lastInsertRowid)
+        } catch (err) {
+          const text = (err as Error).message
+          // 并发窗口：两个请求同时通过了上面的先查。唯一索引是最终保证 —— 认得出就报 409。
+          if (/UNIQUE constraint failed|duplicate key value/i.test(text)) {
+            h.json(409, { ok: false, error: 'already_requested', message: '你已提交过申请，请等待处理' })
+            return
+          }
+          throw err
+        }
+        // 返回 `id`：客户端要用它来撤回自己的申请（撤回端点按 id 定位）
+        h.json(200, { ok: true, slug, id: created, status: 'pending', requestedRole: fields.role })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- GET /api/pages/:slug/access-requests：待审列表（需可管理可见性） ---------- */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/access-requests', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const rows = await adb.query<{
+          id: number
+          user_id: number
+          message: string | null
+          status: string
+          created_at: string
+          decided_at: string | null
+        }>(
+          `SELECT id, user_id, message, status, created_at, decided_at
+             FROM access_requests WHERE page_slug = ? AND status = 'pending'
+            ORDER BY created_at DESC, id DESC LIMIT 200`,
+          [slug],
+        )
+        h.json(200, {
+          ok: true,
+          slug,
+          requests: rows.map((r) => ({
+            id: Number(r.id),
+            userId: Number(r.user_id),
+            // 自由文本：原样回传，**由展示端负责转义**（迁移注释已注明这是唯一承载用户
+            // 自由文本的列）。这里不截断 —— 长度在上游写入时已限死。
+            message: r.message,
+            status: r.status,
+            createdAt: r.created_at,
+            decidedAt: r.decided_at,
+          })),
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/access-requests/:id/approve：批准并落授予 ---------- */
+    /*
+     * 批准 = **一条 `page_grants` + `acl_revision++`**。后者是"被批准者无需重新登录即可见"
+     * 的关键：判定单点按 `acl_revision` 做代际失效（§4.5，**不是 TTL**），所以版本一涨，
+     * 该主体的下一次判定立刻走新结果，不需要他重新登录、也不需要等任何过期窗口。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests/:id/approve', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const body = await readObjectBody(h)
+        if (!body) return
+        const fields = readGrantFields(h, body, ['role', 'expiresAt'])
+        if (!fields) return
+
+        const now = new Date().toISOString()
+        const actorId = guard.principal.userId
+        const outcome = await adb.transaction(async (tx) => {
+          // 带上 page_slug 条件：防止用 A 页的申请 id 去批准 B 页（越权改他人授权）
+          const req = (
+            await tx.query<{ id: number; user_id: number; status: string }>(
+              'SELECT id, user_id, status FROM access_requests WHERE id = ? AND page_slug = ?',
+              [id, slug],
+            )
+          )[0]
+          if (!req) return null
+          if (req.status !== 'pending') return { conflict: req.status } as const
+          const subjectId = String(Number(req.user_id))
+          // 幂等 upsert（与 POST /grants 同款）：先查后写，避免把"改角色"伪装成"新授予"
+          const existing = (
+            await tx.query<{ id: number }>(
+              'SELECT id FROM page_grants WHERE page_slug = ? AND subject_kind = ? AND subject_id = ?',
+              [slug, 'user', subjectId],
+            )
+          )[0]
+          if (existing) {
+            await tx.run('UPDATE page_grants SET role = ?, expires_at = ? WHERE id = ?', [
+              fields.role,
+              fields.expiresAt,
+              existing.id,
+            ])
+          } else {
+            await tx.run(
+              `INSERT INTO page_grants (page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, 'user', ?, ?, ?, ?, ?)`,
+              [slug, subjectId, fields.role, actorId, now, fields.expiresAt],
+            )
+          }
+          await tx.run(`UPDATE access_requests SET status = 'approved', decided_by = ?, decided_at = ? WHERE id = ?`, [
+            actorId,
+            now,
+            id,
+          ])
+          const rev = await bumpAclRevision(tx, slug)
+          return { conflict: null, requesterId: Number(req.user_id), rev } as const
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `申请不存在: ${id}` })
+          return
+        }
+        if (outcome.conflict !== null) {
+          h.json(409, {
+            ok: false,
+            error: 'request_not_pending',
+            message: `该申请已是 ${outcome.conflict} 状态，无法再次裁决`,
+          })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}:user:${outcome.requesterId}`,
+          actorId,
+          after: { role: fields.role, expires_at: fields.expiresAt, via: 'access_request', request_id: id },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, {
+          ok: true,
+          slug,
+          approved: id,
+          userId: outcome.requesterId,
+          role: fields.role,
+          acl_revision: outcome.rev,
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/access-requests/:id/deny：拒绝 ---------- */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests/:id/deny', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const now = new Date().toISOString()
+        const actorId = guard.principal.userId
+        const outcome = await adb.transaction(async (tx) => {
+          const req = (
+            await tx.query<{ id: number; status: string }>(
+              'SELECT id, status FROM access_requests WHERE id = ? AND page_slug = ?',
+              [id, slug],
+            )
+          )[0]
+          if (!req) return null
+          if (req.status !== 'pending') return { conflict: req.status } as const
+          // 拒绝**不**动 acl_revision：没有任何授权的增减，判定结果不变
+          await tx.run(`UPDATE access_requests SET status = 'denied', decided_by = ?, decided_at = ? WHERE id = ?`, [
+            actorId,
+            now,
+            id,
+          ])
+          return { conflict: null } as const
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `申请不存在: ${id}` })
+          return
+        }
+        if (outcome.conflict !== null) {
+          h.json(409, {
+            ok: false,
+            error: 'request_not_pending',
+            message: `该申请已是 ${outcome.conflict} 状态，无法再次裁决`,
+          })
+          return
+        }
+        h.json(200, { ok: true, slug, denied: id })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/access-requests/:id/withdraw：撤回自己的申请 ---------- */
+    /*
+     * 撤回**不需要** `canManageVisibility` —— 那会要求申请人先有管理权，自相矛盾。
+     * 判据是"这条申请是不是你自己的"。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/access-requests/:id/withdraw', async (h) => {
+        const slug = h.params.slug ?? ''
+        const principal = h.principal
+        if (!principal || principal.kind !== 'user' || principal.userId === null) {
+          h.json(401, { ok: false, error: 'unauthorized', message: '请先登录' })
+          return
+        }
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const now = new Date().toISOString()
+        const outcome = await adb.transaction(async (tx) => {
+          const req = (
+            await tx.query<{ id: number; user_id: number; status: string }>(
+              'SELECT id, user_id, status FROM access_requests WHERE id = ? AND page_slug = ?',
+              [id, slug],
+            )
+          )[0]
+          // 不是自己的申请 ⇒ 与"不存在"同样回 404（不泄露"这里有一条别人的申请"）
+          if (!req || Number(req.user_id) !== principal.userId) return null
+          if (req.status !== 'pending') return { conflict: req.status } as const
+          await tx.run(`UPDATE access_requests SET status = 'withdrawn', decided_at = ? WHERE id = ?`, [now, id])
+          return { conflict: null } as const
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `申请不存在: ${id}` })
+          return
+        }
+        if (outcome.conflict !== null) {
+          h.json(409, {
+            ok: false,
+            error: 'request_not_pending',
+            message: `该申请已是 ${outcome.conflict} 状态，无法撤回`,
+          })
+          return
+        }
+        h.json(200, { ok: true, slug, withdrawn: id })
+      }, { access: 'user' }),
+    )
+
     /* ---------- GET /api/pages/:slug/blocks：块级治理视图（★ P3b） ---------- */
     /*
      * ★ **刻意不返回 `text`**。

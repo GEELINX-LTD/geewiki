@@ -29,7 +29,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
-import { asAsync, MIGRATION_TABLE, type Principal } from '@geewiki/core'
+import { anonymousPrincipal, asAsync, MIGRATION_TABLE, type Principal } from '@geewiki/core'
 import { AuthzPlugin } from '@geewiki/authz'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
@@ -53,6 +53,40 @@ const MEMBER: Principal = {
   userId: 1,
   orgId: 1,
   orgRole: 'member',
+  groupIds: [],
+  sessionId: null,
+}
+/**
+ * 夹具用的**第二个**主体：无管理权、且对目标条目**没有**访问权的普通成员。
+ *
+ * 为什么需要它：申请访问的语义是"**你没权限 → 申请 → 别人批准**"，所以申请人不能是
+ * `MEMBER`（`MEMBER` 对 org 档条目天然有读权限，`already_has_access` 会把申请挡掉）。
+ * `userId` 必须在 `users` 表里真实存在 —— `access_requests.user_id` 有外键，否则插入报
+ * `FOREIGN KEY constraint failed`（报错点在 SQL 层，离"夹具缺种子"很远）。
+ */
+const APPLICANT: Principal = {
+  kind: 'user',
+  userId: 2,
+  orgId: 1,
+  orgRole: 'member',
+  groupIds: [],
+  sessionId: null,
+}
+/**
+ * 夹具用的**审批人**主体：组织 owner。
+ *
+ * 为什么审批人必须是 owner（而不能是 `MEMBER`）：`canManageVisibility` 的判据是
+ * `canEdit && (orgRole === 'member' || isAdminRole(p))`（`packages/plugin-authz/src/index.ts:379`），
+ * 而申请访问的用例**必须**把目标页设成 `private`（否则 `MEMBER` 和 `APPLICANT` 同属
+ * 组织成员、都对 `org` 档有读权限，`already_has_access` 会把申请挡掉）。页面一旦是
+ * `private`，`MEMBER` 自己也 `level === 'none'` ⇒ `canEdit` 为假 ⇒ 批不了。
+ * 只有 admin 档（owner/admin）能对 `private` 页行使 `canManageVisibility`。
+ */
+const OWNER: Principal = {
+  kind: 'user',
+  userId: 1,
+  orgId: 1,
+  orgRole: 'owner',
   groupIds: [],
   sessionId: null,
 }
@@ -185,6 +219,14 @@ interface Harness {
     path: string,
     params?: Record<string, string>,
     body?: unknown,
+    /**
+     * 可选的主体覆盖。默认 `MEMBER`（已登录成员）。
+     *
+     * 为什么需要它：申请访问的语义是"**甲申请、乙批准**"，一条用例里必须能切换主体 ——
+     * 否则测不出"申请人看不到、审批人看得到"以及"批准后申请人立刻可见"。
+     * 生产里主体由 `@geewiki/auth` 的钩子填充；夹具手工驱动处理器，故在此显式传入。
+     */
+    principal?: Principal,
   ): Promise<{ status: number; body: Record<string, unknown> }>
   /** 直接取服务（顺带断言它确实被 provide 出来了） */
   svc(): WikiService
@@ -223,6 +265,13 @@ async function makeHarness(
        */
       `INSERT INTO users (id, email, display_name, created_at)
        VALUES (1, 'member@example.com', 'Member', '2026-01-01T00:00:00Z');`,
+      /*
+       * ★ P3b：第二个用户 —— 申请访问用例里的「申请人」。
+       * `access_requests.user_id` 有 `REFERENCES users(id)`，`APPLICANT.userId = 2`
+       * 必须真实存在，否则申请插入报 `FOREIGN KEY constraint failed`。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (2, 'applicant@example.com', 'Applicant', '2026-01-01T00:00:00Z');`,
     ].join('\n'),
   )
 
@@ -295,6 +344,7 @@ async function makeHarness(
     path: string,
     params: Record<string, string> = {},
     body?: unknown,
+    principal: Principal = MEMBER,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
     const handler = routes.get(`${method} ${path}`)
     assert.ok(handler, `应已注册路由 ${method} ${path}`)
@@ -313,8 +363,11 @@ async function makeHarness(
          * 手工驱动处理器（只跑处理器、不跑钩子），所以在这里显式给一个已登录成员。
          * 读路径**保持 public**，匿名访客拿到的是 anonymousPrincipal —— 本夹具刻意
          * 不用匿名，因为新建条目一律写成 `visibility='org'`，匿名看不到它。
+         *
+         * ★ P3b：主体可由调用方覆盖（见 `call` 的第 5 参），用于"甲申请、乙批准"这类
+         * 需要一条用例里切换身份的流程。
          */
-        principal: MEMBER,
+        principal,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)
@@ -619,6 +672,13 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
        */
       `INSERT INTO users (id, email, display_name, created_at)
        VALUES (1, 'member@example.com', 'Member', '2026-01-01T00:00:00Z');`,
+      /*
+       * ★ P3b：第二个用户 —— 申请访问用例里的「申请人」。
+       * `access_requests.user_id` 有 `REFERENCES users(id)`，`APPLICANT.userId = 2`
+       * 必须真实存在，否则申请插入报 `FOREIGN KEY constraint failed`。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (2, 'applicant@example.com', 'Applicant', '2026-01-01T00:00:00Z');`,
     ].join('\n'),
   )
   try {
@@ -1034,6 +1094,183 @@ test('P3b：块级授予闭环（授予 → 可见 → 撤销），且组合式�
     })
     assert.equal(del.status, 200)
     assert.deepEqual((await grantedOf('bp1'))['grants'], [])
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------ P3b：申请访问（★ 本批） ------------------ */
+
+/** 建一个 `private` 页：`APPLICANT`（普通成员）对它没有访问权，只有 admin 档能管。 */
+async function makePrivatePage(h: Harness, slug: string, content: string): Promise<void> {
+  const put = await h.call('PUT', '/api/pages/:slug', { slug }, { title: slug, content }, OWNER)
+  assert.equal(put.status, 200)
+  const vis = await h.call('PUT', '/api/pages/:slug/visibility', { slug }, { visibility: 'private' }, OWNER)
+  assert.equal(vis.status, 200)
+}
+
+test('P3b：申请访问闭环 —— 甲申请、乙批准，批准后甲**无需重新登录**即可见', async () => {
+  const h = await makeHarness()
+  try {
+    await makePrivatePage(h, 'req1', 'secret-A')
+
+    // 前置状态断言：申请人此刻**读不到**。没有这一条，"批准后能读"可能本来就是绿的（假绿）。
+    const before = await h.call('GET', '/api/pages/:slug', { slug: 'req1' }, undefined, APPLICANT)
+    assert.equal(before.status, 404, '前置状态必须是"读不到"，否则下面的"批准后可见"是假绿')
+
+    // 申请
+    const apply = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests',
+      { slug: 'req1' },
+      { message: '请给我看', role: 'viewer' },
+      APPLICANT,
+    )
+    assert.equal(apply.status, 200)
+    assert.equal(apply.body['status'], 'pending')
+    const reqId = Number(apply.body['id'])
+    assert.ok(reqId >= 1, '申请响应必须带 id（客户端要用它撤回）')
+
+    // 同一人重复申请 ⇒ 409（唯一键 (page_slug,user_id,status)）
+    const dup = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req1' }, {}, APPLICANT)
+    assert.equal(dup.status, 409)
+    assert.equal(dup.body['error'], 'already_requested')
+
+    // 已有权限的人申请 ⇒ 409（否则待审列表会被无意义条目灌满）
+    const ownerApply = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req1' }, {}, OWNER)
+    assert.equal(ownerApply.status, 409)
+    assert.equal(ownerApply.body['error'], 'already_has_access')
+
+    // 匿名不能申请（判据是"已登录的真实用户"）
+    const anon = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests',
+      { slug: 'req1' },
+      {},
+      anonymousPrincipal(),
+    )
+    assert.equal(anon.status, 401)
+
+    // 审批人看到待审列表
+    const list = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req1' }, undefined, OWNER)
+    assert.equal(list.status, 200)
+    const reqs = list.body['requests'] as Array<Record<string, unknown>>
+    assert.equal(reqs.length, 1)
+    assert.equal(Number(reqs[0]?.['userId']), 2, '申请人应是 APPLICANT')
+    assert.equal(reqs[0]?.['message'], '请给我看')
+    assert.equal(reqs[0]?.['status'], 'pending')
+
+    // 批准
+    const approve = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/approve',
+      { slug: 'req1', id: String(reqId) },
+      { role: 'viewer' },
+      OWNER,
+    )
+    assert.equal(approve.status, 200)
+    assert.ok(
+      Number(approve.body['acl_revision']) >= 1,
+      '批准必须递增 acl_revision —— 代际失效（不是 TTL）正是"无需重新登录"的机制',
+    )
+
+    // ★ 核心验收：申请人**无需重新登录**即可见（同一条会话、同一个 principal 值）
+    const after = await h.call('GET', '/api/pages/:slug', { slug: 'req1' }, undefined, APPLICANT)
+    assert.equal(after.status, 200, '批准后申请人无需重新登录即可见')
+    assert.equal(after.body['content'], 'secret-A')
+
+    // 待审列表清空（该条已不是 pending）
+    const list2 = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req1' }, undefined, OWNER)
+    assert.deepEqual(list2.body['requests'], [])
+
+    // 重复裁决 ⇒ 409（不是静默成功）
+    const again = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/approve',
+      { slug: 'req1', id: String(reqId) },
+      {},
+      OWNER,
+    )
+    assert.equal(again.status, 409)
+    assert.equal(again.body['error'], 'request_not_pending')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('P3b：拒绝 → 仍不可见且**可再次申请**；撤回仅限本人；跨页裁决 404', async () => {
+  const h = await makeHarness()
+  try {
+    await makePrivatePage(h, 'req2', 'secret-B')
+    await makePrivatePage(h, 'req3', 'secret-C')
+
+    // 甲在 req2 上申请并被拒
+    const a1 = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req2' }, {}, APPLICANT)
+    assert.equal(a1.status, 200)
+    const id1 = Number(a1.body['id'])
+    const deny = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/deny',
+      { slug: 'req2', id: String(id1) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(deny.status, 200)
+
+    // 拒绝**不动**授权 ⇒ 仍然读不到
+    const stillBlocked = await h.call('GET', '/api/pages/:slug', { slug: 'req2' }, undefined, APPLICANT)
+    assert.equal(stillBlocked.status, 404, '拒绝不应让申请人获得任何访问权')
+
+    /*
+     * ★ 唯一键含 `status` 的意义：被拒之后**可以再次申请**（情形会变）。
+     * 若唯一键只有 (page_slug,user_id)，这里会撞唯一约束而永远申请不了。
+     */
+    const again = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req2' }, {}, APPLICANT)
+    assert.equal(again.status, 200, '被拒之后必须能再次申请')
+    const id2 = Number(again.body['id'])
+    assert.notEqual(id2, id1, '应是一条新请求，而不是复用旧行')
+
+    // 撤回只能撤自己的：OWNER 撤 APPLICANT 的 ⇒ 404（不泄露"这里有一条别人的申请"）
+    const foreign = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/withdraw',
+      { slug: 'req2', id: String(id2) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(foreign.status, 404)
+    // 本人撤回 ⇒ 200
+    const own = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/withdraw',
+      { slug: 'req2', id: String(id2) },
+      undefined,
+      APPLICANT,
+    )
+    assert.equal(own.status, 200)
+    // 撤回后待审列表为空
+    const list = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req2' }, undefined, OWNER)
+    assert.deepEqual(list.body['requests'], [])
+
+    // ★ 组合式越权：拿 req2 的申请 id 去 req3 上批 —— 必须 404
+    const a3 = await h.call('POST', '/api/pages/:slug/access-requests', { slug: 'req3' }, {}, APPLICANT)
+    assert.equal(a3.status, 200)
+    const id3 = Number(a3.body['id'])
+    const cross = await h.call(
+      'POST',
+      '/api/pages/:slug/access-requests/:id/approve',
+      { slug: 'req2', id: String(id3) },
+      {},
+      OWNER,
+    )
+    assert.equal(cross.status, 404, '不得用 A 页的申请 id 去批 B 页的申请')
+    // 且 req3 的申请**仍是 pending**（越权尝试不得产生副作用）
+    const list3 = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req3' }, undefined, OWNER)
+    assert.equal((list3.body['requests'] as unknown[]).length, 1)
+
+    // 非 admin 档对 private 页没有 canManageVisibility ⇒ 连列表都看不到（404，不是 403）
+    const memberList = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req3' }, undefined, MEMBER)
+    assert.equal(memberList.status, 404)
   } finally {
     h.dispose()
   }
