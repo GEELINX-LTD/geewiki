@@ -212,6 +212,17 @@ async function makeHarness(
     join(dir, 'test.db'),
     [
       ...SCHEMA_SQL_PATHS.map((p) => readFileSync(p, "utf8")),
+      /*
+       * ★ 种子一个用户。
+       *
+       * 为什么夹具需要它：`page_grants.granted_by` 与 `block_grants.granted_by` 都有
+       * `REFERENCES users(id)`，而两个授予端点都会把 `principal.userId` 写进该列。
+       * 夹具的 `MEMBER.userId = 1` 在库里必须真实存在，否则第一次授予就报
+       * `FOREIGN KEY constraint failed` —— 报错点在 SQL 层，离“夹具缺种子”这个原因很远。
+       * 生产里不会有这个问题（登录主体必然对应真实用户行）。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (1, 'member@example.com', 'Member', '2026-01-01T00:00:00Z');`,
     ].join('\n'),
   )
 
@@ -597,6 +608,17 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
     join(dir, 'test.db'),
     [
       ...SCHEMA_SQL_PATHS.map((p) => readFileSync(p, "utf8")),
+      /*
+       * ★ 种子一个用户。
+       *
+       * 为什么夹具需要它：`page_grants.granted_by` 与 `block_grants.granted_by` 都有
+       * `REFERENCES users(id)`，而两个授予端点都会把 `principal.userId` 写进该列。
+       * 夹具的 `MEMBER.userId = 1` 在库里必须真实存在，否则第一次授予就报
+       * `FOREIGN KEY constraint failed` —— 报错点在 SQL 层，离“夹具缺种子”这个原因很远。
+       * 生产里不会有这个问题（登录主体必然对应真实用户行）。
+       */
+      `INSERT INTO users (id, email, display_name, created_at)
+       VALUES (1, 'member@example.com', 'Member', '2026-01-01T00:00:00Z');`,
     ].join('\n'),
   )
   try {
@@ -903,6 +925,115 @@ test('backlinks：wiki-service 的两个新方法与端点结果一致', async (
     assert.deepEqual(plain((await svc.backlinks('y', MEMBER))!), [{ slug: 'x', title: '甲' }])
     assert.equal((await svc.links('nope', MEMBER)), undefined)
     assert.equal((await svc.backlinks('nope', MEMBER)), undefined)
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------------------ 块级授予端点（P3b） ------------------------------ */
+
+/**
+ * 这一组钉三件事：**治理视图不泄漏正文**、**授予闭环可用**、**组合式越权口被堵住**。
+ *
+ * 第三条尤其值得单独测：只校验"页可管"与"块存在"而不校验**隶属关系**，会留下
+ * "拿 A 页的 slug 配 B 页的 blockId"的绕过（§9 R10 第 4 条引的正是这种形态）。
+ * 这类洞单看每一处校验都是对的，只有把两个参数**组合**起来才暴露。
+ */
+test('P3b：块级治理视图不返回正文，且 granted 块的 tier 为 null', async () => {
+  const h = await makeHarness()
+  try {
+    const put = await h.call(
+      'PUT',
+      '/api/pages/:slug',
+      { slug: 'bp1' },
+      { title: 'A', content: '公开段\n\n<!--gated:granted-->\n运维备注A\n<!--/gated-->' },
+    )
+    assert.equal(put.status, 200)
+
+    const list = await h.call('GET', '/api/pages/:slug/blocks', { slug: 'bp1' })
+    assert.equal(list.status, 200)
+    const blocks = list.body['blocks'] as Array<Record<string, unknown>>
+    assert.equal(blocks.length, 2)
+    for (const b of blocks) {
+      assert.ok(!('text' in b), '治理视图**不得**返回块正文（否则它是 granted 块的读取旁路）')
+    }
+    const granted = blocks.find((b) => b['visibility'] === 'granted')
+    assert.ok(granted, '应有一个 granted 块')
+    assert.equal(granted['tier'], null, 'granted 档不进等级索引 ⇒ tier 必须是 null')
+    assert.deepEqual(granted['grants'], [], '尚未授予时授权列表为空')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('P3b：块级授予闭环（授予 → 可见 → 撤销），且组合式越权口被封', async () => {
+  const h = await makeHarness()
+  try {
+    for (const slug of ['bp1', 'bp2']) {
+      const put = await h.call(
+        'PUT',
+        '/api/pages/:slug',
+        { slug },
+        { title: slug, content: `公开段\n\n<!--gated:granted-->\n备注-${slug}\n<!--/gated-->` },
+      )
+      assert.equal(put.status, 200)
+    }
+    const listOf = async (slug: string): Promise<Array<Record<string, unknown>>> => {
+      const r = await h.call('GET', '/api/pages/:slug/blocks', { slug })
+      assert.equal(r.status, 200)
+      return r.body['blocks'] as Array<Record<string, unknown>>
+    }
+    const grantedOf = async (slug: string): Promise<Record<string, unknown>> => {
+      const b = (await listOf(slug)).find((x) => x['visibility'] === 'granted')
+      assert.ok(b, `${slug} 应有一个 granted 块`)
+      return b
+    }
+
+    const a = await grantedOf('bp1')
+    const post = await h.call(
+      'POST',
+      '/api/pages/:slug/blocks/:blockId/grants',
+      { slug: 'bp1', blockId: String(a['id']) },
+      { subjectKind: 'user', subjectId: '7', role: 'viewer' },
+    )
+    assert.equal(post.status, 200)
+    assert.ok(Number(post.body['acl_revision']) >= 1, '变更后 acl_revision 必须递增（代际失效）')
+
+    const after = await grantedOf('bp1')
+    const grants = after['grants'] as Array<Record<string, unknown>>
+    assert.equal(grants.length, 1)
+    assert.equal(grants[0]?.['subjectKind'], 'user')
+    assert.equal(grants[0]?.['subjectId'], '7')
+
+    // ★ 组合式越权口：拿 bp1 的 slug（自己有管理权）配 bp2 的 blockId
+    const bBlock = await grantedOf('bp2')
+    const cross = await h.call(
+      'POST',
+      '/api/pages/:slug/blocks/:blockId/grants',
+      { slug: 'bp1', blockId: String(bBlock['id']) },
+      { subjectKind: 'user', subjectId: '9', role: 'viewer' },
+    )
+    assert.equal(cross.status, 404, '不得用 A 页的 slug 操作 B 页的块')
+    assert.deepEqual((await grantedOf('bp2'))['grants'], [], 'B 页的块不应被加上授权')
+
+    // ★ D13：角色不是授权对象
+    const badKind = await h.call(
+      'POST',
+      '/api/pages/:slug/blocks/:blockId/grants',
+      { slug: 'bp1', blockId: String(a['id']) },
+      { subjectKind: 'org_role', subjectId: 'member', role: 'viewer' },
+    )
+    assert.equal(badKind.status, 400)
+    assert.equal(badKind.body['error'], 'invalid_subject_kind')
+
+    // 撤销
+    const del = await h.call('DELETE', '/api/pages/:slug/blocks/:blockId/grants/:grantId', {
+      slug: 'bp1',
+      blockId: String(a['id']),
+      grantId: String(grants[0]?.['id']),
+    })
+    assert.equal(del.status, 200)
+    assert.deepEqual((await grantedOf('bp1'))['grants'], [])
   } finally {
     h.dispose()
   }
