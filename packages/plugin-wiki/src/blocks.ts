@@ -363,7 +363,24 @@ function lcsPairs(a: readonly string[], b: readonly string[]): Array<[number, nu
  * 所有拒绝都发生在**任何写入之前**（调用方拿到异常时库还没被改），
  * 这正是"授权丢失与授权误施都要显式化"的落点。
  */
-export function planBlockSync(olds: readonly ExistingBlock[], news: readonly ParsedBlock[]): SyncPlan {
+export function planBlockSync(
+  olds: readonly ExistingBlock[],
+  news: readonly ParsedBlock[],
+  opts: { restructure?: boolean } = {},
+): SyncPlan {
+  /*
+   * ★ `restructure`：**仅"恢复版本"路径使用**（P3c）。
+   *
+   * 为什么需要它：下面的三道守卫是为**编辑**事故设计的 —— 用户改了一段正文，
+   * 而我们无法可靠地把旧块与新块对上时，宁可拒绝保存，也不接受"授权被安到
+   * 语义不同的内容上"或"授权被静默清掉"。但**恢复版本**是另一回事：
+   * 用户显式要求回到那个状态，其中包括它当时的**块结构**；而块级授权会由
+   * 快照整体重建（不是"丢了"，是"被替换成那一刻的样子"）。
+   * 于是三道守卫在恢复路径上都不适用 —— 若仍然拦截，**恢复旧版本会被永久拒绝**。
+   *
+   * 注意它只影响"能不能改块结构"，不影响可见性判定的任何地方。
+   */
+  const restructure = opts.restructure === true
   const plan: SyncPlan = { reuse: new Array<number | null>(news.length).fill(null), toDelete: [], copyGrantsFrom: [] }
   const keyOf = (kind: string, hash: string): string => `${kind}\u0000${hash}`
   const pairs = lcsPairs(
@@ -380,7 +397,7 @@ export function planBlockSync(olds: readonly ExistingBlock[], news: readonly Par
 
     if (k === 0) return // 全是新插入，reuse 保持 null
     if (q === 0) {
-      if (grantedOlds.length > 0) {
+      if (grantedOlds.length > 0 && !restructure) {
         throw new BlockSyncError(
           'block_grant_orphan',
           `不能删除已有块级授权的块（ordinal ${grantedOlds.map((o) => o.ordinal).join(', ')}）—— ` +
@@ -396,7 +413,7 @@ export function planBlockSync(olds: readonly ExistingBlock[], news: readonly Par
         const o = gapOlds[t] as ExistingBlock
         const nIdx = newIdxs[t] as number
         const n = news[nIdx] as ParsedBlock
-        if (o.grantCount > 0 && o.kind !== n.kind) {
+        if (o.grantCount > 0 && o.kind !== n.kind && !restructure) {
           throw new BlockSyncError(
             'block_grant_orphan',
             `已授权的块（ordinal ${o.ordinal}）被改成了另一种块类型（${o.kind} → ${n.kind}）；` +
@@ -419,7 +436,7 @@ export function planBlockSync(olds: readonly ExistingBlock[], news: readonly Par
     if (k > 1 && q === 1) {
       // 合并
       const vis = new Set(gapOlds.map((o) => o.visibility))
-      if (grantedOlds.length > 0 || vis.size > 1) {
+      if (!restructure && (grantedOlds.length > 0 || vis.size > 1)) {
         throw new BlockSyncError(
           'block_merge_conflict',
           `不能把 ${k} 个块合并成一个：` +
@@ -435,7 +452,7 @@ export function planBlockSync(olds: readonly ExistingBlock[], news: readonly Par
       return
     }
     // 形状无法可靠对齐
-    if (grantedOlds.length > 0) {
+    if (grantedOlds.length > 0 && !restructure) {
       throw new BlockSyncError(
         'block_grant_orphan',
         `这次的改动让 ${k} 个旧块变成了 ${q} 个新块，无法确认哪一块对应哪一块，` +
@@ -518,7 +535,17 @@ export async function syncBlocksForPage(
      * 该标志只影响**检索召回**：`blocks` 与 `pages.content` 才是真源，索引随时可从
      * `blocks` 重建（PG 下本就没有索引，检索功能整体不提供 —— 由 §4.3 的方言守卫显式拒绝）。
      */
+    // ★ 必填（P3a 修复轮定的）：默认值会让"新增调用点忘了传"只在 PostgreSQL 上、
+    //   且在事务内部炸（`blocks_fts` 在那边永远不存在）—— 这是最难排查的一类缺陷。
+    //   漏传现在会在**编译期**报错。（P3c 分支上原为 `syncIndex?: boolean`，是 P3a 修复
+    //   之前的旧形态；rebase 时按语义合并为必填，**未回退** P3a 的意图。）
     syncIndex: boolean
+    /**
+     * ★ **仅"恢复版本"路径使用**（P3c）：允许本次同步改变**块结构**
+     * （合并块、删除已有授权的块）。编辑路径**绝不要**传它 ——
+     * `planBlockSync` 里那三道守卫正是用来防编辑事故的。
+     */
+    restructure?: boolean
   },
 ): Promise<ParsedBlock[]> {
   const { pageId, content, pageLevel, now, existing } = args
@@ -528,7 +555,7 @@ export async function syncBlocksForPage(
    * **先算计划再动任何一行。** 计划阶段可能抛 `BlockSyncError`（合并/删除已授权块），
    * 此时库里还没有任何改动 —— 调用方拿到 409 时数据是干净的。
    */
-  const plan = planBlockSync(existing, parsed)
+  const plan = planBlockSync(existing, parsed, { restructure: args.restructure === true })
 
   /*
    * ★ 顺序不能换：**先清索引、再删块行**。

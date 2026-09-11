@@ -355,7 +355,19 @@ async function makeHarness(
     return new Promise((resolve, reject) => {
       const h: RouteHandlerContext = {
         req,
-        res: { once: () => {} } as unknown as ServerResponse,
+        /*
+         * `res` 替身：只实现处理器真正用到的少数成员。
+         *
+         * ★ P3c 补 `headersSent` / `setHeader`：413（快照超限）路径会经
+         * `closeAfterResponse()` 声明 `Connection: close` 并在 `finish` 时销毁请求体 ——
+         * 缺这两个成员时，那条用例会在替身上抛 `h.res.setHeader is not a function`，
+         * 报错点离"替身不完整"这个原因很远（与夹具缺种子同一类问题）。
+         */
+        res: {
+          headersSent: false,
+          setHeader: () => {},
+          once: () => {},
+        } as unknown as ServerResponse,
         url: new URL(`http://localhost${path}`),
         params,
         /*
@@ -1271,6 +1283,204 @@ test('P3b：拒绝 → 仍不可见且**可再次申请**；撤回仅限本人�
     // 非 admin 档对 private 页没有 canManageVisibility ⇒ 连列表都看不到（404，不是 403）
     const memberList = await h.call('GET', '/api/pages/:slug/access-requests', { slug: 'req3' }, undefined, MEMBER)
     assert.equal(memberList.status, 404)
+  } finally {
+    h.dispose()
+  }
+})
+
+/* ------------------ P3c：块级版本与恢复（★ 本批） ------------------ */
+
+test('P3c：改权限**必须**产生新版本；恢复四位一体（正文 + 块级权限 + visibility + published_at + inherit）', async () => {
+  const h = await makeHarness()
+  try {
+    const content = '公开A\n\n<!--gated:org-->\n机密B\n<!--/gated-->'
+    const put = await h.call('PUT', '/api/pages/:slug', { slug: 'vc1' }, { title: 'V1', content }, OWNER)
+    assert.equal(put.status, 200)
+
+    const versionsOf = async (): Promise<Array<{ id: number }>> => {
+      const r = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, OWNER)
+      assert.equal(r.status, 200)
+      return r.body['versions'] as Array<{ id: number }>
+    }
+    const blocksOf = async (): Promise<Array<Record<string, unknown>>> => {
+      const r = await h.call('GET', '/api/pages/:slug/blocks', { slug: 'vc1' }, undefined, OWNER)
+      assert.equal(r.status, 200)
+      return r.body['blocks'] as Array<Record<string, unknown>>
+    }
+    /*
+     * 页面档位**没有 GET 端点**（只有 `PUT /visibility`）⇒ 用可观测行为断言档位：
+     * `org` 档普通成员读得到、`private` 档读不到。这比读一个字段更接近"用户实际看到什么"。
+     */
+    const applicantCanRead = async (): Promise<boolean> => {
+      const r = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, APPLICANT)
+      return r.status === 200
+    }
+
+    const before = { versions: (await versionsOf()).length, blocks: await blocksOf() }
+    assert.equal(await applicantCanRead(), true, '新建条目应用层默认是 org ⇒ 普通成员可读')
+    assert.equal(before.blocks.length, 2)
+    assert.equal(before.blocks[1]?.['visibility'], 'org', '受限块是 org 档')
+
+    /*
+     * ★ 只改 `visibility`、**完全不碰正文** ⇒ 必须仍产生一条新版本。
+     * 否则版本里的权限快照会与实际权限脱节，「恢复此版本」就会恢复出**错误的（可能是放宽的）权限** ——
+     * 这正是 0017 迁移里那条规则的由来。
+     */
+    const vis = await h.call(
+      'PUT',
+      '/api/pages/:slug/visibility',
+      { slug: 'vc1' },
+      { visibility: 'private' },
+      OWNER,
+    )
+    assert.equal(vis.status, 200)
+    const afterChange = await versionsOf()
+    assert.equal(
+      afterChange.length,
+      before.versions + 1,
+      '改权限**必须**产生新版本（content 不变、只有 acl_json/blocks_json 变）',
+    )
+
+    // 此刻是 private ⇒ 普通成员读不到（前置状态，防下面的"恢复后能读"假绿）
+    const blockedNow = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, APPLICANT)
+    assert.equal(blockedNow.status, 404)
+
+    /*
+     * 最新那条版本 = **改档位之前**的状态（约定："先快照旧的，再改"）⇒ 恢复它应当回到 org。
+     */
+    const restoreTarget = afterChange[0]?.id
+    assert.ok(restoreTarget, '应能取到版本 id')
+    const restore = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc1', id: String(restoreTarget) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(restore.status, 200)
+    assert.deepEqual(restore.body['warnings'], [], '新版本恢复不应有 warnings')
+
+    // ★ 四位一体之一：页面 visibility 回来了（用"普通成员又能读"作为可观测证据）
+    assert.equal(await applicantCanRead(), true, '恢复必须包含页面 visibility（回到 org ⇒ 成员可读）')
+    // ★ 之一：块级权限回来了（含 ordinal 与 visibility）
+    const restoredBlocks = await blocksOf()
+    assert.equal(restoredBlocks.length, 2)
+    assert.equal(restoredBlocks[1]?.['visibility'], 'org', '恢复必须包含块级可见性')
+    assert.equal(Number(restoredBlocks[1]?.['ordinal']), 1)
+    // ★ 之一：正文回来了
+    const detail = await h.call('GET', '/api/pages/:slug', { slug: 'vc1' }, undefined, APPLICANT)
+    assert.equal(detail.status, 200, '恢复回 org 后，普通成员应当又能读到')
+    /*
+     * 注意期望值是**去掉 gated 标记**后的形态：标记是**语法**（区段分隔符），不是内容 ——
+     * `ParsedBlock.text` 的注释即此意，读路径返回的是块投影而非 `pages.content` 原文。
+     * 所以这里断言"标记被剥掉、正文在"，而不是断言与 `pages.content` 逐字相等。
+     */
+    assert.equal(detail.body['content'], '公开A\n\n机密B', '恢复必须包含正文（gated 标记按语法剥掉）')
+
+    // ★ 恢复**本身**也记一条版本 ⇒ 可逆
+    assert.equal((await versionsOf()).length, afterChange.length + 1, '恢复本身应产生一条版本（使其可逆）')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('P3c：老版本只恢复正文并带 warnings；含 granted 块的版本对 member 403；超大快照 413；非 canEdit 读历史 404', async () => {
+  const h = await makeHarness()
+  try {
+    const content = '公开A\n\n<!--gated:org-->\n机密B\n<!--/gated-->'
+    await h.call('PUT', '/api/pages/:slug', { slug: 'vc2' }, { title: 'V2', content }, OWNER)
+    const pageId = Number(
+      (h.adapter.query('SELECT id FROM pages WHERE slug = ?', ['vc2']) as Array<{ id: number }>)[0]?.id,
+    )
+    assert.ok(pageId >= 1)
+
+    /* ---- ① 老版本（blocks_json IS NULL）：只恢复正文 + warnings ---- */
+    const legacy = h.adapter.run(
+      'INSERT INTO page_versions (page_id, content, saved_at) VALUES (?, ?, ?)',
+      [pageId, '这是块级功能之前的正文', '2026-01-01T00:00:00Z'],
+    )
+    const legacyId = Number(legacy.lastInsertRowid)
+    assert.ok(legacyId >= 1)
+    const r1 = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc2', id: String(legacyId) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(r1.status, 200)
+    assert.deepEqual(
+      r1.body['warnings'],
+      ['block_acls_not_restored'],
+      '老版本恢复必须**显式告知**块级权限未恢复，绝不猜测当时的权限',
+    )
+    const afterLegacy = await h.call('GET', '/api/pages/:slug', { slug: 'vc2' }, undefined, OWNER)
+    assert.equal(afterLegacy.body['content'], '这是块级功能之前的正文')
+
+    /* ---- ② 非 canEdit 读历史 ⇒ 404（历史含 ACL 结构，投影它等于泄漏） ---- */
+    /*
+     * 用**匿名**而不是 `APPLICANT`：`APPLICANT` 是组织成员，对 `org` 档页面**本来就有
+     * `canEdit`** ⇒ 他读历史返回 200 是正确的（历史对**编辑者**开放）。要验的是
+     * "没有编辑权的人"这条闸门，所以取一个明确无编辑权的主体。
+     */
+    const anonRead = await h.call(
+      'GET',
+      '/api/pages/:slug/versions/:id',
+      { slug: 'vc2', id: String(legacyId) },
+      undefined,
+      anonymousPrincipal(),
+    )
+    assert.equal(anonRead.status, 404, '非 canEdit 一律 404（不能靠 403/404 之差探测历史）')
+
+    /* ---- ③ 含 granted 块的版本：member（rank 1）不得恢复 ⇒ 403 + blockedOrdinals ---- */
+    await h.call(
+      'PUT',
+      '/api/pages/:slug',
+      { slug: 'vc3' },
+      { title: 'V3', content: '公开\n\n<!--gated:granted-->\n仅授权可见\n<!--/gated-->' },
+      OWNER,
+    )
+    // 触发一次权限变更以留下含 granted 块的版本
+    await h.call('PUT', '/api/pages/:slug/visibility', { slug: 'vc3' }, { visibility: 'org' }, OWNER)
+    const v3versions = await h.call('GET', '/api/pages/:slug', { slug: 'vc3' }, undefined, OWNER)
+    const v3id = (v3versions.body['versions'] as Array<{ id: number }>)[0]?.id
+    assert.ok(v3id, 'vc3 应有版本')
+    const asMember = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc3', id: String(v3id) },
+      undefined,
+      MEMBER,
+    )
+    assert.equal(asMember.status, 403, '含 granted 块的版本：普通 member 不得恢复')
+    const blocked = (asMember.body['details'] as Record<string, unknown>)['blockedOrdinals'] as number[]
+    assert.deepEqual(blocked, [1], '应列出违规块的 ordinal')
+    // owner 可以（admin 档 rank 2）
+    const asOwner = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc3', id: String(v3id) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(asOwner.status, 200, 'owner 属 admin 档，应能恢复含 granted 块的版本')
+
+    /* ---- ④ 超大快照 ⇒ 413（不是截断） ---- */
+    const huge = JSON.stringify([{ o: 0, k: 'paragraph', t: 'x'.repeat(1_100_000), v: 'public', i: 1, m: null }])
+    const bigRow = h.adapter.run(
+      'INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)',
+      [pageId, 'x', '2026-01-01T00:00:00Z', huge, '{"visibility":"org","inherit":1,"published_at":null,"page_grants":[],"block_grants":[]}'],
+    )
+    const bigId = Number(bigRow.lastInsertRowid)
+    const r4 = await h.call(
+      'POST',
+      '/api/pages/:slug/versions/:id/restore',
+      { slug: 'vc2', id: String(bigId) },
+      undefined,
+      OWNER,
+    )
+    assert.equal(r4.status, 413, '快照超限必须显式 413，绝不能截断后恢复出残缺正文')
+    assert.equal(r4.body['error'], 'snapshot_too_large')
   } finally {
     h.dispose()
   }

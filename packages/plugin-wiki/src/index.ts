@@ -40,6 +40,7 @@ import {
   sha256Hex,
   syncBlocksForPage,
   tierFor,
+  type BlockKind,
   type BlockReader,
   type BlockTier,
   type BlockVisibility,
@@ -1032,12 +1033,19 @@ export const WikiPlugin = {
         }
         // 幂等保存：标题与正文均未变化 → 不更新 updated_at、不写历史
         if (existing.title === input.title && existing.content === input.content) return 'unchanged'
-        // 快照旧正文到版本历史，再更新页面
-        await tx.run('INSERT INTO page_versions (page_id, content, saved_at) VALUES (?, ?, ?)', [
-          existing.id,
-          existing.content,
-          now,
-        ])
+        /*
+         * 快照旧正文到版本历史，再更新页面。
+         *
+         * ★ P3c：**连同权限一起快照**（块集合 + 页面级 ACL + 授予）。理由：本次保存
+         * 也可能改变**块级可见性**（正文里的 `<!--gated:…-->` 标记一改，块的 visibility
+         * 就变），所以只存正文的话，「恢复此版本」会把当时的正文配上现在的权限 ——
+         * 可能放宽。快照取的是**此刻**（更新之前）的块，正是"变更前状态"。
+         */
+        const snap = await versionSnapshotOf(tx, existing.id)
+        await tx.run(
+          `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)`,
+          [existing.id, existing.content, now, snap.blocksJson, snap.aclJson],
+        )
         await tx.run('UPDATE pages SET title = ?, content = ?, updated_at = ?, content_hash = ? WHERE id = ?', [
           input.title,
           input.content,
@@ -1228,17 +1236,27 @@ export const WikiPlugin = {
       }),
     )
 
-    /* ---------- GET /api/pages/:slug/versions/:id：读取历史版本正文 ---------- */
+    /* ---------- GET /api/pages/:slug/versions/:id：读取历史版本快照 ---------- */
+    /*
+     * ★ P3c：**非 `canEdit` 一律 404**（不是 403、不是裁剪）。
+     *
+     * 为什么不是"投影历史"：历史行里含 `blocks_json` / `acl_json` —— 那是**权限结构本身**
+     * （哪些块被单独收紧过、谁被授予过）。把它按当前主体裁剪等于把 ACL 结构暴露给
+     * 本来读不到它的人；而"哪一段被刻意收紧过"本身就是敏感信息。
+     * 所以历史**只对能编辑该页的人开放**，其他人一律 404（与"不存在"同形，不泄露存在性）。
+     */
     cleanups.push(
       router.register('GET', '/api/pages/:slug/versions/:id', async (h) => {
-        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [h.params.slug]))[0]
-        if (!page) {
-          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${h.params.slug}` })
+        const slug = h.params.slug ?? ''
+        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        const access = page ? await policy().resolvePage(requirePrincipal(h), slug) : null
+        if (!page || !access || !access.canEdit) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
         const version = (
-          await adb.query<{ id: number; content: string; saved_at: string }>(
-            'SELECT id, content, saved_at FROM page_versions WHERE id = ? AND page_id = ?',
+          await adb.query<{ id: number; content: string; saved_at: string; blocks_json: string | null; acl_json: string | null }>(
+            'SELECT id, content, saved_at, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
             [Number(h.params.id), page.id],
           )
         )[0]
@@ -1246,8 +1264,260 @@ export const WikiPlugin = {
           h.json(404, { ok: false, error: 'not_found', message: `版本不存在: ${h.params.id}` })
           return
         }
-        h.json(200, { id: version.id, content: version.content, saved_at: version.saved_at })
+        h.json(200, {
+          id: version.id,
+          content: version.content,
+          saved_at: version.saved_at,
+          // 老版本这两列为 NULL ⇒ 调用方据此提示"该版本早于块级权限功能"
+          blocks: version.blocks_json === null ? null : (JSON.parse(version.blocks_json) as unknown),
+          acl: version.acl_json === null ? null : (JSON.parse(version.acl_json) as unknown),
+        })
       }),
+    )
+
+    /* ---------- POST /api/pages/:slug/versions/:id/restore：恢复某个版本（★ P3c） ---------- */
+    /*
+     * ★ **恢复是四位一体**：正文 + 块级权限 + 页面 `visibility` + `published_at` + `inherit`。
+     * 只恢复正文会把"当时的正文"配上"现在的权限" —— 可能把本该受限的内容**放开**
+     * （这正是 `0017_version_blocks.sql` 那条规则的由来）。
+     *
+     * ★ 恢复**本身也产生一条版本**（记变更前的状态）⇒ 恢复是可逆的：再恢复一次就能退回来。
+     *
+     * ★ 块的重建**走唯一写入路径** `syncBlocksForPage`，但经它的 `parse` 注入点喂入
+     * **快照里的块**而不是重新解析正文。这样同时满足两件事：
+     *   - R12（不得绕过写入路径，否则 `blocks_fts` 与 `blocks` 漂移）；
+     *   - 忠实恢复"当时那组块"（解析器若在这期间升过级，重新解析会得到不同的块）。
+     * 反过来，"删光重建"是**不可接受**的：`block_grants.block_id` 是 `ON DELETE CASCADE`，
+     * 删光会让块 id 全变、**授权被静默清空**（见 `blocks.ts` 的说明）。
+     */
+    const MAX_SNAPSHOT_BYTES = 1_000_000
+
+    /** 块级可见性对应的"读者等级"：`granted` 不属于任何等级，只有 admin 覆盖能触及它。 */
+    const requiredRankOfBlock = (v: string): number => (v === 'granted' ? 2 : v === 'org' ? 1 : 0)
+
+    /** 主体的读者等级。owner/admin 记 2（与 D14 的应急可见一致），member/viewer 记 1，其余 0。 */
+    const readerRankOf = (p: Principal): number => {
+      if (p.kind === 'break-glass') return 2
+      if (p.orgRole === 'owner' || p.orgRole === 'admin') return 2
+      return p.orgRole !== null ? 1 : 0
+    }
+
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/versions/:id/restore', async (h) => {
+        const slug = h.params.slug ?? ''
+        // 恢复会改写**权限** ⇒ 用 requireManage（canManageVisibility），不是普通 canEdit
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const versionId = Number(h.params.id)
+        if (!Number.isInteger(versionId) || versionId < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const row = (
+          await adb.query<{ id: number; content: string; blocks_json: string | null; acl_json: string | null }>(
+            'SELECT id, content, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
+            [versionId, page.id],
+          )
+        )[0]
+        if (!row) {
+          h.json(404, { ok: false, error: 'not_found', message: `版本不存在: ${h.params.id}` })
+          return
+        }
+        /*
+         * 快照体积上限：`blocks_json` 是整页块的文本，理论上可以很大。
+         * 超限**显式 413**而不是截断 —— 截断等于恢复出一份残缺的正文。
+         */
+        if (row.blocks_json !== null && Buffer.byteLength(row.blocks_json, 'utf8') > MAX_SNAPSHOT_BYTES) {
+          closeAfterResponse(h)
+          h.json(413, {
+            ok: false,
+            error: 'snapshot_too_large',
+            message: `该版本的块快照过大（上限 ${MAX_SNAPSHOT_BYTES} 字节）`,
+          })
+          return
+        }
+
+        const now = new Date().toISOString()
+        const actorId = guard.principal.userId
+
+        /*
+         * 老版本（`blocks_json IS NULL`，早于块级权限功能）：**只恢复正文**，绝不猜测当时的权限。
+         * 猜错的后果正是"把本该受限的内容放开" —— 宁可少恢复，不可猜。
+         */
+        if (row.blocks_json === null || row.acl_json === null) {
+          const revision = await adb.transaction(async (tx) => {
+            await snapshotAclVersion(tx, slug) // 恢复前记一条 ⇒ 本次恢复可逆
+            await tx.run('UPDATE pages SET content = ?, content_hash = ?, updated_at = ? WHERE id = ?', [
+              row.content,
+              sha256Hex(row.content),
+              now,
+              page.id,
+            ])
+            await syncBlocksForPage(tx, {
+              pageId: Number(page.id),
+              content: row.content,
+              pageLevel: await pageLevelOf(slug),
+              now,
+              existing: await readExistingBlocks(tx, Number(page.id)),
+              // ★ 恢复是"显式回到那个状态"，可能改变块结构 ⇒ 放行编辑路径那三道守卫
+              restructure: true,
+            })
+            return bumpAclRevision(tx, slug)
+          })
+          void writeAuditLog(adb, {
+            action: 'acl.change',
+            targetKind: 'page',
+            targetId: slug,
+            actorId,
+            after: { restored_version: versionId, block_acls_restored: false },
+          }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+          h.json(200, {
+            ok: true,
+            slug,
+            restored: versionId,
+            acl_revision: revision,
+            warnings: ['block_acls_not_restored'],
+          })
+          return
+        }
+
+        let snapshotBlocks: Array<{ o: number; k: string; t: string; v: string; i: number; m: string | null }>
+        let acl: {
+          visibility: string
+          inherit: number
+          published_at: string | null
+          page_grants: Array<{ k: string; s: string; r: string; e: string | null }>
+          block_grants: Array<{ o: number; k: string; s: string; r: string; e: string | null }>
+        }
+        try {
+          snapshotBlocks = JSON.parse(row.blocks_json) as typeof snapshotBlocks
+          acl = JSON.parse(row.acl_json) as typeof acl
+        } catch {
+          h.json(500, { ok: false, error: 'corrupt_snapshot', message: '该版本的快照无法解析' })
+          return
+        }
+        if (
+          !Array.isArray(snapshotBlocks) ||
+          !Array.isArray(acl.page_grants) ||
+          !Array.isArray(acl.block_grants)
+        ) {
+          h.json(500, { ok: false, error: 'corrupt_snapshot', message: '该版本的快照结构不完整' })
+          return
+        }
+
+        /*
+         * ★ 逐块可见性校验（§8.2 P3c）：恢复者必须"看得见"该版本里的**每一个块**。
+         * 否则一个只能看到 `org` 档的编辑者就能把含 `granted` 块的旧版本恢复回来 ——
+         * 版本恢复于是成了绕过"granted 默认谁都不能看"的写入通道。
+         * 回报 `details.blockedOrdinals` 便于调用方定位是哪几段。
+         */
+        const readerRank = readerRankOf(guard.principal)
+        const blockedOrdinals = snapshotBlocks
+          .filter((b) => requiredRankOfBlock(String(b.v)) > readerRank)
+          .map((b) => Number(b.o))
+        if (blockedOrdinals.length > 0) {
+          h.json(403, {
+            ok: false,
+            error: 'forbidden',
+            message: '该版本含有你无权触及的内容块，无法恢复',
+            details: { reason: 'blocked_blocks', blockedOrdinals },
+          })
+          return
+        }
+
+        const revision = await adb.transaction(async (tx) => {
+          // ① 恢复前先记一条版本 ⇒ 恢复可逆
+          await snapshotAclVersion(tx, slug)
+          // ② 页面级 ACL + 正文
+          await tx.run(
+            `UPDATE pages SET content = ?, content_hash = ?, updated_at = ?, visibility = ?, inherit = ?, published_at = ?
+              WHERE id = ?`,
+            [
+              row.content,
+              sha256Hex(row.content),
+              now,
+              acl.visibility,
+              acl.inherit === 1 ? 1 : 0,
+              acl.published_at,
+              page.id,
+            ],
+          )
+          // ③ 块集合：注入快照块（走唯一写入路径；块身份由保守重解析维持 ⇒ 授权不会因 id 全变而丢失）
+          const parsed: ParsedBlock[] = snapshotBlocks.map((b) => ({
+            ordinal: Number(b.o),
+            kind: String(b.k) as BlockKind,
+            text: String(b.t),
+            visibility: String(b.v) as BlockVisibility,
+            inherit: Number(b.i) === 1,
+            marker: b.m ?? null,
+            contentHash: sha256Hex(String(b.t)),
+          }))
+          await syncBlocksForPage(tx, {
+            pageId: Number(page.id),
+            content: row.content,
+            /*
+             * ★ `self` 传**恢复后**的档位：策略层读的是它自己的连接，看不到本事务里
+             * 尚未提交的 `UPDATE pages` —— 不传 `self` 就会按**旧**档位算 tier，
+             * 于是恢复完的块 tier 全是错的（检索判定随之错误）。
+             */
+            pageLevel: await pageLevelOf(slug, {
+              visibility: acl.visibility,
+              inherit: acl.inherit === 1 ? 1 : 0,
+              published_at: acl.published_at,
+            }),
+            now,
+            existing: await readExistingBlocks(tx, Number(page.id)),
+            parse: () => parsed,
+            /*
+             * ★ 同上：恢复可能改变块结构（快照里的块数与当前不同），
+             * 而 `restructure` 只放行"改结构"，不触及任何可见性判定。
+             */
+            restructure: true,
+          })
+          // ④ 授予：整体替换为快照里的那一组。"恢复权限"必须包含授予 ——
+          //    否则旧版本是私有的、而当前的 page_grants 仍然生效 ⇒ 恢复出的权限**更宽**。
+          await tx.run('DELETE FROM page_grants WHERE page_slug = ?', [slug])
+          for (const g of acl.page_grants) {
+            await tx.run(
+              `INSERT INTO page_grants (page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [slug, String(g.k), String(g.s), String(g.r), actorId, now, g.e ?? null],
+            )
+          }
+          await tx.run('DELETE FROM block_grants WHERE page_slug = ?', [slug])
+          for (const g of acl.block_grants) {
+            // 按 ordinal 找回重建后的块 id（快照按 ordinal 引用块，正是为了这一刻）
+            const b = (
+              await tx.query<{ id: number }>('SELECT id FROM blocks WHERE page_id = ? AND ordinal = ?', [
+                page.id,
+                Number(g.o),
+              ])
+            )[0]
+            if (!b) continue
+            await tx.run(
+              `INSERT INTO block_grants (block_id, page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [Number(b.id), slug, String(g.k), String(g.s), String(g.r), actorId, now, g.e ?? null],
+            )
+          }
+          return bumpAclRevision(tx, slug)
+        })
+
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'page',
+          targetId: slug,
+          actorId,
+          after: { restored_version: versionId, block_acls_restored: true, acl_revision: revision },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, { ok: true, slug, restored: versionId, acl_revision: revision, warnings: [] })
+      }, { access: 'user' }),
     )
 
     /* ---------- PUT /api/pages/:slug：upsert（保存时先快照旧正文，幂等：内容未变不产生新历史） ----------
@@ -1385,6 +1655,114 @@ export const WikiPlugin = {
       await tx.run('UPDATE pages SET acl_revision = acl_revision + 1 WHERE slug = ?', [slug])
       const row = (await tx.query<{ revision: number }>('SELECT revision FROM acl_revision WHERE id = 1'))[0]
       return Number(row?.revision ?? 0)
+    }
+
+    /**
+     * 某页当前的**版本快照载荷**：块集合 + 页面级 ACL + 例外授予。
+     *
+     * ★ **为什么把「授予」也放进快照**（而不只是 visibility/inherit/published_at）：
+     * 「恢复此版本」若只恢复档位、不恢复授予，就会出现**放宽**事故 —— 旧版本里这条是私有的，
+     * 但**当前**的 `page_grants` 仍然生效，恢复后那些被授予者依然能看 ⇒ 恢复出来的权限比
+     * 该版本实际拥有的**更宽**。这正是 `0017_version_blocks.sql` 里那条规则要防的事：
+     * 版本快照与「恢复」必须覆盖同一组事实，否则两者脱节。
+     *
+     * 块级授予按 **`ordinal`** 引用而不是块 id：恢复时块会被整体重建，id 不保证延续，
+     * 而 `ordinal` 在 `blocks_json` 里就是块的身份，两边能对上。
+     */
+    const versionSnapshotOf = async (
+      tx: DatabaseExecutor,
+      pageId: number,
+    ): Promise<{ blocksJson: string; aclJson: string }> => {
+      const blocks = await tx.query<{
+        ordinal: number
+        kind: string
+        text: string
+        visibility: string
+        inherit: number
+        marker: string | null
+      }>(
+        'SELECT ordinal, kind, text, visibility, inherit, marker FROM blocks WHERE page_id = ? ORDER BY ordinal',
+        [pageId],
+      )
+      const page = (
+        await tx.query<{ visibility: string; inherit: number; published_at: string | null }>(
+          'SELECT visibility, inherit, published_at FROM pages WHERE id = ?',
+          [pageId],
+        )
+      )[0]
+      const pageGrants = await tx.query<{
+        subject_kind: string
+        subject_id: string
+        role: string
+        expires_at: string | null
+      }>(
+        `SELECT subject_kind, subject_id, role, expires_at FROM page_grants
+          WHERE page_slug = (SELECT slug FROM pages WHERE id = ?) ORDER BY id`,
+        [pageId],
+      )
+      const blockGrants = await tx.query<{
+        ordinal: number
+        subject_kind: string
+        subject_id: string
+        role: string
+        expires_at: string | null
+      }>(
+        `SELECT b.ordinal AS ordinal, g.subject_kind, g.subject_id, g.role, g.expires_at
+           FROM block_grants g JOIN blocks b ON b.id = g.block_id
+          WHERE b.page_id = ? ORDER BY b.ordinal, g.id`,
+        [pageId],
+      )
+      return {
+        blocksJson: JSON.stringify(
+          blocks.map((b) => ({
+            o: Number(b.ordinal),
+            k: b.kind,
+            t: b.text,
+            v: b.visibility,
+            i: Number(b.inherit),
+            m: b.marker,
+          })),
+        ),
+        aclJson: JSON.stringify({
+          visibility: page?.visibility ?? 'private',
+          inherit: Number(page?.inherit ?? 1),
+          published_at: page?.published_at ?? null,
+          page_grants: pageGrants.map((g) => ({
+            k: g.subject_kind,
+            s: g.subject_id,
+            r: g.role,
+            e: g.expires_at,
+          })),
+          block_grants: blockGrants.map((g) => ({
+            o: Number(g.ordinal),
+            k: g.subject_kind,
+            s: g.subject_id,
+            r: g.role,
+            e: g.expires_at,
+          })),
+        }),
+      }
+    }
+
+    /**
+     * 记一条**权限版本**：`content` 保持当前正文，只有 `blocks_json` / `acl_json` 变化。
+     *
+     * 由**每一条改权限的路径**调用（改档位、页面授予、块级授予；随正文保存而变的块级
+     * 可见性由 `savePage` 那条版本覆盖），理由见 `0017_version_blocks.sql`。
+     *
+     * 记的是**变更前**的状态 —— 与 `savePage` 的既有约定一致（"先快照旧的，再改"），
+     * 于是"版本 N = 变更 N 之前的状态"，恢复版本 N 得到的就是那一刻。
+     */
+    const snapshotAclVersion = async (tx: DatabaseExecutor, slug: string): Promise<void> => {
+      const page = (
+        await tx.query<{ id: number; content: string }>('SELECT id, content FROM pages WHERE slug = ?', [slug])
+      )[0]
+      if (!page) return
+      const snap = await versionSnapshotOf(tx, Number(page.id))
+      await tx.run(
+        `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)`,
+        [Number(page.id), page.content, new Date().toISOString(), snap.blocksJson, snap.aclJson],
+      )
     }
 
     /**
@@ -1581,6 +1959,12 @@ export const WikiPlugin = {
         }
 
         const revision = await adb.transaction(async (tx) => {
+          /*
+           * ★ P3c：**改档位也必须产生一条版本**（记的是变更前的状态）。
+           * 若只恢复正文、不恢复权限，「恢复此版本」会把当时的正文配上现在的权限 ——
+           * 结果可能是把本该受限的内容放开（见 0017 迁移的说明）。
+           */
+          await snapshotAclVersion(tx, slug)
           await tx.run('UPDATE pages SET visibility = ?, inherit = ?, published_at = ? WHERE slug = ?', [
             nextVisibility,
             nextInherit,
@@ -1738,6 +2122,8 @@ export const WikiPlugin = {
          * 把"改角色"伪装成"新授予"，审计会失真。
          */
         const revision = await adb.transaction(async (tx) => {
+          // ★ P3c：授予变更也要产生版本（否则恢复旧版本时，当前授予仍在 ⇒ 恢复出的权限更宽）
+          await snapshotAclVersion(tx, slug)
           const existing = (
             await tx.query<{ id: number; role: string; expires_at: string | null }>(
               'SELECT id, role, expires_at FROM page_grants WHERE page_slug = ? AND subject_kind = ? AND subject_id = ?',
@@ -1786,6 +2172,8 @@ export const WikiPlugin = {
             [id, slug],
           ))[0]
           if (!removed) return null
+          // ★ P3c：撤销授予同样产生版本 —— **放在存在性检查之后**，否则 404 也会写出一条无意义的版本
+          await snapshotAclVersion(tx, slug)
           await tx.run('DELETE FROM page_grants WHERE id = ? AND page_slug = ?', [id, slug])
           const rev = await bumpAclRevision(tx, slug)
           return { rev, removed }
@@ -2032,6 +2420,8 @@ export const WikiPlugin = {
           )[0]
           if (!req) return null
           if (req.status !== 'pending') return { conflict: req.status } as const
+          // ★ P3c：批准等同于"新增一条 page_grant" ⇒ 同样必须产生版本
+          await snapshotAclVersion(tx, slug)
           const subjectId = String(Number(req.user_id))
           // 幂等 upsert（与 POST /grants 同款）：先查后写，避免把"改角色"伪装成"新授予"
           const existing = (
@@ -2342,6 +2732,8 @@ export const WikiPlugin = {
             )
           )[0]
           if (!block) return null
+          // ★ P3c：块级授予同样产生版本 —— 放在校验之后，避免 404 也写出版本
+          await snapshotAclVersion(tx, slug)
           // 幂等 upsert（同页面级：先查后写，避免把"改角色"伪装成"新授予"）
           const existing = (
             await tx.query<{ id: number }>(
@@ -2420,6 +2812,8 @@ export const WikiPlugin = {
             )
           )[0]
           if (!removed) return null
+          // ★ P3c：撤销块级授予同样产生版本（放在存在性检查之后）
+          await snapshotAclVersion(tx, slug)
           await tx.run('DELETE FROM block_grants WHERE id = ? AND block_id = ?', [grantId, blockId])
           return { rev: await bumpAclRevision(tx, slug), removed }
         })
