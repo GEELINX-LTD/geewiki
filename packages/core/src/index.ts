@@ -16,6 +16,18 @@ import './cordis-env.js'
 
 export type { FiberLike } from './cordis-env.js'
 
+/* 审计日志写入设施（`audit_log` 表，见 docs/design/access-control.md §3.4）。
+   放在 core 是因为该表由 db 插件的迁移建立、属核心基础设施，而写入方横跨
+   server（access.break_glass）与 plugin-auth（login.* / 口令变更）两个包。
+   注意：`core` 顶层 `import 'node:fs'`，**本模块不得被前端包引入**（见 §9 R3）。 */
+export {
+  auditIpHash,
+  redactForAudit,
+  writeAuditLog,
+  type AuditEntry,
+  type AuditExecutor,
+} from './audit.js'
+
 /* ============================ 配置 Schema ============================ */
 
 /**

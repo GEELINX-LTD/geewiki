@@ -104,6 +104,22 @@ importers:
         specifier: ^22.0.0
         version: 22.20.1
 
+  packages/plugin-auth:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
   packages/plugin-echo:
     dependencies:
       '@geewiki/core':
@@ -200,6 +216,9 @@ importers:
       '@geewiki/ai':
         specifier: workspace:*
         version: link:../plugin-ai
+      '@geewiki/auth':
+        specifier: workspace:*
+        version: link:../plugin-auth
       '@geewiki/core':
         specifier: workspace:*
         version: link:../core
