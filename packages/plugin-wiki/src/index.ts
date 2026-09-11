@@ -1806,6 +1806,259 @@ export const WikiPlugin = {
       }, { access: 'user' }),
     )
 
+    /* ---------- GET /api/pages/:slug/blocks：块级治理视图（★ P3b） ---------- */
+    /*
+     * ★ **刻意不返回 `text`**。
+     *
+     * 这是治理面板的数据源（"这一页哪些块被单独收紧过、谁被授予了"），不是阅读界面 ——
+     * 而受限块的正文按定义就不该出现在这里。一旦带上 `text`，这个端点立刻变成
+     * "只要 canManageVisibility 就能读到所有 `granted` 块正文"的旁路，而 `granted`
+     * 档的语义恰恰是"默认谁都不能看"（§2.2）。要读正文请走详情页，那里有完整投影。
+     */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/blocks', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const rows = await adb.query<{
+          id: number
+          ordinal: number
+          kind: string
+          visibility: string
+          inherit: number
+          marker: string | null
+          tier: number | null
+        }>(
+          `SELECT b.id, b.ordinal, b.kind, b.visibility, b.inherit, b.marker, b.tier
+             FROM blocks b WHERE b.page_id = ? ORDER BY b.ordinal`,
+          [page.id],
+        )
+        const grants = await adb.query<{
+          id: number
+          block_id: number
+          subject_kind: string
+          subject_id: string
+          role: string
+          granted_at: string
+          expires_at: string | null
+        }>(
+          `SELECT g.id, g.block_id, g.subject_kind, g.subject_id, g.role, g.granted_at, g.expires_at
+             FROM block_grants g JOIN blocks b ON b.id = g.block_id
+            WHERE b.page_id = ? ORDER BY g.id`,
+          [page.id],
+        )
+        const byBlock = new Map<number, typeof grants>()
+        for (const g of grants) {
+          const list = byBlock.get(Number(g.block_id)) ?? []
+          list.push(g)
+          byBlock.set(Number(g.block_id), list)
+        }
+        h.json(200, {
+          ok: true,
+          slug,
+          blocks: rows.map((b) => ({
+            id: Number(b.id),
+            ordinal: Number(b.ordinal),
+            kind: b.kind,
+            visibility: b.visibility,
+            inherit: Number(b.inherit) === 1,
+            marker: b.marker,
+            /** `null` = 该块不属于任何读者等级（`granted` 档，只能靠授权放行） */
+            tier: b.tier === null ? null : Number(b.tier),
+            grants: (byBlock.get(Number(b.id)) ?? []).map((g) => ({
+              id: Number(g.id),
+              subjectKind: g.subject_kind,
+              subjectId: g.subject_id,
+              role: g.role,
+              grantedAt: g.granted_at,
+              expiresAt: g.expires_at,
+            })),
+          })),
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/blocks/:blockId/grants：块级例外授予 ---------- */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/blocks/:blockId/grants', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const blockId = Number(h.params.blockId)
+        if (!Number.isInteger(blockId) || blockId < 1) {
+          h.json(400, { ok: false, error: 'invalid_block_id', message: 'blockId 须为正整数' })
+          return
+        }
+        let body: Record<string, unknown>
+        try {
+          body = (await readBody(h)) as Record<string, unknown>
+        } catch (err) {
+          const message = (err as Error).message
+          if (message.startsWith('payload_too_large')) {
+            closeAfterResponse(h)
+            h.json(413, { ok: false, error: 'payload_too_large', message })
+            return
+          }
+          h.json(400, { ok: false, error: 'invalid_body', message })
+          return
+        }
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+          h.json(400, { ok: false, error: 'invalid_body', message: '请求体须为 JSON 对象' })
+          return
+        }
+        const unknown = Object.keys(body).filter(
+          (k) => k !== 'subjectKind' && k !== 'subjectId' && k !== 'role' && k !== 'expiresAt',
+        )
+        if (unknown.length > 0) {
+          h.json(400, { ok: false, error: 'invalid_body', message: `未知字段: ${unknown.join(', ')}` })
+          return
+        }
+        const subjectKind = body['subjectKind']
+        if (typeof subjectKind !== 'string' || !(SUBJECT_KINDS as readonly string[]).includes(subjectKind)) {
+          // ★ D13：块级与页面级**完全同构** —— 同样明确拒绝 `org_role`
+          h.json(400, {
+            ok: false,
+            error: 'invalid_subject_kind',
+            message: `subjectKind 须为 ${SUBJECT_KINDS.join(' | ')} 之一（角色不是授权对象，见 D13）`,
+          })
+          return
+        }
+        const subjectId = body['subjectId']
+        if (typeof subjectId !== 'string' || subjectId.length === 0 || subjectId.length > 128) {
+          h.json(400, { ok: false, error: 'invalid_subject_id', message: 'subjectId 须为非空字符串（≤128 字符）' })
+          return
+        }
+        const role = body['role']
+        if (typeof role !== 'string' || !(GRANT_ROLES as readonly string[]).includes(role)) {
+          h.json(400, { ok: false, error: 'invalid_role', message: `role 须为 ${GRANT_ROLES.join(' | ')} 之一` })
+          return
+        }
+        const expiresAt = body['expiresAt'] === undefined || body['expiresAt'] === null ? null : body['expiresAt']
+        if (expiresAt !== null && typeof expiresAt !== 'string') {
+          h.json(400, { ok: false, error: 'invalid_expires_at', message: 'expiresAt 须为 ISO 时间字符串或 null' })
+          return
+        }
+
+        const now = new Date().toISOString()
+        const grantedBy = guard.principal.userId
+        const outcome = await adb.transaction(async (tx) => {
+          /*
+           * ★ **必须校验块确实属于该页**（而不是分别校验"页可管"与"块存在"）。
+           *
+           * 只查 `blocks WHERE id = ?` 会留下一个组合式越权口：拿 A 页的 slug（自己有
+           * 管理权）配 B 页的 blockId，就能给别人的块加授权。这类"父 ID + 子 ID 组合"
+           * 的绕过在真实产品里出现过（设计文档 §9 R10 第 4 条引的正是这种形态）。
+           */
+          const block = (
+            await tx.query<{ id: number; visibility: string }>(
+              `SELECT b.id, b.visibility FROM blocks b JOIN pages p ON p.id = b.page_id
+                WHERE b.id = ? AND p.slug = ?`,
+              [blockId, slug],
+            )
+          )[0]
+          if (!block) return null
+          // 幂等 upsert（同页面级：先查后写，避免把"改角色"伪装成"新授予"）
+          const existing = (
+            await tx.query<{ id: number }>(
+              'SELECT id FROM block_grants WHERE block_id = ? AND subject_kind = ? AND subject_id = ?',
+              [blockId, subjectKind, subjectId],
+            )
+          )[0]
+          if (existing) {
+            await tx.run('UPDATE block_grants SET role = ?, expires_at = ? WHERE id = ?', [role, expiresAt, existing.id])
+          } else {
+            await tx.run(
+              `INSERT INTO block_grants (block_id, page_slug, subject_kind, subject_id, role, granted_by, granted_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [blockId, slug, subjectKind, subjectId, role, grantedBy, now, expiresAt],
+            )
+          }
+          return { rev: await bumpAclRevision(tx, slug), blockVisibility: block.visibility }
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `块不存在于本页: ${blockId}` })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}#block:${blockId}:${subjectKind}:${subjectId}`,
+          actorId: grantedBy,
+          after: { role, expires_at: expiresAt },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, {
+          ok: true,
+          slug,
+          blockId,
+          subjectKind,
+          subjectId,
+          role,
+          expiresAt,
+          acl_revision: outcome.rev,
+          /*
+           * 把该块**自身声明**的档位回给调用方。规则 B1（§2.3）说"块只能比页面更窄、
+           * 不能更宽"，所以当这个块是 `public`/`org`、而页面本身更窄时，授权**不会**
+           * 让它突破页面上限 —— 前端据此提示"实际可见性由页面决定"，而不是让用户
+           * 以为授权没生效。这里只回声明值，不回算出的有效值（那个由读路径判定）。
+           */
+          block_visibility: outcome.blockVisibility,
+        })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- DELETE /api/pages/:slug/blocks/:blockId/grants/:grantId：撤销块级授予 ---------- */
+    cleanups.push(
+      router.register('DELETE', '/api/pages/:slug/blocks/:blockId/grants/:grantId', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireManage(h, slug)
+        if (!guard) return
+        const blockId = Number(h.params.blockId)
+        const grantId = Number(h.params.grantId)
+        if (!Number.isInteger(blockId) || blockId < 1 || !Number.isInteger(grantId) || grantId < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'blockId 与 grantId 须为正整数' })
+          return
+        }
+        const outcome = await adb.transaction(async (tx) => {
+          // 同样带上"块属于本页"的条件，防止拿别的页的 id 组合操作（同 POST 的越权口）
+          const owned = (
+            await tx.query<{ id: number }>(
+              `SELECT b.id FROM blocks b JOIN pages p ON p.id = b.page_id WHERE b.id = ? AND p.slug = ?`,
+              [blockId, slug],
+            )
+          )[0]
+          if (!owned) return null
+          const removed = (
+            await tx.query<{ id: number; subject_kind: string; subject_id: string; role: string }>(
+              'SELECT id, subject_kind, subject_id, role FROM block_grants WHERE id = ? AND block_id = ?',
+              [grantId, blockId],
+            )
+          )[0]
+          if (!removed) return null
+          await tx.run('DELETE FROM block_grants WHERE id = ? AND block_id = ?', [grantId, blockId])
+          return { rev: await bumpAclRevision(tx, slug), removed }
+        })
+        if (!outcome) {
+          h.json(404, { ok: false, error: 'not_found', message: `授权不存在: ${grantId}` })
+          return
+        }
+        void writeAuditLog(adb, {
+          action: 'acl.change',
+          targetKind: 'grant',
+          targetId: `${slug}#block:${blockId}:${outcome.removed.subject_kind}:${outcome.removed.subject_id}`,
+          actorId: guard.principal.userId,
+          before: { role: outcome.removed.role },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+        h.json(200, { ok: true, slug, blockId, removed: grantId, acl_revision: outcome.rev })
+      }, { access: 'user' }),
+    )
+
     /* ---------- GET /api/pages/:slug/backlinks：谁链接了本页 ---------- */
     /*
      * 响应信封用 `{ ok: true, slug, backlinks }`：本插件**较早**的读端点（列表/详情/版本）
