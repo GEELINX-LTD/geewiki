@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS blocks (
   ordinal       INTEGER NOT NULL,
   kind          TEXT    NOT NULL,
   text          TEXT    NOT NULL,
-  -- ★ v4：public|org|granted（受规则 B1：min(块档位, 页面有效档位)，块只能更窄）
+  -- ★ v4：public|org|granted（受规则 B1：**块档位与页面有效档位中更窄的那个**，块只能更窄）
+  --   ⚠️ 设计文档 §2.3 写的是 `min(块档位, 页面有效档位)` —— 那句用"**宽松度**"刻度（越大越宽松）；
+  --      `tier` 列是"**限制等级**"（越小越公开，故"更窄"= 更大），**方向相反**
+  --      ⇒ 按 `tier` 的刻度写必须是 **`max`**。照文档写成 `min` 会让"页面 org + 块 public"的块
+  --      拿到 `tier = 0` ⇒ **匿名在搜索里就能搜到它**。以代码的 `effectiveIndexLevel` 为准。
   visibility    TEXT    NOT NULL DEFAULT 'public',
   inherit       INTEGER NOT NULL DEFAULT 1,
   marker        TEXT,

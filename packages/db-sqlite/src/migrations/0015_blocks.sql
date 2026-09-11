@@ -38,7 +38,12 @@ CREATE TABLE IF NOT EXISTS blocks (
   -- 该块的 Markdown 源（**未裁剪**，与 pages.content 同真源）。投影/裁剪发生在读路径。
   text          TEXT    NOT NULL,
   -- ★ v4：public|org|granted（**不再有"仅编辑者"**）。受规则 B1 约束：
-  --   有效档位 = min(块档位, 页面有效档位)，**块只能更窄、不能更宽**（§2.3）。
+  --   有效档位 = **块档位与页面有效档位中更窄的那个**，**块只能更窄、不能更宽**（§2.3）。
+  --   ⚠️ 设计文档 §2.3 把这一条写成 `min(块档位, 页面有效档位)` —— 那句话用的是"**宽松度**"刻度
+  --      （越大越宽松）；而 `tier` 列是"**限制等级**"（`b.tier <= :readerTier`，越小越公开，
+  --      故"更窄"= 更大），**两者方向相反** ⇒ 按 `tier` 的刻度写必须是 **`max`**。
+  --      照文档写成 `min` 会让"页面 org + 块 public"的块拿到 `tier = 0`
+  --      ⇒ **匿名在搜索里就能搜到它**。以代码的 `effectiveIndexLevel` 为准。
   visibility    TEXT    NOT NULL DEFAULT 'public',
   -- 子块（列表项/嵌套块）是否随父块收紧。与页面级的 inherit 同义。
   inherit       INTEGER NOT NULL DEFAULT 1,
@@ -50,7 +55,10 @@ CREATE TABLE IF NOT EXISTS blocks (
   created_at    TEXT    NOT NULL,
   updated_at    TEXT    NOT NULL,
   --
-  -- ★★★ 检索用的密级冗余列（派生列：min(页面有效档位, 块档位)，随祖先可见性变化重算）
+  -- ★★★ 检索用的密级冗余列（派生列：**页面有效档位与块档位中更窄的那个**，随祖先可见性变化重算）
+  --
+  --      ⚠️ 按 `tier` 的刻度算就是 **`max`**，不是设计文档 §2.3 写的 `min` —— 理由同上：
+  --         文档那句用"宽松度"刻度，而 `tier` 是"限制等级"，方向相反。写反即为泄漏。
   --
   --    取值域严格是 { 0 = anon, 1 = org }；**`granted` 档写 NULL**（它不属于任何读者等级，
   --    是逐块 ACL，只能靠检索时的"授权分支"命中，见 §4.3）。
