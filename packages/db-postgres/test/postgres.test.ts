@@ -230,17 +230,19 @@ test('appliedMigrations：迁移表尚未建立（42P01）时视为空清单，�
 
 /* ------------------------------ 配置与密钥纪律 ------------------------------ */
 
-test('resolveConnection：密码优先取 passwordEnv 指向的环境变量', () => {
-  const cfg: PostgresConfig = { host: 'db', port: 5433, database: 'g', user: 'u', passwordEnv: 'GEEWIKI_DB_PASSWORD', password: '明文' }
+test('resolveConnection：密码取自 passwordEnv 指向的环境变量', () => {
+  const cfg: PostgresConfig = { host: 'db', port: 5433, database: 'g', user: 'u', passwordEnv: 'GEEWIKI_DB_PASSWORD' }
   const conn = resolveConnection(cfg, { GEEWIKI_DB_PASSWORD: '来自环境变量' } as NodeJS.ProcessEnv)
-  assert.equal(conn.password, '来自环境变量', '环境变量必须优先于明文')
+  assert.equal(conn.password, '来自环境变量')
   assert.equal(conn.host, 'db')
   assert.equal(conn.port, 5433)
 })
 
-test('resolveConnection：环境变量缺失时回退明文（仅本地开发）', () => {
-  const conn = resolveConnection({ passwordEnv: 'MISSING_VAR', password: '明文' }, {} as NodeJS.ProcessEnv)
-  assert.equal(conn.password, '明文')
+test('resolveConnection：环境变量缺失 → 空串（**没有**明文回退路径）', () => {
+  // 配置里已不存在明文 password 字段（见 secret-discipline 守卫），故此处只能得到空串。
+  // 这条断言的意义：若将来有人把明文字段加回来并接上回退分支，它会立刻变红。
+  const conn = resolveConnection({ passwordEnv: 'MISSING_VAR' }, {} as NodeJS.ProcessEnv)
+  assert.equal(conn.password, '', '缺环境变量就是无密码，不得从配置里取明文')
 })
 
 test('密钥纪律：passwordEnv 只接受**环境变量名**，填密码值本身必须被拒绝', () => {

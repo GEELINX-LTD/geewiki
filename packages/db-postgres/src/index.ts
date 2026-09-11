@@ -8,10 +8,19 @@
  * 2. **同属 `conflictGroup: 'database-provider'`** ⇒ 与 SQLite 天然互斥，无需新增机制。
  * 3. **不热插拔**（`supportsHotReload: false`，与 SQLite 一致）：切换数据库是冷操作，
  *    运行中换掉连接池会让在途查询失去归宿。
- * 4. **密钥纪律**：密码**不写进配置文件**。本适配器优先接受 `connectionStringEnv`
- *    （环境变量**名**，不是值），其次是 `passwordEnv`；明文 `password` 字段仅为本地开发
- *    便利而保留，**并在检测到疑似"把真密码填进环境变量名字段"时拒绝激活**
- *    （沿用 @geewiki/llm 的 `ENV_VAR_NAME` 白名单教训：配置会落盘进入库文件）。
+ * 4. **密钥纪律**：密码**不写进配置文件**。本适配器只接受 `connectionStringEnv` 与
+ *    `passwordEnv`——两者都是环境变量**名**（不是值），**不提供任何明文字段**。
+ *
+ *    为什么连"仅本地开发"的明文字段都不给：`config/plugins.*.json` 是**被 git 跟踪**的
+ *    文件，而 `PUT /api/plugins/:name/config` + `POST /api/session/persist` 会把配置原样
+ *    落盘。任何**能被填进表单的密钥字段**，都等于给"把密钥提交进版本库"开了一个入口——
+ *    这与 `@geewiki/llm` / `@geewiki/openai` 的 `apiKeyEnv` 纪律（只接受变量名）直接冲突。
+ *    "文档里写一句警告"不足以阻止落盘，故在**契约层**去掉该字段。
+ *
+ *    两道闸门（与 openai 同款，见 `packages/plugin-openai/src/index.ts:68`）：
+ *    - schema 的 `.pattern()` 覆盖**配置读写路径**（非法值在 PUT 时即被拒，**不会落盘**）；
+ *    - {@link assertEnvNameLooksLikeName} 覆盖**以代码直接构造 config 调 `ctx.plugin()`**
+ *      的路径（测试、程序化装配）。
  */
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -38,9 +47,21 @@ import {
  */
 const ENV_VAR_NAME_RE = /^(?=[A-Z0-9_]*_)[A-Z_][A-Z0-9_]{0,127}$/
 
+/**
+ * 环境变量名**字段**白名单：与 {@link ENV_VAR_NAME_RE} 的唯一区别是**允许空串**（= 未配置）。
+ *
+ * 为什么单独一条：schema 的 `.pattern()` 必须能接受默认值 `''`，否则空配置本身就校验失败。
+ * 语义上与 `@geewiki/llm` 的 `ENV_VAR_NAME_FIELD_RE`（`/^$|^(?=[A-Z0-9_]*_)[A-Z_][A-Z0-9_]{0,127}$/`）
+ * **逐字等价**；本包刻意不 import 它——让**数据库**插件依赖 **LLM** 插件是错误的耦合方向。
+ * 两处的等价性由 `test/secret-discipline.test.ts` 的**源码级对齐守卫**钉住（照
+ * `packages/plugin-ai/test/queryLengthGuard.test.ts` 处理同类"跨包同义常量"的先例）。
+ */
+const EMPTY_OR_ENV_VAR_NAME_RE = /^$|^(?=[A-Z0-9_]*_)[A-Z_][A-Z0-9_]{0,127}$/
+
 export const PostgresConfigSchema = Schema.object({
   connectionStringEnv: Schema.string()
     .default('')
+    .pattern(EMPTY_OR_ENV_VAR_NAME_RE)
     .description('存放连接串的环境变量名（推荐；留空则用下面的分项配置）。例如 GEEWIKI_DATABASE_URL'),
   host: Schema.string().default('127.0.0.1').description('数据库主机'),
   port: Schema.number().default(5432).min(1).max(65535).description('端口'),
@@ -48,11 +69,8 @@ export const PostgresConfigSchema = Schema.object({
   user: Schema.string().default('geewiki').description('用户名'),
   passwordEnv: Schema.string()
     .default('')
-    .description('存放密码的环境变量名（推荐；留空表示无密码）。例如 GEEWIKI_DB_PASSWORD'),
-  password: Schema.string()
-    .role('password')
-    .default('')
-    .description('明文密码（**仅本地开发**；生产请改用 passwordEnv，避免密码落盘）'),
+    .pattern(EMPTY_OR_ENV_VAR_NAME_RE)
+    .description('存放密码的环境变量名（留空表示无密码）。例如 GEEWIKI_DB_PASSWORD'),
   max: Schema.number().default(10).min(1).max(100).description('连接池上限'),
   connectionTimeoutMillis: Schema.number().default(10_000).min(0).description('建立连接超时（毫秒）'),
   idleTimeoutMillis: Schema.number().default(30_000).min(0).description('空闲连接回收（毫秒）'),
@@ -67,7 +85,6 @@ export interface PostgresConfig {
   database?: string
   user?: string
   passwordEnv?: string
-  password?: string
   max?: number
   connectionTimeoutMillis?: number
   idleTimeoutMillis?: number
@@ -107,14 +124,15 @@ export function assertEnvNameLooksLikeName(field: string, value: string): void {
 export function resolveConnection(config: PostgresConfig, env: NodeJS.ProcessEnv = process.env): ResolvedConnection {
   assertEnvNameLooksLikeName('connectionStringEnv', config.connectionStringEnv ?? '')
   assertEnvNameLooksLikeName('passwordEnv', config.passwordEnv ?? '')
-  // 密码优先级：passwordEnv（环境变量） > 明文 password（仅本地开发）
-  const fromEnv = config.passwordEnv ? (env[config.passwordEnv] ?? '') : ''
+  // 密码**只能**来自环境变量：配置里不存在明文字段，故这里没有回退分支。
+  // 环境变量未设 → 空串 = 无密码（与"未配置"同义，避免把 undefined 塞给驱动）。
+  const password = config.passwordEnv ? (env[config.passwordEnv] ?? '') : ''
   return {
     host: config.host ?? '127.0.0.1',
     port: config.port ?? 5432,
     database: config.database ?? 'geewiki',
     user: config.user ?? 'geewiki',
-    password: fromEnv || config.password || '',
+    password,
     max: config.max ?? 10,
     connectionTimeoutMillis: config.connectionTimeoutMillis ?? 10_000,
     idleTimeoutMillis: config.idleTimeoutMillis ?? 30_000,
