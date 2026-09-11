@@ -13,7 +13,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { BlockParseError, parseBlocks, sha256Hex, syncBlocksForPage, tierFor } from '../src/blocks.js'
+import { BlockParseError, parseBlocks, readExistingBlocks, sha256Hex, syncBlocksForPage, tierFor } from '../src/blocks.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..', '..', '..')
@@ -59,6 +59,24 @@ function txOf(db: DatabaseSync) {
       return Promise.resolve({ changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) })
     },
   }
+}
+
+/** 只读侧替身：`readExistingBlocks` 要的形状 */
+function readerOf(db: DatabaseSync) {
+  return {
+    query: <T,>(sql: string, params: readonly unknown[] = []) =>
+      Promise.resolve(db.prepare(sql).all(...(params as never[])) as T[]),
+  }
+}
+
+/**
+ * 读该页已有块 —— **`syncBlocksForPage` 的 `existing` 必须来自真实读数，不能图省事传 `[]`**。
+ *
+ * 传 `[]` 而库里其实有块，等于告诉保守重解析"这一页是空的"：旧块既不会被复用、
+ * 也不会被删掉，结果是**块越积越多**（下面的"替换而不是追加"用例正是钉这一点）。
+ */
+function existingOf(db: DatabaseSync, pageId = 1) {
+  return readExistingBlocks(readerOf(db), pageId)
 }
 
 /* ------------------------------ 解析 ------------------------------ */
@@ -170,6 +188,8 @@ test('syncBlocksForPage：写 blocks 与 blocks_fts，且 granted 档的 tier �
     content,
     pageLevel: 1,
     now: '2026-01-01T00:00:00Z',
+    // P3b：保守重解析需要该页已有的块（含授权计数）
+    existing: await existingOf(db),
     // 本夹具建了 `blocks_fts`（SQLite）⇒ 与生产同一取值
     syncIndex: true,
   })
@@ -193,9 +213,24 @@ test('syncBlocksForPage：写 blocks 与 blocks_fts，且 granted 档的 tier �
 test('syncBlocksForPage：重复保存是**替换**而不是追加（否则块会越积越多）', async () => {
   const db = freshDb()
   const tx = txOf(db)
-  await syncBlocksForPage(tx as never, { pageId: 1, content: 'a\n\nb', pageLevel: 0, now: 't1', syncIndex: true })
+  await syncBlocksForPage(tx as never, {
+    pageId: 1,
+    content: 'a\n\nb',
+    pageLevel: 0,
+    now: 't1',
+    existing: await existingOf(db),
+    syncIndex: true,
+  })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 2)
-  await syncBlocksForPage(tx as never, { pageId: 1, content: '只有一段', pageLevel: 0, now: 't2', syncIndex: true })
+  // ★ 第二次保存必须传入**库里真实的块**（而不是 `[]`），否则旧块不会被复用也不会被删
+  await syncBlocksForPage(tx as never, {
+    pageId: 1,
+    content: '只有一段',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+    syncIndex: true,
+  })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
   // 索引同步收缩 —— 旧块的行必须在同一事务里删掉，否则会留下孤儿文本
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks_fts').get() as { n: number }).n, 1)
@@ -208,6 +243,7 @@ test('syncBlocksForPage：pageLevel=null（失败关闭）⇒ 全部块 tier 为
     content: '公开段。',
     pageLevel: null,
     now: 't',
+    existing: await existingOf(db),
     syncIndex: true,
   })
   const row = db.prepare('SELECT tier FROM blocks').get() as { tier: number | null }
@@ -397,4 +433,180 @@ test('源码级守卫：块与索引的写入必须成对（不得绕过唯一�
     [],
     '索引插入只允许 blocks.ts 的逐页同步与 search 的全量重建（后者从 blocks 派生）',
   )
+/* ------------------------------ 保守重解析（§4.2，P3b） ------------------------------ */
+
+/**
+ * 这一组钉的是**最容易静默出错**的一类行为：编辑之后"哪个块还是原来那个块"。
+ *
+ * 为什么必须有测试：块级授权钉在 `blocks.id` 上（`block_grants.block_id`），
+ * 而 id 是否跨编辑存活，**完全取决于写入路径怎么对齐**。对齐错了不会报错 ——
+ * 只会让"某段内容悄悄变成公开/私有"，或者让授权飘到另一段内容上。
+ */
+/** 给某块挂一行授权（`granted_by` 可空，故无需先建用户） */
+function addGrant(db: DatabaseSync, blockId: number, slug = 'p1', subjectId = '7'): void {
+  db.prepare(
+    `INSERT INTO block_grants (block_id, page_slug, subject_kind, subject_id, role, granted_at)
+     VALUES (?, ?, 'user', ?, 'viewer', '2026-01-01T00:00:00Z')`,
+  ).run(blockId, slug, subjectId)
+}
+
+function grantCount(db: DatabaseSync, blockId: number): number {
+  return Number(
+    (db.prepare('SELECT COUNT(*) AS n FROM block_grants WHERE block_id = ?').get(blockId) as { n: number }).n,
+  )
+}
+
+async function seedOne(db: DatabaseSync, content: string, pageLevel: 0 | 1 | null = 0) {
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content,
+    pageLevel,
+    now: 't1',
+    existing: await existingOf(db),
+  })
+}
+
+function ids(db: DatabaseSync): number[] {
+  return (db.prepare('SELECT id FROM blocks ORDER BY ordinal').all() as { id: number }[]).map((r) => Number(r.id))
+}
+
+function texts(db: DatabaseSync): string[] {
+  return (db.prepare('SELECT text FROM blocks ORDER BY ordinal').all() as { text: string }[]).map((r) => r.text)
+}
+
+test('保守重解析：纯文本编辑（块数不变）⇒ 块 id 全部保留', async () => {
+  const db = freshDb()
+  await seedOne(db, 'a\n\nb\n\nc')
+  const before = ids(db)
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: 'a改\n\nb改\n\nc改',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+  })
+  assert.deepEqual(ids(db), before, '块数不变时 id 必须原样保留（授权挂在 id 上）')
+  assert.deepEqual(texts(db), ['a改', 'b改', 'c改'])
+})
+
+test('保守重解析：在某块后插入新块 ⇒ 未改动的块 id 保留，新块拿到新 id', async () => {
+  const db = freshDb()
+  await seedOne(db, 'a\n\nb')
+  const before = ids(db)
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: 'a\n\n新插入的\n\nb',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+  })
+  const after = ids(db)
+  assert.equal(after.length, 3)
+  assert.ok(after.includes(before[0] as number), 'a 的 id 应保留')
+  assert.ok(after.includes(before[1] as number), 'b 的 id 应保留（后续块 ordinal 后移不影响身份）')
+  assert.equal(after.filter((x) => !before.includes(x)).length, 1, '只有新插入的那一块是新 id')
+  assert.deepEqual(texts(db), ['a', '新插入的', 'b'])
+})
+
+test('保守重解析：删除**未授权**的块 ⇒ 正常删除，其余 id 保留', async () => {
+  const db = freshDb()
+  await seedOne(db, 'a\n\nb\n\nc')
+  const before = ids(db)
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: 'a\n\nc',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+  })
+  const after = ids(db)
+  assert.deepEqual(after, [before[0], before[2]], '删掉中间那块，首尾 id 不变')
+  // 索引也要收缩（不能留下孤儿文本）
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks_fts').get() as { n: number }).n, 2)
+})
+
+test('保守重解析：合并两个**可见性不同**的块 ⇒ 409 block_merge_conflict', async () => {
+  const db = freshDb()
+  await seedOne(db, '公开段\n\n<!--gated:org-->\n内部段\n<!--/gated-->')
+  await assert.rejects(
+    syncBlocksForPage(txOf(db) as never, {
+      pageId: 1,
+      content: '合二为一',
+      pageLevel: 0,
+      now: 't2',
+      existing: await existingOf(db),
+    }),
+    (err: Error) => {
+      assert.match(err.message, /^block_merge_conflict:/)
+      return true
+    },
+    '合并不同可见性的块必须显式拒绝（静默合并 = 静默放宽/收紧）',
+  )
+  // 拒绝要发生在**任何写入之前**：库里那一页仍是两块
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 2)
+})
+
+test('保守重解析：合并两个**可见性相同**的块 ⇒ 允许（不牵连授权）', async () => {
+  const db = freshDb()
+  await seedOne(db, '甲\n\n乙')
+  const before = ids(db)
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: '甲乙合并',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+  })
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
+  assert.deepEqual(ids(db), [before[0]], '合并保留首块的 id')
+})
+
+test('保守重解析：拆分一个**已授权**的块 ⇒ 两块都继承授权（安全方向）', async () => {
+  const db = freshDb()
+  await seedOne(db, '<!--gated:granted-->\n运维备注\n<!--/gated-->')
+  const before = ids(db)
+  assert.equal(before.length, 1)
+  addGrant(db, before[0] as number)
+  assert.equal(grantCount(db, before[0] as number), 1)
+
+  // 把这一段拆成两段（同属 granted 区段）⇒ 1 个旧块 → 2 个新块
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: '<!--gated:granted-->\n运维备注之一\n\n运维备注之二\n<!--/gated-->',
+    pageLevel: 1,
+    now: 't2',
+    existing: await existingOf(db),
+  })
+  const after = ids(db)
+  assert.equal(after.length, 2, '拆成两块')
+  for (const id of after) {
+    assert.equal(grantCount(db, id), 1, `拆分后每块都应带一份授权（块 ${id}）`)
+  }
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM block_grants').get() as { n: number }).n, 2)
+})
+
+test('保守重解析：删除一个**已授权**的块 ⇒ 409 block_grant_orphan，且不落任何写入', async () => {
+  const db = freshDb()
+  await seedOne(db, '保留段\n\n<!--gated:granted-->\n运维备注\n<!--/gated-->')
+  const before = ids(db)
+  assert.equal(before.length, 2)
+  addGrant(db, before[1] as number) // 给第二块（granted 档）挂授权
+
+  await assert.rejects(
+    syncBlocksForPage(txOf(db) as never, {
+      pageId: 1,
+      content: '保留段', // 把已授权的那块删掉
+      pageLevel: 1,
+      now: 't2',
+      existing: await existingOf(db),
+    }),
+    (err: Error) => {
+      assert.match(err.message, /^block_grant_orphan:/)
+      return true
+    },
+    '删除已授权块必须显式拒绝（静默删除会连授权一起被 CASCADE 清掉，且不留痕迹）',
+  )
+  // 关键：拒绝发生在任何写入之前 —— 两块与授权都原样还在
+  assert.deepEqual(ids(db), before)
+  assert.equal(grantCount(db, before[1] as number), 1)
 })

@@ -33,11 +33,14 @@ import {
 import { extractLinkTargets } from './links.js'
 import {
   BlockParseError,
+  BlockSyncError,
   parseBlocks,
   projectBlocks,
+  readExistingBlocks,
   sha256Hex,
   syncBlocksForPage,
   tierFor,
+  type BlockReader,
   type BlockTier,
   type BlockVisibility,
   type ParsedBlock,
@@ -926,6 +929,12 @@ export const WikiPlugin = {
                   content: r.content,
                   pageLevel,
                   now,
+                  /*
+                   * 回填的选中条件就是"这一页**还没有任何块行**"（`NOT EXISTS (SELECT 1
+                   * FROM blocks …)`），故已有块必然是空的 —— 传 `[]` 是**由判据保证**的，
+                   * 不是"图省事省略"。
+                   */
+                  existing: [],
                   syncIndex: blocksIndexSupported,
                 })
                 // `content_hash` 由调用方一并维护（syncBlocksForPage 只管块与索引）——
@@ -1010,6 +1019,12 @@ export const WikiPlugin = {
             content: input.content,
             pageLevel: level,
             now,
+            /*
+             * 新建分支：这一行刚插进去，库里不可能有它的块。
+             * 传 `[]` 而不是省略 —— `existing` 是**必填**参数，正是为了让"没考虑
+             * 已有块"这件事在编译期就暴露，而不是运行期静默走删光重建（丢授权）。
+             */
+            existing: [],
             syncIndex: blocksIndexSupported,
           })
           await rebuildLinks(tx, slug, input.content)
@@ -1039,6 +1054,12 @@ export const WikiPlugin = {
           content: input.content,
           pageLevel: await pageLevelOf(slug),
           now,
+          /*
+           * ★ P3b：**必须读已有块**（含每块的授权计数），否则保守重解析无从谈起，
+           * 只能退化成"删光重建"⇒ `block_grants` 被外键 CASCADE 静默清空。
+           * 走 `tx` 而不是 `adb`：同一事务、同一连接，读到的就是这次保存将要改的那一份。
+           */
+          existing: await readExistingBlocks(tx as unknown as BlockReader, existing.id),
           syncIndex: blocksIndexSupported,
         })
         // 出链随正文重建（同一事务内，故正文与索引不会不一致）
@@ -1282,6 +1303,18 @@ export const WikiPlugin = {
            */
           if (err instanceof BlockParseError) {
             h.json(400, { ok: false, error: err.code, message: err.message })
+            return
+          }
+          /*
+           * ★ P3b：保守重解析的冲突 ⇒ **409**（不是 400，也不是 500）。
+           *
+           * 语义是"请求本身没错，但与资源的当前状态冲突"：作者想删/合并一个**已有块级
+           * 授权的块**，而那会静默丢掉授权（§4.2）。解决办法是用户先去撤销授权再改 ——
+           * 所以是"冲突"而非"请求非法"。两个错误码：`block_merge_conflict` /
+           * `block_grant_orphan`。
+           */
+          if (err instanceof BlockSyncError) {
+            h.json(409, { ok: false, error: err.code, message: err.message })
             return
           }
           throw err
