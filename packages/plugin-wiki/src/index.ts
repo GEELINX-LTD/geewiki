@@ -31,6 +31,7 @@ import {
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
+import { sha256Hex, syncBlocksForPage, type PageLevel } from './blocks.js'
 
 /**
  * `policy-service` 的**最小结构需求**（结构化类型，刻意不 import `@geewiki/authz`）。
@@ -44,6 +45,18 @@ interface PolicyServiceLike {
   resolvePage(principal: Principal, slug: string): Promise<PageAccessLike>
   resolvePages(principal: Principal, slugs: readonly string[]): Promise<Map<string, PageAccessLike>>
   visibleSlugs(principal: Principal, q?: { prefix?: string; levels?: readonly string[] }): Promise<string[]>
+  /**
+   * 页面的**有效检索等级**（与主体无关）—— 块级索引 `blocks.tier` 的输入（§4.3）。
+   *
+   * **可选**：P3a 之前的策略实现没有这个方法。缺它时**按 `null` 处理**（失败关闭：
+   * 该页的块不进等级索引 ⇒ 搜不到，而不是"按页面自身档位猜一个更宽的等级"）。
+   * 后者才是危险的 —— 页面自身 `public` 但祖先把它收紧成 org 时，"猜"会**泄漏**。
+   * 漏算由 `GET /api/admin/search/verify` 的 `tier IS NULL` 计数探针兜住。
+   */
+  effectiveIndexLevel?(
+    slug: string,
+    self?: { visibility: string; inherit: number | boolean; published_at: string | null },
+  ): Promise<0 | 1 | null>
 }
 
 interface PageAccessLike {
@@ -482,6 +495,39 @@ export const WikiPlugin = {
       return svc
     }
 
+    /**
+     * 页面的**有效检索等级** —— `blocks.tier` 的输入（§4.3）。
+     *
+     * **失败关闭**：策略层不可用、没实现该方法、或它抛错 ⇒ 一律 `null`。
+     * `null` 写进 `blocks.tier` 的后果是"该块不被等级分支命中"（搜不到），
+     * 而不是"按页面自身档位猜一个更宽的等级" —— 后者在"页面自身 public 但祖先把它
+     * 收紧成 org" 时会**泄漏**。漏算由 `/api/admin/search/verify` 的
+     * `tier IS NULL` 计数探针报警。
+     *
+     * `self` 只用于**新建**条目：那一行还在本事务里没提交，而策略层走另一条连接
+     * （PG 下看不到），不传就会被误判成"页面不存在"。更新分支不需要它 ——
+     * `savePage` 只改 title/content/updated_at，不碰任何可见性列。
+     */
+    const pageLevelOf = async (
+      slug: string,
+      self?: { visibility: string; inherit: number | boolean; published_at: string | null },
+    ): Promise<PageLevel> => {
+      const svc = ctx.get('policy-service') as PolicyServiceLike | undefined
+      if (!svc?.effectiveIndexLevel) {
+        console.warn(
+          '[@geewiki/wiki] policy-service 未提供 effectiveIndexLevel —— 该页的块按 tier=NULL 写入' +
+            '（不进等级索引 = 搜不到；失败关闭方向，由 /api/admin/search/verify 报警）',
+        )
+        return null
+      }
+      try {
+        return await svc.effectiveIndexLevel(slug, self)
+      } catch (err) {
+        console.warn('[@geewiki/wiki] effectiveIndexLevel 调用失败，按 null（失败关闭）处理:', err)
+        return null
+      }
+    }
+
     const listPages = async (principal: Principal): Promise<WikiPageSummary[]> => {
       // 先拿"这个主体看得见的集合"，再用它过滤 —— 过滤发生在**服务端**，
       // 且复用策略层的唯一出口（不自己写第二套可见性规则）
@@ -678,11 +724,30 @@ export const WikiPlugin = {
            * 若这里图省事省略该列，新建的页面会默认为私有，与用户预期相反；
            * 而若把 DDL 默认改成 'org'，则导入脚本/第三方插件的插入路径会意外公开内容。
            */
-          await tx.run(
-            `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, acl_revision)
-             VALUES (?, ?, ?, ?, ?, 'org', 1, 0)`,
-            [slug, input.title, input.content, now, now],
+          const ins = await tx.run(
+            `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, acl_revision, content_hash)
+             VALUES (?, ?, ?, ?, ?, 'org', 1, 0, ?)`,
+            [slug, input.title, input.content, now, now, sha256Hex(input.content)],
           )
+          const pageId = Number(ins.lastInsertRowid)
+          /*
+           * ★ P3a：块与块索引的**唯一写入路径**（§9 R12），与 pages 行**同事务**。
+           *
+           * `self` 是必需的：这一行还在本事务里没提交，而策略层走另一条连接读 pages
+           * （PG 下看不到未提交的行），不传就会被误判成"页面不存在" ⇒ tier 全是 NULL。
+           * 传进去的正是刚写下的那一行的可见性三列。
+           */
+          const level = await pageLevelOf(slug, {
+            visibility: 'org',
+            inherit: 1,
+            published_at: null,
+          })
+          await syncBlocksForPage(tx as unknown as Parameters<typeof syncBlocksForPage>[0], {
+            pageId,
+            content: input.content,
+            pageLevel: level,
+            now,
+          })
           await rebuildLinks(tx, slug, input.content)
           return 'created'
         }
@@ -694,12 +759,23 @@ export const WikiPlugin = {
           existing.content,
           now,
         ])
-        await tx.run('UPDATE pages SET title = ?, content = ?, updated_at = ? WHERE id = ?', [
+        await tx.run('UPDATE pages SET title = ?, content = ?, updated_at = ?, content_hash = ? WHERE id = ?', [
           input.title,
           input.content,
           now,
+          sha256Hex(input.content),
           existing.id,
         ])
+        /*
+         * ★ P3a：块与块索引随正文重建（**同一事务**，故正文/块/索引三者不会不一致）。
+         * 本分支不传 `self`：可见性三列没被改，库里已提交的那一行就是准确的。
+         */
+        await syncBlocksForPage(tx as unknown as Parameters<typeof syncBlocksForPage>[0], {
+          pageId: existing.id,
+          content: input.content,
+          pageLevel: await pageLevelOf(slug),
+          now,
+        })
         // 出链随正文重建（同一事务内，故正文与索引不会不一致）
         await rebuildLinks(tx, slug, input.content)
         return 'updated'
@@ -729,6 +805,14 @@ export const WikiPlugin = {
         const page = (await tx.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
         if (!page) return false
         await tx.run('DELETE FROM page_versions WHERE page_id = ?', [page.id])
+        /*
+         * ★ P3a：`blocks_fts` **必须手工清** —— `blocks` 行会被下面的 FK CASCADE 带走，
+         * 但 contentless FTS 表**没有触发器**（tier 重算不是纯 SQL 能表达的，见
+         * 0002_blocks_fts.sql 的说明）⇒ 不清就会留下孤儿索引行。
+         * 检索查询会 JOIN `blocks`，所以孤儿行不会产出命中，但会**留着正文文本**，
+         * 并让 `/api/admin/search/verify` 的 `extra` 计数非零。先删索引再删页。
+         */
+        await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [page.id])
         await tx.run('DELETE FROM pages WHERE id = ?', [page.id])
         await tx.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
         return true

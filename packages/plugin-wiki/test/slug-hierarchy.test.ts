@@ -68,13 +68,22 @@ const MEMBER: Principal = {
 }
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
+/**
+ * ★ P3a：`savePage` 会在同一事务里双写 `blocks` 与 `blocks_fts`，所以夹具也要建出块索引。
+ * 它归 `@geewiki/search` 的迁移目录（FTS5 是 SQLite 专有，没有 PG 孪生文件）——
+ * 与 db 目录分开列，保持"哪份迁移归哪个插件"的可读性。
+ */
+const SEARCH_MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'plugin-search', 'migrations')
 
 /** 按文件名序读出全部真实迁移 SQL（与 `db.migrate()` 的 `readdirSync().sort()` 同序） */
 function readAllMigrations(): { name: string; sql: string }[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith('.sql'))
-    .sort()
-    .map((name) => ({ name, sql: readFileSync(join(MIGRATIONS_DIR, name), 'utf8') }))
+  const read = (dir: string): { name: string; sql: string }[] =>
+    readdirSync(dir)
+      .filter((f) => f.endsWith('.sql'))
+      .sort()
+      .map((name) => ({ name, sql: readFileSync(join(dir, name), 'utf8') }))
+  // 块表在 db 目录、块索引在 search 目录 —— 两者都要建，否则保存用例会 `no such table: blocks_fts`
+  return [...read(MIGRATIONS_DIR), ...read(SEARCH_MIGRATIONS_DIR)]
 }
 
 /** `node:sqlite` 上的 DatabaseAdapter：只做同步转发，不含业务逻辑 */

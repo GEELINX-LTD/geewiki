@@ -60,6 +60,28 @@ const INIT_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 
 /** `page_grants.granted_by` 有 `REFERENCES users(id)`，故 0010 必须一并加载 */
 const IDENTITY_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0010_identity.sql')
 const ACL_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0012_page_acl.sql')
+/**
+ * ★ P3a：`savePage` 现在会在**同一事务里**双写 `blocks` 与 `blocks_fts`（`syncBlocksForPage`），
+ * 所以夹具必须把这两张表也建出来 —— 否则每个保存用例都会以 `no such table: blocks_fts` 挂掉。
+ * 与 P1 合并时那次夹具缺口是同一类：**新迁移落地后，既有插件的测试夹具要同步**。
+ */
+const BLOCKS_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0015_blocks.sql')
+const BLOCKS_FTS_SQL_PATH = join(
+  import.meta.dirname,
+  '..',
+  '..',
+  'plugin-search',
+  'migrations',
+  '0002_blocks_fts.sql',
+)
+/** 夹具要建的全部 schema：顺序即依赖顺序（blocks 建在 pages 之后） */
+const SCHEMA_SQL_PATHS = [
+  INIT_SQL_PATH,
+  IDENTITY_SQL_PATH,
+  ACL_SQL_PATH,
+  BLOCKS_SQL_PATH,
+  BLOCKS_FTS_SQL_PATH,
+] as const
 
 /**
  * `node:sqlite`（Node 内置）上的 DatabaseAdapter 实现。
@@ -82,9 +104,7 @@ class NodeSqliteAdapter implements DatabaseAdapter {
     )`)
     const seed = this.db.prepare(`INSERT OR IGNORE INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`)
     // 只登记本夹具实际执行过的脚本
-    seed.run(basename(INIT_SQL_PATH), new Date().toISOString())
-    seed.run(basename(IDENTITY_SQL_PATH), new Date().toISOString())
-    seed.run(basename(ACL_SQL_PATH), new Date().toISOString())
+    for (const p of SCHEMA_SQL_PATHS) seed.run(basename(p), new Date().toISOString())
   }
 
   query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
@@ -182,9 +202,7 @@ async function makeHarness(
   const adapter = new NodeSqliteAdapter(
     join(dir, 'test.db'),
     [
-      readFileSync(INIT_SQL_PATH, 'utf8'),
-      readFileSync(IDENTITY_SQL_PATH, 'utf8'),
-      readFileSync(ACL_SQL_PATH, 'utf8'),
+      ...SCHEMA_SQL_PATHS.map((p) => readFileSync(p, "utf8")),
     ].join('\n'),
   )
 
@@ -562,9 +580,7 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
   const adapter = new NodeSqliteAdapter(
     join(dir, 'test.db'),
     [
-      readFileSync(INIT_SQL_PATH, 'utf8'),
-      readFileSync(IDENTITY_SQL_PATH, 'utf8'),
-      readFileSync(ACL_SQL_PATH, 'utf8'),
+      ...SCHEMA_SQL_PATHS.map((p) => readFileSync(p, "utf8")),
     ].join('\n'),
   )
   try {

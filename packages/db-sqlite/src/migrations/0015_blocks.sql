@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS blocks (
   --    取值域严格是 { 0 = anon, 1 = org }；**`granted` 档写 NULL**（它不属于任何读者等级，
   --    是逐块 ACL，只能靠检索时的"授权分支"命中，见 §4.3）。
   --
-  --    **为什么内联在这里、而不是像 §3.6 那样另起一条 `ALTER TABLE blocks ADD COLUMN tier`**：
-  --    `blocks` 是本文件**新建**的表，SQLite 没有 `ADD COLUMN IF NOT EXISTS` ⇒ 写成
+  --    **为什么内联在这里、而不是像 §3.6 那样另起一条独立的加列语句**：
+  --    `blocks` 是本文件**新建**的表，SQLite 没有"加列时若已存在则跳过"的语法 ⇒ 写成
   --    独立的 ALTER，本文件就**无法重放**（第二次跑 CREATE TABLE IF NOT EXISTS 跳过建表、
   --    ALTER 却抛 duplicate column name）。P2 在 0012 上已经踩过并把这个限制用守卫测试
   --    钉死（见 packages/db-sqlite/test 的迁移幂等用例），这里不该重蹈。

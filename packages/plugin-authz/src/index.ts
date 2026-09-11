@@ -88,6 +88,17 @@ export interface PolicyService {
   resolvePages(p: Principal, slugs: readonly string[]): Promise<Map<string, PageAccess>>
   /** **唯一允许被 list / search / backlinks / RAG / portal / sitemap 复用的出口** */
   visibleSlugs(p: Principal, q?: VisibleQuery): Promise<string[]>
+  /**
+   * 页面的**有效检索等级** —— **与主体无关**（检索索引是全体共用的，不能按人算）。
+   *
+   * 返回 `0`（匿名可见）/ `1`（组织内可见）/ `null`（没有任何等级能看）。
+   * 供块级索引的 `blocks.tier` 计算使用（设计文档 §4.3）。
+   *
+   * `self` 用于**页面行尚未提交**的场景（新建条目时，写入方在自己的事务里刚 INSERT，
+   * 而本方法走的是另一条连接 —— PG 下看不到未提交的行，会误判成"页面不存在"）。
+   * 传入后它**只覆盖该 slug 自身那一行**，祖先链仍按库里的真实状态算。
+   */
+  effectiveIndexLevel(slug: string, self?: PageVisRow): Promise<0 | 1 | null>
 }
 
 /* ============================== 档位序 ============================== */
@@ -389,6 +400,46 @@ export const AuthzPlugin = {
         )
         if (overrode) auditOverride(p, slug)
         return access
+      },
+
+      /**
+       * 页面的有效检索等级（与主体无关）—— 供块级索引的 `blocks.tier` 计算使用。
+       *
+       * **与 {@link buildAccess} 的判定同源**：同一条 `effectiveRank`（含祖先交集与
+       * `inherit=false` 截链）+ 同一个发布闸门，只是把"某个主体能不能看"换成
+       * "哪个读者等级能看"。这样索引里的等级与判定的结论不会各自漂移。
+       *
+       *   - `rank === RANK_ORG`    ⇒ `1`（组织成员可见；**组织内可见不要求发布**，
+       *                              理由见 buildAccess 里那段：D8 把存量条目回填成 org
+       *                              而 published_at 保持 NULL，若要求发布则升级当天全站
+       *                              条目对组织成员也不可见）
+       *   - `rank === RANK_PUBLIC` ⇒ 已发布 ? `0` : `null`
+       *                              （**发布闸门只约束 public 档** ⇒ 未发布的 public 页面
+       *                               没有任何等级能看 ⇒ null，匿名搜索不得命中）
+       *   - 其余（`RANK_PRIVATE` / 未知取值 / 页面不存在）⇒ `null`
+       *
+       * **失败关闭**：算不出来一律 `null`。写进 `blocks.tier` 的后果是"该块不被等级分支
+       * 命中"（搜不到），而不是"被所有人搜到"。这条取舍由 `tier IS NULL` 计数探针兜住
+       * （见 GET /api/admin/search/verify）。
+       */
+      async effectiveIndexLevel(slug: string, self?: PageVisRow): Promise<0 | 1 | null> {
+        const index = await loadVisibilityIndex()
+        if (self) {
+          // 只覆盖自身那一行（调用方刚 INSERT、还没提交，另一条连接看不到）。
+          // 祖先链仍按库里的真实状态算 —— 覆盖整条链就等于让调用方自己发明规则。
+          index.set(slug, {
+            slug,
+            visibility: self.visibility,
+            inherit: self.inherit === true || Number(self.inherit) === 1 ? 1 : 0,
+            published_at: self.published_at ?? null,
+          })
+        }
+        const row = index.get(slug)
+        if (!row) return null
+        const rank = effectiveRank(slug, index)
+        if (rank === RANK_ORG) return 1
+        if (rank === RANK_PUBLIC) return row.published_at !== null ? 0 : null
+        return null
       },
 
       async resolvePages(rawP, slugs) {
