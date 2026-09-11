@@ -145,8 +145,10 @@ interface PolicyServiceLike {
    * **为什么不在这里自己查 `block_grants`**：那会在检索插件里造出**第二套授权判定**，
    * 与 `policy-service` 的单点判定漂移。授权规则只有一处真源，本插件只消费它的结果。
    *
-   * **P3b 之前没有块级授权表** ⇒ 现返回空数组；SQL 侧用 `IN (NULL)` 保持"恒不成立"
-   * 且语法合法，无需为空列表拼 `IN ()`。
+   * **返回空集合是正常情形**（没有任何块被单独授权），SQL 侧由 `visibilityPredicates`
+   * 处理：空集合时用**字面量 `0`（恒假）/ `1`（恒真）**，**不是** `IN (NULL)` ——
+   * `x NOT IN (NULL)` 与 `x IN (NULL)` 一样恒为 `NULL`（不是 `FALSE`），在 `WHERE` 里不成立，
+   * 会让"受限块计数"恒为 0、探针与 `gatedCount` 双双失真。详见该函数的注释。
    */
   grantedBlockIds(principal: Principal): Promise<readonly number[]>
 }
