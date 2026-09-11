@@ -716,3 +716,41 @@ test('fixture 前置：本文件读的是真实迁移文件（防止 DDL 漂移�
     assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS'), `${basename(name)} 应是建表迁移`)
   }
 })
+
+/* --------------- 10. user_identities 的唯一约束（§8.2 P1-8） --------------- */
+
+test('user_identities：(issuer,sub) 重复插入报错；email 上**刻意没有**唯一约束', async () => {
+  const h = await makeHarness()
+  try {
+    const setup = await h.call('POST', '/api/auth/setup', { body: { email: 'a@b.co', password: GOOD_PASSWORD } })
+    const userId = Number((setup.body.user as { id: number }).id)
+    const now = new Date().toISOString()
+
+    h.adapter.run(
+      `INSERT INTO user_identities (user_id, issuer, subject, email_at_link, linked_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId, 'https://idp.example', 'sub-1', 'a@b.co', now],
+    )
+    // 同一 (issuer, sub) 再插一次必须被数据库挡住 —— 这是"一个外部身份只能绑一个本地用户"
+    // 的唯一保证，靠应用层判断会有并发窗口
+    assert.throws(
+      () =>
+        h.adapter.run(
+          `INSERT INTO user_identities (user_id, issuer, subject, email_at_link, linked_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [userId, 'https://idp.example', 'sub-1', 'other@b.co', now],
+        ),
+      /UNIQUE/i,
+      '重复的 (issuer, sub) 必须报唯一约束错误',
+    )
+    // 同一 issuer 下不同 sub 可以有相同 email（唯一性只由 (issuer,sub) 保证）
+    h.adapter.run(
+      `INSERT INTO user_identities (user_id, issuer, subject, email_at_link, linked_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId, 'https://idp.example', 'sub-2', 'a@b.co', now],
+    )
+    assert.equal(h.q('SELECT id FROM user_identities').length, 2)
+  } finally {
+    h.dispose()
+  }
+})
