@@ -32,8 +32,16 @@ import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
-import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
+import type {
+  DatabaseAdapter,
+  HttpRouterService,
+  Principal,
+  RouteHandler,
+  RouteHandlerContext,
+  RunResult,
+} from '@geewiki/core'
 import { MIGRATION_TABLE } from '@geewiki/core'
+import { AuthzPlugin } from '@geewiki/authz'
 import {
   SLUG_HINT,
   SLUG_MAX_DEPTH,
@@ -46,6 +54,19 @@ import {
 /* ------------------------------ 夹具 ------------------------------ */
 
 /** db-sqlite 的真实迁移目录（0001 建表、0002 建排序索引） */
+/**
+ * 夹具主体：**已登录的组织成员**。新建条目一律写 `visibility='org'`，匿名看不到它，
+ * 用成员主体才能让"建完再读"的往返成立。
+ */
+const MEMBER: Principal = {
+  kind: 'user',
+  userId: 1,
+  orgId: 1,
+  orgRole: 'member',
+  groupIds: [],
+  sessionId: null,
+}
+
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
 
 /** 按文件名序读出全部真实迁移 SQL（与 `db.migrate()` 的 `readdirSync().sort()` 同序） */
@@ -178,7 +199,14 @@ async function makeHarness(): Promise<Harness> {
       }
     },
   } as unknown as Context
-  const dispose = (await WikiPlugin.apply(ctx, { recentVersions: 10 })) as () => void
+  // ★ P2：wiki 的读路径要向 policy-service 要判定，故夹具装**真实的**策略层
+  // （不造假替身 —— 那会把"权限真的接线了没有"一并测掉）
+  const disposeAuthz = (await (AuthzPlugin.apply as (c: Context) => Promise<unknown>)(ctx)) as () => void
+  const disposeWiki = (await WikiPlugin.apply(ctx, { recentVersions: 10 })) as () => void
+  const dispose = (): void => {
+    disposeWiki()
+    disposeAuthz()
+  }
 
   const call = (
     method: string,
@@ -198,6 +226,8 @@ async function makeHarness(): Promise<Harness> {
         res: { once: () => {} } as unknown as ServerResponse,
         url: new URL(`http://localhost${path}`),
         params,
+        // 生产里由 auth 的钩子填充；本夹具手工驱动处理器（不跑钩子），故显式给一个成员主体
+        principal: MEMBER,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)
@@ -430,9 +460,38 @@ test('0002 迁移：建出排序索引、可重复执行（幂等）、且与查
       `迁移目录应含 0002，实际 ${JSON.stringify(migrations.map((m) => m.name))}`,
     )
 
-    // 逐文件执行（与 db.migrate() 同序）；0002 的 IF NOT EXISTS 允许重放
+    // 逐文件执行（与 db.migrate() 同序）。
+    //
+    // ★ 重放保证分两类，**分开断言而不是一律跳过**（P2 给 pages 加列时引入）：
+    //
+    //   - 只含 `CREATE ... IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` 的文件，
+    //     重放必须**不抛错**（原有的强断言，逐字保留）。
+    //   - 含 `ALTER TABLE ... ADD COLUMN` 的文件**在 SQLite 上无法重放** ——
+    //     SQLite 没有 `ADD COLUMN IF NOT EXISTS`，纯 SQL 表达不出"列不存在才加"。
+    //     这不是疏忽，而是方言的能力边界：0010 当初把新列内联进新建表的
+    //     CREATE TABLE 从而绕开了它，而 0012 给**既有表** pages 加列绕不开。
+    //     生产幂等性由 `_migrations` 控制器提供（已应用的文件不再执行），
+    //     所以这里**把这个限制钉死**：第一次必须成功，第二次必须抛
+    //     `duplicate column name` —— 哪天有人误以为它能重放，这条断言会红。
+    const isReplayable = (sql: string) => !/\bADD\s+COLUMN\b/i.test(sql)
     for (const m of migrations) db.exec(m.sql)
-    for (const m of migrations) db.exec(m.sql) // 重放：不得抛错
+
+    for (const m of migrations.filter((x) => isReplayable(x.sql))) {
+      db.exec(m.sql) // 重放：不得抛错
+    }
+
+    const notReplayable = migrations.filter((x) => !isReplayable(x.sql))
+    assert.ok(
+      notReplayable.length > 0,
+      'P2 起应存在含 ADD COLUMN 的迁移（0012_page_acl.sql）；若为空说明这条断言失去了对象',
+    )
+    for (const m of notReplayable) {
+      assert.throws(
+        () => db.exec(m.sql),
+        /duplicate column name/i,
+        `${m.name} 含 ALTER TABLE ADD COLUMN，在 SQLite 上**应当**无法重放（已知方言边界，非缺陷）`,
+      )
+    }
 
     const indexes = db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pages'`)

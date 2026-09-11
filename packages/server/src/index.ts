@@ -47,11 +47,13 @@ import {
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
 import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
 import { AuthPlugin, manifest as authManifest } from '@geewiki/auth'
+import { AuthzPlugin, manifest as authzManifest } from '@geewiki/authz'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
 import { OidcPlugin, manifest as oidcManifest } from '@geewiki/oidc'
 import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
+import { OrgPlugin, manifest as orgManifest } from '@geewiki/org'
 import { SEARCH_MIGRATIONS_DIR, SearchPlugin, manifest as searchManifest } from '@geewiki/search'
 import { POSTGRES_MIGRATIONS_DIR, PostgresPlugin, manifest as postgresManifest } from '@geewiki/postgres'
 import { WikiPlugin, WIKI_MIGRATIONS_DIR, manifest as wikiManifest } from '@geewiki/wiki'
@@ -1352,6 +1354,17 @@ export function defaultRegistry(
     // runtime.supportsHotReload=false：热卸载会让所有会话的解析通道瞬间消失，
     // 而"谁登录了"没有安全的即时降级方式。
     { name: '@geewiki/auth', manifest: authManifest as GeeWikiManifest, module: AuthPlugin, source: 'builtin' },
+    // 组织与团队（P2）：提供 org-service。
+    // **默认启用**（写进 config/plugins.base.json）—— 与 auth 同理：`orgRole` 的存储
+    // 就是 0011 迁移建的 `org_members`；不启用则所有主体的 orgRole 恒为 null（= guest），
+    // 于是 `access:'admin'` 的端点在浏览器里永久不可用，条目可见性也没有"组织内"这一档。
+    // **无自带迁移**：org_* 表由 db 插件的 0011 建立（核心基础设施，不属于业务插件）。
+    // runtime.supportsHotReload=false：热卸载会让"谁是 owner"瞬间无人可答。
+    { name: '@geewiki/org', manifest: orgManifest as GeeWikiManifest, module: OrgPlugin, source: 'builtin' },
+    // 授权策略（P2）：提供 policy-service，是**可见性判定的唯一真源**。
+    // 默认启用 —— 不启用则所有读路径拿不到策略服务（消费方必须显式失败而不是放行）。
+    // runtime.supportsHotReload=true：策略层不持有状态，卸载后消费方在 ctx.get 处显式失败。
+    { name: '@geewiki/authz', manifest: authzManifest as GeeWikiManifest, module: AuthzPlugin, source: 'builtin' },
     { name: '@geewiki/echo', manifest: echoManifest as GeeWikiManifest, module: EchoPlugin, source: 'builtin' },
     // 纯文本编辑器：`editor` 插槽的第一个真实消费者（证明"插件可替换编辑器"这条扩展点可用）。
     // **只登记、不写进基础清单**——它替换的是默认编辑器，是否替换应由使用者显式决定；

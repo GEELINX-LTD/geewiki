@@ -47,9 +47,12 @@ const MIGRATION_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 
 
 /**
  * 本插件依赖的**真实迁移文件**（属 db 插件，不是本插件自带）。
- * `0010` 建 users/sessions/...，`0013` 建 audit_log 与 acl_revision。
+ * `0010` 建 users/sessions/...，`0011` 建 org_members/group_members
+ * （P2 起本插件的 `resolveOrgRole` / `resolveGroupIds` 要读这两张表，
+ * 不加载它会在每个用例上炸出 `no such table: org_members`），
+ * `0013` 建 audit_log 与 acl_revision。
  */
-const AUTH_MIGRATIONS = ['0010_identity.sql', '0013_audit.sql']
+const AUTH_MIGRATIONS = ['0010_identity.sql', '0011_org_team.sql', '0013_audit.sql']
 
 function loadSchema(): string {
   return AUTH_MIGRATIONS.map((f) => readFileSync(join(MIGRATION_DIR, f), 'utf8')).join('\n')

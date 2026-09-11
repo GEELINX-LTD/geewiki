@@ -86,6 +86,42 @@ test('topologicalOrder：检测依赖环并给出环路径', () => {
   assert.throws(() => topologicalOrder(registry, ['@gw/cycle-a', '@gw/cycle-b']), /依赖环检测/)
 })
 
+test('★ 回归：同名服务有多个 provider 时，排序必须认「已启用的那一个」', () => {
+  /*
+   * 这是真实事故的缩影（P2 在 PostgreSQL 上验收时炸出来）：
+   * `@geewiki/db-sqlite` 与 `@geewiki/postgres` **都**提供 `database-provider`，
+   * 前者在 registry 里排在前但部署时并未启用。旧实现用 `registry.find()` 取"第一个
+   * 注册的"，于是 `directDependencies` 把 `database-provider` 解析成**未启用的
+   * db-sqlite**，`present.has(dep)` 为假 ⇒ 依赖方与数据库之间**排序约束整条消失**，
+   * 退化成按字母序激活。名字排在 `postgres` 之前的 `@geewiki/auth` 于是先于数据库
+   * 激活，`ctx.get('db')` 拿到 undefined，只留下一句含糊的"数据库服务不可用"。
+   * （`@geewiki/wiki` 因为 w 在 p 之后而侥幸躲过。）
+   */
+  const reg: RegisteredPlugin[] = [
+    plugin('@gw/sqlite', { geewiki: { provides: 'database-provider', conflictGroup: 'database-provider' } }),
+    plugin('@gw/pg', { geewiki: { provides: 'database-provider', conflictGroup: 'database-provider' } }),
+    plugin('@gw/http', { geewiki: { provides: 'http-service' } }),
+    // 名字按字母序**排在 @gw/pg 之前** —— 正是当初炸掉 @geewiki/auth 的位置
+    plugin('@gw/auth', { geewiki: { requires: ['database-provider', 'http-service'] } }),
+  ]
+  const enabled = ['@gw/http', '@gw/pg', '@gw/auth'] // 注意：@gw/sqlite **未启用**
+  const prefer = new Set(enabled)
+
+  // 解析层：带 prefer 时选启用的那个；不带 prefer 时保持旧行为（单 provider 场景逐字不变）
+  assert.equal(resolveDependency(reg, 'database-provider', prefer)?.name, '@gw/pg')
+  assert.equal(resolveDependency(reg, 'database-provider')?.name, '@gw/sqlite')
+  assert.deepEqual(directDependencies(reg, '@gw/auth', prefer), ['@gw/pg', '@gw/http'])
+
+  // 排序层：启用的 provider 必须先于依赖它的插件
+  const order = topologicalOrder(reg, enabled)
+  const pos = (n: string): number => order.indexOf(n)
+  assert.ok(
+    pos('@gw/pg') < pos('@gw/auth'),
+    `启用的 provider 必须先于依赖方，实际顺序 ${JSON.stringify(order)}`,
+  )
+  assert.ok(pos('@gw/http') < pos('@gw/auth'), `http 应先于 auth，实际 ${JSON.stringify(order)}`)
+})
+
 test('collectDependents：反向依赖（卸载拦截依据）', () => {
   const active = new Set(['@gw/db', '@gw/http', '@gw/wiki', '@gw/editor-hot'])
   assert.deepEqual(collectDependents(registry, active, '@gw/db'), ['@gw/wiki'])

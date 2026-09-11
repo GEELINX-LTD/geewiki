@@ -1,9 +1,25 @@
 {
   "enabled": [
-    { "name": "@geewiki/db-sqlite" },
-    { "name": "@geewiki/http" },
-    { "name": "@geewiki/auth" },
-    { "name": "@geewiki/wiki" },
-    { "name": "@geewiki/search" }
+    {
+      "name": "@geewiki/db-sqlite"
+    },
+    {
+      "name": "@geewiki/http"
+    },
+    {
+      "name": "@geewiki/auth"
+    },
+    {
+      "name": "@geewiki/org"
+    },
+    {
+      "name": "@geewiki/authz"
+    },
+    {
+      "name": "@geewiki/wiki"
+    },
+    {
+      "name": "@geewiki/search"
+    }
   ]
 }

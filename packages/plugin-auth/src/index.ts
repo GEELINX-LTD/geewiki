@@ -155,10 +155,9 @@ export interface AuthUser {
   displayName: string
   orgId: number
   /**
-   * 组织角色。**P1 恒为 `null`** —— 角色的存储（`org_members` 表）属 P2，
-   * 而凭空造第二个角色来源会制造"同一个事实两处存储"的漂移风险。
-   * 后果：`access:'admin'` 的端点（插件管理台）在 P2 之前只有应急通道能过，
-   * 详见本文件末尾 `resolveOrgRole` 的说明。
+   * 组织角色，**唯一来源是 `org_members` 表**（见 `resolveOrgRole`）。
+   * `null` = guest（**没有**组织角色，不是最低档角色）—— 设计文档 §2.1。
+   * 它**只用于能力判定**，不参与"能看哪条内容"的判定（§2.0 两条正交的轴）。
    */
   orgRole: 'owner' | 'admin' | 'member' | 'viewer' | null
   emailVerified: boolean
@@ -212,6 +211,23 @@ export interface AuthService {
    * 本方法**不做任何 token 校验**，它只负责账号策略与数据库。
    */
   authenticateOidc(claims: OidcClaims, req: IncomingMessage): Promise<OidcAuthOutcome>
+  /**
+   * ★ P2：由**受信插件**创建本地账号（当前调用方只有 @geewiki/org 的邀请流程）。
+   *
+   * **本方法不做任何鉴权** —— 它假定调用方已经验证过"这个人确实该有账号"
+   * （org 用的是一个 256 位熵、未过期、未消费、且邮箱匹配的邀请令牌）。
+   * 因此**绝不要**把它直接接到任何 HTTP 端点上。
+   *
+   * 好处是口令哈希、邮箱唯一性、`credentialSource` 的维护都留在身份域内，
+   * 不会被复制到第二个插件里（复制出来的那份将来必然漏掉算法升级）。
+   */
+  createLocalUser(input: {
+    email: string
+    displayName: string
+    password: string
+  }): Promise<
+    { ok: true; userId: number } | { ok: false; error: 'email_taken' | 'invalid_email' | 'invalid_password' }
+  >
 }
 
 export const manifest: GeeWikiManifest = {
@@ -338,19 +354,112 @@ function toAuthUser(row: UserRow, orgRole: AuthUser['orgRole']): AuthUser {
 }
 
 /**
- * 组织角色的**唯一来源**。
- *
- * **P1 恒返回 `null`（= Guest 语义）**，这是刻意的：角色的持久化位置是 `org_members`
- * 表（设计文档 §3.2），它属 P2。若在 P1 另造一个存储（例如给 `users` 加一列
- * `is_owner`），就会产生"同一事实两处真源"，而 P2 必须面对两者不一致时的取舍 ——
- * 本设计通篇在避免的正是这类漂移。
- *
- * **直接后果（必须让使用者知道）**：`access:'admin'` 的端点在 P1 只有应急通道
- * （`GEEWIKI_ADMIN_TOKEN`）能通过 ⇒ **浏览器里登录后，插件管理台的写操作仍不可用**，
- * 读（`/api/plugins` 等）正常。内容编辑（`access:'user'`）不受影响，登录后即可用。
+ * 默认组织 id。**本期单组织（D1）：恒为 1**，由 `0011_org_team.sql` 的幂等种子建立。
+ * 表结构带 `org_id` 是为了将来升多租户时不必做"加列 + 全表回填"，
+ * 但**判别逻辑一律经此常量**而不是散落的字面量 `1`，多租户时只需改这一处。
  */
-function resolveOrgRole(_userId: number): AuthUser['orgRole'] {
-  return null
+const DEFAULT_ORG_ID = 1
+
+/** 组织角色的合法取值（唯一来源是 `org_members.role`，0011_org_team.sql） */
+const ORG_ROLES = ['owner', 'admin', 'member', 'viewer'] as const
+
+/** 类型守卫：库里出现不认识的角色字符串时**不猜测**，一律当作"无角色"（失败关闭） */
+function isOrgRole(value: unknown): value is NonNullable<AuthUser['orgRole']> {
+  return typeof value === 'string' && (ORG_ROLES as readonly string[]).includes(value)
+}
+
+/**
+ * 组织角色的**唯一来源**：`org_members` 表（设计文档 §3.2）。
+ *
+ * **P2 起这里是真实查表**。P1 曾让它恒返回 `null`（= Guest 语义），因为角色的持久化
+ * 位置就是这张表，而当时它还不存在；P1 刻意**不**另造存储（例如给 `users` 加一列
+ * `is_owner`），以避免"同一事实两处真源"—— 本设计通篇在避免的正是这类漂移。
+ *
+ * **为什么由 auth 直接读这张表，而不是经 `org-service`**：`org_members` 与
+ * `users`/`sessions`/`audit_log` 同属**核心基础设施表**（由 db 插件的 0011 迁移建立），
+ * 不是某个业务插件的私有数据。让 Principal 的组装依赖另一个业务插件的服务，会引入
+ * 一个只在"登录成功"这一条路径上才需要的反向依赖，且会让"org 插件没启用时无法登录"
+ * 这种荒谬的耦合成为可能。
+ *
+ * **无行 = Guest**（不是"最低档角色"）：返回 `null`。设计文档 §2.1 明确 guest 是
+ * "没有默认组织角色"，这样它永远不会被组织级继承规则牵连。
+ */
+async function resolveOrgRole(
+  db: DatabaseAdapterAsync,
+  userId: number,
+  orgId: number,
+): Promise<AuthUser['orgRole']> {
+  const rows = await db.query<{ role: unknown }>(
+    'SELECT role FROM org_members WHERE org_id = ? AND user_id = ?',
+    [orgId, userId],
+  )
+  const role = rows[0]?.role
+  return isOrgRole(role) ? role : null
+}
+
+/**
+ * 展开用户所属的组 id（`group_members`，同样属核心基础设施表）。
+ *
+ * 这些 id 直接喂给策略层的 `subject_kind='group'` 判定：**组成员身份由组表决定，
+ * 不由授权表决定** —— 所以"把人加进组"就自动获得该组名下的全部授权，
+ * 不需要逐条改 `page_grants`（设计文档 §3.2 的"为什么邀请要支持组"）。
+ *
+ * 与 `resolveOrgRole` 一样按 `orgId` 收窄：跨组织的组 id 不得进入本主体的判定集合。
+ */
+async function resolveGroupIds(
+  db: DatabaseAdapterAsync,
+  userId: number,
+  orgId: number,
+): Promise<number[]> {
+  const rows = await db.query<{ group_id: number | string }>(
+    `SELECT gm.group_id AS group_id
+       FROM group_members gm
+       JOIN groups g ON g.id = gm.group_id
+      WHERE gm.user_id = ? AND g.org_id = ?`,
+    [userId, orgId],
+  )
+  // PG 的整数可能以字符串返回（与 COUNT(*) 同源），统一 Number 收敛
+  return rows.map((r) => Number(r.group_id))
+}
+
+/** 下发给前端的**能力**集合（与"能看什么"完全正交，见设计文档 §2.0） */
+export interface AuthCapabilities {
+  editContent: boolean
+  administer: boolean
+  manageVisibility: boolean
+}
+
+/**
+ * 由组织角色推导能力集合。
+ *
+ * **只用于前端隐藏入口 —— 服务端判定一律独立进行**：前端隐藏不是安全措施
+ * （设计文档 §9 R10 反模式第 5 条），这些布尔值被改掉也不会多出任何权限。
+ *
+ * 角色语义（§2.1）：
+ * - `owner` / `admin`：管理成员、组、邀请、插件；改任何条目的可见性。
+ * - `member`：建改内容；对自己有编辑权的条目改可见性与授予例外。
+ * - `viewer`：**只读**（能看组织内可见条目，不能写）。
+ * - `null`（= guest，未入伙）：什么都不能做，只能看被显式授予的内容。
+ *
+ * `manageVisibility` 给的是"**是否可能拥有**"的上界；**逐条目的**判定由
+ * policy-service 的 `PageAccess.canManageVisibility` 给出（本文件不认识条目）。
+ */
+function capabilitiesOf(principal: Principal | undefined): AuthCapabilities {
+  if (principal?.kind === 'break-glass') {
+    // 应急通道的意义是"身份系统本身出问题时还能进场"，能力上界等同 owner。
+    // 它的每次使用都由 server 层写 `access.break_glass` 留痕（设计文档 D7）。
+    return { editContent: true, administer: true, manageVisibility: true }
+  }
+  if (principal?.kind !== 'user') {
+    return { editContent: false, administer: false, manageVisibility: false }
+  }
+  const role = principal.orgRole
+  const isAdmin = role === 'owner' || role === 'admin'
+  return {
+    editContent: isAdmin || role === 'member',
+    administer: isAdmin,
+    manageVisibility: isAdmin || role === 'member',
+  }
 }
 
 /* ============================ 插件本体 ============================ */
@@ -361,7 +470,7 @@ export const AuthPlugin = {
 
   async apply(ctx: Context, config: AuthConfig = {}) {
     const rawDb = ctx.get('db') as AnyDatabaseAdapter | undefined
-    if (!rawDb) throw new Error('@geewiki/auth: 数据库服务不可用（@geewiki/db-sqlite 未激活）')
+    if (!rawDb) throw new Error('@geewiki/auth: 数据库服务不可用（没有任何插件提供 database-provider）')
     const db: DatabaseAdapterAsync = asAsync(rawDb)
     const router = ctx.get('http') as HttpRouterService | undefined
     if (!router) throw new Error('@geewiki/auth: http 路由服务不可用（@geewiki/http 未激活）')
@@ -543,7 +652,7 @@ export const AuthPlugin = {
       // ISO8601 同为 UTC 'Z' 定长格式 ⇒ 字典序即时间序（不必解析成 Date）
       if (row.s_expires_at <= now || row.s_idle_expires_at <= now) return undefined
       if (row.status !== 'active') return undefined
-      const user = toAuthUser(row, resolveOrgRole(Number(row.id)))
+      const user = toAuthUser(row, await resolveOrgRole(db, Number(row.id), Number(row.org_id)))
       return {
         user,
         sessionId: row.s_id,
@@ -631,8 +740,10 @@ export const AuthPlugin = {
         userId: session.user.id,
         orgId: session.user.orgId,
         orgRole: session.user.orgRole,
-        // 组成员展开（subject_kind='group' 的授权判定）属 P2：组表在 0011 迁移里。
-        groupIds: [],
+        // ★ P2：组身份由组表展开（见 resolveGroupIds）。**必须逐请求现算**：
+        // Principal 是"此刻的权限快照"，缓存它会让"把人移出组"在下一次请求仍生效 ——
+        // 这正是设计文档 §9 R10 反模式第 3 条（用 TTL 缓存权限判定）的形态。
+        groupIds: await resolveGroupIds(db, session.user.id, session.user.orgId),
         sessionId: session.sessionId,
       }
       h.principal = principal
@@ -647,7 +758,7 @@ export const AuthPlugin = {
       const rows = await db.query<UserRow>('SELECT * FROM users WHERE id = ?', [userId])
       const row = rows[0]
       if (!row) return undefined
-      return toAuthUser(row, resolveOrgRole(userId))
+      return toAuthUser(row, await resolveOrgRole(db, userId, Number(row.org_id)))
     }
 
     /* ---------- OIDC：账号策略（设计文档 §7.2 / §7.3） ---------- */
@@ -907,12 +1018,7 @@ export const AuthPlugin = {
            * 能力下发：**只用于前端隐藏入口**，服务端判定一律独立进行
            * （前端隐藏不是安全措施，见设计文档 §9 R10 反模式第 5 条）。
            */
-          capabilities: {
-            editContent: h.principal?.kind === 'user' || h.principal?.kind === 'break-glass',
-            // P1 恒 false：orgRole 的存储（org_members）属 P2，见 resolveOrgRole
-            administer: false,
-            manageVisibility: false,
-          },
+          capabilities: capabilitiesOf(h.principal),
           /** OIDC 通道（P1.5）：未启用 `@geewiki/oidc` 时 `available:false`，前端不渲染 SSO 按钮 */
           oidc: oidcCapability(),
         })
@@ -973,6 +1079,23 @@ export const AuthPlugin = {
             `INSERT INTO user_credentials (user_id, algo, params, salt, hash, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)`,
             [userId, credential.algo, credential.params, credential.salt, credential.hash, now],
+          )
+          /*
+           * ★ 引导 owner 的**组织成员身份**（P2）。
+           *
+           * 没有这一步，系统里将**永远不存在** owner/admin：`access:'admin'` 的端点
+           * （插件管理台）在浏览器里永久不可用，而 `orgRole` 也恒为 null —— 这正是
+           * P1 结束时的状态，也正是本阶段要解除的那条遗留后果。
+           *
+           * **与账号写入放在同一事务**：账号与"它是 owner"必须同时成立，否则中途失败
+           * 会留下一个既不能管、又无法被提升的孤儿账号（它占着"库里已有账号"这个判据）。
+           *
+           * 本文件直写 `org_members` 而不调 `org-service`：这张表与 `users`/`sessions`
+           * 同属核心基础设施表（0011 迁移建立），理由见 `resolveOrgRole` 的说明。
+           */
+          await tx.run(
+            `INSERT INTO org_members (org_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)`,
+            [DEFAULT_ORG_ID, userId, now],
           )
           return { kind: 'created' as const, userId }
         })
@@ -1139,12 +1262,7 @@ export const AuthPlugin = {
              * 能力下发：**只用于前端隐藏入口**，服务端判定一律独立进行
              * （前端隐藏不是安全措施，见设计文档 §9 R10 反模式第 5 条）。
              */
-            capabilities: {
-              editContent: true,
-              // P1 恒 false：orgRole 的存储（org_members）属 P2，见 resolveOrgRole
-              administer: false,
-              manageVisibility: false,
-            },
+            capabilities: capabilitiesOf(h.principal),
           })
         },
         { access: 'user' },
@@ -1440,6 +1558,58 @@ export const AuthPlugin = {
           }
         }),
       authenticateOidc,
+      /*
+       * ★ P2 新增：由**受信插件**（当前只有 @geewiki/org 的邀请流程）建本地账号。
+       *
+       * 为什么放在服务契约而不是再加一个 HTTP 端点：账号创建是**身份域**的能力
+       * （口令哈希、唯一性、credentialSource 的维护都在本插件），而"凭什么是这个人
+       * 可以有账号"是**组织域**的判断（有效邀请）。让组织插件经服务调用来要这个能力，
+       * 比让它自己写 `user_credentials` 表要正确得多 —— 后者会把口令哈希算法复制成
+       * 两份，将来升级算法必然漏掉一处。
+       *
+       * **它不是"开放注册"**：这个方法本身不做任何鉴权，暴露面由调用方承担；
+       * 调用方（org）必须先验证一个 256 位熵的、未过期、未消费、邮箱匹配的邀请令牌。
+       */
+      async createLocalUser(input) {
+        const email = input.email.trim().toLowerCase()
+        /*
+         * 校验放在**服务这一侧**而不是调用方：口令强度与邮箱格式是身份域的规则，
+         * 让 org 插件各写一份"长度至少几位"必然与这里漂移，而漂移的方向通常是
+         * "某个入口悄悄放宽了"。调用方只需要把用户输入原样递进来。
+         */
+        if (!EMAIL_RE.test(email) || email.length > EMAIL_MAX) {
+          return { ok: false as const, error: 'invalid_email' as const }
+        }
+        if (input.password.length < PASSWORD_MIN || input.password.length > PASSWORD_MAX) {
+          return { ok: false as const, error: 'invalid_password' as const }
+        }
+        return await db.transaction(async (tx) => {
+          // 唯一性判据与 0010 的 `idx_users_org_email` 一致（org_id + email）
+          const existing = await tx.query<{ id: number }>(
+            'SELECT id FROM users WHERE org_id = ? AND email = ?',
+            [DEFAULT_ORG_ID, email],
+          )
+          if (existing[0]) return { ok: false as const, error: 'email_taken' as const }
+          const now = new Date().toISOString()
+          const inserted = await tx.run(
+            `INSERT INTO users (org_id, email, display_name, status, email_verified, created_at)
+             VALUES (?, ?, ?, 'active', 1, ?) RETURNING id`,
+            [DEFAULT_ORG_ID, email, input.displayName, now],
+          )
+          const userId = Number(inserted.lastInsertRowid)
+          const credential: StoredCredential = await hashPassword(input.password)
+          await tx.run(
+            `INSERT INTO user_credentials (user_id, algo, params, salt, hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [userId, credential.algo, credential.params, credential.salt, credential.hash, now],
+          )
+          return { ok: true as const, userId }
+        }).then((result) => {
+          // 库里从此有可登录账号 ⇒ 闸门不该再报 503 bootstrap_required（与 setup 同理）
+          if (result.ok) credentialSource = true
+          return result
+        })
+      },
     }
     const unprovide = ctx.provide('auth-service', svc)
 

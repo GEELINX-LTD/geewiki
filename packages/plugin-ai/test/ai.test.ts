@@ -29,7 +29,7 @@ import {
   type LlmProvider,
   type LlmService,
 } from '@geewiki/llm'
-import type { HttpRouterService, RouteHandler, RouteHandlerContext } from '@geewiki/core'
+import type { HttpRouterService, Principal, RouteHandler, RouteHandlerContext } from '@geewiki/core'
 import {
   AiPlugin,
   MAX_QUERY_LENGTH,
@@ -46,6 +46,22 @@ import {
 
 /* ------------------------------ 夹具 ------------------------------ */
 
+/**
+ * ★ P2：请求主体（匿名）。
+ *
+ * 本插件的用例验证的是"端点与 svc 返回同一份结果"与"降级路径"，与**谁能看什么**
+ * 无关 —— 可见性由策略层决定，而这里的 `search-service` 是替身。故固定用匿名主体，
+ * 让主体成为夹具的一个常量而不是每个用例的变量。
+ */
+const TEST_PRINCIPAL: Principal = {
+  kind: 'anonymous',
+  userId: null,
+  orgId: null,
+  orgRole: null,
+  groupIds: [],
+  sessionId: null,
+}
+
 interface Harness {
   db: SqliteDatabase
   /** 插件的 ctx（用于断言 provide 出来的 ai-service） */
@@ -59,6 +75,11 @@ interface Harness {
   /** 调用 GET /api/ai/capabilities */
   capabilities(): Promise<{ status: number; body: Record<string, unknown> }>
   putPage(slug: string, title: string, content: string, updatedAt?: string): void
+  /**
+   * 覆写策略层返回的可见集合（P2）。`null` = 回到默认「库里所有页面都可见」。
+   * 用于验证 RAG 两条端点（`ask` 与 SSE `stream`）都不会把无权正文喂给模型。
+   */
+  setVisible(slugs: readonly string[] | null): void
   /** 仅卸载 AI 插件（保留 db/ctx，便于断言卸载后的服务状态） */
   unloadAi(): void
   dispose(): void
@@ -103,10 +124,30 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
   if (opts.provider) llm.register(opts.provider)
   if (opts.withNullProvider ?? true) llm.register(NULL_PROVIDER)
 
+  /*
+   * ★ P2：策略层替身。**必须有** —— 本夹具用的是**真实** `SearchPlugin`，而它现在
+   * 依赖 `policy-service`；策略层缺席时它会**显式抛错**（拒绝返回结果，见 §9 R2），
+   * 于是所有检索都会降级成 `search_unavailable`，本文件大半用例会以"看起来像功能坏了"
+   * 的方式红掉。这正是"绝不因策略层缺失而放行"在测试里的表现。
+   *
+   * 默认返回「库里所有页面」（`setVisible(null)`）⇒ 既有用例语义不变；
+   * 需要验证 RAG 不泄漏的用例调用 `setVisible([...])` 覆写。
+   */
+  let visibleOverride: readonly string[] | null = null
+  const policyService = {
+    visibleSlugs: (_principal: Principal, _q?: { levels?: readonly string[] }): Promise<string[]> => {
+      if (visibleOverride !== null) return Promise.resolve([...visibleOverride])
+      return Promise.resolve(
+        db.query<{ slug: string }>('SELECT slug FROM pages ORDER BY slug').map((r) => r.slug),
+      )
+    },
+  }
+
   const services = new Map<string, unknown>([
     ['db', db],
     ['http', routerService],
     ['llm-service', llm],
+    ['policy-service', policyService],
   ])
   const ctx = {
     get: (name: string) => services.get(name),
@@ -145,6 +186,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
         res: { once: () => {}, setHeader: () => {}, headersSent: false } as unknown as ServerResponse,
         url: new URL(`http://localhost${url}`),
         params: {},
+        // ★ P2：路由层现在**必须**拿到主体（拿不到就 401），故夹具显式提供匿名主体。
+        principal: TEST_PRINCIPAL,
         json: (status, payload) => resolve({ status, body: payload as Record<string, unknown> }),
       }
       void Promise.resolve(handler(h)).catch(reject)
@@ -170,6 +213,9 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     db,
     ctx,
     services,
+    setVisible: (slugs) => {
+      visibleOverride = slugs === null ? null : [...slugs]
+    },
     post: (body) => invoke('POST /api/ai/ask', '/api/ai/ask', body),
     get: (qs) => invoke('GET /api/ai/ask', `/api/ai/ask?${qs}`),
     capabilities: () => invoke('GET /api/ai/capabilities', '/api/ai/capabilities'),
@@ -629,7 +675,7 @@ test('服务契约：svc.ask 与 REST 端点逐字段一致（同一份实现，
     h.putPage('kb-2', '无关页面', '与主题无关的内容。用于验证排序与过滤。')
     const svc = h.services.get('ai-service') as AiService
 
-    const viaService = await svc.ask('插件化知识库', { limit: 2, extractive: true })
+    const viaService = await svc.ask(TEST_PRINCIPAL, '插件化知识库', { limit: 2, extractive: true })
     const viaRest = await askOk(h.post({ q: '插件化知识库', limit: 2, extractive: true }))
 
     // 唯一会不同的字段是 elapsedMs（墙钟耗时，两次调用必然不可比），其余必须逐字段一致。
@@ -672,14 +718,14 @@ test('服务契约：卸载后服务注销，且旧引用的调用显式报错�
     h.putPage('kb-1', '插件化知识库', '这是一个插件化的知识库系统。')
     const svc = h.services.get('ai-service') as AiService
     // 卸载前可正常调用
-    assert.equal((await svc.ask('插件化知识库')).ok, true)
+    assert.equal((await svc.ask(TEST_PRINCIPAL, '插件化知识库')).ok, true)
 
     h.unloadAi()
 
     assert.equal(h.services.get('ai-service'), undefined, '卸载后 ctx.get 应回到 undefined')
     // 关键：仍持有旧引用的调用必须**显式报错**。若静默返回空结果，会被误读成
     // "知识库里没有相关内容"——正是最难定位的那类症状（口径同 @geewiki/search）。
-    await assert.rejects(() => svc.ask('插件化知识库'), /已卸载/, '旧的 ask 引用必须显式报错')
+    await assert.rejects(() => svc.ask(TEST_PRINCIPAL, '插件化知识库'), /已卸载/, '旧的 ask 引用必须显式报错')
     assert.throws(() => svc.capabilities(), /已卸载/, '旧的 capabilities 引用必须显式报错')
   } finally {
     h.dispose()

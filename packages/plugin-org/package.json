@@ -1,9 +1,9 @@
 {
-  "name": "@geewiki/wiki",
+  "name": "@geewiki/org",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "GeeWiki Wiki 核心插件：页面 CRUD + 版本历史（REST）",
+  "description": "GeeWiki 组织插件：成员与角色、组、邀请（org-service）",
   "exports": {
     ".": "./src/index.ts"
   },
@@ -17,7 +17,6 @@
     "schemastery": "3.18.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@geewiki/authz": "workspace:*"
+    "@types/node": "^22.0.0"
   }
 }

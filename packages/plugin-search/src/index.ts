@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import { isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
+import { isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type Principal, type RouteHandlerContext } from '@geewiki/core'
 
 /* ============================== 配置 ============================== */
 
@@ -61,7 +61,9 @@ export const manifest: GeeWikiManifest = {
     provides: 'search-service',
     // 依赖以服务标识声明（非具体插件名）：数据库切换（SQLite→PG）对业务插件透明，
     // 依赖边由管理器按 provides 解析（deps.ts resolveDependency）
-    requires: ['database-provider', 'http-service'],
+    // `policy-service` 是 P2 引入的**读路径依赖**：检索在返回任何命中之前必须先问它
+    // "这个主体能看哪些条目"。声明它同时也保证了激活顺序（策略层先就绪）。
+    requires: ['database-provider', 'http-service', 'policy-service'],
     conflictGroup: undefined,
     // 索引表由本插件自己的迁移建立（迁移控制器在激活前执行），不依赖 db-sqlite 的迁移
     migrations: './migrations',
@@ -103,28 +105,77 @@ export interface SearchResult {
 }
 
 /**
+ * `policy-service` 的**最小结构需求**（结构化类型，刻意不 import `@geewiki/authz`）。
+ *
+ * 与 `@geewiki/wiki` 的同名声明保持一致的口径：依赖的是**服务标识**
+ * （manifest 的 `requires`），而不是钉死在某个包的模块上 —— 将来完全可能有另一种
+ * 策略实现，只要它 `ctx.provide('policy-service', …)` 且形状一致即可。
+ */
+interface PolicyServiceLike {
+  visibleSlugs(principal: Principal, q?: { prefix?: string; levels?: readonly string[] }): Promise<string[]>
+}
+
+/**
  * `search-service` 服务契约（本插件经 `ctx.provide('search-service', svc)` 提供）。
  *
- * 存在的意义：让消费方（后续 AI/RAG 批次）**不必**知道检索插件内部怎么建索引、
+ * 存在的意义：让消费方（AI/RAG 插件）**不必**知道检索插件内部怎么建索引、
  * 也不必直接 `SELECT` wiki 的 `pages` 表（那会把表结构变成跨包隐式契约）。
+ *
+ * ★ P2：**两个方法都显式要求 `principal` 且改为异步**（设计文档 §9 R2）。
+ * 为什么必须显式传主体：cordis 服务是进程级单例，把主体藏在服务内部等于让
+ * "忘了传"变成"按上一个人的权限返回"。故 principal 是**必填首参**——
+ * 漏传在编译期即报错，运行期再兜一道（见 {@link assertPrincipal}）。
+ *
+ * 为什么从同步改成异步：可见性判定要走 `policy-service`（`visibleSlugs` 是异步的，
+ * 它可能要查祖先链）。这是 P2 的**破坏性契约变更**，消费方（`@geewiki/ai`）已同步跟进。
  */
 export interface SearchService {
   /**
    * 全文检索。与 `GET /api/search` 是**同一份实现**（端点只是把它包成 HTTP），
-   * 故两者在同 q 同 limit 下结果逐字段一致。
+   * 故两者在同主体、同 q、同 limit 下结果逐字段一致。
    *
+   * **结果已在 SQL 层按主体裁剪**：`total`、`hits`、`snippet` 全部只覆盖当前主体
+   * 可见（`full` 档）的条目。**绝不是"先取全量再后过滤"** —— 那样 `total`、
+   * 高亮与分页语义会一起泄漏（设计文档 §5.6 明令禁止）。
+   *
+   * @param principal 主体（匿名用 `anonymousPrincipal()`，不可省略）
    * @param q    查询串（调用方无需 trim，内部会 trim；trim 后为空则返回空结果）
    * @param opts limit 为本次返回条数上限（1..100，非法值抛错——与端点的 400 语义对应）；
    *             mode 为查询语义：`'phrase'`（默认）= 整串字面短语（搜索框语义），
    *             `'terms'` = 切成词元后 OR（**问句检索**语义，RAG 用）。
    */
-  search(q: string, opts?: { limit?: number; mode?: SearchMode }): SearchResult
+  search(
+    principal: Principal,
+    q: string,
+    opts?: { limit?: number; mode?: SearchMode },
+  ): Promise<SearchResult>
 
   /**
    * 按 slug 批量取整页正文，供 RAG 拼上下文。
-   * 只包含**真实存在**的 slug（查不到的键不出现）；空数组直接返回空 Map。
+   * 只包含**真实存在且当前主体可见（`full` 档）**的 slug（查不到/无权看的键不出现）；
+   * 空数组直接返回空 Map。
+   *
+   * ⚠️ 这是 RAG 的**正文入口**，也是 §5.6 点名的第三条泄漏旁路：调用方若绕过它
+   * 直接读 `pages` 表，权限就白做了。裁剪在本方法内部完成（唯一出口）。
    */
-  contents(slugs: readonly string[]): ReadonlyMap<string, string>
+  contents(principal: Principal, slugs: readonly string[]): Promise<ReadonlyMap<string, string>>
+}
+
+/**
+ * 主体守卫（§9 R2 的运行时兜底）。
+ *
+ * 编译期已经强制传 principal，但 JS 调用方、`as any`、以及将来某个消费方从
+ * 动态结构里取值时仍可能漏。**这里必须抛错而不是"当作匿名"**：当作匿名会静默
+ * 少给内容（可发现），而"不过滤"会静默多给（不可发现且是安全事故）。
+ */
+function assertPrincipal(principal: Principal | undefined): Principal {
+  if (!principal || typeof principal !== 'object' || typeof principal.kind !== 'string') {
+    throw new Error(
+      '@geewiki/search: 检索方法必须显式传入 principal —— ' +
+        '拒绝在缺少主体的情况下返回任何结果（设计文档 §9 R2：漏传必须抛错，不得放行）',
+    )
+  }
+  return principal
 }
 
 /* ============================ 纯函数工具 ============================ */
@@ -134,6 +185,15 @@ export const MIN_TRIGRAM_LENGTH = 3
 
 /** limit 的硬上限（与 configSchema 的 max 一致，防止手改配置绕过校验） */
 const MAX_LIMIT = 100
+
+/**
+ * 下推到 SQL 的可见 slug 上限。
+ *
+ * 取值依据：SQLite 自 3.32 起 `SQLITE_MAX_VARIABLE_NUMBER` 默认为 **32766**，
+ * 这里保守取一半，给 `matchExpr`/`pattern`/`limit` 等其它参数留余量。
+ * 超限时 {@link SearchPlugin} 会**显式抛错**（见 `visiblePlaceholders` 的说明）。
+ */
+const MAX_VISIBLE_SLUGS = 16_000
 
 /**
  * 查询串长度上限（服务层护栏）。
@@ -338,12 +398,48 @@ export const SearchPlugin = {
     const cleanups: (() => void)[] = []
 
     /**
+     * 策略服务（P2）。**逐请求活查询**，不做构造期快照 —— `@geewiki/authz` 在本插件
+     * 之后激活时也能拿到服务；反过来，若策略层缺失则**拒绝返回任何结果**（§9 R2：
+     * 绝不因策略层缺失而放行）。
+     */
+    const policy = (): PolicyServiceLike => {
+      const svc = ctx.get('policy-service') as PolicyServiceLike | undefined
+      if (!svc) {
+        throw new Error(
+          '@geewiki/search: policy-service 不可用 —— 拒绝返回任何检索结果（绝不因策略层缺失而放行，见设计文档 §9 R2）',
+        )
+      }
+      return svc
+    }
+
+    /**
+     * `IN (?,?,…)` 的占位符串。
+     *
+     * 为什么把**可见集合**而不是"隐藏集合"传进来：隐藏集合在"全站皆私有"时同样是
+     * 全量，不解决规模问题；而可见集合是策略层的**唯一真源**输出，语义直白。
+     *
+     * 规模边界（**已知并接受**）：SQLite 的绑定参数上限是 32766（3.32+），故设
+     * {@link MAX_VISIBLE_SLUGS} 为保守阈值。**超限时显式抛错而不是静默截断**：
+     * 截断会让 `total` 变成"部分集合的总数"，是那种"看起来正常但结果是错的"故障。
+     */
+    const visiblePlaceholders = (slugs: readonly string[]): string => slugs.map(() => '?').join(',')
+
+    /**
      * **检索的单一实现**：`GET /api/search` 与 `search-service.search()` 都走这里。
      * 端点只负责把 HTTP 参数解析成 `(q, limit)` 并把结果包成响应体——
      * 若两处各写一份 SQL，迟早会出现"REST 与插件内检索结果不一致"的漂移。
+     *
+     * ★ P2：**先按主体取可见集合，再把它下推到 SQL**。三条路（FTS / 短查询 LIKE /
+     * `contents`）全部如此。**绝不先取全量再在 JS 里过滤** —— 那样 `total`、高亮
+     * 片段与分页语义会一起泄漏（设计文档 §5.6 明令禁止）。
      */
-    const search = (rawQuery: string, opts?: { limit?: number; mode?: SearchMode }): SearchResult => {
+    const search = async (
+      principal: Principal,
+      rawQuery: string,
+      opts?: { limit?: number; mode?: SearchMode },
+    ): Promise<SearchResult> => {
       assertLive()
+      assertPrincipal(principal)
       const q = (rawQuery ?? '').trim()
       // 空查询在这里返回空结果：空串传给 MATCH 会抛
       // `SqliteError: fts5: syntax error near ""`（FTS5 不接受空表达式）。
@@ -374,6 +470,26 @@ export const SearchPlugin = {
       const terms = queryMode === 'terms' ? buildTermQuery(q) : []
       const useFts = queryMode === 'terms' ? terms.length > 0 : q.length >= MIN_TRIGRAM_LENGTH
 
+      /*
+       * ★ P2：本主体的**可见集合**，交给下面的 SQL 下推（三条路共用）。
+       *
+       * 为什么只取 `full` 档：`summary` 档的语义是"只见标题与占位"（§2.2）。若让它
+       * 参与检索，命中片段（`snippet`）与 `SELECT_COLUMNS` 里的 `p.content` 就会把
+       * 正文带出来 —— 那正是"看起来有权限"的假象。**宁可少给，不可多给。**
+       */
+      const visible = await policy().visibleSlugs(principal, { levels: ['full'] })
+      if (visible.length > MAX_VISIBLE_SLUGS) {
+        throw new Error(
+          `@geewiki/search: 可见条目数（${visible.length}）超过下推上限 ${MAX_VISIBLE_SLUGS} —— ` +
+            '拒绝静默截断（截断会让 total 变成"部分集合的总数"，属于"看起来正常但结果是错的"）。' +
+            '这是本实现已知的规模边界，需要改为数据库侧可见性下推（设计文档 §5.6）。',
+        )
+      }
+      // 一条都看不见 ⇒ 直接返回空结果、**不查库**：既省一次全表扫，也避免构造 `IN ()` 这种非法 SQL。
+      // mode 仍按"本来会走哪条路"报告，避免调用方据 mode 反推出"这个人有没有可见内容"。
+      if (visible.length === 0) return { mode: useFts ? 'fts' : 'like', total: 0, hits: [] }
+      const inClause = visiblePlaceholders(visible)
+
       let total: number
       let rows: SearchHitRow[]
       let mode: 'fts' | 'like'
@@ -388,15 +504,16 @@ export const SearchPlugin = {
         // 而契约里 total 是"全量命中数"（与 hits 的行语义一致）。
         total = countOf(
           db.query<{ n: number }>(
-            `SELECT COUNT(DISTINCT p.id) AS n FROM pages_fts f JOIN pages p ON p.id = f.rowid WHERE f.pages_fts MATCH ?`,
-            [matchExpr],
+            `SELECT COUNT(DISTINCT p.id) AS n FROM pages_fts f JOIN pages p ON p.id = f.rowid
+              WHERE f.pages_fts MATCH ? AND p.slug IN (${inClause})`,
+            [matchExpr, ...visible],
           ),
         )
         rows = db.query<SearchHitRow>(
           `SELECT ${SELECT_COLUMNS}, f.rank AS score
              FROM pages_fts f JOIN pages p ON p.id = f.rowid
-            WHERE f.pages_fts MATCH ? ORDER BY f.rank LIMIT ?`,
-          [matchExpr, limit],
+            WHERE f.pages_fts MATCH ? AND p.slug IN (${inClause}) ORDER BY f.rank LIMIT ?`,
+          [matchExpr, ...visible, limit],
         )
         mode = 'fts'
         // BM25（FTS5 的 `rank`）原始值是**负的**，越小越相关；这里**取负**换成
@@ -414,17 +531,20 @@ export const SearchPlugin = {
         // ≥3 字符的 FTS 路则必须有索引，索引缺失会显式报错（宁可响，不可静默空）。
         total = countOf(
           db.query<{ n: number }>(
+            // 括号不能省：`A OR B AND C` 的优先级是 `A OR (B AND C)`，会让权限过滤只作用于一半条件。
             `SELECT COUNT(*) AS n FROM pages p
-              WHERE p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\'`,
-            [pattern, pattern],
+              WHERE (p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\')
+                AND p.slug IN (${inClause})`,
+            [pattern, pattern, ...visible],
           ),
         )
         rows = db.query<SearchHitRow>(
           `SELECT ${SELECT_COLUMNS}
              FROM pages p
-            WHERE p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\'
+            WHERE (p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\')
+              AND p.slug IN (${inClause})
             ORDER BY p.updated_at DESC LIMIT ?`,
-          [pattern, pattern, limit],
+          [pattern, pattern, ...visible, limit],
         )
         mode = 'like'
         // LIKE 路没有相关度可言（全表子串匹配），统一给 0；
@@ -457,17 +577,38 @@ export const SearchPlugin = {
      * 故必须按个数拼 `?,?,?`。**拼的只是占位符本身，slug 值一律走参数绑定**——
      * 绝不把 slug 文本拼进 SQL（否则 `' OR 1=1 --` 之类的输入会变成注入）。
      */
-    const contents = (slugs: readonly string[]): ReadonlyMap<string, string> => {
+    const contents = async (
+      principal: Principal,
+      slugs: readonly string[],
+    ): Promise<ReadonlyMap<string, string>> => {
       assertLive()
+      assertPrincipal(principal)
       const out = new Map<string, string>()
       if (slugs.length === 0) return out
-      const placeholders = slugs.map(() => '?').join(',')
+
+      /*
+       * ★ P2：这是 RAG 的**正文入口**，也是设计文档 §5.6 点名的第三条泄漏旁路
+       * （原先它是"给什么 slug 就吐什么正文"的裸接口）。
+       *
+       * 做法是**先求交集再查库**：`allowed = 请求的 slug ∩ 本主体可见（full 档）`。
+       * 因此不可见的 slug **从来没有**进入过 SQL —— 这不是"先取全量再在 JS 里过滤"
+       * （那种做法会把 `total`、高亮、分页一起泄漏，是被明令禁止的）。
+       *
+       * 为什么不像检索那样把"可见集合"也一并下推做第二道过滤：`allowed` 由构造保证
+       * 是 `visible` 的子集，第二道 `IN` 是可证明冗余的，却会让绑定参数翻倍并更早
+       * 撞上 SQLite 的参数上限。**冗余检查换不来安全性，只换来更早的规模边界。**
+       */
+      const visible = new Set(await policy().visibleSlugs(principal, { levels: ['full'] }))
+      const allowed = slugs.filter((slug) => visible.has(slug))
+      if (allowed.length === 0) return out
+
+      const placeholders = allowed.map(() => '?').join(',')
       const rows = db.query<{ slug: string; content: string }>(
         `SELECT slug, content FROM pages WHERE slug IN (${placeholders})`,
-        [...slugs],
+        [...allowed],
       )
       for (const row of rows) out.set(row.slug, row.content)
-      // 查不到的 slug 不进 Map（消费方据此区分"页面不存在"与"正文为空串"）
+      // 查不到 / 无权看的 slug 都不进 Map（消费方据此区分"页面不存在"与"正文为空串"）
       return out
     }
 
@@ -475,7 +616,7 @@ export const SearchPlugin = {
     const svc: SearchService = { search, contents }
 
     cleanups.push(
-      router.register('GET', '/api/search', (h: RouteHandlerContext) => {
+      router.register('GET', '/api/search', async (h: RouteHandlerContext) => {
         const q = (h.url.searchParams.get('q') ?? '').trim()
         // 空查询必须在这里拦下（HTTP 语义：400 比"200 + 空结果"更能暴露调用方 bug）
         if (!q) {
@@ -531,7 +672,23 @@ export const SearchPlugin = {
         }
 
         // 查询本体完全交给 search()（单一实现）；端点只管 HTTP 层
-        const result = search(q, { ...(limit === undefined ? {} : { limit }), mode: queryMode })
+        //
+        // ★ P2：主体必须显式取出并传入。路由层已由 P0 的闸门保证 `access: 'public'`
+        // 的端点上 `h.principal` 也已解析（匿名有 anonymousPrincipal 对象，不是 undefined）；
+        // 但这里仍显式判空并 401 —— 与 `@geewiki/wiki` 同款兜底，宁可返回错误也不放行。
+        const principal = h.principal
+        if (!principal) {
+          h.json(401, {
+            ok: false,
+            error: 'unauthorized',
+            message: '缺少主体信息，无法判定可见范围',
+          })
+          return
+        }
+        const result = await search(principal, q, {
+          ...(limit === undefined ? {} : { limit }),
+          mode: queryMode,
+        })
         h.json(200, {
           ok: true,
           query: q,
