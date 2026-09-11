@@ -470,6 +470,73 @@ export function resolveProjectPath(path: string, fromUrl: string): string {
 
 /* ========================= HTTP 路由服务（插件间共享） ========================= */
 
+/* -------------------- 身份主体与路由访问等级（P0 鉴权骨架） -------------------- */
+
+/**
+ * 路由的**访问等级**（粗粒度闸门）。
+ *
+ * 语义刻意保持"粗"：它只回答"这条路由至少需要什么身份"，
+ * **不做**逐对象判定——"这个用户能不能看这一条数据"属于 policy-service 的职责。
+ * 粗粒度闸门挡的是"整类端点被匿名调用"（插件启停、条目写入），
+ * 它**不能替代**逐对象判定：两者是纵深防御的两层，不是二选一。
+ *
+ * - `public`：任何主体（含匿名）都可调用。**默认值**，保证既有调用点零改动。
+ * - `user`：需要已登录用户（`principal.kind === 'user'`）或应急通道（`'break-glass'`）。
+ * - `admin`：需要管理员（`orgRole` 为 `owner`/`admin`）或应急通道。
+ */
+export type RouteAccess = 'public' | 'user' | 'admin'
+
+/** `register()` 的可选第 4 参；省略等价于 `{ access: 'public' }` */
+export interface RouteAccessOptions {
+  access?: RouteAccess
+}
+
+/**
+ * 请求身份主体。
+ *
+ * **为什么永远返回一个对象、而不是 `undefined` 表示"没有身份"**：让下游少一个可空分支。
+ * "匿名"是一种**明确的主体**，不是"缺少信息"——若用 `undefined` 表示匿名，
+ * `if (principal) { 过滤 }` 这类写法会把"忘了传"误当成"匿名"、把"匿名"误当成"没传"，
+ * 最终演变成静默放行。故本类型没有"空主体"，只有 `kind: 'anonymous'`。
+ */
+export interface Principal {
+  kind: 'anonymous' | 'user' | 'break-glass'
+  /** 用户 id；匿名与应急通道为 `null` */
+  userId: number | null
+  /** 所属组织；单组织阶段恒为 1，匿名与应急通道为 `null` */
+  orgId: number | null
+  /**
+   * 组织角色。**只用于能力判定，不参与可见性判定**
+   * （唯一例外是 owner/admin 的应急覆盖，见设计文档规则 O1）。
+   * P0 阶段还没有用户表，故非应急主体恒为 `null`。
+   */
+  orgRole: 'owner' | 'admin' | 'member' | 'viewer' | null
+  /** 已展开的组成员 id（`subject_kind='group'` 的授权判定直接用） */
+  groupIds: readonly number[]
+  /** 会话 id；P0 无会话机制，恒为 `null` */
+  sessionId: string | null
+}
+
+/** 匿名主体：未携带任何可用凭据（也用于"凭据来源根本不存在"的情形） */
+export function anonymousPrincipal(): Principal {
+  return { kind: 'anonymous', userId: null, orgId: null, orgRole: null, groupIds: [], sessionId: null }
+}
+
+/**
+ * 应急（break-glass）主体：经 `GEEWIKI_ADMIN_TOKEN` 环境变量进来的运维通道。
+ *
+ * 它**旁路**整个权限体系（应急通道的意义就在于"身份系统本身出问题时还能进场"），
+ * 因此每次使用都必须留痕。该通道在环境变量**未设置时完全禁用**——
+ * 不是"默认令牌"，也不接受任何回退值。
+ *
+ * `orgRole` 刻意留 `null` 而不是假装成 `'owner'`：旁路能力只由 `kind === 'break-glass'`
+ * 表达。这样任何"按 orgRole 授权"的下游判定对应急主体都是**默认拒绝**（失败关闭），
+ * 想放行就必须显式识别 `kind` —— 而那正是要写审计的地方。
+ */
+export function breakGlassPrincipal(): Principal {
+  return { kind: 'break-glass', userId: null, orgId: null, orgRole: null, groupIds: [], sessionId: null }
+}
+
 /**
  * HTTP 路由处理器上下文：由 @geewiki/http 路由服务构造后交给已注册的路由。
  * 处理器可同步返回或返回 Promise（异步错误统一转 500）。
@@ -500,10 +567,52 @@ export interface RouteHandlerContext {
    * 可选（`?`）以保持向后兼容：既有测试替身与只发 JSON 的实现无需立刻补齐。
    */
   noteStatus?(status: number): void
+  /**
+   * 本次请求的身份主体（**P0 新增；可选**）。
+   *
+   * 由路由服务在请求分发时填入，处理器与前置钩子都可读；钩子**可以替换**它
+   * （P1 的会话解析就是给匿名主体换上真实用户，再由访问等级闸门统一裁决）。
+   *
+   * 可选（`?`）以保持向后兼容：既有测试替身与只关心业务逻辑的处理器无需立刻读取它。
+   * **但读取方必须失败关闭**：拿不到主体时按"匿名"处理、而不是按"有权限"处理。
+   */
+  principal?: Principal
 }
 
 /** 路由处理器 */
 export type RouteHandler = (h: RouteHandlerContext) => void | Promise<void>
+
+/**
+ * 前置钩子的裁决结果。
+ *
+ * **为什么把 HTTP 状态码写进类型、而不是让钩子自己写响应**：钩子是集中单点，
+ * 让它们只做"判定"、由路由服务统一写响应，才能保证错误信封一致
+ * （`{ ok:false, error, message, details }`）与指标记账不被绕过——
+ * 这正是"只堵了详情页、旁路却还开着"这类事故的来源。
+ *
+ * 状态码只开放三个语义明确的值：
+ * - `401`：未认证（缺凭据或凭据无效）
+ * - `403`：已认证但无权限
+ * - `503`：系统尚未就绪（如引导期没有任何凭据来源），**不是**"未认证"
+ */
+export type RequestVerdict =
+  | { ok: true }
+  | { ok: false; status: 401 | 403 | 503; code: string; message: string }
+
+/**
+ * 请求前置钩子：在路由匹配成功之后、处理器执行之前运行。
+ *
+ * 契约：
+ * 1. 按注册顺序**串行**执行；任一钩子返回 `ok:false` 即短路（后续钩子与处理器都不再执行）。
+ * 2. 钩子**可以**读取或替换 `h.principal`（这是 P1 会话解析的挂载点）。
+ * 3. 钩子**不得**自行结束响应（不要调 `h.json` / `res.end`）：只返回裁决。
+ *    否则错误信封与 `stats()` 记账会被绕过。
+ * 4. 钩子抛错视同 500（由路由服务统一处理）——**不要**用抛错表达"拒绝"（那是静默失败面）。
+ * 5. 只用 `ok:true` 表示"放行"；返回形态不合法（非对象、缺 `ok`）时按**拒绝**处理（失败关闭）。
+ *
+ * 可选实现（`HttpRouterService.use`）以保持向后兼容：既有测试替身无需提供。
+ */
+export type RequestHook = (h: RouteHandlerContext) => RequestVerdict | Promise<RequestVerdict>
 
 /**
  * 请求体未读完即已应答时的连接收尾：响应刷出后关闭连接。
@@ -556,8 +665,29 @@ export interface HttpStreamStats {
  * RouteHandlerContext.params 获取。
  */
 export interface HttpRouterService {
-  /** 注册路由（method 大写，path 精确或带 :param 匹配）；返回注销函数 */
-  register(method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH', path: string, handler: RouteHandler): () => void
+  /**
+   * 注册路由（method 大写，path 精确或带 :param 匹配）；返回注销函数。
+   *
+   * `opts.access` 是**粗粒度**访问等级（默认 `'public'`，故只传 3 个实参的既有调用点
+   * 行为完全不变）：它只挡"整类端点被匿名调用"，**逐对象判定必须由处理器另行完成**
+   * （见 {@link RouteAccess}）。
+   */
+  register(
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
+    path: string,
+    handler: RouteHandler,
+    opts?: RouteAccessOptions,
+  ): () => void
+
+  /**
+   * 注册请求前置钩子；返回注销函数（**幂等**，重复调用安全）。
+   *
+   * 钩子的执行位置与契约见 {@link RequestHook}。它存在的意义是给"身份解析 / 全局策略"
+   * 一个**不依赖具体插件**的挂载点——否则每个插件都得自己解析一遍身份。
+   *
+   * 可选（`?`）以保持向后兼容：既有测试替身与第三方实现无需提供。
+   */
+  use?(hook: RequestHook): () => void
   /** 请求统计（看门狗探针数据源） */
   stats(): HttpRouterStats
   /** 进行中的路由请求数（路由处理器尚未结算；交接给静态资源层的请求不计入） */

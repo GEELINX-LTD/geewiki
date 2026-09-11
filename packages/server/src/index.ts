@@ -11,6 +11,7 @@
  * 4. SIGINT/SIGTERM 优雅退出：逆序卸载全部插件后退出。
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
@@ -25,12 +26,19 @@ import {
   PLUGIN_UI_ASSET_PATH,
   PLUGIN_UI_PREFIX,
   asAsync,
+  anonymousPrincipal,
+  breakGlassPrincipal,
   normalizeRuntime,
   resolveProjectPath,
   type AnyDatabaseAdapter,
   type GeeWikiManifest,
   type HttpRouterService,
   type HttpRouterStats,
+  type Principal,
+  type RequestHook,
+  type RequestVerdict,
+  type RouteAccess,
+  type RouteAccessOptions,
   type RouteHandler,
   type RouteHandlerContext,
 } from '@geewiki/core'
@@ -88,6 +96,8 @@ interface RouteEntry {
   /** 路径段：':xxx' 开头为参数段 */
   segments: string[]
   handler: RouteHandler
+  /** 粗粒度访问等级（默认 `'public'`；见 @geewiki/core 的 RouteAccess） */
+  access: RouteAccess
 }
 
 /**
@@ -114,8 +124,139 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
   return typeof (value as { then?: unknown }).then === 'function'
 }
 
+/* ======================= 请求鉴权骨架（P0） ======================= */
+
+/**
+ * 应急（break-glass）令牌的环境变量名。
+ *
+ * **未设置该变量 = 整条通道禁用**（不是"默认令牌"、也没有回退值）。
+ * 理由：应急通道的代价是"旁路整个权限体系"，长期开启等于权限体系不存在。
+ */
+const ADMIN_TOKEN_ENV = 'GEEWIKI_ADMIN_TOKEN'
+
+/** 读取应急令牌；未设置或为空串都视为"通道未启用"（空串是配置事故，不能当有效令牌） */
+function envAdminToken(): string | null {
+  const raw = process.env[ADMIN_TOKEN_ENV]
+  return raw !== undefined && raw.length > 0 ? raw : null
+}
+
+/**
+ * 从请求头取出调用方声称的令牌。
+ *
+ * 支持两种形态：`X-GW-Admin-Token: <token>`（脚本/CI 友好）与
+ * `Authorization: Bearer <token>`（通用惯例）。两者都没有则返回 `null`。
+ */
+function presentedAdminToken(req: IncomingMessage): string | null {
+  const direct = req.headers['x-gw-admin-token']
+  if (typeof direct === 'string' && direct.length > 0) return direct
+  const authorization = req.headers.authorization
+  if (typeof authorization === 'string') {
+    const matched = /^Bearer\s+(\S+)$/i.exec(authorization.trim())
+    if (matched?.[1]) return matched[1]
+  }
+  return null
+}
+
+/**
+ * 定长比较：先各自 sha256 再 `timingSafeEqual`。
+ *
+ * 为什么不直接 `===`：字符串比较会在首个不同字符处短路，逐字节的耗时差异足以在
+ * 大量请求下逐位试出令牌（时序侧信道）。哈希后长度固定，`timingSafeEqual` 才是恒时的。
+ */
+function secretsMatch(presented: string, expected: string): boolean {
+  const a = createHash('sha256').update(presented).digest()
+  const b = createHash('sha256').update(expected).digest()
+  return timingSafeEqual(a, b)
+}
+
+/**
+ * 应急通道使用留痕（P0-6）。
+ *
+ * TODO(audit-service)：P1 建 `audit_log` 表、P4 建审计闭环后，本函数改为写入
+ * audit-service（`action='access.break_glass'`，`actor` 记 break-glass 来源）。
+ * **P0 刻意不建表**——P0 的范围明确不新增表/迁移，故先用结构化 stdout 行，
+ * 前缀固定为 `[audit]` 便于日志系统采集与 grep。
+ */
+function auditBreakGlassUse(req: IncomingMessage): void {
+  console.log(
+    `[audit] action=access.break_glass actor=break-glass ` +
+      `method=${req.method ?? 'GET'} path=${req.url ?? '/'} ` +
+      `remote=${req.socket.remoteAddress ?? '-'} at=${new Date().toISOString()}`,
+  )
+}
+
+/** 访问等级闸门的拒绝结论（状态码 + 机器码 + 人读消息） */
+interface AccessDenial {
+  status: 401 | 403 | 503
+  code: string
+  message: string
+}
+
+/**
+ * 粗粒度访问等级闸门（纯函数，便于单测）。
+ *
+ * 判定顺序即优先级，**每一步都是失败关闭**：
+ * 1. `public` ⇒ 放行（与 P0 之前的行为完全一致）；
+ * 2. 应急主体 ⇒ 放行（旁路；留痕在前一步的解析里已完成）；
+ * 3. **没有任何凭据来源** ⇒ 503 `bootstrap_required`。
+ *    为什么不是 401：401 的语义是"你去登录"，但引导期**根本没有可登录的东西**
+ *    （P0 无用户表；P1 起是"库里没有任何 owner/admin"）。把它与"未登录"混为一谈，
+ *    会让前端把运维问题显示成"请重新登录"，并在登录页里死循环。
+ * 4. 匿名 ⇒ 401（此时确实存在凭据来源，只是没带或带错）；
+ * 5. `user` ⇒ 放行（已认证即可）；
+ * 6. 组织角色为 owner/admin ⇒ 放行；
+ * 7. 其余 ⇒ 403（已认证但权限不足）。
+ *
+ * 第 3 步必须放在第 4 步**之前**：未配置令牌时带着任意令牌头发请求，必须得到 503，
+ * 绝不能因为"没配令牌"而滑进某个放行分支。
+ */
+function judgeAccess(access: RouteAccess, principal: Principal, credentialSourceAvailable: boolean): AccessDenial | null {
+  if (access === 'public') return null
+  if (principal.kind === 'break-glass') return null
+  if (!credentialSourceAvailable) {
+    return {
+      status: 503,
+      code: 'bootstrap_required',
+      message: `尚未初始化任何凭据来源（未配置 ${ADMIN_TOKEN_ENV}）`,
+    }
+  }
+  if (principal.kind === 'anonymous') {
+    return { status: 401, code: 'unauthorized', message: '需要登录' }
+  }
+  if (access === 'user') return null
+  if (principal.orgRole === 'owner' || principal.orgRole === 'admin') return null
+  return { status: 403, code: 'forbidden', message: '需要管理员权限' }
+}
+
+/**
+ * 把钩子的返回值规约为裁决；返回 `null` 表示放行。
+ *
+ * **失败关闭**：只有显式 `{ ok: true }` 才放行。返回值形态不合法（非对象、缺 `ok`、
+ * 状态码不在白名单内）一律按拒绝处理——钩子是插件代码，把它写错不应该等于"全部放行"。
+ *
+ * 不合法形态返回 403 而不是 500：500 会被看门狗计入"服务连续失败"并可能在阈值处
+ * 触发熔断，而这是某个插件的编程错误、不是服务不可用。机器码固定为
+ * `hook_invalid_verdict` 以便日志与告警精确匹配。
+ */
+function verdictDenial(raw: unknown): AccessDenial | null {
+  if (typeof raw === 'object' && raw !== null && (raw as { ok?: unknown }).ok === true) return null
+  const shape = raw as { status?: unknown; code?: unknown; message?: unknown } | null
+  const code = typeof shape?.code === 'string' ? shape.code : 'hook_invalid_verdict'
+  const message = typeof shape?.message === 'string' ? shape.message : '前置钩子返回了不合法的裁决（已按拒绝处理）'
+  const status = shape?.status
+  if (status === 401 || status === 403 || status === 503) return { status, code, message }
+  return { status: 403, code, message }
+}
+
 class HttpRouter implements HttpRouterService {
   private readonly routes: RouteEntry[] = []
+  /**
+   * 请求前置钩子（按注册顺序串行执行）。
+   *
+   * 默认**为空**是有意义的：没有钩子时 dispatch 走全同步路径，
+   * 既有的"同步返回 boolean"语义逐字不变；只有注册了钩子才会转异步续段。
+   */
+  private readonly hooks: RequestHook[] = []
   private readonly counters = { total: 0, ok: 0, fail: 0, consecutiveFailures: 0 }
   private msHistory: number[] = []
   private lastMs = 0
@@ -151,8 +292,15 @@ class HttpRouter implements HttpRouterService {
     method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
     path: string,
     handler: RouteHandler,
+    opts?: RouteAccessOptions,
   ): () => void {
-    const entry: RouteEntry = { method, segments: path.split('/').filter(Boolean), handler }
+    const entry: RouteEntry = {
+      method,
+      segments: path.split('/').filter(Boolean),
+      handler,
+      // 默认 public：只传 3 个实参的既有调用点（以及全部现存插件）行为完全不变
+      access: opts?.access ?? 'public',
+    }
     this.routes.push(entry)
     let removed = false
     return () => {
@@ -160,6 +308,18 @@ class HttpRouter implements HttpRouterService {
       removed = true
       const idx = this.routes.indexOf(entry)
       if (idx >= 0) this.routes.splice(idx, 1)
+    }
+  }
+
+  /** 注册请求前置钩子；返回注销函数（幂等）。契约见 @geewiki/core 的 RequestHook。 */
+  use(hook: RequestHook): () => void {
+    this.hooks.push(hook)
+    let removed = false
+    return () => {
+      if (removed) return
+      removed = true
+      const idx = this.hooks.indexOf(hook)
+      if (idx >= 0) this.hooks.splice(idx, 1)
     }
   }
 
@@ -316,9 +476,18 @@ class HttpRouter implements HttpRouterService {
     }
   }
 
-  /** 请求分发入口（node:http server 回调）。返回 true 表示已接管响应（含 API 404），
-   *  false 表示无匹配路由且非 /api 前缀（静态资源层可尝试兜底）。 */
-  dispatch(req: IncomingMessage, res: ServerResponse): boolean {
+  /**
+   * 请求分发入口（node:http server 回调）。
+   *
+   * 返回 `true` 表示已接管响应（含 API 404），`false` 表示无匹配路由且非 /api 前缀
+   * （静态资源层可尝试兜底）。
+   *
+   * **`Promise<boolean>` 的由来（P0）**：注册了前置钩子时，钩子可以是异步的
+   * （P1 的会话解析要查库），此时无法在当拍给出结论。返回类型因此放宽为
+   * `boolean | Promise<boolean>`，**语义不变**：调用方一律等它结算后再决定是否交给静态层。
+   * 未注册钩子时（默认）仍是**同步**返回，既有调用路径与测试行为逐字不变。
+   */
+  dispatch(req: IncomingMessage, res: ServerResponse): boolean | Promise<boolean> {
     const started = Date.now()
     this.counters.total++
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
@@ -363,7 +532,9 @@ class HttpRouter implements HttpRouterService {
       }
     }
 
-    // 内置健康检查（路由表之外常驻，保证看门狗探针永不因插件卸载而缺失）
+    // 内置健康检查（路由表之外常驻，保证看门狗探针永不因插件卸载而缺失）。
+    // **刻意在鉴权骨架之外**：它不属于路由表，且看门狗/容器编排必须在"身份系统尚未就绪"
+    // 时也能探活——把它收进闸门会让"权限没配好"表现为"服务不可用"，反而更难排障。
     if (method === 'GET' && url.pathname === HEALTH_PATH) {
       const state: RequestState = { active: false }
       this.enterHandler(state)
@@ -420,34 +591,22 @@ class HttpRouter implements HttpRouterService {
         }
       }
       if (!matched) continue
-      const h: RouteHandlerContext = { req, res, url, params, json, noteStatus }
+      // 身份解析：每请求一次。P0 只有应急令牌一种凭据来源（用户会话属 P1），故此步同步。
+      const principal = this.resolvePrincipal(req)
+      const h: RouteHandlerContext = { req, res, url, params, json, noteStatus, principal }
       // 在途登记：插件卸载前的优雅排空以"处理器是否结算"为准（同步处理器即刻结算）
       const state: RequestState = { active: false }
       this.enterHandler(state)
       // 处理器在请求上下文中执行：管理器于处理器内部调用 drain() 时才能排除自身
-      this.requestScope.run(state, () => {
-        try {
-          const result: unknown = route.handler(h)
-          if (isThenable(result)) {
-            // Promise.resolve 兜住非原生 thenable（自定义 then）：结算时机正确，且 rejection 有人接管
-            void Promise.resolve(result).then(
-              () => this.exitHandler(state),
-              (err: unknown) => {
-                console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
-                json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
-                this.exitHandler(state)
-              },
-            )
-          } else {
-            this.exitHandler(state)
-          }
-        } catch (err) {
-          console.error(`[http] 路由 ${method} ${url.pathname} 异常:`, err)
-          json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
-          this.exitHandler(state)
+      return this.requestScope.run(state, () => {
+        // 无钩子（默认）⇒ 全同步路径：既有的"同步返回 boolean"语义逐字不变
+        if (this.hooks.length === 0) {
+          this.gateThenInvoke(route, h, state, method, url.pathname)
+          return true
         }
+        // 有钩子 ⇒ 异步续段（钩子允许返回 Promise）
+        return this.runHooks(route, h, state, method, url.pathname)
       })
-      return true
     }
 
     // 无路由匹配：/api 前缀按 API 404 处理；其余交给静态资源层（SPA fallback）
@@ -456,6 +615,112 @@ class HttpRouter implements HttpRouterService {
       return true
     }
     return false
+  }
+
+  /**
+   * 解析请求身份（P0：只有应急令牌这一种凭据；用户会话属 P1）。
+   *
+   * 未配置令牌 ⇒ **直接匿名，即使请求带了令牌头也一样**——
+   * 这是"未设置环境变量即整条通道禁用"的落点，也是 P0-5 的验收点。
+   */
+  private resolvePrincipal(req: IncomingMessage): Principal {
+    const expected = envAdminToken()
+    if (expected === null) return anonymousPrincipal()
+    const presented = presentedAdminToken(req)
+    if (presented === null || !secretsMatch(presented, expected)) return anonymousPrincipal()
+    // 通过应急通道认证即留痕（不区分端点等级：令牌本身的"使用"就要可追责）
+    auditBreakGlassUse(req)
+    return breakGlassPrincipal()
+  }
+
+  /**
+   * 串行执行前置钩子；全部放行后再过访问等级闸门与处理器。
+   *
+   * 只在注册过钩子时被调用（否则 dispatch 走全同步路径）。
+   */
+  private async runHooks(
+    route: RouteEntry,
+    h: RouteHandlerContext,
+    state: RequestState,
+    method: string,
+    pathname: string,
+  ): Promise<boolean> {
+    for (const hook of this.hooks) {
+      let raw: unknown
+      try {
+        raw = await hook(h)
+      } catch (err) {
+        console.error(`[http] 路由 ${method} ${pathname} 前置钩子异常:`, err)
+        h.json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
+        this.exitHandler(state)
+        return true
+      }
+      const denial = verdictDenial(raw)
+      if (denial) {
+        h.json(denial.status, { ok: false, error: denial.code, message: denial.message })
+        this.exitHandler(state)
+        return true
+      }
+    }
+    this.gateThenInvoke(route, h, state, method, pathname)
+    return true
+  }
+
+  /**
+   * 访问等级闸门 → 调用处理器。
+   *
+   * 闸门读 `h.principal` 而**不是**某个局部变量：钩子替换过的主体必须在此生效。
+   * `h.principal` 缺失时按**匿名**处理——失败关闭，绝不"没身份就放行"。
+   */
+  private gateThenInvoke(
+    route: RouteEntry,
+    h: RouteHandlerContext,
+    state: RequestState,
+    method: string,
+    pathname: string,
+  ): void {
+    const denial = judgeAccess(route.access, h.principal ?? anonymousPrincipal(), envAdminToken() !== null)
+    if (denial) {
+      h.json(denial.status, {
+        ok: false,
+        error: denial.code,
+        message: denial.message,
+        details: { access: route.access },
+      })
+      this.exitHandler(state)
+      return
+    }
+    this.invokeHandler(route.handler, h, state, method, pathname)
+  }
+
+  /** 调用处理器并按结算时机收尾（同步 / thenable 两条通路，语义与 P0 之前完全一致） */
+  private invokeHandler(
+    handler: RouteHandler,
+    h: RouteHandlerContext,
+    state: RequestState,
+    method: string,
+    pathname: string,
+  ): void {
+    try {
+      const result: unknown = handler(h)
+      if (isThenable(result)) {
+        // Promise.resolve 兜住非原生 thenable（自定义 then）：结算时机正确，且 rejection 有人接管
+        void Promise.resolve(result).then(
+          () => this.exitHandler(state),
+          (err: unknown) => {
+            console.error(`[http] 路由 ${method} ${pathname} 异常:`, err)
+            h.json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
+            this.exitHandler(state)
+          },
+        )
+      } else {
+        this.exitHandler(state)
+      }
+    } catch (err) {
+      console.error(`[http] 路由 ${method} ${pathname} 异常:`, err)
+      h.json(500, { ok: false, error: 'internal', message: err instanceof Error ? err.message : String(err) })
+      this.exitHandler(state)
+    }
   }
 }
 
@@ -767,7 +1032,29 @@ export const HttpPlugin = {
     })
 
     const server: Server = createServer((req, res) => {
-      if (!router.dispatch(req, res)) {
+      const handled = router.dispatch(req, res)
+      // 注册了前置钩子时 dispatch 转入异步续段（P0）：此时无法当拍判断是否交给静态层。
+      // 未注册钩子时仍是同步 boolean —— 既有路径逐字不变。
+      if (isThenable(handled)) {
+        void Promise.resolve(handled).then(
+          (taken) => {
+            if (!taken) void serveStatic({ webDist: config.webDist ?? null, pluginUiRoots }, req, res)
+          },
+          (err: unknown) => {
+            // 分发本身抛错必须显式收尾，否则客户端会一直挂着一个不会再有字节的连接
+            console.error('[@geewiki/http] 请求分发异常:', err)
+            if (res.writableEnded) return
+            if (!res.headersSent) {
+              res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: 'internal', message: '请求分发异常' }))
+            } else {
+              res.end()
+            }
+          },
+        )
+        return
+      }
+      if (!handled) {
         void serveStatic({ webDist: config.webDist ?? null, pluginUiRoots }, req, res)
       }
     })
