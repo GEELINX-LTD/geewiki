@@ -179,6 +179,28 @@ export interface PageDetail extends PageSummary {
   versions: VersionMeta[]
 }
 
+/**
+ * 站内链接引用。出链里 `title === null` 表示**目标页面不存在**（即「红链」，先写引用后建页的正常用法）。
+ */
+export interface PageLinkRef {
+  slug: string
+  title: string | null
+}
+
+/** `GET /api/pages/:slug/backlinks` —— 谁引用了本页。 */
+export interface BacklinksResponse {
+  ok: true
+  slug: string
+  backlinks: { slug: string; title: string }[]
+}
+
+/** `GET /api/pages/:slug/links` —— 本页引用了谁。 */
+export interface OutLinksResponse {
+  ok: true
+  slug: string
+  links: PageLinkRef[]
+}
+
 export interface SaveResult {
   ok: true
   slug: string
@@ -383,6 +405,17 @@ export const api = {
       'GET',
       `/api/pages/${encodeURIComponent(slug)}/versions/${id}`,
     ),
+  /*
+    反向链接与出链：**按 slug 的两个小端点**。
+
+    ⚠️ 刻意**不**为了它们去拉 `GET /api/pages` 全量列表——详情页此前为算「上一篇/下一篇」重复拉过
+    整张列表，是 O(N)/页 的规模瓶颈（已由 pagesStore 修掉）。这里必须保持按 slug 取数。
+    两个端点都由 wiki 插件提供；插件未启用时会 404，调用方须优雅降级。
+  */
+  backlinks: (slug: string) =>
+    request<BacklinksResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/backlinks`),
+  links: (slug: string) =>
+    request<OutLinksResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/links`),
 
   /* 检索与 AI 问答（后端插件未启用时这两个端点会 404，调用方须优雅降级） */
   search: (q: string, limit?: number) =>

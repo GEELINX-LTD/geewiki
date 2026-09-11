@@ -9,6 +9,7 @@ import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { SearchView } from '../components/SearchView'
 import { TableOfContents } from '../components/TableOfContents'
+import { PageLinks } from '../components/PageLinks'
 import { FILTER_HINT_ID, FILTER_INPUT_ID, SEARCH_INPUT_ID } from '../lib/domIds'
 import {
   decideDraftRestore,
@@ -969,6 +970,8 @@ function WikiDetail(props: {
               />
             </nav>
           )}
+
+          <PageLinks slug={page.slug} />
 
           <Card>
             <CardHeader
