@@ -376,6 +376,32 @@ export const PLUGIN_UI_PREFIX = '/plugins-ui'
 export const PLUGIN_UI_FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 /**
+ * UI 资产**相对路径**校验（`<PLUGIN_UI_PREFIX>/<插件名>/<本规则>`）：
+ * 一个或多个 {@link PLUGIN_UI_FILE_SEGMENT} 形态的段，以 `/` 连接。
+ *
+ * 为什么需要它、而不是放宽 `PLUGIN_UI_FILE_SEGMENT`：后者是**入口表**
+ * （`client.entry` / `client.css`）与静态层**共用**的"单段文件名"规则——
+ * `packages/manager/src/plugin-ui.ts` 用它校验清单声明，`packages/web` 持有同名副本，
+ * 两侧各有测试钉住"含 `/` 即非法"。改它的语义会让入口表也接受带斜杠的入口名
+ * （那是另一件事，且是回归）。故此处**新增**一条更宽的规则，两者并存、各自表述意图。
+ *
+ * 安全语义（这是本规则存在的**主要**理由）：段必须以字母/数字开头，故 `..`、`.env`、
+ * `.` 这类段天然非法；空段（`a//b`）、绝对路径（`/a`）、反斜杠（Windows 分隔符）、
+ * 尾随斜杠、以及 `%`（任何百分号编码）也一律非法。
+ * ⇒ 消费方**无需解码**即可安全使用：不解码，就没有 `%2e%2e`、`..%2f`
+ * 与双重编码这一整类陷阱，也没有"先解码再校验"的顺序依赖。
+ *
+ * 无 `g` 标志，`test()` 无 lastIndex 状态。
+ */
+export const PLUGIN_UI_ASSET_PATH = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/
+
+/**
+ * 资产相对路径的**最大段数**（含文件名）。纯粹是输入体积的兜底：
+ * 真实产物（Vite 的 `assets/js/chunk-x.js`）远达不到这个深度。
+ */
+export const PLUGIN_UI_ASSET_MAX_DEPTH = 16
+
+/**
  * 缓存清理事件名（架构 §5.7）：插件停用/卸载后，若其 manifest 声明
  * `runtime.requiresCachePurge: true`，插件管理器经 cordis 事件总线广播本事件
  * （唯一参数为插件名）；持有派生缓存（索引、渲染结果、前端资源表等）的插件

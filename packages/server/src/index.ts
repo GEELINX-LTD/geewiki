@@ -13,7 +13,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from 'cordis'
@@ -21,7 +21,8 @@ import {
   DEFAULT_DATA_DIR,
   DEFAULT_PORT,
   HEALTH_PATH,
-  PLUGIN_UI_FILE_SEGMENT,
+  PLUGIN_UI_ASSET_MAX_DEPTH,
+  PLUGIN_UI_ASSET_PATH,
   PLUGIN_UI_PREFIX,
   asAsync,
   normalizeRuntime,
@@ -472,6 +473,11 @@ const STATIC_MIME: Record<string, string> = {
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.wasm': 'application/wasm',
+  '.avif': 'image/avif',
   '.txt': 'text/plain; charset=utf-8',
   '.webmanifest': 'application/manifest+json',
   '.map': 'application/json',
@@ -497,11 +503,30 @@ function sendNotFound(res: ServerResponse): void {
 }
 
 /**
- * 插件 UI 资产：`<PLUGIN_UI_PREFIX>/<插件名>/<文件名单段>`（插件名 1 段或 2 段 scope 形态）。
+ * 带内容指纹的产物文件名（Vite 等打包器的 `name-<hash>.js` / `logo-D3f4G5.svg`）。
+ * 命中即可给「长缓存 + immutable」：文件名一变就是新 URL，旧 URL 的内容永不改变。
+ */
+const HASHED_ASSET_NAME = /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/
+
+/**
+ * 插件 UI 资产：`<PLUGIN_UI_PREFIX>/<插件名>/<相对路径>`（插件名 1 段或 2 段 scope 形态，
+ * 相对路径可含子目录，例如 `assets/logo.svg`、`js/chunk-2.js`）。
  *
- * 安全模型：**先按段还原插件名，再在根表里精确查名**——查不到直接 404，因此不存在由
- * 不可信输入拼出的路径。文件名限定单段后仍做一次 `startsWith` 纵深防御。
- * 插件名**不解码**：`%40geewiki` 查不到表 → 404（编码名一律不认，与前端约定一致）。
+ * 安全模型（四层，任一层不过即 404）：
+ * 1. **先按段还原插件名，再在根表里精确查名**——查不到直接 404，因此不存在由不可信输入
+ *    拼出的路径。**插件名与资产路径都不解码**：`%40geewiki` 查不到表 → 404
+ *    （编码名一律不认，与前端约定一致）；也正因不解码，`%2e%2e` / `..%2f` / 双重编码
+ *    这一整类陷阱不存在（{@link PLUGIN_UI_ASSET_PATH} 直接拒掉含 `%` 的输入）。
+ * 2. **相对路径形态校验**：段必须以字母/数字开头，故 `..`、`.env`、空段、绝对路径、
+ *    反斜杠、尾随斜杠一律非法；另有段数上限。
+ * 3. **词法包含**：`relative(root, file)` 不得以 `..` 开头或为绝对路径。
+ *    刻意**不用 `startsWith`**——那是前缀字符串比较，`/a/b-evil` 会通过 `/a/b` 的检查。
+ * 4. **真实路径包含**：`realpath` 之后再比一次，挡住**符号链接逃逸**
+ *    （产物目录里指向根外的软链）。
+ *
+ * 名字/路径的切分歧义：`/plugins-ui/@a/b/c.js` 既可读作「插件 `@a/b` + 路径 `c.js`」，
+ * 也可读作「插件 `@a` + 路径 `b/c.js`」。规则是**两段（scope）名优先**，且只在根表里
+ * **确实存在**该名时才选定——与 npm 的 `@scope/pkg` 规范形态一致，且结果确定。
  *
  * 与普通静态资源的关键差别：**绝不回退 index.html**。缺失即 404，否则会被 SPA fallback
  * 掩盖成 200 `text/html`，浏览器加载插件 bundle 时报 MIME 错误、且快照里看不出真因。
@@ -512,54 +537,92 @@ async function servePluginUiAsset(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const segments = pathname
-    .slice(PLUGIN_UI_PREFIX.length)
-    .split('/')
-    .filter((s) => s !== '')
-  // 形状：1–2 段插件名 + 1 段文件名
-  if (segments.length < 2 || segments.length > 3) {
+  const raw = pathname.slice(PLUGIN_UI_PREFIX.length)
+  // 严格：**不折叠空段**。`a//b` 与尾随 `/` 直接 404，使「请求路径 == 生效路径」，
+  // 审阅者无需推理规范化差异（若在此 filter 掉空段，`assets//logo.svg` 会静默变成
+  // `assets/logo.svg` 并 200——虽无害，但会让"URL 与实际取到的文件"不再一一对应）。
+  if (raw.includes('//') || raw.endsWith('/')) {
     sendNotFound(res)
     return
   }
-  const fileName = segments[segments.length - 1] as string
-  const name = pluginUiNameFromSegments(segments.slice(0, -1))
-  if (!name || !PLUGIN_UI_FILE_SEGMENT.test(fileName)) {
+  const segments = raw.split('/').filter((s) => s !== '')
+  // 名字候选：2 段（scope）优先，其次 1 段；各自都要满足插件名规则
+  const candidates: { name: string; asset: string }[] = []
+  if (segments.length >= 3) {
+    const name = pluginUiNameFromSegments(segments.slice(0, 2))
+    if (name) candidates.push({ name, asset: segments.slice(2).join('/') })
+  }
+  if (segments.length >= 2) {
+    const name = pluginUiNameFromSegments(segments.slice(0, 1))
+    if (name) candidates.push({ name, asset: segments.slice(1).join('/') })
+  }
+  const table = roots.pluginUiRoots?.() ?? {}
+  // 取**第一个在根表里存在**的名字候选；其后的候选不再考虑（切分必须是确定的）
+  const hit = candidates.find((c) => table[c.name] !== undefined)
+  if (!hit) {
     sendNotFound(res)
     return
   }
-  const root = roots.pluginUiRoots?.()[name]
-  if (!root) {
+  const asset = hit.asset
+  const root = table[hit.name] as string
+  if (!PLUGIN_UI_ASSET_PATH.test(asset) || asset.split('/').length > PLUGIN_UI_ASSET_MAX_DEPTH) {
     sendNotFound(res)
     return
   }
-  const file = resolve(root, fileName)
-  // 纵深防御：文件名已是单段，这里再确认规范化结果仍在该根内
-  if (!file.startsWith(resolve(root))) {
+  const rootAbs = resolve(root)
+  const file = resolve(rootAbs, asset)
+  // 词法包含（纵深防御：形态校验已排除 `..` 与绝对路径，这里独立再验一次）
+  if (!isContained(rootAbs, file)) {
     sendNotFound(res)
     return
   }
-  const dot = fileName.lastIndexOf('.')
-  const ext = dot < 0 ? '' : fileName.slice(dot).toLowerCase()
+  const dot = asset.lastIndexOf('.')
+  const ext = dot < 0 ? '' : asset.slice(dot).toLowerCase()
   try {
+    // 真实路径包含：挡住符号链接逃逸（realpath 在文件不存在时抛错 → 404，正合语义）
+    if (!isContained(await realpath(rootAbs), await realpath(file))) {
+      sendNotFound(res)
+      return
+    }
     const info = await stat(file)
     if (!info.isFile()) throw new Error('not a file')
     const data = await readFile(file)
+    // 弱校验器：由 size + mtime 派生，足以做 revalidate（不读内容算哈希，避免大资产开销）
+    const etag = `W/"${info.size.toString(16)}-${Math.trunc(info.mtimeMs).toString(16)}"`
+    // 带内容指纹的文件名（`name-<hash>.js`）可长缓存：文件名一变即新 URL，旧 URL 内容永不变。
+    // 无指纹的（`client.js`）沿用既有 `no-cache`：浏览器每次回来校验，不会长期缓存旧产物。
+    // 刻意**不**依赖 `?v=<rev>` 之类的 query 做缓存击穿：该方案已实测证伪——给**根相对** URL 加 query
+    // 会被 dev 下的 Vite 改写成 `?import&v=…` → 必然 500；改用同源绝对 URL 虽能绕开改写，但 `rev`
+    // 一变就产生**新模块实例**，而 ESM 无法从模块图卸载 → 插槽条目翻倍。`rev` 只作**变更检测**，
+    // 真正换代码的路径是 unload → load（同 URL 命中模块缓存，新产物需整页刷新才生效）。
+    // 详细实测记录见 `packages/web/src/lib/pluginUiPlan.ts` 文件头。
+    const cacheControl = HASHED_ASSET_NAME.test(asset) ? 'public, max-age=31536000, immutable' : 'no-cache'
+    // 条件请求命中即 304（无响应体；规范禁止在 304 上带 content-length）。
+    // 与入口表 revision/304 是**两套独立机制**：那条是 JSON 入口表的 ETag，这条是资产字节的 ETag。
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, { etag, 'cache-control': cacheControl })
+      res.end()
+      return
+    }
     res.writeHead(200, {
       'content-type': STATIC_MIME[ext] ?? 'application/octet-stream',
-      // 与既有非 hashed 资产策略一致：`no-cache`——浏览器每次都会回来校验/取用，不会长期缓存旧产物
-      // （本响应未设 ETag/Last-Modified，故实际等同于每次重新获取）。
-      // 刻意**不**依赖 `?v=<rev>` 之类的 query 做缓存击穿：该方案已实测证伪——给**根相对** URL 加 query
-      // 会被 dev 下的 Vite 改写成 `?import&v=…` → 必然 500；改用同源绝对 URL 虽能绕开改写，但 `rev`
-      // 一变就产生**新模块实例**，而 ESM 无法从模块图卸载 → 插槽条目翻倍。`rev` 只作**变更检测**，
-      // 真正换代码的路径是 unload → load（同 URL 命中模块缓存，新产物需整页刷新才生效）。
-      // 详细实测记录见 `packages/web/src/lib/pluginUiPlan.ts` 文件头。
-      'cache-control': 'no-cache',
+      'cache-control': cacheControl,
+      etag,
       'content-length': data.length,
     })
     res.end(req.method === 'HEAD' ? undefined : data)
   } catch {
     sendNotFound(res)
   }
+}
+
+/**
+ * 词法包含判定：`child` 是否位于 `parent` 之内（按**路径段**比较，而非前缀字符串）。
+ * 为什么必须是段比较：`startsWith` 会让 `/a/b-evil` 通过 `/a/b` 的检查。
+ */
+function isContained(parent: string, child: string): boolean {
+  const rel = relative(parent, child)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
 }
 
 /**
@@ -586,7 +649,7 @@ async function serveStatic(roots: StaticRoots, req: IncomingMessage, res: Server
   const rel = pathname === '/' ? 'index.html' : pathname.slice(1)
   // 路径穿越防护：规范化后必须仍位于静态根内
   const file = isAbsolute(rel) ? '' : resolve(root, rel)
-  if (!file || !file.startsWith(resolve(root))) {
+  if (!file || !isContained(resolve(root), file)) {
     notFound()
     return
   }
