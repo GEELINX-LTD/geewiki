@@ -1,8 +1,9 @@
 # GeeWiki 访问控制、组织管理与公开门户 —— 设计构想
 
-> **状态**：**v6 修订版**（= v5 定稿版 **+ 实现反馈驱动的修订** —— **本文档已无待决项**）。由两轮架构设计（v1 完整设计 + v2 修订版）合并而成，并经五轮评审纳入**十二项**已拍板决定（v2 的 D1–D4；v5 新锁定的 D7–D10；v3 的 D11 / D13 / D14；v4 的 D15 —— 另有 D5 / D6 由 §10.2 说明）。五轮修订依次是：① 把"**角色**"从**授权对象**里彻底摘掉（D13）；② 把 `owner`/`admin` 的**应急可见权**写成显式规则 + 审计（D14）；③ **D11 权限版本永久保留**；④ **块级第三档由"仅编辑者"改为"仅授权"**（D15）；⑤ **锁定 D7/D8/D9/D10 的默认值并定稿**。
-> **★ 第六轮（v6）不是新的设计决策**：它由 **P0 阶段的落地实现 + 一轮独立代码审查**驱动（**不是**用户拍板），只做三类事 —— ① 把"**实现过程中自行定义、文档里从未写过**"的六项 API 形状（`RouteAccess` / `RequestVerdict` / `use?()` / `dispatch` 返回值 / `register()` 第 4 参 / `judgeAccess` 判定顺序）**回写为正式章节 §2.5**；② 订正 §8.2 里两条**按字面执行不通或自相矛盾**的 P0 验收（P0-1 命令的 URL 编码、P0-6 与 §8.1 的建表归属冲突）；③ 把审查**实测到**的 `config` 回显通道记入 **P2 交付项（第 14 条）** 与 **§12 第 19 条**。核心在 §2.0 与 §4.3，修订记录见 **§13.1（v3）/ §13.2（v4）/ §13.3（v5 定稿）/ §13.4（v6 实现反馈）**。
-> **⚠️ 定稿 ≠ 已实现（★ v6 解冻一部分）**：这是一份**设计稿**。**P0 阶段已落地**（worktree 分支 `feat/p0-route-auth-guard`，基线提交 `bb43fc2`，另含一轮修复改动；实际 API 形状见 **§2.5**），**P1 及其后各阶段仍未实现**；文中其余结论**未经验证（未实测 / 未跑代码）**。§12 保留的条目是**已知的"未验证 / 实现前需复核"项，不是待决项**；实现前须按 §12 与各章的「原文如此，实现前需复核」逐条复核（完整声明见 §13.3，v6 的声明见 §13.4）。
+> **状态**：**v7 修订版**（= v6 修订版 **+ 实现反馈驱动的三处订正** —— **本文档已无待决项**）。由两轮架构设计（v1 完整设计 + v2 修订版）合并而成，并经五轮评审纳入**十二项**已拍板决定（v2 的 D1–D4；v5 新锁定的 D7–D10；v3 的 D11 / D13 / D14；v4 的 D15 —— 另有 D5 / D6 由 §10.2 说明）。五轮修订依次是：① 把"**角色**"从**授权对象**里彻底摘掉（D13）；② 把 `owner`/`admin` 的**应急可见权**写成显式规则 + 审计（D14）；③ **D11 权限版本永久保留**；④ **块级第三档由"仅编辑者"改为"仅授权"**（D15）；⑤ **锁定 D7/D8/D9/D10 的默认值并定稿**。
+> **★ 第六轮（v6）不是新的设计决策**：它由 **P0 阶段的落地实现 + 一轮独立代码审查**驱动（**不是**用户拍板），只做三类事 —— ① 把"**实现过程中自行定义、文档里从未写过**"的六项 API 形状（`RouteAccess` / `RequestVerdict` / `use?()` / `dispatch` 返回值 / `register()` 第 4 参 / `judgeAccess` 判定顺序）**回写为正式章节 §2.5**；② 订正 §8.2 里两条**按字面执行不通或自相矛盾**的 P0 验收（P0-1 命令的 URL 编码、P0-6 与 §8.1 的建表归属冲突）；③ 把审查**实测到**的 `config` 回显通道记入 **P2 交付项（第 14 条）** 与 **§12 第 19 条**。核心在 §2.0 与 §4.3，修订记录见 **§13.1（v3）/ §13.2（v4）/ §13.3（v5 定稿）/ §13.4（v6 实现反馈）/ §13.5（v7 实现反馈）**。
+> **★ 第七轮（v7）同样不是新的设计决策**：它由 **P1 / P1.5 阶段的落地实现 + 一次 PostgreSQL 实机试跑** 驱动（**不是**用户拍板），只做三处**订正** —— ① §7.2 的 `link_ticket` **不落库**（HMAC 自包含票据；原文"存 DB"与 §7.6 的"迁移增量 0"不可兼得，两批实现者各自独立选了同一个解法）；② §4.3 补**明确的方言语义**（该 FTS 形态**仅支持 SQLite**、PG 下检索插件**显式拒绝激活**、PG 等价物是 `tsvector` + `pg_trgm` 且**列为非目标**）；③ 记录**进度事实**（P0 / P1 已合入 `main`，P1.5 / P2 正在 worktree 分支上实现）与一条**方法学事实**。修订记录见 **§13.5**。
+> **⚠️ 定稿 ≠ 已实现（★ v7 更新进度）**：这是一份**设计稿**。**P0 与 P1 均已合入 `main`**（合并提交 `e708814` / `f3990a9`，见 §8.1 两行的 ★ v7 标注）；**P1.5（OIDC）与 P2（组织与条目可见性）正在各自的 worktree 分支上实现**（`.wt-p15` / `feat/p15-oidc`、`.wt-p2` / `feat/p2-org-visibility`）；**P3a 及其后各阶段仍未实现**。文中结论除 **§13.5 明确标为"实现反馈 / 已在实现中核对"** 的三处外，**仍属未验证（未实测 / 未跑代码）**。§12 保留的条目是**已知的"未验证 / 实现前需复核"项，不是待决项**；实现前须按 §12 与各章的「原文如此，实现前需复核」逐条复核（完整声明见 §13.3，v6 的声明见 §13.4，v7 的见 §13.5）。
 > **读者**：项目所有者（非权限系统专家）。所有专业术语首次出现时都会用一句白话解释。
 > **素材来源**：① GeeWiki 后端/数据层现状调查；② 前端现状调查；③ 业界权限模型与游客首页调研（外部来源链接见第 11 节）；④ 两轮架构设计。
 > **标注约定**：文中标 **「实测」** 的结论来自对仓库实际执行过的 SQLite 探测（用的是 `:memory:` 库，未触碰 `data/geewiki.db`）；标 **「原文如此，实现前需复核」** 的地方表示来源本身存在不确定或矛盾，**不要照着猜**。
@@ -511,6 +512,7 @@ function judgeAccess(access: RouteAccess, principal: Principal, credentialSource
 - 迁移文件内**不写 `BEGIN/COMMIT`** —— 控制器已逐文件包事务（`packages/db-sqlite/src/index.ts:77-101`）。
 - 全部语句用 `IF NOT EXISTS`，保证 `db.migrate()` 幂等重放安全。
 - **FTS 相关迁移的归属插件是 `@geewiki/search`，不是 db 插件**。它的文件在 `packages/plugin-search/migrations/`（现有 `0001_search.sql` 就是它）。定义 `pages` 表的是 `packages/db-sqlite/src/migrations/0001_init.sql`。**这直接影响 §4.3 的落地位置。**
+  > **★ v7 补充（与上面第 1 条的边界，必须一起读）**："**必须双侧方言成对**"这条规则**只管 db 插件的迁移**（`packages/db-sqlite` ↔ `packages/db-postgres`）。**`@geewiki/search` 的迁移是 SQLite 专有的**（FTS5 语法，PG 上根本没有对应物）⇒ 它**没有也不该有 VIRTUAL TABLE** 的 PG 孪生文件；正确的姿势是**在 manifest 里按方言声明迁移目录**，让 PG 下直接跳过（`migrations: { sqlite: './migrations' }`）。现状是用裸字符串声明的 ⇒ PG 下会被执行并失败，见 **§4.3 的「★ v7：方言语义」**。
 - 内置插件的迁移目录在 `defaultRegistry()` 硬编码（`packages/server/src/index.ts:938-1017`）。
 
 ### 3.1 `0010_identity.sql` —— 用户、凭据、会话、外部身份
@@ -576,6 +578,8 @@ CREATE INDEX IF NOT EXISTS idx_identities_user ON user_identities(user_id);
 ```
 
 > **为什么 `email_verified` 与 `user_identities` 必须提前到 P1 建**（v2 的顺序修正）：若 P1 不建，P1.5 会需要一次额外的 `ALTER TABLE` + 一次 email 验证状态的回填。而**回填逻辑无法判断历史账号是否验证过**，只能全置 0 或全置 1，两者都会让"自动绑定"策略在过渡期行为不确定。
+
+> **★ v7 核对（`link_ticket` 不落库的事实基础，与 §7.2 配套）**：本迁移**没有任何存 ticket 的表** —— 全仓 `grep -rn ticket packages/db-sqlite/src/migrations/ packages/db-postgres/migrations/` **零命中**。因此 §7.2 原写的"`link_ticket` 存 DB"**在 P1/P1.5 的边界内根本无处落库**，v7 已把那句改成"**HMAC 签名的自包含票据，不落库**"（理由与安全性论证见 §7.2 的 ★ v7 小节）。本节 DDL 与之一致，**无矛盾表述**：P1 建的表只有 `users` / `user_credentials` / `sessions` / `user_identities`（另有 §3.4 的 `audit_log` 等，见 §8.1 P1 行）。
 
 ### 3.2 `0011_org_team.sql` —— 组织、成员、组、邀请
 
@@ -923,6 +927,34 @@ SELECT p.slug, p.title, p.updated_at, b.ordinal, f.rank AS score
 
 **为什么给 `blocks` 加一个 `tier` 冗余列**：`tier` 是页面有效可见性与块可见性的**组合结果**（`min(page, block)`）。它随祖先可见性变化而变，所以是**派生列**（页面的 `acl_revision` 变化时重算该页所有块）。把它放在 `blocks` 上，FTS 查询就是一条 `AND b.tier <= ?`，**且这条路径已实测正确**。相对把 `tier` 放进 FTS 表（不可行）或建多张 FTS 表（跨表 `rank` 不可比），这是唯一同时满足"正确 + 单表 + 可比排名"的形态。
 
+#### ★ v7：方言语义 —— 这套 FTS 形态**仅支持 SQLite**（PG 下检索插件**显式拒绝激活**，不是静默恒空）
+
+**结论先行**：`blocks_fts` 沿用 **FTS5**（`contentless + contentless_delete=1 + tokenize='trigram'`），**FTS5 是 SQLite 专有特性** ⇒ **本节整套设计（含 tier 分层可见性）只在 SQLite 部署下成立**。这是**已知且经过权衡的限制，不是遗漏**。
+
+**PostgreSQL 部署下的行为（刻意的设计，不是 bug）**：`@geewiki/search` 在 `apply()` 里**用方言守卫提前拒绝激活**，而不是启动成功、检索恒为空。源码注释（原文引用，`packages/plugin-search/src/index.ts:308-312`）：
+
+> 全文索引建立在 SQLite 专有的 FTS5 之上（`tokenize='trigram'`，中文子串检索的关键），**PostgreSQL 没有 FTS5**——PG 侧的等价物是 `tsvector` + 分词配置，属另一个工程（本批不做）。若在这里静默放行，会先炸在迁移脚本的语法上，**或更糟：启动成功但检索恒为空**。故提前拒绝并说清原因与替代方案。
+
+判据用**方言**而非"同步/异步"（`:312-313`：*"将来若有同步的 PG 驱动，本插件同样不适用"*）；抛出的错误文案是 *"`@geewiki/search`: 当前数据库方言是 …，而本插件的全文索引依赖 SQLite 专有的 FTS5（trigram 分词器），暂不支持该方言。请改用 `@geewiki/db-sqlite`，或等待基于 tsvector 的 PG 检索实现。"*（`:314-319`）。
+
+> **★ 一个必须说清的细节（本轮的实证发现）**：在 PG 上**实际触发拒绝的通常不是这段守卫** —— 迁移控制器排在激活**之前**（`packages/manager/src/index.ts:1162-1184` 的 5.5 步 → `:1204` 的 `ctx.plugin(...)`），所以插件往往**先死在迁移的语法错误上**（见下方"诊断体验"）。结论不变（**拒绝激活，不是静默恒空**），但排障时看到的报错来自迁移失败（`migration_failed`），而不是上面那句守卫文案。
+
+**PG 侧若将来要实现（等价物与工作量）**：等价物是 **`tsvector` + `pg_trgm`**（`tsvector` 做词元检索、`pg_trgm` 补中文/短串的相似匹配）。但**光换检索引擎不够**：本节整套 **tier 分层可见性**（`blocks.tier` 派生列 + 等级分支 OR 授权分支 + `:grantedBlockIds` + contentless 表的应用层同步 + 一致性探针）都建立在 FTS5 的 `rowid` 与 `rank` 语义上，**必须在 PG 上重做一遍**（可能是 GIN 索引 + `ts_rank` + 不同的过滤计划）⇒ **工作量可能与 P3a 本体相当**。
+
+**⇒ 明确列为非目标（本期不做）**：PG 部署下**没有全文检索**。块模型、逐块可见性、读路径裁剪（P3a 的非 FTS 部分）仍可在 PG 上落地，但"搜索"这一路在 PG 下**不可用**，且必须是**可诊断的拒绝**（现在的行为），不能退化成"能启动但搜不到"。
+
+**★ 诊断体验问题（非正确性问题，列为可选改进项，不阻塞任何阶段）**：迁移控制器**在插件激活之前**就会尝试执行 `packages/plugin-search/migrations/0001_search.sql`，而该脚本是 FTS5 语法（`CREATE VIRTUAL TABLE … USING fts5(…)`，`packages/plugin-search/migrations/0001_search.sql:17-21`）⇒ **在 PG 上必然失败回滚**，并在日志里留下那段 PG 语法错误堆栈。
+
+- **实测记录（出处：编排者在容器 `geewiki-pg-test`（`postgres:15-alpine`）上把服务切到 PG 后取得；本轮修订只改文档、未亲自复现）**：
+  ```
+  [db-postgres] 迁移失败（已回滚）: 0001_search.sql error: syntax error at or near "VIRTUAL"
+  ```
+- **根因（已核实到行）**：迁移目录**按当前方言取**，先精确匹配方言键、再回退 `'default'`（`packages/manager/src/index.ts:1163-1164`、`:1168`）；而 `@geewiki/search` 的 manifest 把迁移目录声明为**裸字符串** `migrations: './migrations'`（`packages/plugin-search/src/index.ts:67`）⇒ 在 `resolveMigrationsDirs` 里归入 **`'default'` 键**（"所有方言共用"，`packages/manager/src/discovery.ts:100-108`）⇒ PG 下 `migrationsDirs['postgres'] ?? migrationsDirs['default']` **命中的正是 `'default'`** ⇒ 脚本照样被执行。
+- **理想做法**：把声明改成**按方言**的形式 `migrations: { sqlite: './migrations' }` ⇒ PG 下取不到目录，走"**未声明该方言的迁移目录，跳过迁移**"分支（`packages/manager/src/index.ts:1179-1183`），日志里只剩一行告警、没有误导性的语法错误堆栈。**先例**：`@geewiki/wiki` 正是只声明 sqlite 目录的那一类（`packages/server/src/index.ts:1391` 只给了 `{ sqlite: WIKI_MIGRATIONS_DIR }`）⇒ PG 下跳过，行为干净。
+- **⚠️ 由此订正本节上方的一句注释**：§4.3 的迁移示例里写着"**PG 侧不执行本文件**" —— 那是**目标行为**（控制器确实支持按方言跳过），但**当前不会自动成立**（见上一条根因）。要让这句话成真，必须先把 manifest 的迁移声明改成按方言的形式。已在该处就地标注。
+
+**⇒ 对验收的影响**：§8.1 的 P3a 行与 §8.2 的 P3a 验收项**凡涉及 FTS / `blocks_fts` / `pages_fts` / `GET /api/search` 的，都已就地标注"仅 SQLite"**（PG 下这些项**不适用**，因为检索插件不会激活）。逐条清单见 §8.2 的 P3a 小标题下说明与 §13.5。
+
 #### ★ v4：第三档 `granted` 无法用 `tier` 表达 —— 检索改形
 
 `blocks.tier` 的原取值域是 `0=anon, 1=org, 2=private(编辑者)`。v4 把第三档换成 `granted`（"**默认谁都不能看，靠 `block_grants` 放人**"，§2.2）之后，它**不再是"读者等级"，而是逐块的 ACL** —— 处在同一个"读者等级"的人里，只有**被显式授权的那几个人**能看。**等级数字表达不了"具体是谁"**，所以 `tier` 无法承载这一档。
@@ -972,6 +1004,10 @@ DROP TRIGGER IF EXISTS pages_fts_au;
 
 -- 4) 保留老表作为回滚锚点（PG 侧不执行本文件——FTS5 是 SQLite 专有，
 --    与 0001_search.sql 的能力守卫同源，见 packages/plugin-search/src/index.ts 的 dialect 拒绝）
+-- ★ v7 订正：「PG 侧不执行本文件」是**目标行为**、但**当前不会自动成立**：
+--    @geewiki/search 用裸字符串声明迁移目录（migrations: './migrations'）⇒ 归入 'default' 键
+--    ⇒ PG 下照样执行，必然以 syntax error at or near "VIRTUAL" 失败回滚。
+--    修法（可选、不阻塞）：改成 migrations: { sqlite: './migrations' }。详见本节「★ v7：方言语义」。
 -- ALTER TABLE pages_fts RENAME TO pages_fts_legacy;   -- 仅当需要回滚时执行
 ```
 
@@ -1091,6 +1127,7 @@ interface ContentView {
 **改法**：`WikiOutlink` 增 `exists: boolean | 'hidden'`；**新增** `visibleBlocks: number`（该目标页对当前主体可见的块数）—— 它让前端能在**不泄漏任何内容**的前提下区分"完全无权"与"部分可见"。
 
 ### 5.6 搜索三路（**v2 修订：v1 漏判了 LIKE 兜底路**）
+> **★ v7（方言语义，先说清适用范围）**：本节的三条路**全部由 `@geewiki/search` 提供** ⇒ **仅 SQLite 部署下存在**；PG 下该插件**显式拒绝激活**、`GET /api/search` 不存在（见 §4.3 的「★ v7：方言语义」）。**也就是说：PG 部署下本节讨论的泄漏面不存在，代价是"没有检索"** —— 这是已知的非目标，不是遗漏。
 `packages/plugin-search/src/index.ts`：FTS 路 `:395-400`、**LIKE 短查询兜底路 `:415-428`**、`SELECT_COLUMNS` `:298`、`contents()` `:460-472`
 
 - **FTS 路**：改 `JOIN blocks_fts` + `JOIN blocks b ON b.id = f.rowid` + **`AND ( b.tier <= ? OR b.id IN (:grantedBlockIds) )`**（★ v4 改形：两个分支，形态与理由见 §4.3）。
@@ -1223,7 +1260,7 @@ users (本地账号，唯一)
 | 场景 | 处理 |
 |---|---|
 | OIDC 首登，`(issuer,sub)` **未绑定**，email **不存在** | 按 `provisioning_mode` 决定：`auto` ⇒ 建用户 + 绑定；`invite_only`（默认）⇒ 需存在该 email 的未消费邀请，否则 403 `no_invitation`；`off` ⇒ 403 |
-| OIDC 首登，`(issuer,sub)` 未绑定，email **已存在**（本地账号） | **绝不自动合并**。返回 409 `identity_link_required` + 一次性 `link_ticket`（5 分钟、绑当前 OIDC 身份、存 DB）。用户必须在**已登录的本地会话**里确认绑定（`POST /api/auth/identities/link`），或先用本地密码登录再走绑定页 |
+| OIDC 首登，`(issuer,sub)` 未绑定，email **已存在**（本地账号） | **绝不自动合并**。返回 409 `identity_link_required` + 一次性 `link_ticket`（5 分钟、绑当前 OIDC 身份、**HMAC 签名的自包含票据，不落库** —— ★ v7 订正，理由与安全论证见下方 ★ v7 小节）。用户必须在**已登录的本地会话**里确认绑定（`POST /api/auth/identities/link`），或先用本地密码登录再走绑定页 |
 | 用户想解绑 | 允许，但**至少保留一种登录方式**（不能解绑掉最后一个 identity 且无密码）⇒ 409 `last_credential` |
 
 **为什么禁止自动绑定**（两条都是账号接管）：
@@ -1232,6 +1269,45 @@ users (本地账号，唯一)
 2. 反向：本地恶意用户可用自己的 email 预先占位，等真实用户通过 OIDC 登录时"被合并"进攻击者的账号。
 
 **唯一的例外仍不例外**：当 `email_verified=true`（IdP 声明）**且**目标本地账号的 `email_verified=1` 时，也**仍然要求手动确认** —— 因为 `email_verified` 只是 IdP 的**声明**，不是我们独立验证的事实。
+
+#### ★ v7：`link_ticket` **不落库** —— HMAC 签名的自包含票据（订正"存 DB"的旧表述）
+
+**结论先行**：票据就是一张**服务端签了名的纸条** —— `base64url(JSON 载荷) + '.' + base64url(HMAC-SHA256)`。服务端**只验签、不存任何一行**；票据自己携带 `(iss, sub, exp)`，验得过就说明"这是本服务在 5 分钟内签发的、针对这个 OIDC 身份的一次性凭据"。
+
+**为什么旧表述必须改**：v6 及更早的 §7.2 要求"**存 DB**"，但 §7.6 把本阶段的**迁移增量定为 0**（`user_identities` 已在 P1 建表），而 §3.1 的 `0010_identity.sql` 里**根本没有存 ticket 的表**（已 grep 确认，零命中，见 §3.1 的 ★ v7 核对）。**两条要求不可兼得**；P1.5 的两个独立实现者各自独立选了同一个解法 —— **不新增表，改用签名票据**。
+
+**实现（出处：P1.5 worktree `.wt-p15`，尚未合入 `main`；行号取自核对当时的该工作区状态）**
+
+| 事项 | 落点 |
+|---|---|
+| 载荷类型 `LinkTicketPayload` = `{ iss, sub, email, emailVerified, displayName, exp }` | `.wt-p15/packages/plugin-auth/src/oidc.ts:71-81` |
+| 有效期 `TICKET_TTL_MS = 5 * 60 * 1000` | `.wt-p15/packages/plugin-auth/src/oidc.ts:84` |
+| 承载 cookie 名 `LINK_COOKIE = 'gw_link'` | `.wt-p15/packages/plugin-auth/src/oidc.ts:93` |
+| 签发 `signLinkTicket(payload, secret)` | `.wt-p15/packages/plugin-auth/src/oidc.ts:96-100` |
+| 校验 `verifyLinkTicket(token, secret, now)` —— **任一处不合法返回 `null`（失败关闭）**；顺序是"格式 → 签名（恒时比较）→ 载荷形状 → 过期"（**先验签名再解析载荷**，不把未验证的 JSON 当可信输入） | `.wt-p15/packages/plugin-auth/src/oidc.ts:102-147` |
+| 密钥：`GEEWIKI_OIDC_TICKET_SECRET`（≥16 字符）生效，**未配置则每进程随机**（`randomBytes(32)`） | `.wt-p15/packages/plugin-auth/src/index.ts:476-478` |
+| cookie 属性 `Path=/; HttpOnly; SameSite=Lax`（生产加 `Secure`）⇒ **前端 JS 读不到** | `.wt-p15/packages/plugin-auth/src/http.ts:59-69` |
+| 票据**从不出现在 URL / 查询串**里（放进去会经 `Referer`、浏览器历史、反代日志与截图泄漏） | `.wt-p15/packages/plugin-auth/src/oidc.ts:86-92` 的注释 |
+
+**安全性论证：不落库与落库"等价"** —— 这是本改法能被接受的关键，请勿跳过：
+
+绑定端点**同时**要求两件事（都在一次请求内强制）：
+
+1. **持有有效 ticket**（从 `gw_link` cookie 读，验签 + 未过期）；
+2. **以「目标本地账号」的会话登录** —— `const userId = h.principal?.userId ?? null`，为 `null` 直接 **401**（`.wt-p15/packages/plugin-auth/src/index.ts:1262-1266`）。
+
+⇒ **攻击者拿自己的 ticket 一点用都没有**：票据里绑的是**他自己的** `(iss, sub)`，而第 2 道要求的是**受害者的本地会话**。他签不出受害者的票据（没有密钥），也过不了受害者的会话闸门。**所以"ticket 可能被他人重放"这条顾虑不成立** —— 重放一张**自己签发**的票据，最多只能把自己的身份绑到自己已登录的账号上（等于什么都没做）。落库版的存在意义是"服务端能记住票据被消费过"，而本设计里"**能不能绑**"从来不由票据单独决定，**两道门缺一不可** ⇒ 两种存法**安全性等价**。
+
+**"一次性"由唯一索引兜底**：`idx_identities_issuer_sub`（§3.1）—— 重放或并发下第二次 `INSERT` 会撞唯一约束，代码如实报冲突并**不放行**。实现里的原话：*"**唯一索引就是『一次性』的实现**"*（`.wt-p15/packages/plugin-auth/src/index.ts:1299-1310`）。
+
+**为什么不新增迁移**：P1.5 的边界是"**迁移增量 = 0**"（§7.6）。落库至少要新增一张表，连带**两侧方言成对迁移**（§3.0）**加上一条过期行清理任务** —— 全都超出该阶段的范围，且与"P1.5 只叠加在 P1 之上"的定位相冲突。
+
+**代价（诚实列出，两条都是失败关闭方向）**：
+
+1. **进程重启 ⇒ 有效期内（≤5 分钟）的票据失效**：用户重走一次 SSO 即可，**拒绝而非放行**。
+2. **多实例部署下票据不通用**：除非显式配置 `GEEWIKI_OIDC_TICKET_SECRET`（同一密钥即可跨实例）。**绝不用固定默认值兜底** —— 那等于把"猜不到密钥"这条保证换成"读源码就知道"（`.wt-p15/packages/plugin-auth/src/index.ts:470-475` 的注释原话）。
+
+> **类型说明**：以上结论来自**只读查阅 P1.5 的实现源码**（该分支尚在演进 ⇒ **行号可能小幅漂移，定位请以函数 / 常量名为准**）。§7.6 的"迁移增量 0"与 §3.1 的 DDL 均**无需改动**。本轮**未运行任何代码、未跑该端点的端到端流程** —— 详见 §13.5 的未验证项。
 
 ### 7.3 OIDC 首次登录的 provisioning
 
@@ -1292,11 +1368,11 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 | 阶段 | 范围 | 涉及文件:行号 / 新增插件 | 量级 | 测试影响 |
 |---|---|---|---|---|
-| **P0** | 钩子表 + 路由 `access` 声明 + break-glass + `bootstrap_required`。**★ v5（D7）落地方式**：break-glass 令牌取 `GEEWIKI_ADMIN_TOKEN`，**环境变量未设置即整个通道禁用**（不是"默认令牌"）；**每次使用留痕**，`actor` 记为 **break-glass 来源**（`principal.kind='break-glass'`，§2.4）。**★ v6（实现反馈）**：P0 **已落地**（worktree `feat/p0-route-auth-guard`，基线提交 `bb43fc2` + 一轮修复改动），实际 API 形状见 **§2.5**。**★ 注意：P0 不新增任何表 / 迁移** ⇒ 留痕在 P0 只有 **stdout 结构化行**（`auditBreakGlassUse()`）；`audit_log` 建表归 **P1**（`0013_audit.sql`）、审计闭环归 **P4** —— 取舍与风险见 §8.2 P0-6 | `packages/core/src/index.ts:487-492,502-518,544-580,598-620,679-698`；`packages/server/src/index.ts:135-249,490-618,637-694`；`packages/manager/src/index.ts:1574-1683`；`packages/plugin-wiki/src/index.ts:649-692` | **S** | 管理端点测试需补 token（**已落地为 `adminHeaders()`**，见 §8.2 P0-4） |
-| **P1** | 身份/会话/本地密码 + **`email_verified` + `user_identities` 建表** + 登录/登出/初始化向导 | 迁移 `0010_identity.sql`、`0013_audit.sql`；新增 `packages/plugin-auth`（`provides:'auth-service'`）；`packages/server/src/index.ts:938-1017` 登记；`config/plugins.base.json`；前端 `lib/authStore.ts`、`packages/web/src/api.ts:27-44`、`lib/errorText.ts:81-105` | **M** | `packages/web/test/errorText.test.ts` 必改 |
-| **P1.5** | **OIDC 通道**：授权码 + PKCE、`(issuer,sub)` 绑定、`provisioning_mode`、手动绑定流 | 新增 `packages/plugin-oidc`（`provides` **无** —— 只往 `auth-service` 注册 provider，**与 `@geewiki/openai` 同形态**：`packages/server/src/index.ts:1000-1017` 的注释明说"只往 llm-service 注册一条路由，故**无 provides**"）；`packages/plugin-auth` 增绑定端点 | **M** | 仅新增 |
-| **P2** | 组织/成员/组/邀请 + **页面级**可见性 + 继承 + `page_grants` + 全量**读路径**加 principal + 门户 `/portal` + 导航 IA + 404/403。**★ v5（D8）新增上线步骤**：**存量条目一次性回填 `visibility='org'`**（见 §8.2 P2 第 13 条） | 迁移 `0011_org_team.sql`、`0012_page_acl.sql`；**新增数据回填**（D8：`UPDATE pages SET visibility='org' WHERE …`，属上线动作、**不是 DDL 默认值**，§3.3）；新增 `packages/plugin-org`、`packages/plugin-authz`（`policy-service`）；`packages/plugin-wiki/src/index.ts:388-425,601-722`；`packages/plugin-search/src/index.ts:478` 与查询层过滤；前端 §6.6 各项 | **L** | 最大（导航/详情按钮/wiki 服务契约） |
-| **P3a** | **块模型落地 + 读路径改造 + FTS tier 切换**（原子 PR） | 迁移 `0015_blocks.sql` + `packages/plugin-search/migrations/0002_blocks_fts.sql`；`packages/plugin-wiki` 的 `parseBlocks` + `savePage` 事务（`:489-531`）；`packages/plugin-search/src/index.ts:290-478`；`packages/plugin-ai/src/index.ts:438`、`packages/plugin-ai/src/select.ts:41-44` | **L** | `packages/plugin-search/test/search.test.ts`（`SearchHit.content` 删除）、`packages/plugin-ai/test/*` |
+| **P0** | 钩子表 + 路由 `access` 声明 + break-glass + `bootstrap_required`。**★ v5（D7）落地方式**：break-glass 令牌取 `GEEWIKI_ADMIN_TOKEN`，**环境变量未设置即整个通道禁用**（不是"默认令牌"）；**每次使用留痕**，`actor` 记为 **break-glass 来源**（`principal.kind='break-glass'`，§2.4）。**★ v6（实现反馈）**：P0 **已落地**（worktree `feat/p0-route-auth-guard`，基线提交 `bb43fc2` + 一轮修复改动），实际 API 形状见 **§2.5**；**★ v7：该分支已合入 `main`（合并提交 `e708814`）**。**★ 注意：P0 不新增任何表 / 迁移** ⇒ 留痕在 P0 只有 **stdout 结构化行**（`auditBreakGlassUse()`）；`audit_log` 建表归 **P1**（`0013_audit.sql`）、审计闭环归 **P4** —— 取舍与风险见 §8.2 P0-6 | `packages/core/src/index.ts:487-492,502-518,544-580,598-620,679-698`；`packages/server/src/index.ts:135-249,490-618,637-694`；`packages/manager/src/index.ts:1574-1683`；`packages/plugin-wiki/src/index.ts:649-692` | **S** | 管理端点测试需补 token（**已落地为 `adminHeaders()`**，见 §8.2 P0-4） |
+| **P1** | 身份/会话/本地密码 + **`email_verified` + `user_identities` 建表** + 登录/登出/初始化向导。**★ v7：已合入 `main`**（合并提交 `f3990a9`，分支 `feat/p1-identity`，基线 `e708814`，tip `4b19e7b`） | 迁移 `0010_identity.sql`、`0013_audit.sql`；新增 `packages/plugin-auth`（`provides:'auth-service'`）；`packages/server/src/index.ts:938-1017` 登记；`config/plugins.base.json`；前端 `lib/authStore.ts`、`packages/web/src/api.ts:27-44`、`lib/errorText.ts:81-105` | **M** | `packages/web/test/errorText.test.ts` 必改 |
+| **P1.5** | **OIDC 通道**：授权码 + PKCE、`(issuer,sub)` 绑定、`provisioning_mode`、手动绑定流。**★ v7：正在实现中** —— worktree `.wt-p15`、分支 `feat/p15-oidc`（**堆叠在 P1 的 tip `4b19e7b` 上**）⇒ 本行内容以 §7.2 的 ★ v7 小节为准（`link_ticket` 已改为**不落库**） | 新增 `packages/plugin-oidc`（`provides` **无** —— 只往 `auth-service` 注册 provider，**与 `@geewiki/openai` 同形态**：`packages/server/src/index.ts:1000-1017` 的注释明说"只往 llm-service 注册一条路由，故**无 provides**"）；`packages/plugin-auth` 增绑定端点 | **M** | 仅新增 |
+| **P2** | 组织/成员/组/邀请 + **页面级**可见性 + 继承 + `page_grants` + 全量**读路径**加 principal + 门户 `/portal` + 导航 IA + 404/403。**★ v7：正在实现中** —— worktree `.wt-p2`、分支 `feat/p2-org-visibility`（**基线 `f3990a9`**）。**★ v5（D8）新增上线步骤**：**存量条目一次性回填 `visibility='org'`**（见 §8.2 P2 第 13 条） | 迁移 `0011_org_team.sql`、`0012_page_acl.sql`；**新增数据回填**（D8：`UPDATE pages SET visibility='org' WHERE …`，属上线动作、**不是 DDL 默认值**，§3.3）；新增 `packages/plugin-org`、`packages/plugin-authz`（`policy-service`）；`packages/plugin-wiki/src/index.ts:388-425,601-722`；`packages/plugin-search/src/index.ts:478` 与查询层过滤；前端 §6.6 各项 | **L** | 最大（导航/详情按钮/wiki 服务契约） |
+| **P3a** | **块模型落地 + 读路径改造 + FTS tier 切换**（原子 PR）。**★ v7：其中"FTS tier 切换"部分仅 SQLite 适用** —— `blocks_fts` 是 FTS5（SQLite 专有），PG 部署下 `@geewiki/search` **显式拒绝激活**⇒ 检索不可用；块模型与读路径裁剪两部分仍可两方言落地。详见 §4.3 的「★ v7：方言语义」与 §8.2 P3a 的逐条标注 | 迁移 `0015_blocks.sql` + `packages/plugin-search/migrations/0002_blocks_fts.sql`；`packages/plugin-wiki` 的 `parseBlocks` + `savePage` 事务（`:489-531`）；`packages/plugin-search/src/index.ts:290-478`；`packages/plugin-ai/src/index.ts:438`、`packages/plugin-ai/src/select.ts:41-44` | **L** | `packages/plugin-search/test/search.test.ts`（`SearchHit.content` 删除）、`packages/plugin-ai/test/*` |
 | **P3b** | **块级权限 + `block_grants` + 例外授予 + 申请访问** | 迁移 `0016_block_grants.sql`；`policy-service` 的块级判定；条目详情页"内容块"治理面板 | **M** | 新增为主 |
 | **P3c** | **块级版本与恢复** | 迁移 `0017_version_blocks.sql`；`packages/plugin-wiki/src/index.ts:621-639`（读历史）+ 恢复端点 | **M** | `packages/plugin-wiki/test/service.test.ts` |
 | **P3d** | **块级编辑器体验**：标记语法高亮/自动补全、块级可见性侧栏、"预览为匿名视角" | `packages/web/src/components/MarkdownEditor*.tsx`、`packages/web/src/pages/WikiPage.tsx:1135-1140,1670` | **S–M** | `packages/web/test/designSystem.test.ts`、`contrastPlan.test.ts` |
@@ -1370,19 +1446,29 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
     - **为什么不能更早做（P0 不做的理由）**：① P0 的契约是"**读端点行为与改动前逐字一致**"（§8.1 P0 行），且 **P0 不许改 `packages/web`** —— 裁剪 `config` 会改变管理台首屏的取数结果（配置表单依赖 snapshot 的 `config`），属**读路径改造**，必须与 §5 的读路径裁剪一起在 P2 做；② 现实约束：`GET /api/session` 在 P0 **刻意保持 `public`**（理由见 §2.5 ⑤ —— `AdminPage` 的 `Promise.all` 里**只有它没有 `.catch()`**）⇒ **收紧它时必须同时处理那个 `Promise.all`**，否则管理台首屏直接白屏。
     - **运维缓解建议（在修复之前）**：**不要把凭据内嵌进 `baseUrl`（或任何配置值）**，改用环境变量；`config` 里只写**变量名**。已经内嵌过的，按"**已泄漏**"处理（轮换凭据）。
 
-**P3a**
+**P3a**（★ v7：本阶段部分验收项**仅 SQLite 适用**）
+
+> **★ v7 —— 本阶段验收项的方言适用范围（逐条已就地标注，**不要漏读**）**：P3a 的 FTS 部分**仅 SQLite 适用**。PG 部署下 `@geewiki/search` **显式拒绝激活**（理由见 §4.3 的「★ v7：方言语义」）⇒ 凡走 `GET /api/search` / `blocks_fts` / `pages_fts` 的验收项**在 PG 上无法执行、且不适用**（这是设计边界，不是待修缺陷）。**逐条清单**：
+> - **仅 SQLite**：第 **3**（部分，见该条）、**4**、**6**、**9**、**11①** 条；
+> - **LIKE 路 SQL 本身与方言无关，但端到端依赖 `@geewiki/search` 插件（PG 下不激活）⇒ 实际也只在 SQLite 下可执行**：第 **5**、**11②③④** 条；
+> - **间接依赖 `search-service`**：第 **7**、**8** 条（RAG）；
+> - **探针 SQL 方言无关、但报警端点归属待定**：第 **10** 条；
+> - **两方言同样适用**：第 **1**、**2** 条。
 
 1. `PUT /api/pages/:slug` 请求体**与 P2 完全一致**（无新字段）—— CodeMirror 零改造的证据（可用既有前端 e2e 断言请求体形状不变）。
 2. 保存含 `<!--gated:org-->` 的正文后：`SELECT ordinal, visibility FROM blocks WHERE page_id=?` 的可见性分布正确；`pages.content_hash = sha256(content)` 校验通过。
 3. **一致性探针**：`GET /api/admin/blocks/verify` 返回 `{ mismatched: 0 }`；`GET /api/admin/search/verify` 返回 `{ missing: 0, extra: 0 }`。
-4. **匿名不泄漏（FTS 路）**：org 块的唯一词做匿名 `GET /api/search` ⇒ `total=0`；member ⇒ `total=1`（**实测形态已在 §4.3 验证**）。
-5. **匿名不泄漏（LIKE 路，★ v1 漏判的那条）**：用 **2 字元**中文词（trigram 缺口）重复上条 ⇒ 同样 `total=0`。**这一条必须单独测**，因为它走的是完全不同的 SQL。
-6. **改写不残留**：把 org 块文本从"A"改为"B"后，匿名搜"A" `total=0`、搜"B" `total=0`、member 搜"B" `total=1`（对应实测的"改写后旧词元不残留"）。
-7. **RAG 不泄漏**：匿名 `POST /api/ai/ask` 询问只有 org 块才有的信息 ⇒ 答案与 `sources` 均不含；`gatedCount` **不出现**在匿名响应里。
-8. **RAG 分块边界**：构造 public 块紧邻 org 块且总长逼近 `perSourceChars` 的场景 ⇒ 匿名上下文**不含** org 文本的任何片段（**这是块级新增的泄漏面，必须专测**）。
-9. `pages_fts` 的旧触发器已 DROP（grep 断言），且 `pages` 的 UPDATE 不再写 `pages_fts`（性能断言：改可见性的 UPDATE 不放大索引写）。
+   **★ v7：本条部分仅 SQLite** —— `search/verify` 的 `{missing, extra}` 比对的是 `blocks` 与 `blocks_fts`（§4.3）⇒ **仅 SQLite 适用**（PG 下该虚表根本不存在）；`blocks/verify` 的 `{mismatched}`（`content_hash` / `tier` 一致性）不依赖 FTS ⇒ **两方言都适用**。
+   **★ 待复核（本轮不臆断）**：§4.3 又把 `tier` 探针的"报警"也挂在 `GET /api/admin/search/verify` 上（§4.3 「代价（诚实列出）」第 4 条）—— 若该端点确实由 `@geewiki/search` 提供，则 PG 下**连 `tier` 探针的报警都没有落点**（"静默漏算"的告警会缺失）⇒ 实现前须把该端点（或至少 `tier` 探针）放到一个**方言无关**的位置。**另有一处顺序问题（v7 自检发现）**：§8.1 把这两个 verify 端点列在 **P4** 的交付项里，而本阶段的验收标准（本条）**现在就要用它们** ⇒ 要么把它们提前到 P3a，要么本条的验收标准在 P3a 内不可执行。
+4. **匿名不泄漏（FTS 路）**：org 块的唯一词做匿名 `GET /api/search` ⇒ `total=0`；member ⇒ `total=1`（**实测形态已在 §4.3 验证**）。**★ v7：仅 SQLite 适用**（FTS 路 = FTS5；PG 下检索插件不激活）。
+5. **匿名不泄漏（LIKE 路，★ v1 漏判的那条）**：用 **2 字元**中文词（trigram 缺口）重复上条 ⇒ 同样 `total=0`。**这一条必须单独测**，因为它走的是完全不同的 SQL。**★ v7：该 SQL 本身与方言无关，但整条端到端依赖 `@geewiki/search` 插件 ⇒ 实际也只在 SQLite 下可执行**（PG 下插件拒绝激活、`GET /api/search` 不存在）。
+6. **改写不残留**：把 org 块文本从"A"改为"B"后，匿名搜"A" `total=0`、搜"B" `total=0`、member 搜"B" `total=1`（对应实测的"改写后旧词元不残留"）。**★ v7：仅 SQLite 适用**（"旧词元不残留"针对的正是 `blocks_fts` 的词元表 ⇒ FTS5 专有）。
+7. **RAG 不泄漏**：匿名 `POST /api/ai/ask` 询问只有 org 块才有的信息 ⇒ 答案与 `sources` 均不含；`gatedCount` **不出现**在匿名响应里。**★ v7：间接仅 SQLite** —— 本条不写 FTS SQL，但 RAG 经 `search-service`（`packages/plugin-ai/src/index.ts:438`）取内容，而该服务在 PG 下不存在 ⇒ PG 上只能验证"检索不可用"，**验证不了"检索结果被过滤"**。
+8. **RAG 分块边界**：构造 public 块紧邻 org 块且总长逼近 `perSourceChars` 的场景 ⇒ 匿名上下文**不含** org 文本的任何片段（**这是块级新增的泄漏面，必须专测**）。**★ v7：同第 7 条**（间接依赖 `search-service`）。
+9. `pages_fts` 的旧触发器已 DROP（grep 断言），且 `pages` 的 UPDATE 不再写 `pages_fts`（性能断言：改可见性的 UPDATE 不放大索引写）。**★ v7：仅 SQLite 适用**（`pages_fts` 与它的三条触发器都是 FTS5 对象，PG 上从不创建）。
 10. **（★ v4 新增，D15）`tier` 一致性探针**：`SELECT COUNT(*) FROM blocks WHERE tier IS NULL` **等于** `SELECT COUNT(*) FROM blocks WHERE visibility='granted'`（两个数不等 ⇒ 有块被漏算，`GET /api/admin/search/verify` 必须报警）；且**不存在** `DEFAULT 0` 造成的"匿名等级"漏算块（§3.6、§4.3）。
-11. **（★ v4 新增，D15）授权段落可检索（两条 SQL 都要测）**：把某块标成 `<!--gated:granted-->` 并授予用户 A ⇒ ① **A 用 FTS 路搜该块的唯一词 ⇒ 能命中**；② **A 用 2 字元中文短查询（LIKE 路）搜同样的词 ⇒ 同样命中**（★ 只改 FTS 路会漏掉这条）；③ **未授权用户 B（含匿名）在两条路上都 ⇒ `total=0`**；④ **A 搜一个未授权给他的 `granted` 块 ⇒ `total=0`**。这是"授权=放宽、且不牺牲召回"的核心回归测试。
+    **★ v7：探针 SQL 本身与方言无关**（两条都是 `blocks` 普通列上的 `COUNT(*)`），**但报警的落点是不是方言无关，取决于第 3 条那个待复核项**：若报警只挂在 `GET /api/admin/search/verify` 上，则 PG 部署下这条"把静默错误变成显式告警"的机制会**整体缺失**。**实现前须定该端点归属；本轮不臆断。**
+11. **（★ v4 新增，D15）授权段落可检索（两条 SQL 都要测）**：把某块标成 `<!--gated:granted-->` 并授予用户 A ⇒ ① **A 用 FTS 路搜该块的唯一词 ⇒ 能命中**；② **A 用 2 字元中文短查询（LIKE 路）搜同样的词 ⇒ 同样命中**（★ 只改 FTS 路会漏掉这条）；③ **未授权用户 B（含匿名）在两条路上都 ⇒ `total=0`**；④ **A 搜一个未授权给他的 `granted` 块 ⇒ `total=0`**。这是"授权=放宽、且不牺牲召回"的核心回归测试。**★ v7：① 仅 SQLite 适用**（FTS 路）；**②③④ 的 LIKE 路 SQL 与方言无关，但整条依赖 `@geewiki/search` 插件 ⇒ 同样只在 SQLite 下可执行**（同第 5 条）。
 
 **P3b**
 
@@ -1425,6 +1511,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - 迁移必须**双方言成对**，且两侧序号已不同步 ⇒ 建议统一从 `0010` 起编。
 - PG 侧 `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT` 在大表上有锁风险（本期数据量小，可接受，但要写进迁移注释）。
 - **v2 缓解**：P2 不碰 FTS（§8.0 修正 1），风险从 P2 推迟并集中到 P3a 一个原子 PR。
+- **★ v7 补充**：本条的"双方言成对"**不适用于 FTS 部分** —— `@geewiki/search` 的迁移是 FTS5 专有语法，**没有 PG 孪生文件**，靠"按方言声明迁移目录"在 PG 下跳过（§3.0 的 ★ v7 补充、§4.3 的「★ v7：方言语义」）。**R1 在 PG 部署下真正剩下的风险只有"给 `pages` 加列"本身**（触发器/索引那部分在 PG 上不存在）。
 
 ### R2 —— cordis 服务是全局单例 → 权限判定必须逐调用传 `principal`
 `ctx.provide('wiki-service', svc)`（`packages/plugin-wiki/src/index.ts:726`）提供的是**进程级单例**，`WikiService.list()/get()/save()/remove()`（`:141-154`）**均无 principal 入参**。若只在路由层判定而服务方法签名不变，任何新消费者调 `svc.get(slug)` 都拿到**未裁剪**的数据。
@@ -1770,8 +1857,10 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 > | 17（`invitations.org_role` 命名保留） | **不是矛盾**（说明性留痕，保留不改名） |
 > | 18（`pages.visibility` 两层默认值） | **不是矛盾**（v5 说明性留痕，保留；见本条正文） |
 > | 19（P0 实现自行定义了文档未写的 API 形状） | **已解决**（v6：已回写为 §2.5；过程与根因见本条正文） |
+> | 20（`link_ticket` 要求"存 DB" vs §7.6 的"迁移增量 0"） | **已解决**（v7：改为 **HMAC 签名的自包含票据，不落库**；安全性与落库等价、代价已写明 —— §7.2 的 ★ v7 小节，事实基础见 §3.1 的 ★ v7 核对） |
+> | 21（§4.3 写"PG 侧不执行本文件" vs PG 实跑仍执行） | **已解决（且暴露了一个可选的诊断体验改进项）**（v7：控制器确按方言取目录，但 `@geewiki/search` 用裸字符串声明 ⇒ 归入 `'default'` 键 ⇒ PG 上照样执行并失败；修法 `{ sqlite: './migrations' }`，**不阻塞任何阶段** —— §4.3 的 ★ v7 小节） |
 >
-> 也就是说：**定稿后本节不再含"待拍板"类条目**，只剩第 11 条（可选简化）与第 12 条（需复核）这类**实现期事项**，外加 **v6 新增的第 19 条**（**实现回写留痕，已解决，不是待决项**）。
+> 也就是说：**定稿后本节不再含"待拍板"类条目**，只剩第 11 条（可选简化）与第 12 条（需复核）这类**实现期事项**，外加 **v6 新增的第 19 条**（**实现回写留痕，已解决，不是待决项**）与 **v7 新增的第 20 / 21 条**（**实现反馈订正，均已解决**）。
 
 1. **v1 明确否决了块级模型，而用户选择了它。** v1 §6.3 的结论是"**推荐 A 方案**（内联标记 + 服务端投影裁剪），B 方案（blocks 表）列为 P4+ 可选演进"，并给出了理由：B 会**同时炸掉** FTS5 external content 触发器、版本历史、AI RAG 三条链路。用户选择了 B（完整块级模型）⇒ **v2 §6 整节重写**，v1 §6 与 §9-D3 作废。本文档以 v2 为准。**风险没有消失，只是被 v2 的具体方案接住了**（§4.3 的 tier 设计 + §4.4 的版本语义 + §4.5 的 RAG 契约），而 R11–R15 是这套方案**新增**的风险。
 2. **v1 推荐"仅本地密码"，用户要 OIDC** ⇒ v1 D2 作废，v2 新增 P1.5（§7）。
@@ -1823,6 +1912,20 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
     - **与既有 18 条的关系（已逐条核对，无重复）**：不是第 6 条（那讲的是 **D5–D8 决策**未获同等处理）、不是第 13 条（那讲的是 **v1 附录的三处订正**）；本条讲的是"**章节迁移过程中的内容丢失**"，是**新的一类** —— 特点是"**丢了的东西没进 §12，因为当时没人知道它丢了**"。**故不合并，只在此交叉引用。**
     - **可复用的一条经验**：**合并 / 重排章节时必须逐节核对"目标编号是否已被占用、原内容是否已迁移"**，并给被并掉的节留一条**显式的作废或迁移指针**。本条就是缺这一步的代价（代价最终落在 P0 的实现者与审查者身上）。
 
+20. **★ v7：§7.2 要求 `link_ticket`"存 DB"，而 §7.6 把本阶段的迁移增量定为 0 —— 两条要求不可兼得。** 这是一条**真矛盾**（不是缺口），只是**直到 P1.5 开始实现才暴露**。
+    - **事实**：§3.1 的 `0010_identity.sql` 里**没有存 ticket 的表**（`grep -rn ticket packages/db-sqlite/src/migrations/ packages/db-postgres/migrations/` **零命中**）；§7.6 又明写"迁移增量 **0**（`user_identities` 已在 P1 建表）"。要落库就得**新增一张表** + **两侧方言成对迁移**（§3.0）+ **一条过期行清理任务** —— 全都超出该阶段范围。
+    - **实现怎么解的（两个独立实现者得出同一结论）**：**不新增表**，改用 **HMAC 签名的自包含票据**（`base64url(JSON 载荷) + '.' + base64url(HMAC-SHA256)`），服务端只验签、**不落任何一行**。
+    - **为什么这样也安全（v7 的关键论证）**：绑定端点**同时**要求"**持有有效 ticket**"**且**"**以目标本地账号的会话登录**"（`.wt-p15/packages/plugin-auth/src/index.ts:1262-1266` 的 `h.principal?.userId ?? null` ⇒ 为 `null` 即 401）⇒ **攻击者拿自己的 ticket 也没用，他过不了第二道**。"ticket 被重放"这条顾虑**不成立**；"一次性"另由 `idx_identities_issuer_sub` 唯一索引兜底。完整论证见 **§7.2 的 ★ v7 小节**。
+    - **v7 的处理**：把 §7.2 那句"**存 DB**"改为"**HMAC 签名的自包含票据，不落库**"，并补上安全意识论证、代价（进程重启 / 多实例）与"为什么不新增迁移"。**§7.6 与 §3.1 均无需改动**（它们本来就没有 ticket 表）。
+    - **可复用的一条经验**：**"存 DB"这类实现细节一旦与阶段边界（迁移增量 = 0）冲突，冲突会在实现期才炸出来** —— 因为写设计稿时没人去数"这张表要不要迁移"。凡是文档里写"存 DB / 落库 / 加一列"的地方，都应同时注明**它属于哪次迁移**。
+
+21. **★ v7：§4.3 写着"PG 侧不执行本文件"，而 PG 实跑时它照样被执行并失败。** 本条是**文档与实机行为的不一致**，暴露的是一个**诊断体验**问题（**不是正确性问题**）。
+    - **实测记录（出处：编排者在容器 `geewiki-pg-test`（`postgres:15-alpine`）上把服务切到 PG）**：`[db-postgres] 迁移失败（已回滚）: 0001_search.sql error: syntax error at or near "VIRTUAL"`。
+    - **根因（已核实到行）**：迁移控制器**确实**支持按方言取目录（`packages/manager/src/index.ts:1163-1164`、`:1168` 的 `migrationsDirs[dialect] ?? migrationsDirs['default']`），但 `@geewiki/search` 把迁移目录声明为**裸字符串** `migrations: './migrations'`（`packages/plugin-search/src/index.ts:67`）⇒ 在 `resolveMigrationsDirs` 里归入 **`'default'` 键**（"所有方言共用"，`packages/manager/src/discovery.ts:100-108`）⇒ PG 下命中的正是 `'default'` ⇒ FTS5 语法的脚本照样执行、必然失败回滚。
+    - **为什么值得记**：失败发生在插件激活**之前**（迁移控制器是 5.5 步、`ctx.plugin` 在 `:1204`）⇒ 排障者看到的是**迁移语法错误**，而**不是** `@geewiki/search` 那句写得很清楚的方言拒绝文案（`packages/plugin-search/src/index.ts:308-319`）。日志会把人引向"迁移写错了"，而不是"这个插件在 PG 上就是不支持"。
+    - **修法（可选，不阻塞任何阶段）**：把声明改成**按方言**的形式 `migrations: { sqlite: './migrations' }` ⇒ PG 下取不到目录，走"**未声明该方言的迁移目录，跳过迁移**"分支（`packages/manager/src/index.ts:1179-1183`），日志只剩一行告警。**先例**：`@geewiki/wiki` 正是只声明 sqlite 目录的那一类（`packages/server/src/index.ts:1391`）。
+    - **v7 的处理**：在 §4.3 新增「**★ v7：方言语义**」小节（含 `tsvector` + `pg_trgm` 等价物与"**列为非目标**"的结论），并在 §4.3 那句"PG 侧不执行本文件"旁**就地标注**它是**目标行为而非当前事实**。
+
 ---
 
 ## 13. 交付确认
@@ -1831,6 +1934,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - **未修改任何现有文件、未改动任何代码。**
 - 文中标 **「实测」** 的结论来自对仓库实际执行过的只读 SQLite 探测（使用 `:memory:` 库，未触碰 `data/geewiki.db`）。
 - **★ v6 补充**：上面三条描述的是 **v1–v5 的写作过程**。**v6（本次修订）同样是纯文档改动**（只改本文件、**未动任何代码**）；但 v6 的**依据不再是用户决策**，而是 **P0 阶段的落地实现 + 一轮独立代码审查** —— 详见 §13.4。另需说明：v6 期间仓库里**已经存在 P0 的实现代码**（worktree 分支 `feat/p0-route-auth-guard`），它是本轮**核对的对象**，不是本文档的产出。
+- **★ v7 补充**：**v7 同样是纯文档改动**（只改本文件、**未动任何代码**）；依据是 **P1 / P1.5 阶段的落地实现 + 一次 PostgreSQL 实机试跑**，**仍不是用户决策**。本轮**只读**查阅了实现源码（其中 P1.5 的源码在 worktree `.wt-p15` 里，尚未合入 `main`），**没有运行任何代码、没有执行任何 SQL、没有跑任何迁移、没有复现 PG 试跑** —— 详细的范围与未验证项见 **§13.5**。另需说明：v7 期间仓库里 P0 与 P1 **已合入 `main`**，P1.5 / P2 **正在各自的 worktree 分支上演进** ⇒ 本轮引用的行号**取自核对当时的工作区状态**，可能小幅漂移。
 
 ### 13.1 ★ v3 修订记录（本次修订；依据 = 用户的三项决定）
 
@@ -1905,10 +2009,12 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 - **§12 逐条核对结果**：17 条全部核对，**无一条被删除**。已解决：1/2/3/4/5/6/7/8/9/10/14/15/16；非矛盾说明：17，以及 v5 新增的 18；**仍未解决但不属待决项**：11（可选简化，实现期风格选择）、12（迁移最终编号需复核）。其中**第 8 条特别说明：`901` / `8192` 是任务提示词自身的错误，文档无误**（文档从未写入这两个值）。
 - **★ 定稿声明（必须与"已拍板"一起读）**：
   1. 本文档是**设计稿**，**尚未实现**：文中所有表、DDL、端点、SQL、测试断言都**没有落到代码里**，本次五轮修订**全是纯文档改动**（只用 `edit` 工具），**未运行任何代码、未执行任何 SQL、未跑任何迁移**。
+     > **★ v7 就地订正**：本句描述的是 **v5 定稿当时**的状态。到 **v7** 时，**P0 与 P1 已合入 `main`**（合并提交 `e708814` / `f3990a9`），**P1.5 / P2 正在实现中** —— 因此"没有任何表/端点落到代码里"**已不再成立**（`0010_identity.sql` / `0013_audit.sql` 与 `packages/plugin-auth` 均已存在；见 §8.1 各行与 §13.5）。
   2. 因此本定稿的含义是"**设计层面已无待决项**"，**不是**"已实现/已验证"。文中的"待决策项"已清零，但"**未验证项**"仍在，典型如：块级检索的 **"等级分支 OR 授权分支" 形态未实测**、`blocks.tier` 用 **`NULL`** 的实际查询计划未验证、**索引体积倍数需在自有语料上实测**、**迁移序号是否从 `0010` 起编**。
   3. **实现前必须按 §12 与各章的「原文如此，实现前需复核」逐条复核**；凡本文标"（原文如此，实现前需复核）"处，**不要照着猜**。
   4. 全文既有 `文件:行号` 引用**沿用原始调查与两轮设计、五轮修订均未逐条复核**（仅抽查过 3 处：`packages/plugin-wiki/src/index.ts:274` 的 `isValidSlug`、同文件 `:672` 的 `savePage(...)` 调用、`packages/server/src/index.ts:131` 的 `AsyncLocalStorage<RequestState>`）。
   5. 本次修订事实核对（仅此两项）：① 全仓库 grep 确认 ACL 相关标识在 `*.ts`/`*.tsx`/`*.sql` 中**零命中**（⇒ 未实现，改动不会与代码冲突）；② `ls` 核实双方言迁移目录的现有编号与 §12 第 12 条所述一致。
+     > **★ v7 就地订正**：第 ① 项是 **v5 当时**的事实。到 **v7** 时 P0 / P1 已落地（`packages/plugin-auth` 等已存在），只是**本设计里的 ACL 标识仍未落地**：`page_grants` / `block_grants` 两张表与相关端点**全仓零命中**（`subject_kind` 目前只出现在 `packages/core/src/index.ts:526` 的一句注释里）⇒ P2 / P3 的这部分仍属未实现（P2 正在 `.wt-p2` 上实现，见 §13.5）。
 
 ### 13.4 ★ v6 修订记录（依据 = **P0 实现 + 独立代码审查**，**不是**新的用户决策）
 
@@ -1933,5 +2039,39 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
   3. §12 第 19 条里"**v1 的 §4 是路由鉴权插入方案**"**无法在仓库内核验**（无 v1 存档），已在该条就地标注来源。
   4. `packages/manager/src/index.ts:413` 的 `error` 字段是否泄漏连接信息 ⇒ **待排查**（审查未实测到），**不要当成已确认**。
 - **★ 不变的要求（继承 §13.3 第 3 条）**：本文其余仍标「**原文如此，实现前需复核**」的地方，**本次修订一条都没有验证过**，**不要照着猜**。v6 的范围**严格限于上面五项**；§12 的既有 18 条**一条都没有被删除**（只增补与就地标注）。
+
+### 13.5 ★ v7 修订记录（依据 = **P1 / P1.5 实现反馈 + 一次 PostgreSQL 实机试跑**，**不是**新的用户决策）
+
+- **本次修订的性质（务必与 §13.1–§13.3 区分）**：**v3 / v4 / v5 都是"用户拍板驱动"的修订**（用户的第三、四、五项决定）；**v6 是"P0 实现 + 独立代码审查"驱动**；**v7 同样不是用户决策驱动** —— 它由 **P1 / P1.5 阶段的落地实现**与**一次 PostgreSQL 实机试跑**驱动，**没有引入任何新的设计决策**，只做三处**订正**（一处表述、一处补章、一处记账）。
+- **改动清单（三项）**：
+
+  | # | 改动 | 落点 |
+  |---|---|---|
+  | 1 | **§7.2 的 `link_ticket` 由"存 DB"改为"HMAC 签名的自包含票据，不落库"** —— 原文与 §7.6 的"迁移增量 0"**不可兼得**（§3.1 里没有存 ticket 的表）；补**安全性论证**（绑定同时要求"持有有效 ticket"**且**"以目标账号的本地会话登录"⇒ 与落库**等价**，"被重放"的顾虑不成立）、**"一次性"由 `idx_identities_issuer_sub` 唯一索引兜底**、**为什么不新增迁移**、以及两条**失败关闭**方向的代价 | **§7.2** 表格行 + **新增 §7.2 的 ★ v7 小节**；**§3.1** 的 ★ v7 核对；**§12 第 20 条** |
+  | 2 | **§4.3 补"明确的方言语义"** —— `blocks_fts` 沿用 FTS5 ⇒ **全文检索仅支持 SQLite**（**已知且经权衡的限制，不是遗漏**）；PG 部署下 `@geewiki/search` **显式拒绝激活**（**不是静默恒空**，判据用方言、文案见源码）；PG 等价物是 `tsvector` + `pg_trgm`，且整套 tier 分层可见性要在 PG 上重做 ⇒ **明确列为非目标**；另记一个**诊断体验问题**（迁移控制器在激活前仍会执行 FTS5 语法的迁移脚本 ⇒ PG 上必然失败回滚、日志里是 PG 语法错误而不是那句方言拒绝文案）⇒ **可选改进项，不阻塞任何阶段**；并据此把 §8.2 P3a 的 FTS 相关验收项**逐条标注"仅 SQLite"** | **§4.3 新增 ★ v7 小节**；**§4.3** 迁移示例的"PG 侧不执行本文件"就地订正；**§8.1 P3a 行**；**§8.2 P3a**（小标题 + 第 3/4/5/6/7/8/9/10/11 条逐条标注）；**§12 第 21 条** |
+  | 3 | **记录进度事实与方法学事实**（简短，不喧宾夺主） | **头部状态行**（v7 + 进度）；**§8.1** 的 P0 / P1 / P1.5 / P2 / P3a 五行；**§13 的 ★ v7 补充**；本节的下面两段 |
+
+- **进度事实（v7 核对当时）**：
+  - **P0 已合入 `main`** —— 合并提交 **`e708814`**（分支 `feat/p0-route-auth-guard`，基线 `bb43fc2` + 一轮修复改动）。
+  - **P1 已合入 `main`** —— 合并提交 **`f3990a9`**（分支 `feat/p1-identity`，基线 `e708814`，tip `4b19e7b`；29 文件 / +3617 −23，改动文件与 `main` 无交集）。**P1 的落地记录称"791 例测试全绿"** ⇒ ★ 本轮**未复跑测试**，且仓库的提交信息与既有文档里**没有**这个数字 ⇒ 按"**实现方报告**"记录，**不要当成已核验事实**。
+  - **P1.5（OIDC）正在 `.wt-p15`、分支 `feat/p15-oidc` 上实现**（**堆叠在 P1 的 tip `4b19e7b` 上**）。核对当时该工作区**有未提交改动**（含**尚未跟踪的新文件** `packages/plugin-auth/src/oidc.ts` 与 `packages/plugin-oidc/`）⇒ **它尚未定型**。
+  - **P2（组织与条目可见性）正在 `.wt-p2`、分支 `feat/p2-org-visibility` 上实现**（**基线 `f3990a9`**；核对当时有 1 处未提交改动）。
+  - 两个 worktree 的分支名与 HEAD 已用 `git -C <worktree> rev-parse --abbrev-ref HEAD` 逐个核对（`.wt-p15` @ `4b19e7b`、`.wt-p2` @ `f3990a9`）。
+- **★ 方法学事实（必须留痕，属已知风险）**：**P1 阶段的"独立代码审查 agent 未在合理时间内返回结论"** —— 也就是说，**P1 并没有完成过一次独立的对抗性审查**。最终由**编排者直接核实**了以下关键安全项：
+  1. 会话令牌**只存 `sha256`**（不落明文）；
+  2. cookie 属性（`HttpOnly` + `SameSite=Lax` + 生产 `Secure`）；
+  3. **CSRF 的 Host 头缺陷已修为"失败关闭"**；
+  4. 口令与应急令牌的比较使用 **`timingSafeEqual`**；
+  5. 登出为**服务端吊销**（`revoked_at`，**不是**仅客户端删 cookie）；
+  6. 既有测试断言**只增不减**。
+  **⚠️ 但这不等于一次完整的对抗性审查** —— 它是**逐项核对清单**，覆盖的是"实现方声称做了什么"，**不覆盖"还有哪些没想到的路径"**。本条**作为已知风险留痕**：P1 的读路径与边界条件**缺少一次独立的对抗性视角**，建议在 P2 阶段补一次（或至少在 P2 的验收标准里显式覆盖 P1 留下的边界）。
+- **本次修订的核对方式（与 v6 同源、但对象不同）**：v7 **读了实现源码（全部只读，未改动任何代码）**，而不是只读旧文档。覆盖：`.wt-p15/packages/plugin-auth/src/oidc.ts`、`.wt-p15/packages/plugin-auth/src/index.ts`、`.wt-p15/packages/plugin-auth/src/http.ts`、`packages/db-sqlite/src/migrations/0010_identity.sql`、`packages/plugin-search/src/index.ts`、`packages/plugin-search/migrations/0001_search.sql`、`packages/manager/src/index.ts`、`packages/manager/src/discovery.ts`、`packages/server/src/index.ts` 的内置插件注册表段，以及 `git log` / `git rev-parse` / `git status`（含四个 worktree）。另外核对了"迁移目录按方言取"这条链路的**三个环节**（manifest 声明 → `resolveMigrationsDirs` → 控制器的方言回退），因此 §4.3 那段诊断体验问题的**根因是逐行核实过的**，不是推测。
+- **★ 未验证项（诚实声明）**：
+  1. 本轮**没有运行任何代码 / 测试、没有执行任何 SQL、没有跑任何迁移**（约束：只改文档）。**"791 例测试全绿"未复跑**（见上）。
+  2. **PG 的失败日志来自编排者的实机试跑**（容器 `geewiki-pg-test`，`postgres:15-alpine`），v7 只做了**根因核实**（读源码 + 读迁移脚本），**没有亲自再跑一次**复现那条 `syntax error at or near "VIRTUAL"` ⇒ 该日志文本以编排者的记录为准；行号级的根因解释是本轮**独立核实**的。
+  3. **P1.5 的源码行号取自"未提交的工作区状态"**（`.wt-p15` @ `4b19e7b` **+ 若干未提交改动**，`oidc.ts` 甚至尚未被 git 跟踪）⇒ **行号可能明显漂移，定位请以函数 / 常量名（`signLinkTicket` / `verifyLinkTicket` / `TICKET_TTL_MS` / `LINK_COOKIE`）为准**。
+  4. **§8.2 P3a 第 3 / 10 条有一处待复核**：`tier` 一致性探针的报警被 §4.3 挂在 `GET /api/admin/search/verify` 上，而该端点**是否随 `@geewiki/search`（仅 SQLite）提供**文档里从未写明 ⇒ 若是，则 **PG 部署下"静默漏算"的告警没有落点**。本轮**不臆断**，已就地标为待复核。
+  5. 全文既有的 `文件:行号` 引用**仍未逐条复核**（继承 §13.3 第 4 条）；v7 只核对了**本次新增内容所引用的行号**。
+  6. v7 **未修改 §12 的任何既有条目**（第 1–19 条原文保持），只**新增第 20 / 21 条**并在其现状表里追加两行。
 
 
