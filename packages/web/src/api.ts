@@ -4,6 +4,7 @@
  * HTTP 状态码与 ManagerError.code 映射（404 not_found / 409 冲突类 / 400 / 500）。
  */
 import { createAiStreamDecoder, type AiStreamEvent } from './lib/aiStreamPlan'
+import type { SlotName } from './lib/slots'
 
 export interface ApiFailure {
   ok: false
@@ -383,10 +384,45 @@ export async function aiAskStream(q: string, opts: AiStreamOptions): Promise<voi
   }
 }
 
+/**
+ * `GET /api/plugins/slots` 的响应形状。
+ *
+ * ⚠️ 这里刻意按**后端实际返回**建模，而不是按 `packages/manager/src/slots.ts:57` 的
+ * `SlotConflict`：REST handler（`packages/manager/src/index.ts:1572-1576`）返回的是
+ * **过滤后的 `SlotAssignment`**，字段为 `{slot, cardinality, owners, effective, suppressed}`，
+ * **没有 `winner`**——胜出者是 `effective[0]`。
+ *
+ * 两处形状不一致是既有事实（`conflictsOf()` 产出 `winner` 但端点没用它）。前端必须按**实际**
+ * 形状写：若照 `SlotConflict` 读 `c.winner`，拿到的是 `undefined`，界面会显示成空名字而不是报错
+ * ——正是本仓库反复在打的那类静默故障。
+ */
+export interface SlotAssignmentInfo {
+  slot: SlotName
+  cardinality: 'single' | 'multi'
+  /** 全部声明者，按激活顺序（未激活过的排在最后，按名字典序） */
+  owners: string[]
+  /** 实际生效者：`multi` 全部生效；`single` 只取激活顺序里的第一个 */
+  effective: string[]
+  /** 被抑制的声明者（仅 `single` 且被多方声明时非空） */
+  suppressed: string[]
+}
+
+export interface SlotsResponse {
+  ok: true
+  slots: SlotAssignmentInfo[]
+  /** 只保留"真有多方声明"的单占用插槽（后端已按 `suppressed.length > 0` 过滤） */
+  conflicts: SlotAssignmentInfo[]
+}
+
 export const api = {
   /* 插件管理 */
   plugins: () =>
     request<{ ok: true; plugins: PluginInfo[]; issues?: DiscoveryIssueInfo[] }>('GET', '/api/plugins'),
+  /**
+   * 插槽裁决与冲突诊断。**与入口表分开的只读端点**（后端注释：入口表给前端驱动加载、走 revision +
+   * 304；冲突是运维/排障问题，必须每次现算）。
+   */
+  slots: () => request<SlotsResponse>('GET', '/api/plugins/slots'),
   graph: () => request<{ ok: true; graph: GraphData }>('GET', '/api/plugins/graph'),
   session: () => request<{ ok: true } & SessionState>('GET', '/api/session'),
   enable: (name: string, config?: Record<string, unknown>) =>

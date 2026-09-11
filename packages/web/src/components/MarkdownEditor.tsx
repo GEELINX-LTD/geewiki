@@ -211,6 +211,17 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       cmPlaceholder(props.placeholder ?? ''),
       baseTheme,
       EditorView.lineWrapping,
+      /*
+        可访问名称必须落在**真正可聚焦的那个元素**上：CodeMirror 给 `.cm-content`
+        （contenteditable）加了 `role="textbox"`，而外层包裹元素上的 `aria-label`
+        **不会**成为它的名称——读屏用户 Tab 进来只会听到一个**无名文本框**。
+        （axe 规则 `aria-input-field-name` 正是这样命名的：它查的就是 role=textbox 自身。）
+        故用 CodeMirror 官方的 `contentAttributes` 把名称交给它自己。
+        注：本 effect 的依赖数组刻意为空（见下方注释），故 `ariaLabel` 只在创建时读取一次；
+        调用点传的是字面量（`packages/web/src/pages/WikiPage.tsx` 的「Markdown 正文编辑器」），
+        不是会变化的运行期值。
+      */
+      EditorView.contentAttributes.of({ 'aria-label': props.ariaLabel }),
       editable.of(EditorView.editable.of(!props.disabled)),
       keymap.of([
         // 保存：拦截浏览器默认（否则会弹"保存网页"）——真正落盘由父组件负责
@@ -276,8 +287,12 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       ref={host}
       className="overflow-hidden rounded-md"
       style={{ minHeight: props.minHeight ?? '420px' }}
-      aria-label={props.ariaLabel}
-      role="group"
+      /*
+        这里**刻意不加** `role="group"` / `aria-label`：可访问名称已由上面的
+        `contentAttributes` 交给 `.cm-content`（真正的 role="textbox"）。
+        若外层再挂一个同名 label，读屏会先念一遍组名、再念一遍文本框名，**重复播报**。
+        一个没有语义的纯容器 div 不该带 ARIA——"no ARIA is better than bad ARIA"。
+      */
     />
   )
 }

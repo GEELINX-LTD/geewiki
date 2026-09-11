@@ -10,7 +10,7 @@ import {
   Save,
   Square,
 } from 'lucide-react'
-import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState } from '../api'
+import { ApiError, api, type ConfigIssue, type DiscoveryIssueInfo, type ListEntry, type PluginInfo, type SessionState, type SlotAssignmentInfo } from '../api'
 import { SchemaForm } from '../components/SchemaForm'
 import { describeRoot, type FieldDescriptor } from '../lib/configSchema'
 import { describeError, errorLine } from '../lib/errorText'
@@ -48,6 +48,32 @@ import {
 
 function fmtError(err: unknown): string {
   return errorLine(err)
+}
+
+/**
+ * 插槽名 → 人话。`editor` 是唯一 `single`（单占用）插槽，故实际冲突只可能出现在它上面；
+ * 另两个 `multi` 插槽留着是为了将来后端新增 `single` 插槽时界面不会退化成显示裸标识符
+ * （未知插槽名回退为原标识符，宁可难看也不要静默显示成空）。
+ */
+const SLOT_HUMAN: Record<string, string> = {
+  'app-header': '顶部栏界面',
+  'app-footer': '页脚界面',
+  editor: '正文编辑器',
+}
+
+function slotHuman(slot: string): string {
+  return SLOT_HUMAN[slot] ?? slot
+}
+
+/**
+ * 冲突提示的标题：把"几处未生效"汇总成一个数，避免标题里塞满包名。
+ *
+ * 为什么要汇总而不是逐个列进标题：冲突可能同时出现在多个插槽上（后端按插槽分组），
+ * 标题只负责"有事发生"，具体是哪些插件放在卡片正文里逐条说。
+ */
+function slotConflictTitle(conflicts: readonly SlotAssignmentInfo[]): string {
+  const n = conflicts.reduce((sum, c) => sum + c.suppressed.length, 0)
+  return `有 ${n} 个插件的界面没有生效`
 }
 
 /**
@@ -161,17 +187,32 @@ export function AdminPage(): ReactNode {
   const [blockedDisable, setBlockedDisable] = useState<{ name: string; dependents: string[] } | null>(null)
   /** 「应用并持久化」的二次确认（有副作用：写进基础清单） */
   const [persistPrompt, setPersistPrompt] = useState(false)
+  /**
+   * 插槽冲突（同一单占用插槽被多个插件声明，仲裁后有插件未生效）。
+   *
+   * 后端 `GET /api/plugins/slots` 的 `conflicts` 常为空数组；为空时**整个区块不渲染**
+   * （不留空壳）。这是纯诊断信息，取不到就不显示——见 `load()` 里的容错说明。
+   */
+  const [slotConflicts, setSlotConflicts] = useState<SlotAssignmentInfo[]>([])
 
   /** 插件 UI 状态（含入口表 skipped）：由 pluginUi.ts 的订阅式 store 提供 */
   const uiState = useSyncExternalStore(subscribePluginUiState, pluginUiState, pluginUiState)
 
   const load = useCallback(async () => {
     try {
-      const [p, s] = await Promise.all([api.plugins(), api.session()])
+      /*
+        插槽冲突信息与主数据**并行**取，且**失败不致命**（`.catch(() => null)`）。
+        为什么不像其它失败那样弹提示：本仓库的纪律是「同一个失败只呈现一次」，而这个端点
+        与 `api.plugins()` 同属管理器——它单独失败通常意味着管理器整体不可用，那时上面的
+        `api.plugins()` 已经失败并整块报错了。为它再弹一条只会变成第二个"服务出错"提示。
+        代价是"插槽诊断静默缺失"，但它本就是**附加**信息，不影响启停插件本身。
+      */
+      const [p, s, slots] = await Promise.all([api.plugins(), api.session(), api.slots().catch(() => null)])
       setLoadError(null)
       setPlugins(p.plugins)
       setSession(s)
       setIssues(p.issues ?? [])
+      setSlotConflicts(slots?.conflicts ?? [])
       // 插件 UI 与 fork 生命周期绑定：load() 是四条变更成功路径（act/confirmEnable/doReplace/
       // saveConfig）的汇聚点，故只挂这一处即可让插槽跟随启停。
       // **强制**拉取：整表 revision 只覆盖 plugins（已激活 ∩ 有界面 ∩ 产物存在），**不含 skipped**，
@@ -460,7 +501,7 @@ export function AdminPage(): ReactNode {
     <div className="mx-auto flex w-full max-w-[76rem] flex-col gap-4 p-4 sm:p-6">
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1">
-          <h1 className="m-0 text-lg font-semibold text-ink">插件管理</h1>
+          <h1 className="m-0 text-xl font-semibold text-ink">插件管理</h1>
           <p className="m-0 mt-0.5 text-xs text-muted">
             启用或停用插件、调整它们的配置。改动立即生效，无需重启。
           </p>
@@ -563,6 +604,61 @@ export function AdminPage(): ReactNode {
             ))}
           </ul>
         </details>
+      )}
+
+      {/*
+        插槽冲突：某个**单占用**插槽（目前只有 `editor`）被多个已启用插件同时声明。
+        后端按"谁先启用谁生效"确定性裁决，所以功能是正常的——但**用户必须知道**自己启用的
+        第二个编辑器没有生效。此前这条信息只存在于 REST 响应里，界面上完全看不到，
+        于是"我启用了却没反应"变成静默故障（本仓库反复在打的那一类）。
+
+        放在 issues / uiSkips 之后、blockedDisable 之前：同属"需要你注意"的信息组。
+      */}
+      {slotConflicts.length > 0 && (
+        <Card className="border-warn-line bg-warn-bg">
+          <CardHeader
+            as="h2"
+            title={
+              <span className="flex items-center gap-1.5 text-warn-ink">
+                <AlertTriangle className="size-3.5" aria-hidden="true" />
+                {slotConflictTitle(slotConflicts)}
+              </span>
+            }
+            description="同一个位置只能由一个插件提供。这些插件本身都在正常运行，只是它们贡献的那部分界面被系统按「谁先启用谁生效」裁定掉了。"
+          />
+          <CardBody className="flex flex-col gap-2">
+            <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
+              {/*
+                排版注意：缩进换行会让 JSX 在文本与元素之间插入一个空格，而中文标点前不该有空格
+                （「备用编辑器 的正文编辑器」）。故这里用 flex + gap 表达间隔，文本片断之间不留换行，
+                既避免了游离空格，也让徽标与文字的对齐由布局而非空格决定。
+              */}
+              {slotConflicts.map((c) => (
+                <li
+                  key={`${c.slot}:${c.owners.join(',')}`}
+                  className="flex flex-wrap items-center gap-1 text-xs text-ink-soft"
+                >
+                  <span className="text-ink">{slotHuman(c.slot)}</span>
+                  <span>：</span>
+                  <Badge tone="ok">{labelOf(c.effective[0] ?? '')}</Badge>
+                  <span>正在提供，</span>
+                  {c.suppressed.map((n) => (
+                    <Badge key={n} tone="neutral">
+                      {labelOf(n)}
+                    </Badge>
+                  ))}
+                  <span>未生效。</span>
+                </li>
+              ))}
+            </ul>
+            <p className="m-0 text-xs text-ink-soft">
+              想换成另一个：在下面<strong>停用</strong>正在提供它的那个插件，被顶掉的那个会自动接上（裁定在每次启停后重新计算）。
+            </p>
+            <p className="m-0 text-xs text-ink-soft">
+              若希望这类插件本来就互斥、在<strong>启用时</strong>就得到明确提示，需要插件作者用「冲突组」声明——那是一处配置，不是这里的操作能改的。
+            </p>
+          </CardBody>
+        </Card>
       )}
 
       {blockedDisable && (

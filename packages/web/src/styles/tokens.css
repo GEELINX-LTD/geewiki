@@ -127,7 +127,15 @@
   --gw-surface-hover: var(--gw-gray-100);
   --gw-ink: var(--gw-gray-850);
   --gw-ink-soft: var(--gw-gray-700);
-  --gw-ink-muted: var(--gw-gray-500);
+  /*
+    次级文字的取值受 WCAG 1.4.3（正文 ≥4.5:1）**硬约束**：
+    上一档 `--gw-gray-500`(#6b7a8c) 在本主题**所有**浅色背景上都不达标——
+    对 #ffffff=4.38、#fbfcfe=4.27、#f5f7fa=4.09、#eef2f7=3.90、#eff6ff=4.03、
+    #fde68a=3.52、#e8edf4=3.73（axe 实测命中 174 处）。
+    改用下一档 `--gw-gray-600`(#55637a)：对上述背景依次为 6.08/5.93/5.67/5.41/5.59/4.88/5.17，
+    **处处达标且有余量**。深色主题的 `--gw-ink-muted` 用 gray-400，实测 5.06~7.28 本已达标，不动。
+  */
+  --gw-ink-muted: var(--gw-gray-600);
   --gw-line: var(--gw-gray-200);
   --gw-line-strong: var(--gw-gray-300);
 
@@ -146,7 +154,15 @@
   --gw-warn: var(--gw-amber-600);
   --gw-warn-bg: var(--gw-amber-50);
   --gw-warn-line: var(--gw-amber-200);
-  --gw-warn-ink: var(--gw-amber-700);
+  /*
+    `--gw-warn-ink` 会被用在**两种**琥珀底色上，取值的约束来自更暗的那一个：
+      · 对 `--gw-warn-bg`(#fffbeb)：amber-700=4.84（勉强过）、amber-900=8.75
+      · 对 `--gw-warn-line`(#fde68a)：amber-700=**4.03（不达标）**、amber-900=7.28
+    `--gw-warn-line` 正是 `<mark>` 搜索高亮的底色（见 styles.css 的 mark 规则），
+    故必须按它取值 ⇒ 用 `--gw-amber-900`。深色主题另用 `--gw-dk-amber-ink`(#fbbf24)，
+    对 `--gw-dk-amber-line`(#5c4413) 实测 5.49，本已达标，不动。
+  */
+  --gw-warn-ink: var(--gw-amber-900);
 
   --gw-danger: var(--gw-red-600);
   --gw-danger-bg: var(--gw-red-50);

@@ -2,18 +2,20 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 import {
   Background,
   BaseEdge,
-  Controls,
+  ControlButton,
   EdgeLabelRenderer,
   Handle,
+  Panel,
   Position,
   ReactFlow,
   getSmoothStepPath,
+  useReactFlow,
   type Edge,
   type EdgeProps,
   type Node,
   type NodeProps,
 } from '@xyflow/react'
-import { AlertTriangle, Info, RefreshCw, Workflow } from 'lucide-react'
+import { AlertTriangle, Info, Maximize, Minus, Plus, RefreshCw, Workflow } from 'lucide-react'
 import { api, type GraphData, type GraphNodeInfo } from '../api'
 import { Badge, Button, Dialog, DialogClose, DialogContent, ErrorState, LoadingState, Skeleton } from '../ui'
 import { describeError, errorLine } from '../lib/errorText'
@@ -234,6 +236,49 @@ function layoutGraph(g: GraphData, labelOf: (id: string) => string): { nodes: No
   return { nodes, edges, width: x }
 }
 
+/* ---------- 视图控制条 ---------- */
+
+/**
+ * 放大 / 缩小 / 适应窗口。
+ *
+ * **为什么不用库自带的 `<Controls>`**：它把 `aria-label` 挂在**没有 role 的 `<div>`** 上
+ * （React Flow 12.5 的 `ControlProps` 只收 `'aria-label'`、**不收 `role`**），而 ARIA 1.2
+ * 规定 `generic` 角色**不支持可访问名称** ⇒ 该属性属 prohibited，会被 AT 忽略，axe 也报
+ * `aria-prohibited-attr`。库文档给出的官方扩展路径正是"用 `Panel` + `ControlButton` 自己拼"，
+ * 于是这里自己拼：`Panel` 的 props 是完整的 `HTMLAttributes<HTMLDivElement>`，可以给它
+ * **正确的 `role="group"`**——控制条本来就是"一组按钮"，这是语义正确，而不是为消警告而加的假 ARIA。
+ * 顺带把按钮名从库默认的英文（zoom in / zoom out / fit view）改成中文，与产品语言一致
+ * （读屏用户此前听到的是英文）。
+ *
+ * 注意：`useReactFlow()` 必须在 `<ReactFlow>` 的 provider 之内调用，故本组件只作为
+ * `<ReactFlow>` 的子元素渲染。
+ */
+function ViewControls(): ReactNode {
+  const { zoomIn, zoomOut, fitView } = useReactFlow()
+  return (
+    <Panel
+      position="bottom-left"
+      role="group"
+      aria-label="视图控制"
+      className="!m-3 flex flex-col overflow-hidden rounded-md border border-line bg-surface shadow-sm"
+    >
+      <ControlButton onClick={() => void zoomIn()} aria-label="放大" title="放大">
+        <Plus className="size-4" aria-hidden="true" />
+      </ControlButton>
+      <ControlButton onClick={() => void zoomOut()} aria-label="缩小" title="缩小">
+        <Minus className="size-4" aria-hidden="true" />
+      </ControlButton>
+      <ControlButton
+        onClick={() => void fitView({ padding: 0.2 })}
+        aria-label="适应窗口"
+        title="适应窗口"
+      >
+        <Maximize className="size-4" aria-hidden="true" />
+      </ControlButton>
+    </Panel>
+  )
+}
+
 /* ---------- 页面 ---------- */
 
 export function GraphPage(): ReactNode {
@@ -319,7 +364,7 @@ export function GraphPage(): ReactNode {
     <div className="mx-auto flex w-full max-w-[90rem] flex-col gap-3 p-4 sm:p-6">
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1">
-          <h1 className="m-0 text-lg font-semibold text-ink">插件依赖图</h1>
+          <h1 className="m-0 text-xl font-semibold text-ink">插件依赖图</h1>
           <p className="m-0 mt-0.5 text-xs text-muted">
             箭头从「被依赖的插件」指向「依赖它的插件」。点击任一插件查看详情。
           </p>
@@ -402,7 +447,7 @@ export function GraphPage(): ReactNode {
             onNodeClick={(_, n) => setDetail(n.id)}
           >
             <Background gap={18} />
-            <Controls showInteractive={false} />
+            <ViewControls />
           </ReactFlow>
         )}
       </div>
