@@ -35,16 +35,27 @@ import { COPY_BUTTON_ATTR, codeTextFromButton, renderMarkdownBody } from '../lib
 const OK_MS = 1000
 const MANUAL_MS = 3000
 
-/** 计算 Markdown 的渲染产物（消毒 + 锚点 + 复制按钮 + 目录） */
+/** 计算 Markdown 的渲染产物（消毒 + 锚点 + 复制按钮 + 目录 + 链接改写） */
 export function useRenderedMarkdown(
   markdown: string,
-  opts: { withCopyButtons?: boolean; route?: string } = {},
+  opts: {
+    withCopyButtons?: boolean
+    route?: string
+    /** 已知页面（slug → 标题）：判定站内链接是否存在、并给 `[[wikilink]]` 回填标题 */
+    pages?: ReadonlyMap<string, string> | null
+  } = {},
 ): ReturnType<typeof renderMarkdownBody> {
   const withCopyButtons = opts.withCopyButtons ?? true
   const route = opts.route ?? ''
+  /*
+   * `pages` 必须进依赖数组：它是惰性取的（页面列表可能晚于正文到达），
+   * 到货后需要重算一次，否则链接会一直停在"未判定"的形态（不显示页面标题、
+   * 也不标"不存在"）。
+   */
+  const pages = opts.pages ?? null
   return useMemo(
-    () => renderMarkdownBody(markdown, { withCopyButtons, route }),
-    [markdown, withCopyButtons, route],
+    () => renderMarkdownBody(markdown, { withCopyButtons, route, pages }),
+    [markdown, withCopyButtons, route, pages],
   )
 }
 

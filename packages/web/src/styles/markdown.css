@@ -21,6 +21,65 @@
     scroll-margin-top: calc(var(--spacing-header) + 12px);
   }
 
+  /* ---------- 正文链接 ---------- */
+
+  /*
+   * **必须显式给正文链接写样式**，否则它们与普通文字完全一样、看不出能点。
+   *
+   * 原因（实测确认，不是推测）：Tailwind v4 的 preflight 会把 `a` 重置为
+   * `color: inherit; -webkit-text-decoration: inherit; text-decoration: inherit`
+   * （见 `tailwindcss/preflight.css`），于是 `<a>` 既不继承浏览器默认的蓝色、
+   * 也没有下划线——正文里的链接**视觉上与正文同色无下划线**。
+   *
+   * 可辨识性不只靠颜色（WCAG 1.4.1 "Use of Color"）：颜色 + **下划线**双重编码，
+   * 色觉障碍用户与高对比度模式下同样能分辨（下划线在强制颜色模式下也会保留）。
+   *
+   * 排除我们自己注入的 `.gw-heading-anchor`（它是标题旁的零宽锚点，有自己的样式），
+   * 也排除 `.gw-link-missing`（"目标不存在"用弱化样式，见下）。
+   */
+  .md-body a:not(.gw-heading-anchor):not(.gw-link-missing) {
+    color: var(--gw-accent);
+    text-decoration: underline;
+    /* 让下划线不贴着字形，长 URL 折行时更易读 */
+    text-underline-offset: 0.18em;
+    text-decoration-thickness: 1px;
+  }
+
+  .md-body a:not(.gw-heading-anchor):not(.gw-link-missing):hover {
+    color: var(--gw-accent-hover);
+    text-decoration-thickness: 2px;
+  }
+
+  /*
+   * 焦点环：用 `outline` 而非 box-shadow，保证在强制颜色模式下仍可见（WCAG 2.4.13）。
+   * `outline-offset` 防止下划线被焦点环压住。
+   */
+  .md-body a:focus-visible {
+    outline: 2px solid var(--gw-accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /*
+   * "目标页面不存在"的链接：**弱化但不隐藏**。
+   *
+   * 为什么不做成不可点的死链接：那会让用户以为页面坏了；保留可点（进"页面不存在"空态，
+   * 那里有返回列表的入口）+ 虚线 + 弱色 + `title` 说明，既诚实又留了下一步。
+   * 虚线下划线是有意的"不一样"信号，与正常链接的实线区分。
+   */
+  .md-body a.gw-link-missing {
+    color: var(--gw-ink-muted);
+    text-decoration: underline dashed;
+    text-decoration-color: var(--gw-line-strong);
+    text-underline-offset: 0.18em;
+    cursor: help;
+  }
+
+  .md-body a.gw-link-missing:hover {
+    color: var(--gw-ink-soft);
+    text-decoration-color: var(--gw-ink-muted);
+  }
+
   /*
    * 锚点链接：平时不可见，悬停/聚焦标题时淡入。
    *

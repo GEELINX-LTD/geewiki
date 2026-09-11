@@ -132,7 +132,16 @@ h2 + .empty { padding: 8px; }
 .md-body h1 { font-size: 1.55em; }
 .md-body h2 { font-size: 1.3em; border-bottom: 1px solid var(--line); padding-bottom: 0.25em; }
 .md-body h3 { font-size: 1.12em; }
-.md-body a { color: var(--accent); }
+/*
+ * 正文链接样式**已移交** `styles/markdown.css`（components 层），此处不再声明 `color`。
+ *
+ * 为什么必须删掉而不是留着（这里踩过一个真实的坑）：层序是
+ * `theme < base < components < legacy < utilities`，**层优先级高于选择器特异性**——
+ * 于是这条 legacy 规则会盖掉 components 层里 `.md-body a.gw-link-missing` 的弱化配色，
+ * 让"目标页面不存在"的链接看起来与正常链接一模一样（实测确认）。
+ * 一个视觉职责被两层同时拥有，迟早会打架；现在由 components 层单独拥有：
+ * 颜色 + 下划线（不只靠颜色区分，WCAG 1.4.1）、hover、focus-visible、以及 missing 变体。
+ */
 .md-body pre {
   background: var(--gw-header-bg); color: var(--gw-header-ink); padding: 12px 14px; border-radius: 8px;
   overflow-x: auto; font-size: 13px;

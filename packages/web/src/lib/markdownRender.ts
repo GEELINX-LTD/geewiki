@@ -33,6 +33,13 @@
 import { mdToHtml } from './sanitize'
 import { buildHash } from './hashAnchor'
 import { anchorLabel, assignHeadingIds, tocEntries, type HeadingEntry } from './headingPlan'
+import {
+  MISSING_LINK_ATTR,
+  MISSING_LINK_CLASS,
+  normalizeSlugTarget,
+  resolveBodyLink,
+} from './linkPlan'
+import { WIKILINK_ATTR, WIKILINK_AUTO_ATTR } from './wikilink'
 
 /** 复制按钮的标记（事件委托靠它定位；见 `MarkdownBody`） */
 export const COPY_BUTTON_ATTR = 'data-gw-copy'
@@ -51,6 +58,51 @@ export interface RenderedMarkdown {
 const SKIP_SELECTOR = '[data-gw-no-toc]'
 
 /**
+ * 改写正文里的链接，使其在本应用的 hash 路由下真正可用（详见 `lib/linkPlan.ts`）。
+ *
+ * 四类处置：
+ * - **外链**（http/https）→ 原 href 不变，补 `target="_blank"` + `rel="noopener noreferrer"`；
+ * - **同页锚点**（`#section`）→ 转成路由内锚点 `#/wiki/<slug>?a=<id>`，否则会把 hash
+ *   换成 `#section` 而打乱路由；
+ * - **站内页面**（`/architecture`、`/wiki/foo`）→ 转成 `#/wiki/<encoded>`，**不整页跳走**；
+ * - **目标不存在** → 仍是站内 hash 链接（点进去是"页面不存在"空态，有返回入口），
+ *   但加 `data-gw-missing` + 弱化样式 + `title` 说明。**不做成死链接**：死链接会让用户
+ *   以为页面渲染坏了，而"点进去看到明确的空态"既诚实又给了下一步动作。
+ *
+ * `[[wikilink]]` 额外做一件事：显示文本是自动的（`[[slug]]`）且该页存在时，
+ * 用**页面真实标题**替换 slug——这是 wiki 的阅读预期（`[[guides/authoring]]`
+ * 不该显示成一串标识符）。
+ */
+function rewriteBodyLinks(
+  holder: HTMLElement,
+  route: string,
+  pages: ReadonlyMap<string, string> | null,
+): void {
+  for (const a of [...holder.querySelectorAll('a[href]')]) {
+    const res = resolveBodyLink(a.getAttribute('href') ?? '', { route, knownSlugs: pages })
+    if (res.kind !== 'keep') {
+      a.setAttribute('href', res.href)
+      if (res.blank) {
+        a.setAttribute('target', '_blank')
+        a.setAttribute('rel', 'noopener noreferrer')
+      }
+      if (res.kind === 'missing') {
+        a.setAttribute(MISSING_LINK_ATTR, '')
+        a.classList.add(MISSING_LINK_CLASS)
+        a.setAttribute('title', `目标页面不存在：${res.slug ?? ''}`)
+      }
+    }
+
+    // wikilink 的自动显示文本 → 页面真实标题（仅在页面确实存在时）
+    if (a.getAttribute(WIKILINK_AUTO_ATTR) === null) continue
+    const target = a.getAttribute(WIKILINK_ATTR)
+    if (target === null || pages === null) continue
+    const title = pages.get(normalizeSlugTarget(target))
+    if (title !== undefined && title !== '') a.textContent = title
+  }
+}
+
+/**
  * Markdown → 已消毒 HTML + 注入锚点与复制按钮 + 目录。
  *
  * @param markdown 原始 Markdown
@@ -58,15 +110,32 @@ const SKIP_SELECTOR = '[data-gw-no-toc]'
  *                       锚点不能写成 `#<id>`——本应用是 hash 路由，那会被当成新路由
  *                       （详见 `lib/hashAnchor.ts` 的说明）。
  * @param opts.withCopyButtons 是否为代码块加复制按钮（历史预览等只读小窗可以关掉）
+ * @param opts.pages     已知页面（slug → 标题）。用于两件事：
+ *                       ① 判定站内链接的目标是否存在（不存在则标 `data-gw-missing`）；
+ *                       ② 把 `[[wikilink]]` 的自动显示文本换成**页面真实标题**。
+ *                       `null`/缺省表示"尚未取到列表"——此时**不判定缺失**，
+ *                       只把显式路径改写成 hash 形态（否则列表加载完成前会把全站链接
+ *                       都标成"不存在"）。
  */
 export function renderMarkdownBody(
   markdown: string,
-  opts: { withCopyButtons?: boolean; route?: string } = {},
+  opts: {
+    withCopyButtons?: boolean
+    route?: string
+    pages?: ReadonlyMap<string, string> | null
+  } = {},
 ): RenderedMarkdown {
   const withCopyButtons = opts.withCopyButtons ?? true
   const route = opts.route ?? ''
+  const pages = opts.pages ?? null
   const holder = document.createElement('div')
   holder.innerHTML = mdToHtml(markdown)
+
+  /*
+   * 链接改写必须在**注入标题锚点之前**：那时 holder 里只有正文自己的 `<a>`，
+   * 我们注入的 `.gw-heading-anchor` 还没出现，因而不存在"把自己刚写的锚点再改写一次"的问题。
+   */
+  rewriteBodyLinks(holder, route, pages)
 
   const headingEls = [...holder.querySelectorAll('h2, h3')].filter(
     (el) => el.closest(SKIP_SELECTOR) === null,

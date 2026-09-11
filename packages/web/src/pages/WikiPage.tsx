@@ -767,7 +767,22 @@ function WikiDetail(props: {
     () => (page === null ? '' : stripDuplicateLeadingTitle(page.content, page.title)),
     [page],
   )
-  const rendered = useRenderedMarkdown(bodyMarkdown, { route })
+  /*
+   * slug → 标题。给正文链接改写用：判定站内链接目标是否存在（不存在则弱化标注），
+   * 并把 `[[wikilink]]` 的自动显示文本换成页面真实标题。
+   *
+   * 必须在**任何 early return 之前**（hook 顺序不能随分支改变，否则 React 抛 #310）。
+   * `pagesState.pages` 为 null 时传 null——渲染层据此**不判定"缺失"**，
+   * 免得列表还没到货就把全站链接都标成"不存在"。
+   */
+  const pageTitles = useMemo(
+    () =>
+      pagesState.pages === null
+        ? null
+        : new Map(pagesState.pages.map((p) => [p.slug, p.title] as const)),
+    [pagesState.pages],
+  )
+  const rendered = useRenderedMarkdown(bodyMarkdown, { route, pages: pageTitles })
   const tocIds = useMemo(() => rendered.toc.map((t) => t.id), [rendered.toc])
   const activeId = useActiveHeading(tocIds)
 
@@ -879,7 +894,11 @@ function WikiDetail(props: {
 
   const versionHtml = versionContent
     ? // 与正文同款处理：历史快照也可能以 `# 标题` 开头，直接渲染会出现重复标题
-      renderMarkdownBodyForPreview(stripDuplicateLeadingTitle(versionContent.content, page.title))
+      renderMarkdownBodyForPreview(
+        stripDuplicateLeadingTitle(versionContent.content, page.title),
+        route,
+        pageTitles,
+      )
     : ''
 
   return (
@@ -1049,8 +1068,12 @@ function WikiDetail(props: {
 }
 
 /** 历史快照预览：只要 HTML，不要复制按钮（只读小窗里按钮是噪声） */
-function renderMarkdownBodyForPreview(markdown: string): string {
-  return renderMarkdownBody(markdown, { withCopyButtons: false }).html
+function renderMarkdownBodyForPreview(
+  markdown: string,
+  route: string,
+  pages: ReadonlyMap<string, string> | null,
+): string {
+  return renderMarkdownBody(markdown, { withCopyButtons: false, route, pages }).html
 }
 
 function SiblingLink({
@@ -1155,6 +1178,14 @@ function WikiEdit(props: {
    * ⚠️ 必须在下面的 early return 之前调用（hook 顺序不能随分支改变，否则 React 抛 #310）。
    */
   const editPages = usePages().pages
+  /*
+   * slug → 标题（预览面板的链接改写用，与详情页同一套语义）。
+   * 与详情页一样必须在任何 early return 之前调用。
+   */
+  const editPageTitles = useMemo(
+    () => (editPages === null ? null : new Map(editPages.map((p) => [p.slug, p.title] as const))),
+    [editPages],
+  )
   /** 保存冲突：服务端的 updated_at 与本页加载时不同 */
   const [conflictAt, setConflictAt] = useState<string | null>(null)
   const [origSlug, setOrigSlug] = useState('')
@@ -1245,7 +1276,11 @@ function WikiEdit(props: {
     const t = window.setTimeout(() => setPreviewSource(content), PREVIEW_DEBOUNCE_MS)
     return () => window.clearTimeout(t)
   }, [content])
-  const previewRendered = useRenderedMarkdown(previewSource, { withCopyButtons: false, route })
+  const previewRendered = useRenderedMarkdown(previewSource, {
+    withCopyButtons: false,
+    route,
+    pages: editPageTitles,
+  })
 
   const save = useCallback(
     async (opts: { force?: boolean } = {}): Promise<void> => {
