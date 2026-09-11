@@ -155,6 +155,25 @@ export interface WikiSaveInput {
   content: string
 }
 
+/**
+ * 一次 `blocks.tier` 扇出重算的**结果**：把"没重算"与"重算失败"分开。
+ *
+ * 为什么需要这一层：`resynced === 0` 本身是**歧义**的 —— 它既可能是"该页没有子孙"
+ * （完全正常），也可能是"扇出抛错、一个都没算"（**内容泄漏级**：祖先收紧没传导到
+ * 子孙的 `tier`，于是读路径 404 而检索仍命中并吐出正文片段）。调用方拿到一个裸数字
+ * 时无法区分这两者，而它们的处置完全不同。
+ *
+ * 单一真源：写入路径的响应（`WikiSaveResult.indexTiersResync`）、档位变更端点、
+ * 以及 `POST /api/admin/blocks/resync` 的逐页结果都用这一个类型。
+ */
+export interface ResyncReport {
+  /** 被重算的**块**数（0 且 `failed === false` = 该页没有子孙 / 没有块） */
+  resynced: number
+  /** 是否**整个扇出抛错**（true 时 `resynced` 必然为 0，且必须处置） */
+  failed: boolean
+  error?: string
+}
+
 export interface WikiSaveResult {
   outcome: 'created' | 'updated' | 'unchanged'
   version: number
@@ -162,11 +181,8 @@ export interface WikiSaveResult {
    * 仅 `outcome === 'created'` 时可能出现：新建的页可能**成为已有页的祖先**（slug 前缀），
    * 于是那些子孙的有效档位被收紧，必须重算它们的 `blocks.tier`（否则检索仍按旧档位 ⇒
    * 读路径 404 而检索命中，属内容泄漏级）。
-   *
-   * `resynced` 与 `failed` 必须分开看：`resynced === 0 && !failed` 是"没有子孙"（正常），
-   * 而 `failed === true` 是"扇出抛错、一个都没算"（**必须处置**）。
    */
-  indexTiersResync?: { resynced: number; failed: boolean; error?: string }
+  indexTiersResync?: ResyncReport
 }
 
 /** 反向链接项：**引用**了某页的页面（对应 GET /api/pages/:slug/backlinks 的单项） */
@@ -1341,26 +1357,14 @@ export const WikiPlugin = {
     }
 
     /**
-     * 扇出的**结果**：把"没重算"与"重算失败"分开。
-     *
-     * 为什么需要这一层：`resynced === 0` 本身是**歧义**的 —— 它既可能是
-     * "该页没有子孙"（完全正常），也可能是"扇出抛错、一个都没算"（**内容泄漏级**：
-     * 祖先收紧没传导到子孙的 `tier`，于是读路径 404 而检索仍命中并吐出正文片段）。
-     * 调用方拿到一个裸数字时无法区分这两者，而它们的处置完全不同。
-     */
-    interface ResyncReport {
-      resynced: number
-      failed: boolean
-      error?: string
-    }
-
-    /**
      * 跑扇出并把失败**升级为一等可观测信号**（响应字段 + 审计行），而不是只打一行 warn。
      *
      * 为什么失败不回滚、不抛给调用方：档位变更**已经提交且是用户要的结果**，
-     * 为了一个派生的索引列去回滚用户的操作是本末倒置。正确做法是让偏差**可发现**：
-     * 响应里带 `index_tiers_resync_failed`、审计里留 `acl.resync_failed`、
-     * 并由 `GET /api/admin/blocks/verify` 的 `tier_mismatched` 长期盯住。
+     * 为了一个派生的索引列去回滚用户的操作是本末倒置。正确做法是让偏差**可发现
+     * 且可修复**：响应里带 `index_tiers_resync_failed`、审计里留 `acl.resync_failed`、
+     * 由 `GET /api/admin/blocks/verify` 的 `tier_mismatched` 长期盯住，
+     * 并用 **`POST /api/admin/blocks/resync`** 真正把它重算回去 —— 探针只负责报警，
+     * **没有修复入口的报警等于把问题永远挂在那里**。
      */
     const resyncDescendantsReporting = async (slug: string): Promise<ResyncReport> => {
       try {
@@ -1967,6 +1971,137 @@ export const WikiPlugin = {
             tier_check_skipped: !policyReady,
             samples,
             tier_samples: tierSamples,
+          })
+        },
+        { access: 'admin' },
+      ),
+    )
+
+    /* ---------- POST /api/admin/blocks/resync：把 tier 重算回一致（修复入口） ---------- */
+    /*
+     * 与上面的 `blocks/verify` 是一对：**verify 是探针（只报警），本端点是修复入口**。
+     *
+     * ## 为什么必须有它（审查标出的合并条件）
+     *
+     * 扇出（`resyncDescendantTiers`）在**事务提交之后**执行，这是技术必需 ——
+     * `pageLevelOf` 走策略层的另一条连接，PG 的 MVCC 下看不到本事务未提交的行
+     * （见 `resyncDescendantTiers` 的注释）。代价是那里有一个**毫秒级窗口**：
+     * 若进程恰在"档位已提交、扇出未跑完"之间崩溃，或扇出抛错，子孙的 `tier` 就会
+     * **永久陈旧** —— 读路径 404 而检索仍命中并吐出正文片段。
+     *
+     * 那种状态下探针会报 `tier_mismatched > 0`，但**光有报警修不好它**：
+     * 回填只处理"还没有块行"的页，`plugin-search` 的索引重建只从 `blocks` 抄文本、
+     * 不重算 `tier`，而扇出只覆盖"刚被改动的那个祖先的子树"。
+     * 本端点就是缺的那个入口，两者合起来才构成"报警 → 修复 → 归零"的闭环。
+     *
+     * ## 用法
+     *
+     *   POST /api/admin/blocks/resync               全库重算
+     *   POST /api/admin/blocks/resync?prefix=a/b    只重算某子树（按 slug 前缀）
+     *
+     * ## 为什么复用 `applyTierToPageBlocks` 而不是在 SQL 里重写
+     *
+     * `tier` 的语义（"页面压上限、块只能更窄"、`granted ⇒ NULL`）**只有一处真源**
+     * （`tierFor`）。在 SQL 里再写一份必然漂移，而漂移的后果正是检索的可见性判定错误
+     * —— 那恰恰是本端点要修的东西，不能自己再造一个第二真源。
+     *
+     * ## 幂等与分批
+     *
+     * `tier` 是"页面有效档位 × 块自身档位"的**纯函数**，故重复跑结果一致。
+     * 扫描按 keyset 分批（每批独立事务），单页失败**不中断整体**：
+     * 计入 `failed` 并留样本 —— 否则"某几页有问题"与"整个跑不动"不可区分。
+     *
+     * ## 已知代价
+     *
+     * 前缀筛选在 JS 侧做（原因同 `resyncDescendantTiers`：slug 允许 `_`，LIKE 需 ESCAPE），
+     * 所以带 `prefix` 时**仍然全表扫描**，只是只对匹配的页做写。库很大时应分批调用。
+     */
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/admin/blocks/resync',
+        async (h) => {
+          const principal = h.principal
+          if (!principal) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息' })
+            return
+          }
+
+          /*
+           * `tier` 只能由策略层算出来。策略服务缺席时**显式失败**，而不是"重算成 0 个"
+           * —— 后者会被读成"已经一致了"，把一个"算不了"伪装成"没问题"。
+           */
+          const policyReady = Boolean(
+            (ctx.get('policy-service') as PolicyServiceLike | undefined)?.effectiveIndexLevel,
+          )
+          if (!policyReady) {
+            h.json(503, {
+              ok: false,
+              error: 'policy_unavailable',
+              message: 'policy-service 不可用，无法计算页面有效档位（重算未执行）',
+            })
+            return
+          }
+
+          // 归一：去首尾空白与**尾部斜杠**，使 `?prefix=a/b` 与 `?prefix=a/b/` 等价。
+          const prefix = (h.url.searchParams.get('prefix') ?? '').trim().replace(/\/+$/, '')
+          const subtreeOnly = prefix.length > 0
+          // 与 `resyncDescendantTiers` 同一口径：`a/b` 的子树是 `a/b/...`，**不含 `a/b` 自身**
+          const childPrefix = `${prefix}/`
+
+          const BATCH = 500
+          const MAX_SAMPLES = 10
+          let pages = 0
+          let blocks = 0
+          let failed = 0
+          const samples: { slug: string; reason: string }[] = []
+          let cursor = 0
+
+          for (;;) {
+            const rows = await adb.query<{ id: number; slug: string }>(
+              'SELECT id, slug FROM pages WHERE id > ? ORDER BY id LIMIT ?',
+              [cursor, BATCH],
+            )
+            if (rows.length === 0) break
+            cursor = rows[rows.length - 1]!.id
+            const targets = subtreeOnly ? rows.filter((r) => r.slug.startsWith(childPrefix)) : rows
+
+            for (const p of targets) {
+              pages += 1
+              try {
+                const level = await pageLevelOf(p.slug)
+                blocks += await adb.transaction((tx) => applyTierToPageBlocks(tx, p.id, level))
+              } catch (err) {
+                failed += 1
+                if (samples.length < MAX_SAMPLES) {
+                  samples.push({
+                    slug: p.slug,
+                    reason: err instanceof Error ? err.message : String(err),
+                  })
+                }
+              }
+            }
+
+            if (rows.length < BATCH) break
+          }
+
+          // 审计：只记计数与样本，**不含正文**（`redactForAudit` 还有一道兜底）
+          void writeAuditLog(adb, {
+            action: 'admin.resync_tiers',
+            targetKind: 'system',
+            targetId: subtreeOnly ? prefix : 'blocks',
+            actorId: principal.userId,
+            after: { prefix: subtreeOnly ? prefix : null, pages, blocks, failed },
+          }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
+
+          h.json(200, {
+            ok: true,
+            // 回显实际生效的筛选范围，让调用方能确认"我确实只重算了这一棵子树"
+            subtree: subtreeOnly ? prefix : null,
+            pages,
+            blocks,
+            failed,
+            samples,
           })
         },
         { access: 'admin' },

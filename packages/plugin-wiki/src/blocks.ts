@@ -264,7 +264,12 @@ export async function syncBlocksForPage(
     /** 注入以便测试；默认用 {@link parseBlocks} */
     parse?: (content: string) => ParsedBlock[]
     /**
-     * 是否同步 `blocks_fts`。默认 `true`（保持既有调用点的行为与既有测试不变）。
+     * 是否同步 `blocks_fts`。**必填，由调用方按方言显式传入**（本仓惯例是传
+     * `blocksIndexSupported = db.dialect === 'sqlite'`）。
+     *
+     * ⚠️ **刻意不给默认值**：它原先默认 `true`，于是"新增调用点时忘了传"会在 PostgreSQL 上
+     * 让**整个写块事务失败**（`blocks_fts` 在那边永远不存在）—— 一个只在某一种方言上炸、
+     * 且炸在事务里的默认值，是最难排查的那类缺陷。改成必填后，漏传在**编译期**就报错。
      *
      * ★ **PostgreSQL 下必须传 `false`**，理由不是"省一步"，而是**不能靠捕获异常来跳过**：
      *
@@ -281,7 +286,7 @@ export async function syncBlocksForPage(
      * 该标志只影响**检索召回**：`blocks` 与 `pages.content` 才是真源，索引随时可从
      * `blocks` 重建（PG 下本就没有索引，检索功能整体不提供 —— 由 §4.3 的方言守卫显式拒绝）。
      */
-    syncIndex?: boolean
+    syncIndex: boolean
   },
 ): Promise<ParsedBlock[]> {
   const { pageId, content, pageLevel, now } = args
@@ -307,7 +312,7 @@ export async function syncBlocksForPage(
    * 这只影响检索召回，不影响正确性 —— `blocks` 与 `pages.content` 才是真源，
    * 索引任何时候都能从 `blocks` 重建，差异由 `GET /api/admin/search/verify` 显式报出。
    */
-  let indexEnabled = args.syncIndex ?? true
+  let indexEnabled = args.syncIndex
   if (indexEnabled) {
     try {
       await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [pageId])

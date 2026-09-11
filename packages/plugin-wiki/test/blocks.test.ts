@@ -170,6 +170,8 @@ test('syncBlocksForPage：写 blocks 与 blocks_fts，且 granted 档的 tier �
     content,
     pageLevel: 1,
     now: '2026-01-01T00:00:00Z',
+    // 本夹具建了 `blocks_fts`（SQLite）⇒ 与生产同一取值
+    syncIndex: true,
   })
 
   const rows = db
@@ -191,9 +193,9 @@ test('syncBlocksForPage：写 blocks 与 blocks_fts，且 granted 档的 tier �
 test('syncBlocksForPage：重复保存是**替换**而不是追加（否则块会越积越多）', async () => {
   const db = freshDb()
   const tx = txOf(db)
-  await syncBlocksForPage(tx as never, { pageId: 1, content: 'a\n\nb', pageLevel: 0, now: 't1' })
+  await syncBlocksForPage(tx as never, { pageId: 1, content: 'a\n\nb', pageLevel: 0, now: 't1', syncIndex: true })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 2)
-  await syncBlocksForPage(tx as never, { pageId: 1, content: '只有一段', pageLevel: 0, now: 't2' })
+  await syncBlocksForPage(tx as never, { pageId: 1, content: '只有一段', pageLevel: 0, now: 't2', syncIndex: true })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
   // 索引同步收缩 —— 旧块的行必须在同一事务里删掉，否则会留下孤儿文本
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks_fts').get() as { n: number }).n, 1)
@@ -206,6 +208,7 @@ test('syncBlocksForPage：pageLevel=null（失败关闭）⇒ 全部块 tier 为
     content: '公开段。',
     pageLevel: null,
     now: 't',
+    syncIndex: true,
   })
   const row = db.prepare('SELECT tier FROM blocks').get() as { tier: number | null }
   assert.equal(row.tier, null)
@@ -246,47 +249,106 @@ test('syncBlocksForPage：删页后块与索引都被清（回归：contentless 
  * ⚠️ 测试夹具（`test/` 目录）**排除在外** —— 它们本来就在裸写以构造状态。
  */
 test('源码级守卫：块与索引的写入必须成对（不得绕过唯一写入路径）', () => {
-  const pkgRoot = join(REPO, 'packages')
+  /*
+   * 扫描范围必须与注释里"全仓"的说法**一致** —— 原实现只扫各包 `src` 目录下的 `.ts`，
+   * 而 `0002_blocks_fts.sql` 的注释却声称"再无第二处 `INSERT INTO blocks`/`INTO blocks_fts`"。
+   * "申报范围 ≠ 实际范围"本身就是这次要修的那类问题，故扩为：
+   *   - 各包 `src` 目录下的 `.ts`（生产代码主体）
+   *   - `plugins/` 与 `scripts/` 下的 `.ts`/`.tsx`（示例插件与脚本同样能写库）
+   *   - 各 `migrations/` 目录下的 `.sql`（迁移里同样能插入块与索引行）
+   * 仍**排除** `test/`、`node_modules/`、`dist/`：夹具本来就在裸写以构造状态。
+   */
   const files: string[] = []
-  const walk = (dir: string): void => {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
+  const walk = (dir: string, exts: readonly string[]): void => {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return // 目录不存在（例如没有 scripts/）——不是错误
+    }
+    for (const e of entries) {
       const p = join(dir, e.name)
       if (e.isDirectory()) {
-        if (e.name === 'node_modules' || e.name === 'test') continue
-        walk(p)
-      } else if (e.name.endsWith('.ts')) {
+        if (e.name === 'node_modules' || e.name === 'test' || e.name === 'dist') continue
+        walk(p, exts)
+      } else if (exts.some((x) => e.name.endsWith(x))) {
         files.push(p)
       }
     }
   }
+  const pkgRoot = join(REPO, 'packages')
+  for (const p of readdirSync(pkgRoot)) walk(join(pkgRoot, p, 'src'), ['.ts'])
+  walk(join(REPO, 'plugins'), ['.ts', '.tsx'])
+  walk(join(REPO, 'scripts'), ['.ts', '.tsx'])
+  // 迁移目录有两种形态：`packages/<pkg>/migrations` 与 `packages/<pkg>/src/migrations`
   for (const p of readdirSync(pkgRoot)) {
-    try {
-      walk(join(pkgRoot, p, 'src'))
-    } catch {
-      /* 该包没有 src（例如纯 fixtures）——不是错误 */
-    }
+    walk(join(pkgRoot, p, 'migrations'), ['.sql'])
+    walk(join(pkgRoot, p, 'src', 'migrations'), ['.sql'])
   }
 
   const WRITE_PATH = join('plugin-wiki', 'src', 'blocks.ts')
   const REBUILD = join('plugin-search', 'src', 'index.ts')
 
-  /** 返回**不在允许清单里**却命中该模式的位置 */
+  /**
+   * 把注释内容替换成**等长空白**（保留换行 ⇒ 行号不漂），再对整段文本匹配。
+   *
+   * 为什么不按行匹配 + 跳过注释行（原做法）：那样只能发现"同一行内、且形态恰好"的写法。
+   * 实测漏三种：
+   *   - `INSERT INTO blocks(` —— 无空格，原正则 `/INSERT INTO blocks \(/` 抓不到；
+   *   - `INSERT INTO\n  blocks (...)` —— 跨行，按行匹配永远看不到；
+   *   - 缩进深或写在多行模板串里的同类写法。
+   * 换成"先抹注释、再对整段文本用 `\s+` 匹配"可以全覆盖，且等长替换保证行号不漂。
+   *
+   * `sql=true` 时额外处理 `--` 行注释（SQL 的注释符不是 `//`）；TS 侧**不**处理 `--`，
+   * 因为那在 TS 里是自减运算符，误判会把整行抹掉、反而藏住违规。
+   *
+   * ⚠️ 已知边界：它不解析字符串字面量，故一行里若先出现 `//`（例如某个 `'https://…'`
+   * 字面量），该行 `//` 之后会被当成注释抹掉。对本仓现状无影响（SQL 都在反引号模板串里，
+   * 且不以 `//` 作注释），但将来新增此类字面量时要留意。
+   */
+  const stripCommentsToSpaces = (text: string, sql: boolean): string => {
+    let out = ''
+    let i = 0
+    while (i < text.length) {
+      const two = text.slice(i, i + 2)
+      if (two === '//' || (sql && two === '--')) {
+        while (i < text.length && text[i] !== '\n') {
+          out += ' '
+          i += 1
+        }
+      } else if (two === '/*') {
+        out += '  '
+        i += 2
+        while (i < text.length && text.slice(i, i + 2) !== '*/') {
+          out += text[i] === '\n' ? '\n' : ' '
+          i += 1
+        }
+        if (i < text.length) {
+          out += '  '
+          i += 2
+        }
+      } else {
+        out += text[i]
+        i += 1
+      }
+    }
+    return out
+  }
+
+  /** 返回**不在允许清单里**却命中该模式的位置（跨行可命中，行号按剥离后的文本算） */
   const offenders = (pattern: RegExp, allowed: readonly string[]): string[] => {
     const hits: string[] = []
+    const re = new RegExp(
+      pattern.source,
+      pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`,
+    )
     for (const f of files) {
       if (allowed.some((a) => f.endsWith(a))) continue
-      readFileSync(f, 'utf8')
-        .split('\n')
-        .forEach((line, i) => {
-          /*
-           * 跳过注释行：本守卫是**按行匹配文本**的，注释里提到 SQL（`blocks.ts` 头部就写着
-           * "绕过它直接 `INSERT INTO blocks` 会让索引漂移"）会被误判成违规。
-           * 真实语句行不会以 `*` 或 `//` 开头（它们以 `tx.run(`、反引号或引号开头）。
-           */
-          const t = line.trimStart()
-          if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) return
-          if (pattern.test(line)) hits.push(`${f}:${i + 1}: ${line.trim()}`)
-        })
+      const stripped = stripCommentsToSpaces(readFileSync(f, 'utf8'), f.endsWith('.sql'))
+      for (const m of stripped.matchAll(re)) {
+        const line = stripped.slice(0, m.index ?? 0).split('\n').length
+        hits.push(`${f}:${line}: ${m[0].replace(/\s+/g, ' ').trim()}`)
+      }
     }
     return hits
   }
@@ -296,29 +358,42 @@ test('源码级守卫：块与索引的写入必须成对（不得绕过唯一�
    * 没有这一段，上面三条"0 处违规"在"扫描范围写错/文件没被读到"时同样会全绿。
    */
   assert.ok(files.length > 20, `应当扫到生产源文件，实际只扫到 ${files.length} 个`)
-  const writePathText = readFileSync(
-    files.find((f) => f.endsWith(WRITE_PATH)) ?? '',
-    'utf8',
-  )
-  assert.ok(/INSERT INTO blocks \(/i.test(writePathText), '唯一写入路径里应当确实有 INSERT INTO blocks')
-  assert.ok(/DELETE FROM blocks\b/i.test(writePathText), '唯一写入路径里应当确实有 DELETE FROM blocks')
+  /*
+   * 反空洞（新增范围的）：扩了范围就必须证明**那几个范围真的收到了文件**，
+   * 否则"0 处违规"在"`.`sql` 一个都没扫到 / `plugins/` 目录名写错"时同样会全绿。
+   */
   assert.ok(
-    /INSERT INTO blocks_fts/i.test(readFileSync(files.find((f) => f.endsWith(REBUILD)) ?? '', 'utf8')),
+    files.some((f) => f.endsWith('.sql')),
+    '扫描范围应当包含迁移 .sql（否则新增的 SQL 维度是空洞的）',
+  )
+  assert.ok(
+    files.some((f) => f.includes(`${'plugins'}/`)),
+    '扫描范围应当包含 plugins/（存在该目录时必须收到文件）',
+  )
+
+  const writePathText = readFileSync(files.find((f) => f.endsWith(WRITE_PATH)) ?? '', 'utf8')
+  // 注意用 `\s*\(` 而不是字面的 ` (`：无空格的 `INSERT INTO blocks(` 同样是合法写法
+  assert.ok(/INSERT\s+INTO\s+blocks\s*\(/i.test(writePathText), '唯一写入路径里应当确实有 INSERT INTO blocks')
+  assert.ok(/DELETE\s+FROM\s+blocks\b/i.test(writePathText), '唯一写入路径里应当确实有 DELETE FROM blocks')
+  assert.ok(
+    /INSERT\s+INTO\s+blocks_fts/i.test(
+      readFileSync(files.find((f) => f.endsWith(REBUILD)) ?? '', 'utf8'),
+    ),
     'search 的全量重建里应当确实有 INSERT INTO blocks_fts',
   )
 
   assert.deepEqual(
-    offenders(/INSERT INTO blocks \(/i, [WRITE_PATH]),
+    offenders(/INSERT\s+INTO\s+blocks\s*\(/i, [WRITE_PATH]),
     [],
     '新增块行必须经 blocks.ts 的 syncBlocksForPage，否则块与索引漂移',
   )
   assert.deepEqual(
-    offenders(/DELETE FROM blocks\b/i, [WRITE_PATH]),
+    offenders(/DELETE\s+FROM\s+blocks\b/i, [WRITE_PATH]),
     [],
     '删除块行必须经 blocks.ts，否则 contentless 索引里留下孤儿',
   )
   assert.deepEqual(
-    offenders(/INSERT INTO blocks_fts/i, [WRITE_PATH, REBUILD]),
+    offenders(/INSERT\s+INTO\s+blocks_fts/i, [WRITE_PATH, REBUILD]),
     [],
     '索引插入只允许 blocks.ts 的逐页同步与 search 的全量重建（后者从 blocks 派生）',
   )
