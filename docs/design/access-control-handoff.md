@@ -2,11 +2,12 @@
 
 > **本文件是状态交接，不是设计说明。** 设计与规格看 `docs/design/access-control.md`（v7，2077 行）。
 > 用途：让下一任（人或 agent）能在不看历史对话的情况下接手剩余工作。
+> **维护要求：每完成一个阶段、或发现一条规格错误，就把事实写进这里。** 对话上下文会被压缩，这里不会。
 
 ## 一句话状态
 
-**P0 / P1 / P1.5 / P2（M1–M4，M5 部分）已实现并合入 `main`（`cfdafd0`）。
-P3a–P3d（块级模型）与 P4（审计与运维闭环）一行代码都未写。**
+**`main` = `953f41d`。已合入：P0 / P1 / 文档 v7 / P1.5 / P2 / P2-M5（前 3 项）。**
+**P3a 实现完成但经审查判定不可合并（2 条 Critical 泄漏，修复中）；P3b 基本完成；P3c / P3d / P4 未完成。**
 
 ## 对照最初的四项需求
 
@@ -14,118 +15,171 @@ P3a–P3d（块级模型）与 P4（审计与运维闭环）一行代码都未�
 |---|---|---|
 | 1 | 权限管理 | ✅ 完成 |
 | 2 | 团队/组织管理 | ✅ 完成 |
-| 3 | 部分条目**或条目中的内容**需权限才能显示 | ⚠️ **条目级 ✅；内容级（块级）❌ 未做** |
-| 4 | 未登录进站应有主页面 | ✅ 服务端门户 `/portal` 完成；⚠️ 前端导航能力驱动未完成 |
+| 3 | 部分条目**或条目中的内容**需权限才能显示 | ⚠️ **条目级 ✅**；**内容级（块级）实现中**（P3a 待修、P3b 基本完成、P3c/P3d 未做） |
+| 4 | 未登录进站应有主页面 | ✅ 服务端门户 `/portal` 完成；✅ 前端导航能力驱动已完成（M5） |
 
-第 3 项的"条目中的内容"就是 P3a–P3d。第 4 项的前端部分见下方「P2 M5 剩余」。
-
-## 已合入的提交
+## 分支与 worktree 现状
 
 ```
-cfdafd0  merge(privacy): P2-M5（部分）能力下发、按钮条件化与真实 404
-f2a876e  test(auth): e2e-p1 的两条断言按 P2 后的行为更新
-fd785fd  test(oidc): 夹具改为加载全部迁移
-c126e27  merge(privacy): P2 组织/团队与条目级可见性（M1–M4）
-d048e2b  merge(oidc): P1.5 OIDC 双通道
-40f63fd  docs: 设计文档 v7
-f3990a9  merge(auth): P1 身份与登录
-e708814  merge(security): P0 路由鉴权骨架
+main                     953f41d   已合入 P0/P1/v7-doc/P1.5/P2/M5
+feat/p3a-blocks-cont     289f0b4   worktree .wt-p3a2   ← P3a 全部实现完成；审查判不可合并，修复中
+feat/p3bcd-block-acl     8a58db6   worktree .wt-p3bcd  ← P3b 基本完成；P3c/P3d/申请访问未做
+feat/p3a-blocks          0f34e06   worktree .wt-p3a    ← 上面那条的祖先（旧），勿动
+feat/p0-route-auth-guard / feat/p1-identity / feat/p15-oidc / feat/p2-org-visibility /
+feat/p2-m5-frontend-ia              均已合入，worktree .wt-p0/.wt-p1/.wt-p15/.wt-p2/.wt-m5
 ```
 
-各阶段交付内容的详细清单，见对应的 merge 提交信息（每一个都写清了落地内容、验证证据、已知缺口与未验证项）。
+**合并顺序与 rebase 计划**：先合 **P3a（含修复）**，再把 **P3bcd rebase** 上去。
+两者都改 `packages/plugin-wiki/src/index.ts`（P3a 补子孙 tier 重算、P3b 改保守重解析与写入路径），
+**rebase 必有冲突，需按语义合并**——它们是两件不同的事，不要二选一。
+
+## P3a 的两条 Critical 泄漏（审查端到端复现；修复轮进行中）
+
+**根因链**：`blocks.tier` 是检索用的**物化派生列**，而读路径按 slug 前缀**实时算**有效档位。
+两者一旦不同步 ⇒ **读路径 404、检索却命中并吐出正文片段**。当前实现只在"改档位"一条路径上做了子孙重算。
+
+**Critical 1 —— `packages/plugin-wiki/src/index.ts:907-937`（`savePage` create 分支）**
+只有本页 `syncBlocksForPage`，**无子孙扇出**。复现：建 `a/b`（public + published）→ 匿名读 200、搜 `total=1`；
+再 `PUT /api/pages/a`（默认 org）→ 匿名读 `a/b` **404**，但匿名 `/api/search` 仍 **`total:1` 且响应体出现唯一词 `CHILDUNIQ777`**。
+同刻 `blocks/verify` 报 `tier_mismatched:1, mismatched:0`。
+
+**Critical 2 —— `packages/plugin-wiki/src/index.ts:991-1007`（`deletePage`）**
+无扇出。复现：`a`=private、`a/b`=public + published + **`inherit=false`**（断链点）、`a/b/c`=public + published
+→ 匿名读 `c` 200、搜得到；`DELETE /api/pages/a%2Fb` 后 → 匿名读 404，但匿名搜仍吐 `DEEPUNIQ999`。
+
+**根因（已独立核实）**：`packages/plugin-authz/src/index.ts:261-271` 的 `effectiveRank`——
+`ancestorsOf` **由近及远**；对**缺失**祖先 `continue`（不构成收紧）、对 `inherit !== 1` 才 `break`（断链）。
+删掉断链点后更上层更严的祖先**重新开始压制**，rank 0→2，而 `blocks.tier` 仍为 0。
+**`continue`/`break` 的不对称是刻意的，不要去改它**，只能补"档位变了要重算 tier"。
+
+**要求的修法**：`savePage` create 分支与 `deletePage` 事务提交后各调一次 `resyncDescendantTiers(slug)`（与 `:1404` 同写法）；
+并评估能否把扇出放进同一事务（当前扇出在提交**之后**且失败只 `console.warn` ⇒ 泄漏窗口 + 无自动修复，
+`index_tiers_resynced=0` 与"没有子孙"不可区分）。
+**e2e 必须补这两条顺序的断言**——现有脚本 G 阶段**只测了"改档位"**，所以它绿着而泄漏仍在。
+
+## P3b/P3c/P3d 状态
+
+已完成（5 个提交，`feat/p3bcd-block-acl`）：`0014_access_requests.sql` + `0016_block_grants.sql`（双方言，
+含 `idx_block_grants_subject`）；`grantedBlockIds()` 真实查询（user 直授 + groupIds 组授、**按 `expires_at` 过滤**、
+匿名/break-glass 返回空集、**激活期表存在性自检**）；投影授权分支；**保守重解析**（保留块 id、拆分继承授权、
+合并/删除已授权块 409，全部在写入前拒绝）；块级治理与授予端点（3 个，含 `acl_revision` 递增与审计）。
+
+**未完成**：① 申请访问流程端点（表已建、端点未做，§8.2 P3b 第 6 条）；② **P3c 完全未开始**（`0017_version_blocks.sql`、
+`blocks_json`/`acl_json`、"改权限也产生版本"、四位一体恢复、1MB 上限、老版本 `warnings:['block_acls_not_restored']`）；
+③ **P3d 完全未开始**（标记高亮、「预览为匿名视角」开关）。
+
+**★ 一条跨阶段的隐性依赖（P3b 执行者发现的）**：`syncBlocksForPage` 的"删光重建"会让 `block_grants`
+被 `ON DELETE CASCADE` **静默清空** ⇒ P3b **必须**改写入路径。两个阶段各自看自己那一半都对，
+**缺陷只存在于交界处**——这是"必须做跨阶段 e2e"的实证。
+
+## P4 未开始
+
+规格见 §8.1 的 P4 行与 §5.12。注意：原属 P4 的两个 verify 端点
+（`GET /api/admin/{search,blocks}/verify`）**已由编排者裁定提前到 P3a 实现**（它们是 P3a 分层索引与双写的一致性探针，
+缺它们无法验收 P3a 自身）。
+
+## ★★ 待回写的设计文档更正（**累积清单，不要丢**）
+
+1. **§2.3 规则 B1 的方向写反了（安全相关）**：文档写 `effectiveBlockTier = min(block, page)`，但那句话的刻度是
+   "**宽松度**"（越大越宽松），而 `tier` 列是"**限制等级**"（`b.tier <= :readerTier`，**越小越公开**）
+   ⇒ 同一语义必须是 **`max`**。写反会让"页面 org + 块 public"的块拿到 tier 0，**匿名在搜索里就能搜到它**。
+   以代码的 `effectiveIndexLevel` / `packages/plugin-authz` 的 `RANK_*` 为准（`RANK_PUBLIC=0 / RANK_ORG=1 / RANK_PRIVATE=2`，越右越窄）。
+2. **§3.6 的迁移落点是错的**：文档说写 `plugin-wiki/migrations/`，但 `@geewiki/wiki` 的迁移目录**只声明了 sqlite**
+   ⇒ 照文档写，**PG 部署下 `blocks` 表根本不会被建出来**。实际落在 db 包、两侧成对。
+3. **§9 R9（约 1558 行）写错**：把 `navOrder.test.ts（导航合并）` 列为"P2 必然触碰"——
+   该文件测的是 `lib/navTree.ts` 的前后序，**与顶栏导航无关**（审查用 `git diff --stat` 证明其 diff 长度 0 行）。
+4. **`tier` 必须内联在 `CREATE TABLE` 里**（不是另起 `ALTER ... ADD COLUMN`）：SQLite 没有"加列时若已存在则跳过"的语法
+   ⇒ 独立 ALTER 会让迁移**无法重放**（P2 在 0012 上踩过并用守卫测试钉死）。
+5. **config 脱敏的判据被放宽**：文档只写 break-glass，实现为 **break-glass 或 `orgRole ∈ {owner,admin}`**
+   （否则登录为 owner 的管理员拿不到 config、配置表单无法回填；不重新打开匿名泄漏）。两条通道都堵
+   （`/api/plugins` + `/api/session` 经 `PluginListFile.enabled[].config`），**未改 `snapshotOf()`**（改了会打瞎配置表单）。
+6. **`snippet()` 是静默失败**：设计写"不可用"，实测是**返回 `null` 而不报错**（我已用真 probe 验过）。
+7. **§8.2 的 P2 验收标准 1–14 全是后端项**，没有前端 IA 条目 ⇒ M5 工作**没有设计文档层面的验收标准**。
+8. **§4.3 低估了 P3a 的方言成本**：文档说"块模型与读路径裁剪两部分仍可两方言落地"——
+   在这三个 PG 缺陷修掉之前那句话不成立（见下）。建议补一句：*"块模型的 PG 可用性依赖 `RETURNING id`
+   与索引表存在的方言判定，二者都不由类型系统保证，必须有真方言 e2e 兜底。"*
+9. **`blocks_fts` 只索引块文本** ⇒ **FTS 路不再按标题匹配**（LIKE 路仍匹配）。这是 §4.3 SQL 形态的直接后果，
+   已有断言钉住。建议写进文档。
+10. **`系统状态`（服务健康/DB 方言/表清单）随 `管理 ▾` 下沉为管理员专属**——文档里 `grep 系统状态|服务健康`
+    **零命中**，规格从未表态。**编排者裁定：维持管理员专属**（内容是运维细节，与所在分组的"运维台面"语义一致；
+    `GET /api/health` 本身仍是公共端点，看门狗不受影响）。
+
+## 环境约束与教训（**必须遵守**）
+
+- **沙箱只允许写 `/root/dev/geewiki` 之内** ⇒ worktree 必须建在仓库内（`.wt-<阶段>`）。
+- **⛔ 派工必须写明"绝对不要创建 worktree 或分支"**。已发生过两次：执行者自己另建 worktree/分支，
+  导致工作 split 在两条分支上、编排者差点在旧基线上继续（靠"报告里的提交号与 worktree tip 对不上"才发现）。
+- **路径陷阱**：`edit`/`write` 按**会话工作区（主工作树）**解析相对路径 ⇒ 在 worktree 里干活**必须用绝对路径**。十三位执行者里踩过的占多数。
+- **`subagent_implementer` / `subagent_general` 会继承对话上下文**，可能把自己当编排者转手派活（发生过：一行代码没写）⇒ 派工要写"你亲自写代码，禁止派发子代理/子会话/转交"。
+- **job 型子代理无法用 `send_message` 插话**（报 `unavailable`）⇒ 只能事后核查。常驻子代理（reviewer/debugger/plan/docs/git）可以，但**不能用 `job_output` 阻塞等待**，只能等通知。
+- **`interrupt_agent` 只停"当轮"**，不等于停止；用**文件 mtime** 确认原执行者真停了，别用轮数判断。
+- **agent 会因上下文耗尽而中途收尾** ⇒ 派工时就把"按里程碑提交、跑不完就交代停在哪里"写死。
+- **PG 隔离配方**：临时目录写 `plugins.base.json`，`@geewiki/postgres` 内联 `config` 用 `passwordEnv: "GEEWIKI_DB_PASSWORD"`；
+  启动 `GEEWIKI_CONFIG_DIR=<tmp> GEEWIKI_DATA_DIR=<tmp> GEEWIKI_DB_PASSWORD=testpw GEEWIKI_PORT=<自选> node --import tsx packages/server/src/index.ts`。
+  ⚠️ **必须轮询 `/api/health` 到 `"present":true` 才开始验收**（http 就绪即 200，迁移可能没跑完 —— 三位执行者栽在这里）。
+- **PG 共享库 `geewiki_test` 已"中毒"**（留着先前运行的 owner 账号 ⇒ e2e 跳过 setup 直接登录 ⇒ 全线 401 假失败）⇒ 用干净库 **`geewiki_e2e_clean`**。
+- **容器 `geewiki-pg-test`**：`postgres:15-alpine`，host `127.0.0.1` port **55432**，user `geewiki` / password `testpw`。
+- **端口分段避让**：41xxx PG 验证 / 42xxx P1.5 / 43xxx P2 / 45xxx 合并验证 / 46xxx M5 合并 / 47xxx P3a / 48xxx M5 前端 / **50xxx P3bcd**
+- **`plugin-search` 在 PG 上报** `迁移失败（已回滚）: 0001_search.sql error: syntax error at or near "VIRTUAL"` —— **预期行为**
+  （插件有显式方言守卫 `packages/plugin-search/src/index.ts:307-320`）。根因是它用**裸字符串**声明 `migrations: './migrations'`（`:67`）
+  ⇒ 在 `resolveMigrationsDirs` 里归入 `'default'` 键被所有方言命中；**最小修法一行**：`migrations: { sqlite: './migrations' }`。
+- **FTS5 实测（编排者跑的真 probe）**：SQLite **3.53.4**（better-sqlite3 13.0.3）；`contentless_delete=1` 建表/删除/rowid 复用均 OK；
+  **trigram 3 字符门槛真实**（2 字查询 `MATCH` 恒为空 ⇒ 短查询必须走 LIKE 兜底）；**`snippet()` 静默返回 `null` 而不报错**；
+  **`tier` 过滤绝不能写在 FTS 表上**（contentless + `UNINDEXED` 会静默返回 0 行）。
+- **SQL 括号陷阱**：`A OR B AND C` 的优先级是 `A OR (B AND C)` ⇒ 权限过滤条件必须加括号（P2 栽过一次）。
+- **SQLite 没有 `ADD COLUMN IF NOT EXISTS`** ⇒ 给既有表加列的迁移**无法重放**（守卫测试已钉死，**不要放宽**）。
+- **既有守卫测试有基于文本启发的**（如 `/\bADD\s+COLUMN\b/i` 判断迁移可重放）⇒ **注释里写这几个词会被误判**。
+- **`/tmp` 在本沙箱跨 bash 调用不保留** ⇒ 日志要写在工作区内或同一条命令里消费。
+- **主工作树默认没有 `node_modules`** ⇒ 在 main 上跑 typecheck/test 前需 `pnpm install --frozen-lockfile`。
+- **`compress` 工具反复报错** `session event "user/message" carries an invalid replace surfaceOp`，但**压缩实际仍生效**（用 `acp_status` 核实）。
+  ⚠️ **教训：不要把关键工作笔记只留在对话上下文里——压缩会吃掉它们（本文件就是这么产生的）。**
+- **编排者（我）犯过的错**：① 指令里写过 `901`/`8192` 两个**不存在**的数值；② 任务书写成 `/api/slots`，真实是 `/api/plugins/slots`；
+  ③ 要求补的 `details` 修复**原本无测试覆盖**；④ 任务书要求"同步更新 `navOrder.test.ts`" —— **错，该文件与顶栏导航无关**；
+  ⑤ **检查脚本四次假阳性**（grep 命中注释、grep 模式路径写错、mN 引用过期）⇒ 关键结论一律二次确认。
 
 ## 验证基线（复现用）
 
 ```bash
 pnpm install --frozen-lockfile        # 主工作树默认没有 node_modules
 pnpm typecheck                        # 预期 exit 0（17 个包）
-pnpm test                             # 预期 811 例全绿 / 0 失败
+pnpm test                             # main 上 831 例全绿；各分支基线见其提交信息
+pnpm build                            # exit 0
 
-# 四条端到端（真实起服务 + 真实 curl，pnpm test 不包含它们）
+# e2e（真实起服务 + 真实 curl，pnpm test 不包含它们）
 PORT=46101 bash packages/plugin-auth/test/e2e-p1.sh      # 38/38
 bash packages/plugin-oidc/test/e2e-p15.sh                # 44/44（测试内 mock IdP）
 PORT=46301 bash packages/plugin-org/test/e2e-p2-org.sh   # 44/44
 PORT=46401 bash packages/plugin-authz/test/e2e-p2.sh     # 34/34（SQLite）
+bash packages/plugin-wiki/test/e2e-p3a.sh                # P3a：SQLite 59/0/0、PG 22/0/6 跳过
 ```
 
-**PostgreSQL 侧**：容器 `geewiki-pg-test`（`postgres:15-alpine`，`127.0.0.1:55432`，user `geewiki` / password `testpw`）。
-隔离配方（**不要改仓库里被跟踪的 `config/`**）：
+**跨阶段回归是必须做的**：P3a 分支上既有四条 e2e 共 160 项全绿；P3bcd 分支上五条共 219 项全绿。
+`pnpm test` 是各包单测，**覆盖不到跨阶段的服务端到端**。
 
-```
-临时目录写 plugins.base.json，把 @geewiki/db-sqlite 换成
-  { "name": "@geewiki/postgres",
-    "config": { "host": "127.0.0.1", "port": 55432, "database": "geewiki_test",
-                "user": "geewiki", "passwordEnv": "GEEWIKI_DB_PASSWORD" } }
-启动：GEEWIKI_CONFIG_DIR=<tmp> GEEWIKI_DATA_DIR=<tmp> GEEWIKI_DB_PASSWORD=testpw \
-      GEEWIKI_PORT=<自选> node --import tsx packages/server/src/index.ts
-```
+## 已知未完成的安全/质量项（非阻塞，应跟进）
 
-⚠️ **验收必须轮询 `/api/health` 到 `"present":true`** —— http 就绪即返回 200，但迁移可能还没跑完。
-插件配置是**内联在清单文件 `enabled[]` 条目里**的（见 `packages/manager/src/index.ts:642-648` 的 `persistConfig`）。
-
-## 剩余工作
-
-### P2 M5 剩余 4 项（前端体验，非安全缺陷）
-
-1. 导航改能力驱动 + 三处重复渲染合并为一处 —— 无权的「管理 ▾」**仍会渲染**
-2. 侧边栏改吃可见集合
-3. 命令面板动作按能力过滤
-4. **红链三步态** —— 受限条目的站内链接仍会被渲染成"不存在"的红链，会让用户去创建已存在的页面。
-   **这不是泄漏面**（服务端已把 `title` 裁剪为 `null`），是纯体验缺陷
-
-### P3a —— 块模型落地 + 读路径改造 + FTS tier 切换
-
-规格见设计文档 **§4.3 / §3.6 / §8.2 P3a**。落地要点：
-
-- `0015_blocks.sql`：`blocks` 表含 `tier` 冗余列，**无默认值**（`DEFAULT 0` 是失败开放：漏算 tier 的块会以匿名等级进索引）
-- `packages/plugin-search/migrations/0002_blocks_fts.sql`：`fts5(text, content='', contentless_delete=1, tokenize='trigram')`，**要求 SQLite ≥3.43**，且 `snippet()` 不可用
-- 必须 `DROP TRIGGER` 旧的 `pages_fts_ai/ad/au`，同步改由**应用层**负责
-- **两条已实测的坑**：① tier 过滤**不能写在 FTS 表上**（contentless + `UNINDEXED` 会静默返回 0 行），必须把 `tier` 冗余到 `blocks` 表上 JOIN 过滤；② **短查询 LIKE 路是独立的另一条 SQL**，必须单独改
-- **本阶段的 FTS 部分仅 SQLite 适用**（设计文档 §4.3 ★v7 已逐条标注验收项）
-
-### P3b / P3c / P3d
-
-见 §2.3（规则 B1/B2）、§3.7（`block_grants`）、§3.5 与 §4.4（版本语义）、§8.2。
-要点：`granted` 档不进等级索引（`tier` 写 `NULL`）；改权限**也必须产生新版本**；合并可见性不同的块 ⇒ 409 `block_merge_conflict`；删除已授权块 ⇒ 409 `block_grant_orphan`；旧标记 `role=editor` 必须**显式拒绝**而非静默忽略。
-
-### P4 —— 审计与运维闭环
-
-见 §8.1 P4 行与 §5.12。
-
-## ★ 规格内部的一处顺序冲突（已裁定）
-
-`§8.2` 的 **P3a 验收标准要用 `GET /api/admin/{search,blocks}/verify`**，而 `§8.1` 把这两个端点划给了 **P4**。
-
-**裁定：这两个端点提前到 P3a 实现。** 理由 —— 它们是 P3a 引入的分层索引与双写的一致性探针
-（`search/verify` 比对 `blocks` 与 `blocks_fts`，`blocks/verify` 比对 `pages.content_hash` 与由 blocks 重算的哈希），
-**没有它们就无法验收 P3a 自己**；P4 只是复用它们做运维闭环。这是工程顺序问题，不是产品决策。
-（P3a 的提交信息里记录了这个裁定及其理由。）
-
-## 已知陷阱（下一任必看）
-
-1. **`plugin-org` 与 `plugin-authz` 没有单元测试**，只有 shell e2e 脚本。e2e 是真起服务的、可信度不低，但改这两个包时没有快速回归网。
-2. **PG 共享库 `geewiki_test` 已"中毒"**：里面留着先前运行创建的 owner 账号，`e2e-p2.sh` 的 PG 模式据此跳过 setup 直接登录 ⇒ 全线 401，表现为 17/20 的**假失败**。
-   已备好干净库 **`geewiki_e2e_clean`**：`PG_DB=geewiki_e2e_clean GEEWIKI_E2E_PG=1 bash packages/plugin-authz/test/e2e-p2.sh` → 31/31。
-3. **`plugin-search` 在 PG 上会报** `迁移失败（已回滚）: 0001_search.sql error: syntax error at or near "VIRTUAL"` —— 这是**预期行为**（插件有显式方言守卫，见 `packages/plugin-search/src/index.ts:307-320`）。
-   根因是它用**裸字符串**声明 `migrations: './migrations'`（`:67`），在 `resolveMigrationsDirs` 里归入 `'default'` 键被所有方言命中。**最小修法是一行**：改成 `migrations: { sqlite: './migrations' }`。
-4. **`db-postgres` 的 20 例测试是 `fakePool()` 桩测试**（`packages/db-postgres/test/postgres.test.ts:98` 起），只验 SQL 改写，**不连真库**。真正的 PG 验证必须真起服务。
-5. **worktree 必须建在仓库内**（沙箱只允许写 `/root/dev/geewiki` 之内），命名 `.wt-<阶段>`。在 worktree 里干活**必须用绝对路径** —— `edit`/`write` 按会话工作区（主工作树）解析相对路径，用相对路径会把改动落错地方。
-6. **派工时必须写明"你亲自写代码，禁止派发子代理/子会话/转交"** —— 会继承对话上下文的执行者（`subagent_implementer` / `subagent_general`）曾把自己当编排者转手派活，结果一行代码没写。
-7. **`interrupt_agent` 只停"当轮"**，不等于停止。重派前用**文件 mtime** 确认原执行者真的停了，别用轮数判断（goal round 间隔可能只有 20–30 秒）。
-8. **既有 worktree**：`.wt-p0` / `.wt-p1` / `.wt-p15` / `.wt-p2`。后三个的分支均已合入 main，可 `git worktree remove` 清理（清理后全文搜索不会再扫到重复文件）。
-
-## 已知未完成的安全/质量项（非阻塞，但应跟进）
-
-- `GET /api/plugins` 与 `GET /api/session` 对匿名仍会回显插件 `config`（**已由 P2 M4 处理**，此处保留以备回归核对）
-- `packages/web/src/pages/AccountPage.tsx:63` 跳登录时丢掉 `link=required`，会话过期重登后确认绑定卡片不再出现（纯 UX）
-- `packages/plugin-oidc/test/oidc.test.ts` 缺三块单测：`kid` 未命中强制刷新一次、`nbf` 边界、`jwks_empty` 失败关闭
-- `packages/plugin-auth/src/index.ts:1278` 的 `clearLink()` 被重复调用且内部无 `writableEnded` 防护
-- `MAX_VISIBLE_SLUGS = 16_000`（SQLite 3.32+ 绑定上限 32766 的一半，超限**显式抛错**而非静默截断）—— 已知的规模边界
+- `packages/web/src/pages/WikiPage.tsx:341,487` 仍有两个**未按 `editContent` 收口**的「新建页面」按钮
+- **能力不随角色变更刷新**：`capabilities` 只在 `loadAuth()` 写入；`denied`(403) 分支只跳转不刷新
+  ⇒ 提升后不重载看不到新入口、降级后旧入口留着（外观层面的失败开放；服务端仍独立判定）
+- `<SlotOutlet name="app-header" />` **零门控**（当前无插件贡献该槽，属潜在洞）
+- 测试守卫窄缝：`packages/web/test/navPlan.test.ts:127-137` 的 `id` 计数正则；`navGate.test.ts:84-86` 以子串 `管理` 计数
+- `packages/plugin-auth/src/index.ts:1278` 的 `clearLink()` 被重复调用且无 `writableEnded` 防护
+- `packages/web/src/pages/AccountPage.tsx:63` 跳登录丢掉 `link=required`
+- `packages/plugin-oidc/test/oidc.test.ts` 缺三块单测（`kid` 未命中强制刷新一次、`nbf` 边界、`jwks_empty` 失败关闭）
+- `backlinks`/`links` 的可见性防护在**路由层**（`packages/plugin-wiki/src/index.ts:1217-1249` 两重检查），
+  **服务方法本身仍只查 `pageExists`**（`:765-772`）—— 无当前消费者的不对称点
+- `packages/db-postgres` 的 20 例是 **`fakePool()` 桩测试**（`packages/db-postgres/test/postgres.test.ts:98` 起），**不连真库**
+- P3a 的扇出性能（子树 N 页 = N 次全表扫描）；检索不再覆盖 `page_grants` 与 owner/admin 覆盖（方向是"少给"，非泄漏）；
+  `search/verify` 的 `tier_mismatch` 只做 NULL 计数代理 ⇒ 对"非 NULL 的陈旧 tier"完全盲
+- `packages/plugin-wiki/src/blocks.ts:22` 曾声称"有源码级守卫测试钉住唯一写入路径"而**该测试不存在**（修复轮要求补上）；
+  `0002_blocks_fts.sql:63` 引用的模块名 `blocksWriters` 不存在（实际是 `blocks.ts` 的 `syncBlocksForPage`）
 
 ## 未验证项（诚实清单）
 
-- **真实浏览器交互从未验证**：所有端到端都是 curl；前端只有类型检查与守卫测试
+- **真实浏览器交互从未验证**：所有端到端都是 curl；前端只有类型检查、守卫测试与 SSR 测试
 - **多实例部署必然失败**（OIDC 流程状态存进程内，**失败关闭方向**）
 - **AI 两条端点的端到端不泄漏未验**（需要 LLM 配置；单测层面已覆盖主体透传与 SSE 建连时取主体）
 - **D8 存量回填没有真实对象可验**（e2e 库是空的，回填无对象可作用）
 - 移动条目后权限变化、第二个账号授权后立即可见 —— 未构造
+- `plugin-org` / `plugin-authz` / P3a 新增的辅助函数 **无单元测试**，只由 e2e 覆盖
+- PG 模式跳过了检索阶段（FTS 仅 SQLite，设计如此）与部分 e2e 阶段
