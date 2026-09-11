@@ -145,7 +145,7 @@ interface Harness {
   dispose(): void
 }
 
-function makeHarness(): Harness {
+async function makeHarness(): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gw-wiki-slug-'))
   const adapter = new NodeSqliteAdapter(
     join(dir, 'test.db'),
@@ -178,7 +178,7 @@ function makeHarness(): Harness {
       }
     },
   } as unknown as Context
-  const dispose = WikiPlugin.apply(ctx, { recentVersions: 10 }) as () => void
+  const dispose = (await WikiPlugin.apply(ctx, { recentVersions: 10 })) as () => void
 
   const call = (
     method: string,
@@ -284,7 +284,7 @@ test('isValidSlug：保留段被拒——首段 search/ask/new/list、第二段 
 /* ------------------ 2. 层级 slug：端点往返（集成层） ------------------ */
 
 test('层级 slug 的完整 CRUD 往返：PUT → GET → 列表 → 版本 → DELETE', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     // PUT 新建
     const put = await save(h, 'guide/intro', '入门', '第一版正文')
@@ -331,7 +331,7 @@ test('层级 slug 的完整 CRUD 往返：PUT → GET → 列表 → 版本 → 
 })
 
 test('多级 slug（a/b/c）同样往返一致，且与扁平 slug 互不干扰', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     await save(h, 'a', '顶层')
     await save(h, 'a/b', '二级')
@@ -353,7 +353,7 @@ test('多级 slug（a/b/c）同样往返一致，且与扁平 slug 互不干扰'
 })
 
 test('非法 slug 经端点仍返回 400 invalid_slug（错误语义不变）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     for (const bad of ['search/x', 'guide/edit', 'a//b', 'guide/', 'guide/../x', 'x'.repeat(81) + '/y']) {
       const res = await save(h, bad)
@@ -361,9 +361,9 @@ test('非法 slug 经端点仍返回 400 invalid_slug（错误语义不变）', 
       assert.equal(res.body['error'], 'invalid_slug', `${bad} 错误码应为 invalid_slug`)
       assert.equal(res.body['message'], SLUG_HINT, '错误文案应来自同一份 SLUG_HINT')
     }
-    // 服务层同口径（消息前缀即错误码）
-    assert.throws(() => h.svc().save('search/x', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
-    assert.throws(() => h.svc().save('guide/../etc', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
+    // 服务层同口径（消息前缀即错误码）。异步方法抛错 = rejection，故用 assert.rejects
+    await assert.rejects(async () => h.svc().save('search/x', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
+    await assert.rejects(async () => h.svc().save('guide/../etc', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
   } finally {
     h.dispose()
   }
@@ -372,7 +372,7 @@ test('非法 slug 经端点仍返回 400 invalid_slug（错误语义不变）', 
 /* ------------------ 3. 排序稳定性（并列 updated_at） ------------------ */
 
 test('列表排序稳定：updated_at 全部并列时，顺序由 id DESC 决定且可重复', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     const slugs = ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
     for (const s of slugs) await save(h, s)
@@ -401,7 +401,7 @@ test('列表排序稳定：updated_at 全部并列时，顺序由 id DESC 决定
 })
 
 test('列表排序：分页切片不重不漏（同一并列集合）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     for (const s of ['p1', 'p2', 'p3', 'p4', 'p5']) await save(h, s)
     h.adapter.db.prepare('UPDATE pages SET updated_at = ?').run('2026-01-01T00:00:00.000Z')

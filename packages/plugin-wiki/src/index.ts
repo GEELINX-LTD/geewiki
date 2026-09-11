@@ -19,7 +19,15 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import { closeAfterResponse, isAsyncAdapter, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type RouteHandlerContext } from '@geewiki/core'
+import {
+  asAsync,
+  closeAfterResponse,
+  type AnyDatabaseAdapter,
+  type DatabaseExecutor,
+  type GeeWikiManifest,
+  type HttpRouterService,
+  type RouteHandlerContext,
+} from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
 
 /**
@@ -124,20 +132,25 @@ export interface WikiOutlink {
  *
  * 入参非法时抛错（而非静默返回空值）：`message` 以 `<code>: ` 开头，`code` 与端点的
  * 400/413 错误码同源（`invalid_slug` / `invalid_title` / `content_too_large`）。
+ *
+ * **方法全部返回 Promise（自本批起）**：本插件同时支持同步适配器（better-sqlite3）与
+ * 异步适配器（pg），后者本质上是异步的，故唯一的共同形态是异步。
+ * 契约变更的代价为零：全仓 grep 确认**没有任何 `ctx.get('wiki-service')` 消费者**
+ * （只有提及它的注释），故不存在需要同步迁移的调用方。
  */
 export interface WikiService {
   /** 页面摘要列表（按 updated_at 倒序，与端点同序） */
-  list(): WikiPageSummary[]
+  list(): Promise<WikiPageSummary[]>
   /** 页面详情；slug 不存在时返回 `undefined`（对应端点 404） */
-  get(slug: string): WikiPageDetail | undefined
+  get(slug: string): Promise<WikiPageDetail | undefined>
   /** 新建或更新（幂等 upsert）：标题与正文均未变化时 outcome='unchanged' 且不写历史 */
-  save(slug: string, input: WikiSaveInput): WikiSaveResult
+  save(slug: string, input: WikiSaveInput): Promise<WikiSaveResult>
   /** 删除页面及其全部版本历史；返回是否确实删除（false 对应端点 404） */
-  remove(slug: string): boolean
+  remove(slug: string): Promise<boolean>
   /** 引用了该页的页面（按标题、slug 稳定排序）；页面不存在时返回 `undefined`（对应端点 404） */
-  backlinks(slug: string): WikiBacklink[] | undefined
+  backlinks(slug: string): Promise<WikiBacklink[] | undefined>
   /** 该页正文指向的目标（含尚未创建的页面，其 title 为 null）；同理 `undefined` 对应 404 */
-  links(slug: string): WikiOutlink[] | undefined
+  links(slug: string): Promise<WikiOutlink[] | undefined>
 }
 
 export const manifest: GeeWikiManifest = {
@@ -315,19 +328,26 @@ export const WikiPlugin = {
   /** cordis 约定：声明 Config 后由 cordis 负责校验与默认值填充 */
   Config: WikiConfigSchema,
 
-  apply(ctx: Context, config: WikiConfig = {}) {
-    const db = ctx.get('db') as DatabaseAdapter | undefined
+  /**
+   * 异步 apply：本插件要支持异步适配器（pg），而 `db.migrate()`/`appliedMigrations()`
+   * 在异步形态下是 Promise，故激活过程必须可等待。
+   *
+   * `packages/manager/src/index.ts` 的 `await this.ctx.plugin(...)` 会等激活完成
+   * （含 async apply），失败经 `_error` 抛出；`@geewiki/postgres` 已是同一模式。
+   */
+  async apply(ctx: Context, config: WikiConfig = {}) {
+    const db = ctx.get('db') as AnyDatabaseAdapter | undefined
     if (!db) throw new Error('@geewiki/wiki: 数据库服务不可用（@geewiki/db-sqlite 未激活）')
-    // **能力边界：显式失败，而不是静默坏掉**。本插件的查询/事务按**同步**适配器
-    // （better-sqlite3）编写；异步驱动（PostgreSQL）下这些调用返回 Promise 而拿不到行，
-    // 表现为"能启动但每个接口都读不到数据"——最难排查的一类故障。
-    // 异步化改造（约 15 处 db 调用）留待后续批次；在此之前明确拒绝并给出可执行指引。
-    if (isAsyncAdapter(db)) {
-      throw new Error(
-        `@geewiki/wiki: 当前数据库是异步适配器（${db.dialect}），本插件尚未支持。` +
-          '请改用 @geewiki/db-sqlite，或等待本插件的异步化改造（见 docs/plugin-platform-plan.md 的 PostgreSQL 条目）。',
-      )
-    }
+    /*
+     * **两种驱动，一条代码路径**：`asAsync` 把同步适配器（better-sqlite3）提升为异步门面，
+     * 异步适配器则原样返回。于是本文件不再需要任何 `isAsyncAdapter` 分支——
+     * 那正是上一版"异步下拒绝启动"守卫的替代品。
+     *
+     * ⚠️ 事务回调**必须使用传入的 `tx`**，不能用外层的 `adb`：异步适配器背后是连接池，
+     * `pool.query()` 会把语句分派到任意空闲连接上，导致 `BEGIN` 与后续语句不在同一条连接，
+     * **事务静默失效**（不报错但回滚不了）。`rebuildLinks` 因此把 `tx` 作为首参。
+     */
+    const adb = asAsync(db)
     const router = ctx.get('http') as HttpRouterService | undefined
     if (!router) throw new Error('@geewiki/wiki: http 路由服务不可用（@geewiki/http 未激活）')
     const recentLimit = config.recentVersions ?? 10
@@ -342,9 +362,11 @@ export const WikiPlugin = {
      * 于是回填**恰好发生一次**（老库升级时），新装的库因 pages 为空而是空操作，
      * 后续每次启动都直接跳过（不会重复扫描全部正文）。
      * ------------------------------------------------------------------- */
-    const migrationsBefore = new Set(db.appliedMigrations())
-    db.migrate(WIKI_MIGRATIONS_DIR)
-    const justAppliedMigration = db.appliedMigrations().some((name) => !migrationsBefore.has(name))
+    const migrationsBefore = new Set(await adb.appliedMigrations())
+    await adb.migrate(WIKI_MIGRATIONS_DIR)
+    const justAppliedMigration = (await adb.appliedMigrations()).some(
+      (name) => !migrationsBefore.has(name),
+    )
 
     /* ---------------------------------------------------------------------
      * 内部实现（端点与 wiki-service **共用**，单一真源）
@@ -363,38 +385,41 @@ export const WikiPlugin = {
      * 即"看起来稳定"的顺序会在加索引那一刻悄悄翻转——分页/侧边栏会因此漏项或重项。
      * 显式 tiebreaker 让顺序由 SQL 决定，而非由计划决定。
      */
-    const listPages = (): WikiPageSummary[] =>
-      db
-        .query<PageRow>(
+    const listPages = async (): Promise<WikiPageSummary[]> =>
+      (
+        await adb.query<PageRow>(
           `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at,
                   (SELECT COUNT(*) FROM page_versions v WHERE v.page_id = p.id) AS version_count
              FROM pages p ORDER BY p.updated_at DESC, p.id DESC`,
         )
-        .map((r) => ({
-          slug: r.slug,
-          title: r.title,
-          updated_at: r.updated_at,
-          version: Number((r as unknown as { version_count: number }).version_count) + 1,
-        }))
+      ).map((r) => ({
+        slug: r.slug,
+        title: r.title,
+        updated_at: r.updated_at,
+        version: Number((r as unknown as { version_count: number }).version_count) + 1,
+      }))
 
     /** 页面详情（正文 + 最近 recentLimit 条版本历史）；slug 不存在返回 undefined */
-    const getPage = (slug: string): WikiPageDetail | undefined => {
-      const page = db.query<PageRow>('SELECT * FROM pages WHERE slug = ?', [slug])[0]
+    const getPage = async (slug: string): Promise<WikiPageDetail | undefined> => {
+      const page = (await adb.query<PageRow>('SELECT * FROM pages WHERE slug = ?', [slug]))[0]
       if (!page) return undefined
-      const versions = db.query<{ id: number; saved_at: string }>(
+      const versions = await adb.query<{ id: number; saved_at: string }>(
         `SELECT id, saved_at FROM page_versions WHERE page_id = ? ORDER BY id DESC LIMIT ?`,
         [page.id, recentLimit],
       )
       const totalVersions = (
-        db.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])[0] as unknown as { n: number }
-      ).n
+        await adb.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])
+      )[0] as unknown as { n: number }
       return {
         slug: page.slug,
         title: page.title,
         content: page.content,
         created_at: page.created_at,
         updated_at: page.updated_at,
-        version: totalVersions + 1,
+        // **必须 Number() 强转**：`pg` 把 `COUNT(*)`（bigint）作为**字符串**返回以避免精度丢失，
+        // 而 better-sqlite3 返回数字。直接 `+ 1` 在 PG 下会变成字符串拼接（"0"+1 → "01"），
+        // 响应里的 version 就成了字符串——契约悄悄变化，且只在 PG 这一种驱动下发生。
+        version: Number(totalVersions.n) + 1,
         versions: versions.map((v) => ({ id: v.id, saved_at: v.saved_at })),
       }
     }
@@ -406,17 +431,20 @@ export const WikiPlugin = {
      *
      * 语义是"重建"而非"追加"：先删该页全部出行，再按当前正文重插。
      * 这样删掉正文里的链接后，旧边会被一并清掉——若只追加，反向链接会永远累积陈旧边。
+     *
+     * **首参是 `tx` 而不是闭包里的 `adb`**：事务内所有语句必须走同一条连接，
+     * 用适配器自身的方法在连接池下会落到别的连接上，事务静默失效（见 apply 顶部注释）。
      */
-    const rebuildLinks = (slug: string, content: string): void => {
-      db.run('DELETE FROM page_links WHERE source_slug = ?', [slug])
+    const rebuildLinks = async (tx: DatabaseExecutor, slug: string, content: string): Promise<void> => {
+      await tx.run('DELETE FROM page_links WHERE source_slug = ?', [slug])
       for (const target of extractLinkTargets(content, isValidSlug)) {
-        db.run('INSERT INTO page_links (source_slug, target_slug) VALUES (?, ?)', [slug, target])
+        await tx.run('INSERT INTO page_links (source_slug, target_slug) VALUES (?, ?)', [slug, target])
       }
     }
 
     /** 页面是否存在（比 getPage 轻：不取正文、不取版本历史） */
-    const pageExists = (slug: string): boolean =>
-      db.query<{ slug: string }>('SELECT slug FROM pages WHERE slug = ?', [slug]).length > 0
+    const pageExists = async (slug: string): Promise<boolean> =>
+      (await adb.query<{ slug: string }>('SELECT slug FROM pages WHERE slug = ?', [slug])).length > 0
 
     /**
      * 引用了 `slug` 的页面（反向链接）。
@@ -425,8 +453,8 @@ export const WikiPlugin = {
      * 排序 `title, slug`：标题做主序便于阅读，`slug` 是不能省的次级键——
      * 同名页面（或中文标题的同一码点序）下顺序才不会由查询计划决定。
      */
-    const listBacklinks = (slug: string): WikiBacklink[] =>
-      db.query<WikiBacklink>(
+    const listBacklinks = (slug: string): Promise<WikiBacklink[]> =>
+      adb.query<WikiBacklink>(
         `SELECT p.slug AS slug, p.title AS title
            FROM page_links l JOIN pages p ON p.slug = l.source_slug
           WHERE l.target_slug = ? ORDER BY p.title, p.slug`,
@@ -434,8 +462,8 @@ export const WikiPlugin = {
       )
 
     /** 该页正文指向的目标；`LEFT JOIN` 让"尚未创建的目标"也返回（title 为 null） */
-    const listOutlinks = (slug: string): WikiOutlink[] =>
-      db.query<WikiOutlink>(
+    const listOutlinks = (slug: string): Promise<WikiOutlink[]> =>
+      adb.query<WikiOutlink>(
         `SELECT l.target_slug AS slug, p.title AS title
            FROM page_links l LEFT JOIN pages p ON p.slug = l.target_slug
           WHERE l.source_slug = ? ORDER BY l.target_slug`,
@@ -443,60 +471,63 @@ export const WikiPlugin = {
       )
 
     /** 老库升级时一次性回填（恰好一次；理由见上面迁移段落） */
-    const backfillLinks = (): void => {
-      const rows = db.query<{ slug: string; content: string }>('SELECT slug, content FROM pages')
-      db.transaction(() => {
-        db.run('DELETE FROM page_links')
-        for (const r of rows) rebuildLinks(r.slug, r.content)
+    const backfillLinks = async (): Promise<void> => {
+      const rows = await adb.query<{ slug: string; content: string }>('SELECT slug, content FROM pages')
+      await adb.transaction(async (tx) => {
+        await tx.run('DELETE FROM page_links')
+        for (const r of rows) await rebuildLinks(tx, r.slug, r.content)
       })
       console.log(`[@geewiki/wiki] 反向链接已回填: ${rows.length} 个页面`)
     }
-    if (justAppliedMigration) backfillLinks()
+    if (justAppliedMigration) await backfillLinks()
 
     /**
      * upsert：保存前把旧正文快照进 page_versions（版本即历史）。
      * 幂等：标题与正文均未变化时既不更新 updated_at、也不写历史。
      * 入参须已由 normalizeSaveFields 校验（服务与端点都走该校验）。
      */
-    const savePage = (slug: string, input: WikiSaveInput): WikiSaveResult => {
+    const savePage = async (slug: string, input: WikiSaveInput): Promise<WikiSaveResult> => {
       const now = new Date().toISOString()
-      const outcome = db.transaction((): 'created' | 'updated' | 'unchanged' => {
-        const existing = db.query<PageRow>('SELECT id, title, content FROM pages WHERE slug = ?', [slug])[0]
+      const outcome = await adb.transaction(async (tx): Promise<'created' | 'updated' | 'unchanged'> => {
+        const existing = (await tx.query<PageRow>('SELECT id, title, content FROM pages WHERE slug = ?', [slug]))[0]
         if (!existing) {
-          db.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
+          await tx.run('INSERT INTO pages (slug, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [
             slug,
             input.title,
             input.content,
             now,
             now,
           ])
-          rebuildLinks(slug, input.content)
+          await rebuildLinks(tx, slug, input.content)
           return 'created'
         }
         // 幂等保存：标题与正文均未变化 → 不更新 updated_at、不写历史
         if (existing.title === input.title && existing.content === input.content) return 'unchanged'
         // 快照旧正文到版本历史，再更新页面
-        db.run('INSERT INTO page_versions (page_id, content, saved_at) VALUES (?, ?, ?)', [
+        await tx.run('INSERT INTO page_versions (page_id, content, saved_at) VALUES (?, ?, ?)', [
           existing.id,
           existing.content,
           now,
         ])
-        db.run('UPDATE pages SET title = ?, content = ?, updated_at = ? WHERE id = ?', [
+        await tx.run('UPDATE pages SET title = ?, content = ?, updated_at = ? WHERE id = ?', [
           input.title,
           input.content,
           now,
           existing.id,
         ])
         // 出链随正文重建（同一事务内，故正文与索引不会不一致）
-        rebuildLinks(slug, input.content)
+        await rebuildLinks(tx, slug, input.content)
         return 'updated'
       })
       const version =
-        (db.query<{ n: number }>(
-          'SELECT COUNT(*) AS n FROM page_versions v JOIN pages p ON p.id = v.page_id WHERE p.slug = ?',
-          [slug],
-        )[0] as unknown as { n: number }).n + 1
-      return { outcome, version }
+        (
+          await adb.query<{ n: number }>(
+            'SELECT COUNT(*) AS n FROM page_versions v JOIN pages p ON p.id = v.page_id WHERE p.slug = ?',
+            [slug],
+          )
+        )[0] as unknown as { n: number }
+      // 同上：PG 的 COUNT(*) 是字符串，必须强转（否则 "1"+1 → "11"）
+      return { outcome, version: Number(version.n) + 1 }
     }
 
     /**
@@ -508,13 +539,13 @@ export const WikiPlugin = {
      * 需引用方重新保存一次。选择"清两侧"是为了让索引与"页面存在"这一事实保持一致，
      * 不让索引里长期留有指向已删页面的边。
      */
-    const deletePage = (slug: string): boolean =>
-      db.transaction(() => {
-        const page = db.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug])[0]
+    const deletePage = (slug: string): Promise<boolean> =>
+      adb.transaction(async (tx) => {
+        const page = (await tx.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
         if (!page) return false
-        db.run('DELETE FROM page_versions WHERE page_id = ?', [page.id])
-        db.run('DELETE FROM pages WHERE id = ?', [page.id])
-        db.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
+        await tx.run('DELETE FROM page_versions WHERE page_id = ?', [page.id])
+        await tx.run('DELETE FROM pages WHERE id = ?', [page.id])
+        await tx.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
         return true
       })
 
@@ -528,46 +559,55 @@ export const WikiPlugin = {
 
     /** 服务实例：契约见 {@link WikiService}（方法集与六个端点一一对应） */
     const svc: WikiService = {
-      list: () => {
+      list: async () => {
         assertLive()
         return listPages()
       },
-      get: (slug) => {
+      get: async (slug) => {
         assertLive()
         return getPage(slug)
       },
-      save: (slug, input) => {
+      save: async (slug, input) => {
         assertLive()
         assertValidSlug(slug)
         return savePage(slug, normalizeSaveFields(input?.title, input?.content))
       },
-      remove: (slug) => {
+      remove: async (slug) => {
         assertLive()
         assertValidSlug(slug)
         return deletePage(slug)
       },
-      backlinks: (slug) => {
+      backlinks: async (slug) => {
         assertLive()
-        return pageExists(slug) ? listBacklinks(slug) : undefined
+        return (await pageExists(slug)) ? listBacklinks(slug) : undefined
       },
-      links: (slug) => {
+      links: async (slug) => {
         assertLive()
-        return pageExists(slug) ? listOutlinks(slug) : undefined
+        return (await pageExists(slug)) ? listOutlinks(slug) : undefined
       },
     }
 
     /* ---------- GET /api/pages：列表 ---------- */
+    /*
+     * 端点处理器一律 **async**：这些是**短请求**，返回 Promise 是正确且更好的——
+     * `packages/server/src/index.ts` 的 `dispatch()` 只在 `isThenable(result)` 为真时才把
+     * `exitHandler` 挂到结算上，故 async 处理器会被**正确计入在途请求**，排空会等它们。
+     *
+     * ⚠️ 反例：**SSE / 长连接处理器必须同步返回非 thenable**，否则会被永久计为在途，
+     * 让排空空转到超时并打印假的"排空超时"告警。已核实**本插件没有 SSE 端点**
+     * （全是请求-响应式的 JSON 端点），故此处不存在该风险。
+     */
     cleanups.push(
-      router.register('GET', '/api/pages', (h) => {
-        h.json(200, { pages: listPages() })
+      router.register('GET', '/api/pages', async (h) => {
+        h.json(200, { pages: await listPages() })
       }),
     )
 
     /* ---------- GET /api/pages/:slug：详情 + 最近版本历史 ---------- */
     cleanups.push(
-      router.register('GET', '/api/pages/:slug', (h) => {
+      router.register('GET', '/api/pages/:slug', async (h) => {
         // 路由段存在即为字符串；`?? ''` 仅为类型收窄（无匹配行 → 404，与既有行为一致）
-        const page = getPage(h.params.slug ?? '')
+        const page = await getPage(h.params.slug ?? '')
         if (!page) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${h.params.slug}` })
           return
@@ -578,15 +618,17 @@ export const WikiPlugin = {
 
     /* ---------- GET /api/pages/:slug/versions/:id：读取历史版本正文 ---------- */
     cleanups.push(
-      router.register('GET', '/api/pages/:slug/versions/:id', (h) => {
-        const page = db.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [h.params.slug])[0]
+      router.register('GET', '/api/pages/:slug/versions/:id', async (h) => {
+        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [h.params.slug]))[0]
         if (!page) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${h.params.slug}` })
           return
         }
-        const version = db.query<{ id: number; content: string; saved_at: string }>(
-          'SELECT id, content, saved_at FROM page_versions WHERE id = ? AND page_id = ?',
-          [Number(h.params.id), page.id],
+        const version = (
+          await adb.query<{ id: number; content: string; saved_at: string }>(
+            'SELECT id, content, saved_at FROM page_versions WHERE id = ? AND page_id = ?',
+            [Number(h.params.id), page.id],
+          )
         )[0]
         if (!version) {
           h.json(404, { ok: false, error: 'not_found', message: `版本不存在: ${h.params.id}` })
@@ -627,16 +669,16 @@ export const WikiPlugin = {
           h.json(400, { ok: false, error: 'invalid_body', message })
           return
         }
-        const { outcome, version } = savePage(slug, save)
+        const { outcome, version } = await savePage(slug, save)
         h.json(200, { ok: true, slug, title: save.title, outcome, version })
       }),
     )
 
     /* ---------- DELETE /api/pages/:slug（版本历史依赖外键级联；此处显式事务删除以防实现差异） ---------- */
     cleanups.push(
-      router.register('DELETE', '/api/pages/:slug', (h) => {
+      router.register('DELETE', '/api/pages/:slug', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!deletePage(slug)) {
+        if (!(await deletePage(slug))) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
@@ -657,25 +699,25 @@ export const WikiPlugin = {
      * 而这两种情况的界面处理明显不同（前者该显示"页面不存在"，后者该显示"暂无反向链接"）。
      */
     cleanups.push(
-      router.register('GET', '/api/pages/:slug/backlinks', (h) => {
+      router.register('GET', '/api/pages/:slug/backlinks', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!pageExists(slug)) {
+        if (!(await pageExists(slug))) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
-        h.json(200, { ok: true, slug, backlinks: listBacklinks(slug) })
+        h.json(200, { ok: true, slug, backlinks: await listBacklinks(slug) })
       }),
     )
 
     /* ---------- GET /api/pages/:slug/links：本页指向了谁（出链） ---------- */
     cleanups.push(
-      router.register('GET', '/api/pages/:slug/links', (h) => {
+      router.register('GET', '/api/pages/:slug/links', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!pageExists(slug)) {
+        if (!(await pageExists(slug))) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
-        h.json(200, { ok: true, slug, links: listOutlinks(slug) })
+        h.json(200, { ok: true, slug, links: await listOutlinks(slug) })
       }),
     )
 

@@ -29,7 +29,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
-import { MIGRATION_TABLE } from '@geewiki/core'
+import { asAsync, MIGRATION_TABLE } from '@geewiki/core'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
 /* ------------------------------ 夹具 ------------------------------ */
@@ -142,8 +142,16 @@ interface Harness {
 /**
  * 建一个隔离的 wiki 环境：真实 SQLite + 真实初始迁移 + 路由服务替身。
  * `provide` 按 cordis 的**同 ctx** 语义实现（provide→get 立即可见、注销后回到 undefined）。
+ *
+ * `asyncDb: true` 时把同一个真实 SQLite 适配器经 **`asAsync`（core 的真实实现）** 包成
+ * 异步适配器再交给插件——于是 `isAsyncAdapter()` 为真、插件内部走异步分支
+ * （`asAsync` 成为直通）。这是"异步驱动下 wiki 是否可用"的回归守卫：
+ * PostgreSQL 无法在单测里起，但它与这里**走的是同一条代码路径**（含 asAsync 的
+ * BEGIN/COMMIT 显式事务）。
  */
-function makeHarness(config: { recentVersions?: number } = {}): Harness {
+async function makeHarness(
+  config: { recentVersions?: number; asyncDb?: boolean; pgBigintAsString?: boolean } = {},
+): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gw-wiki-'))
   const adapter = new NodeSqliteAdapter(join(dir, 'test.db'), readFileSync(INIT_SQL_PATH, 'utf8'))
 
@@ -158,8 +166,35 @@ function makeHarness(config: { recentVersions?: number } = {}): Harness {
     pending: () => 0,
     drain: () => Promise.resolve(true),
   }
+  /*
+   * `pgBigintAsString: true` 模拟真实 `pg` 驱动的行为：**int8（COUNT(*)）以字符串返回**
+   * （node-postgres 为避免 JS number 精度丢失而如此设计），而 better-sqlite3 返回数字。
+   * 于是"只在一驱动下出错"的类型问题（version 变成 "01"）才能被单测抓到——
+   * 单纯用 sqlite 跑，两条路径都返回数字，测不出任何差异。
+   */
+  const dbValue =
+    config.asyncDb === true || config.pgBigintAsString === true ? asAsync(adapter) : adapter
+  const dbForPlugin =
+    config.pgBigintAsString === true
+      ? (() => {
+          const base = dbValue as ReturnType<typeof asAsync>
+          const stringifyCounts = <T,>(rows: T[]): T[] =>
+            rows.map((r) => {
+              if (r === null || typeof r !== 'object') return r
+              const o = { ...(r as unknown as Record<string, unknown>) }
+              // pg 只对 int8 这样处理；本插件里唯一被当作数字消费的聚合列就是这两个
+              for (const k of ['n', 'version_count']) if (k in o) o[k] = String(o[k])
+              return o as unknown as T
+            })
+          return {
+            ...base,
+            query: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) =>
+              stringifyCounts(await base.query<T>(sql, params)),
+          } as ReturnType<typeof asAsync>
+        })()
+      : dbValue
   const services = new Map<string, unknown>([
-    ['db', adapter],
+    ['db', dbForPlugin],
     ['http', routerService],
   ])
   const ctx = {
@@ -172,7 +207,7 @@ function makeHarness(config: { recentVersions?: number } = {}): Harness {
       }
     },
   } as unknown as Context
-  const dispose = WikiPlugin.apply(ctx, { recentVersions: 10, ...config }) as () => void
+  const dispose = (await WikiPlugin.apply(ctx, { recentVersions: 10, ...config })) as () => void
 
   const call = (
     method: string,
@@ -223,8 +258,8 @@ function makeHarness(config: { recentVersions?: number } = {}): Harness {
 
 /* ------------------ 1. 服务存在性与契约（本批核心） ------------------ */
 
-test('wiki-service：apply 后 ctx.get 拿得到，四个方法与 manifest 的 provides 一致', () => {
-  const h = makeHarness()
+test('wiki-service：apply 后 ctx.get 拿得到，四个方法与 manifest 的 provides 一致', async () => {
+  const h = await makeHarness()
   try {
     // 探针反证：manifest 声明的 provides 不会自己变成 cordis 服务——
     // 若插件里漏掉 ctx.provide，这里拿到的是 undefined（这正是本批要修的症状）
@@ -234,24 +269,24 @@ test('wiki-service：apply 后 ctx.get 拿得到，四个方法与 manifest 的 
     for (const m of ['list', 'get', 'save', 'remove'] as const) {
       assert.equal(typeof svc[m], 'function', `wiki-service.${m} 应是函数`)
     }
-    assert.deepEqual(svc.list(), [], '空库应返回空列表')
-    assert.equal(svc.get('nope'), undefined, '不存在的 slug 返回 undefined（对应端点 404）')
+    assert.deepEqual((await svc.list()), [], '空库应返回空列表')
+    assert.equal((await svc.get('nope')), undefined, '不存在的 slug 返回 undefined（对应端点 404）')
   } finally {
     h.dispose()
   }
 })
 
-test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome=unchanged 且不写历史', () => {
-  const h = makeHarness()
+test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome=unchanged 且不写历史', async () => {
+  const h = await makeHarness()
   try {
     const svc = h.svc()
 
     // 新建
-    assert.deepEqual(svc.save('getting-started', { title: '入门', content: '第一版' }), {
+    assert.deepEqual((await svc.save('getting-started', { title: '入门', content: '第一版' })), {
       outcome: 'created',
       version: 1,
     })
-    const created = svc.get('getting-started')
+    const created = (await svc.get('getting-started'))
     assert.ok(created, 'save 后应能读到')
     assert.equal(created.title, '入门')
     assert.equal(created.content, '第一版')
@@ -259,21 +294,21 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
     assert.deepEqual(created.versions, [], '新建不产生历史')
 
     // 幂等：标题与正文都没变 → unchanged，且不新增历史、版本号不变
-    assert.deepEqual(svc.save('getting-started', { title: '入门', content: '第一版' }), {
+    assert.deepEqual((await svc.save('getting-started', { title: '入门', content: '第一版' })), {
       outcome: 'unchanged',
       version: 1,
     })
-    const afterNoop = svc.get('getting-started')
+    const afterNoop = (await svc.get('getting-started'))
     assert.equal(afterNoop?.version, 1, 'unchanged 不应推进版本号')
     assert.deepEqual(afterNoop?.versions, [], 'unchanged 不应写历史快照')
     assert.equal(afterNoop?.updated_at, created.updated_at, 'unchanged 不应改 updated_at')
 
     // 更新：旧正文进历史，版本号 +1
-    assert.deepEqual(svc.save('getting-started', { title: '入门', content: '第二版' }), {
+    assert.deepEqual((await svc.save('getting-started', { title: '入门', content: '第二版' })), {
       outcome: 'updated',
       version: 2,
     })
-    const updated = svc.get('getting-started')
+    const updated = (await svc.get('getting-started'))
     assert.equal(updated?.content, '第二版')
     assert.equal(updated?.version, 2)
     assert.equal(updated?.versions.length, 1, '更新应留下一条历史')
@@ -286,7 +321,7 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
     )
 
     // 列表：摘要字段与排序（单条时只校验字段形状）
-    assert.deepEqual(svc.list(), [
+    assert.deepEqual((await svc.list()), [
       {
         slug: 'getting-started',
         title: '入门',
@@ -296,49 +331,49 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
     ])
 
     // 标题变化也应记为更新（即使正文相同）
-    assert.equal(svc.save('getting-started', { title: '入门（改名）', content: '第二版' }).outcome, 'updated')
+    assert.equal((await svc.save('getting-started', { title: '入门（改名）', content: '第二版' })).outcome, 'updated')
   } finally {
     h.dispose()
   }
 })
 
-test('wiki-service：remove 删除页面与历史；不存在的 slug 返回 false', () => {
-  const h = makeHarness()
+test('wiki-service：remove 删除页面与历史；不存在的 slug 返回 false', async () => {
+  const h = await makeHarness()
   try {
     const svc = h.svc()
-    svc.save('temp', { title: '临时', content: 'a' })
-    svc.save('temp', { title: '临时', content: 'b' }) // 产生一条历史
+    await svc.save('temp', { title: '临时', content: 'a' })
+    await svc.save('temp', { title: '临时', content: 'b' }) // 产生一条历史
     assert.equal(h.adapter.query('SELECT id FROM page_versions').length, 1, '前置：应有一条历史')
 
-    assert.equal(svc.remove('temp'), true, '删除存在的页面应返回 true')
-    assert.equal(svc.get('temp'), undefined, '删除后 get 应返回 undefined')
-    assert.deepEqual(svc.list(), [], '删除后列表应为空')
+    assert.equal((await svc.remove('temp')), true, '删除存在的页面应返回 true')
+    assert.equal((await svc.get('temp')), undefined, '删除后 get 应返回 undefined')
+    assert.deepEqual((await svc.list()), [], '删除后列表应为空')
     assert.equal(h.adapter.query('SELECT id FROM page_versions').length, 0, '版本历史应一并清除')
 
-    assert.equal(svc.remove('temp'), false, '删除不存在的页面应返回 false（对应端点 404）')
+    assert.equal((await svc.remove('temp')), false, '删除不存在的页面应返回 false（对应端点 404）')
   } finally {
     h.dispose()
   }
 })
 
-test('wiki-service：非法入参抛错，消息前缀与端点的错误码同源', () => {
-  const h = makeHarness()
+test('wiki-service：非法入参抛错，消息前缀与端点的错误码同源', async () => {
+  const h = await makeHarness()
   try {
     const svc = h.svc()
     // 非法 slug
-    assert.throws(() => svc.save('bad slug!', { title: 't', content: 'c' }), /^Error: invalid_slug: /)
+    assert.rejects(async () => (await svc.save('bad slug!', { title: 't', content: 'c' })), /^Error: invalid_slug: /)
     // 空标题（含仅空白）
-    assert.throws(() => svc.save('ok-slug', { title: '   ', content: 'c' }), /^Error: invalid_title: /)
+    assert.rejects(async () => (await svc.save('ok-slug', { title: '   ', content: 'c' })), /^Error: invalid_title: /)
     // 标题过长
-    assert.throws(() => svc.save('ok-slug', { title: 'x'.repeat(201), content: 'c' }), /^Error: invalid_title: /)
+    assert.rejects(async () => (await svc.save('ok-slug', { title: 'x'.repeat(201), content: 'c' })), /^Error: invalid_title: /)
     // 正文过长（与端点同为 500KB 上限）
-    assert.throws(
-      () => svc.save('ok-slug', { title: 't', content: 'y'.repeat(500_001) }),
+    assert.rejects(
+      async () => (await svc.save('ok-slug', { title: 't', content: 'y'.repeat(500_001) })),
       /^Error: content_too_large: /,
     )
     // 非法 remove 入参同样拒绝
-    assert.throws(() => svc.remove('../etc'), /^Error: invalid_slug: /)
-    assert.deepEqual(svc.list(), [], '校验失败不得留下任何落库副作用')
+    assert.rejects(async () => (await svc.remove('../etc')), /^Error: invalid_slug: /)
+    assert.deepEqual((await svc.list()), [], '校验失败不得留下任何落库副作用')
   } finally {
     h.dispose()
   }
@@ -347,7 +382,7 @@ test('wiki-service：非法入参抛错，消息前缀与端点的错误码同�
 /* ---------- 2. 服务与端点同源（单一实现的可执行证据） ---------- */
 
 test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一实现包成 HTTP）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     const svc = h.svc()
 
@@ -356,13 +391,13 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
     assert.equal(put.status, 200)
     assert.equal(put.body['outcome'], 'created')
     assert.deepEqual(
-      svc.get('via-http'),
+      (await svc.get('via-http')),
       {
         slug: 'via-http',
         title: 'HTTP 写入',
         content: 'v1',
-        created_at: svc.get('via-http')?.created_at,
-        updated_at: svc.get('via-http')?.updated_at,
+        created_at: (await svc.get('via-http'))?.created_at,
+        updated_at: (await svc.get('via-http'))?.updated_at,
         version: 1,
         versions: [],
       },
@@ -370,7 +405,7 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
     )
 
     // 经服务写入 → 端点读取（同一实现，两条路径必须等价）
-    svc.save('via-svc', { title: '服务写入', content: 'v1' })
+    await svc.save('via-svc', { title: '服务写入', content: 'v1' })
     const detail = await h.call('GET', '/api/pages/:slug', { slug: 'via-svc' })
     assert.equal(detail.status, 200)
     assert.deepEqual(Object.keys(detail.body).sort(), [
@@ -387,15 +422,15 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
 
     // 列表：服务的 list() 与端点 pages 数组逐字段一致（含顺序）
     const list = await h.call('GET', '/api/pages')
-    assert.deepEqual(list.body['pages'], svc.list())
+    assert.deepEqual(list.body['pages'], (await svc.list()))
 
     // 幂等语义在两条路径上一致：端点 unchanged ⇔ 服务 unchanged
     const putSame = await h.call('PUT', '/api/pages/:slug', { slug: 'via-svc' }, { title: '服务写入', content: 'v1' })
     assert.equal(putSame.body['outcome'], 'unchanged')
-    assert.equal(svc.save('via-svc', { title: '服务写入', content: 'v1' }).outcome, 'unchanged')
+    assert.equal((await svc.save('via-svc', { title: '服务写入', content: 'v1' })).outcome, 'unchanged')
 
     // 删除：端点在服务删除后应 404（两条路径共享同一状态）
-    assert.equal(svc.remove('via-http'), true)
+    assert.equal((await svc.remove('via-http')), true)
     const gone = await h.call('GET', '/api/pages/:slug', { slug: 'via-http' })
     assert.equal(gone.status, 404)
     assert.equal(gone.body['error'], 'not_found')
@@ -405,7 +440,7 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
 })
 
 test('端点既有错误语义未被本次重构改变（invalid_slug 400 / 未知字段 400 / 正文超限 413）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     const badSlug = await h.call('PUT', '/api/pages/:slug', { slug: '../etc/passwd' }, { title: 't', content: 'c' })
     assert.equal(badSlug.status, 400)
@@ -432,11 +467,11 @@ test('端点既有错误语义未被本次重构改变（invalid_slug 400 / 未�
 
 /* ------------------ 3. 卸载语义（不留"仍可调用但已失效"） ------------------ */
 
-test('wiki-service：卸载后 ctx.get 回到 undefined、路由摘除、旧引用调用显式报错', () => {
-  const h = makeHarness()
+test('wiki-service：卸载后 ctx.get 回到 undefined、路由摘除、旧引用调用显式报错', async () => {
+  const h = await makeHarness()
   try {
     const svc = h.svc() // 卸载前先拿到引用（模拟"消费方仍持有旧引用"）
-    svc.save('p', { title: 't', content: 'c' })
+    await svc.save('p', { title: 't', content: 'c' })
     assert.equal(h.hasRoute('GET', '/api/pages'), true, '前置：卸载前路由已注册')
 
     h.unload()
@@ -447,10 +482,10 @@ test('wiki-service：卸载后 ctx.get 回到 undefined、路由摘除、旧引�
     assert.equal(h.adapter.query('SELECT id FROM pages').length, 1, '数据仍在（卸载不删数据）')
 
     // 旧引用不得静默返回空结果，而应显式报错
-    assert.throws(() => svc.list(), /插件已卸载，wiki-service 不可再调用/)
-    assert.throws(() => svc.get('p'), /插件已卸载，wiki-service 不可再调用/)
-    assert.throws(() => svc.save('p', { title: 't', content: 'c' }), /插件已卸载，wiki-service 不可再调用/)
-    assert.throws(() => svc.remove('p'), /插件已卸载，wiki-service 不可再调用/)
+    assert.rejects(async () => (await svc.list()), /插件已卸载，wiki-service 不可再调用/)
+    assert.rejects(async () => (await svc.get('p')), /插件已卸载，wiki-service 不可再调用/)
+    assert.rejects(async () => (await svc.save('p', { title: 't', content: 'c' })), /插件已卸载，wiki-service 不可再调用/)
+    assert.rejects(async () => (await svc.remove('p')), /插件已卸载，wiki-service 不可再调用/)
   } finally {
     h.dispose()
   }
@@ -501,7 +536,7 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
     assert.equal(seenBySibling, svc, '兄弟插件拿到的应是同一个服务实例')
 
     // 兄弟插件经服务写入，宿主侧端点能读到（跨插件经服务操作同一份数据）
-    svc.save('cross-plugin', { title: '跨插件', content: '正文' })
+    await svc.save('cross-plugin', { title: '跨插件', content: '正文' })
     assert.equal(adapter.query('SELECT COUNT(*) AS n FROM pages')[0]?.['n'], 1)
 
     // 卸载后对所有人注销
@@ -522,32 +557,129 @@ test('真实 cordis：wiki-service 对兄弟插件可见，卸载后注销', asy
  * 静默放行，插件会正常启动、但每个接口都读不到数据 —— "能启动但全是空的"是最难排查的
  * 一类故障。故这里钉住"必须抛错、且错误里要给出可执行指引"。
  */
-test('异步数据库适配器：wiki 显式拒绝并给出指引（不静默坏掉）', () => {
-  const services = new Map<string, unknown>([
-    [
-      'db',
-      {
-        kind: 'async',
-        dialect: 'postgres',
-        query: async () => [],
-        run: async () => ({ changes: 0, lastInsertRowid: 0 }),
-        migrate: async () => undefined,
-        listTables: async () => [],
-        appliedMigrations: async () => [],
-        transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
-        close: async () => undefined,
-      },
-    ],
-  ])
-  const ctx = { get: (n: string) => services.get(n) } as unknown as Context
-  assert.throws(
-    () => WikiPlugin.apply(ctx, {}),
-    (err: Error) => {
-      assert.match(err.message, /异步适配器（postgres）/, '错误里必须点明方言')
-      assert.match(err.message, /db-sqlite/, '错误里必须给出可执行的替代方案')
-      return true
-    },
-  )
+/*
+ * 本用例守护**本批的核心契约变更**：`@geewiki/wiki` 从"异步适配器下拒绝启动"
+ * 改为"两种驱动都能跑"。
+ *
+ * 为什么用真实 SQLite + `asAsync` 而不是手写异步替身：PG 起不了单测，但
+ * `asAsync(sync)` 产出的正是 `isAsyncAdapter() === true` 的适配器，且其
+ * `transaction` 走 **BEGIN/COMMIT/ROLLBACK 显式语句**——与 PG 版"必须用传入的 tx"
+ * 是同一条代码路径。手写替身会绕过真实实现，测不出真问题。
+ */
+test('异步数据库适配器：wiki 正常激活并走通全部读写（不再拒绝启动）', async () => {
+  const h = await makeHarness({ asyncDb: true })
+  try {
+    // 前置：确实拿到了异步适配器（否则本用例会退化成"又测了一遍同步路径"）
+    const db = h.services.get('db') as { kind?: string; dialect?: string }
+    assert.equal(db.kind, 'async', '前置：交给插件的必须是异步适配器')
+    assert.equal(db.dialect, 'sqlite', '方言由 asAsync 从同步适配器继承')
+
+    // 写入 → 读回（走 asAsync 的异步 query/run）
+    const put = await h.call('PUT', '/api/pages/:slug', { slug: 'async-p' }, { title: '异步', content: 'v1' })
+    assert.equal(put.status, 200)
+    assert.equal(put.body['outcome'], 'created')
+
+    const got = await h.call('GET', '/api/pages/:slug', { slug: 'async-p' })
+    assert.equal(got.status, 200)
+    assert.equal(got.body['title'], '异步')
+    assert.equal(got.body['content'], 'v1')
+
+    // 更新 → 版本历史（事务：快照旧正文 + 更新页面 + 重建出链，三步须同生共死）
+    const put2 = await h.call('PUT', '/api/pages/:slug', { slug: 'async-p' }, { title: '异步', content: 'v2' })
+    assert.equal(put2.body['outcome'], 'updated')
+    assert.equal(put2.body['version'], 2, '第二次保存应产生 1 条历史 ⇒ version=2')
+
+    // 反向链接（依赖事务内重建的 page_links）
+    await h.call('PUT', '/api/pages/:slug', { slug: 'async-q' }, { title: '目标', content: '目标' })
+    await h.call('PUT', '/api/pages/:slug', { slug: 'async-p' }, { title: '异步', content: '见 [目标](/wiki/async-q)' })
+    const bl = await h.call('GET', '/api/pages/:slug/backlinks', { slug: 'async-q' })
+    assert.equal(bl.status, 200)
+    assert.deepEqual(
+      (bl.body['backlinks'] as { slug: string }[]).map((b) => b.slug),
+      ['async-p'],
+      '异步路径下反向链接也必须建得起来（证明事务内的 rebuildLinks 生效）',
+    )
+
+    // 服务方法同样可用（与端点共用实现）
+    assert.ok((await h.svc().get('async-p')), '异步适配器下 wiki-service 也应可用')
+  } finally {
+    h.dispose()
+  }
+})
+
+/*
+ * 本用例守护**只在 PostgreSQL 下才会暴露**的类型缺陷（真实 PG 实测发现）：
+ * `pg` 把 `COUNT(*)`（int8）作为**字符串**返回，而 better-sqlite3 返回数字。
+ * 修复前 `version: totalVersions.n + 1` 在 PG 下退化为**字符串拼接**：
+ * 新建 → `"0"+1 = "01"`、更新 → `"1"+1 = "11"`，即响应里的 version 静默变成字符串。
+ *
+ * 为什么必须专门模拟：用 sqlite 跑，两条路径都返回数字，**测不出任何差异**——
+ * 这正是"能启动、能返回、但契约悄悄变了"的那类故障。
+ */
+test('pg 把 COUNT(*) 返回为字符串时，version 仍是数字（PG 实测发现的类型缺陷）', async () => {
+  const h = await makeHarness({ pgBigintAsString: true })
+  try {
+    const put = await h.call('PUT', '/api/pages/:slug', { slug: 'v' }, { title: 'V', content: 'v1' })
+    assert.equal(put.status, 200)
+    assert.equal(put.body['version'], 1, 'version 必须是数字 1，而不是字符串 "01"')
+    assert.equal(typeof put.body['version'], 'number', 'version 的类型必须是 number')
+
+    const got = await h.call('GET', '/api/pages/:slug', { slug: 'v' })
+    assert.equal(got.body['version'], 1)
+    assert.equal(typeof got.body['version'], 'number', '详情里的 version 也必须是 number')
+
+    // 更新一次 → 应有 1 条历史 ⇒ version = 2（修复前会是字符串 "11"）
+    const put2 = await h.call('PUT', '/api/pages/:slug', { slug: 'v' }, { title: 'V', content: 'v2' })
+    assert.equal(put2.body['version'], 2, 'version 必须是数字 2，而不是字符串 "11"')
+    assert.equal(typeof put2.body['version'], 'number')
+
+    const got2 = await h.call('GET', '/api/pages/:slug', { slug: 'v' })
+    assert.equal(got2.body['version'], 2)
+    assert.equal(typeof got2.body['version'], 'number')
+
+    // 列表里的 version 同样必须是数字（该处原本已有 Number()，一并钉住防回归）
+    const list = await h.call('GET', '/api/pages')
+    const item = (list.body['pages'] as { version: unknown }[])[0]
+    assert.equal(typeof item?.version, 'number', '列表里的 version 也必须是 number')
+    assert.equal(item?.version, 2)
+
+    // 服务方法与端点共用实现，故同样必须是数字
+    const svcDetail = await h.svc().get('v')
+    assert.equal(typeof svcDetail?.version, 'number')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('同步与异步两条路径：同一操作的响应逐字段一致（避免"只在一种驱动下对"）', async () => {
+  const sync = await makeHarness()
+  const asyn = await makeHarness({ asyncDb: true })
+  try {
+    const body = { title: '两驱动', content: '正文 [x](/wiki/nowhere)' }
+    const a = await sync.call('PUT', '/api/pages/:slug', { slug: 'dual' }, body)
+    const b = await asyn.call('PUT', '/api/pages/:slug', { slug: 'dual' }, body)
+    assert.deepEqual(b.body, a.body, 'PUT 响应应逐字段一致（outcome/version 等）')
+
+    const ga = await sync.call('GET', '/api/pages/:slug', { slug: 'dual' })
+    const gb = await asyn.call('GET', '/api/pages/:slug', { slug: 'dual' })
+    // created_at/updated_at 含时间戳，逐字段比对时用同步侧的值回填（两次独立运行，时刻必然不同）
+    assert.deepEqual(
+      { ...(gb.body as Record<string, unknown>), created_at: null, updated_at: null },
+      { ...(ga.body as Record<string, unknown>), created_at: null, updated_at: null },
+      '详情响应除时间戳外应逐字段一致',
+    )
+
+    const la = await sync.call('GET', '/api/pages')
+    const lb = await asyn.call('GET', '/api/pages')
+    assert.deepEqual(
+      (lb.body['pages'] as { updated_at: string }[]).map((p) => ({ ...p, updated_at: null })),
+      (la.body['pages'] as { updated_at: string }[]).map((p) => ({ ...p, updated_at: null })),
+      '列表响应除时间戳外应逐字段一致',
+    )
+  } finally {
+    sync.dispose()
+    asyn.dispose()
+  }
 })
 
 
@@ -568,7 +700,7 @@ const P = '/api/pages/:slug'
 const plain = <T,>(rows: T[]): T[] => rows.map((r) => ({ ...r }))
 
 test('backlinks：保存时按正文重建出链；改掉正文后旧边消失（重建而非追加）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     await h.call('PUT', P, { slug: 'src' }, { title: '源页', content: '见 [甲](/wiki/a1) 与 [[a2]]' })
     await h.call('PUT', P, { slug: 'a1' }, { title: '甲页', content: '甲' })
@@ -602,7 +734,7 @@ test('backlinks：保存时按正文重建出链；改掉正文后旧边消失�
 })
 
 test('backlinks：删除页面时两侧都清（不留遗留边）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     await h.call('PUT', P, { slug: 'p' }, { title: '引用方', content: '[目标](/wiki/t)' })
     await h.call('PUT', P, { slug: 't' }, { title: '目标页', content: '目标' })
@@ -621,7 +753,7 @@ test('backlinks：删除页面时两侧都清（不留遗留边）', async () =>
 })
 
 test('backlinks：指向尚未创建的页面是合法的（title 为 null）', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     await h.call('PUT', P, { slug: 'host' }, { title: '宿主', content: '[未来页](/wiki/ghost)' })
     assert.deepEqual(
@@ -639,7 +771,7 @@ test('backlinks：指向尚未创建的页面是合法的（title 为 null）', 
 })
 
 test('backlinks：不存在的页面返回 404，与详情端点同语义', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     for (const suffix of ['/backlinks', '/links']) {
       const r = await h.call('GET', `${P}${suffix}`, { slug: 'nope' })
@@ -652,15 +784,15 @@ test('backlinks：不存在的页面返回 404，与详情端点同语义', asyn
 })
 
 test('backlinks：wiki-service 的两个新方法与端点结果一致', async () => {
-  const h = makeHarness()
+  const h = await makeHarness()
   try {
     await h.call('PUT', P, { slug: 'x' }, { title: '甲', content: '[乙](/wiki/y)' })
     await h.call('PUT', P, { slug: 'y' }, { title: '乙', content: '乙' })
     const svc = h.svc()
-    assert.deepEqual(plain(svc.links('x')!), [{ slug: 'y', title: '乙' }])
-    assert.deepEqual(plain(svc.backlinks('y')!), [{ slug: 'x', title: '甲' }])
-    assert.equal(svc.links('nope'), undefined)
-    assert.equal(svc.backlinks('nope'), undefined)
+    assert.deepEqual(plain((await svc.links('x'))!), [{ slug: 'y', title: '乙' }])
+    assert.deepEqual(plain((await svc.backlinks('y'))!), [{ slug: 'x', title: '甲' }])
+    assert.equal((await svc.links('nope')), undefined)
+    assert.equal((await svc.backlinks('nope')), undefined)
   } finally {
     h.dispose()
   }
