@@ -376,6 +376,15 @@ export type ReaderTier = 0 | 1
 
 /** 投影的输入：块的最小形状（`ParsedBlock` 与 `blocks` 表的行都满足）。 */
 export interface ProjectableBlock {
+  /**
+   * 块 id。**只有来自 `blocks` 表的行才有** —— 现场解析 `pages.content` 得到的结果
+   * （P3a 之前保存的历史页面）没有 id，因而**不可能**命中授权分支。
+   *
+   * 这是刻意的：授权钉在稳定块身份上（§4.2），而"现场解析"的 ordinal 会随编辑漂移，
+   * 拿它去对授权就是拿一个不稳定的键去查权限表。宁可少给（无 id ⇒ 只能走等级分支），
+   * 不可多给。
+   */
+  id?: number
   ordinal: number
   text: string
   visibility: BlockVisibility
@@ -403,21 +412,36 @@ export interface ProjectedContent {
  * 判据（{@link blockLevelOf}）—— 否则会出现"搜不到但读得到"（读路径漏过滤）或
  * "读得到但搜不到"（索引算错），前者是泄漏、后者是体验缺陷。
  *
- * ## 判据只看块自身的 `visibility`
+ * ## 判据只看块自身的 `visibility` + 该主体的块级授予
  *
  * 页面级可见性由 `policy-service.resolvePage` 在此之前判定完毕（`level === 'none'`
- * 早已 404）。所以到这里只需问"**这个块**对**这个读者**是否可见"。
- * `granted` 档的 `blockLevelOf` 返回 `null` ⇒ 等级分支**永不命中**，只能靠授权分支
- * （`block_grants`，属 P3b）。P3a 阶段还没有授权表，故 `granted` 块对所有人不可见 ——
- * 这是**失败关闭**，方向正确（宁可少给，不可多给）。
+ * 早已 404）。所以到这里只需问"**这个块**对**这个读者**是否可见"，两条分支：
+ *
+ * - **等级分支**：`blockLevelOf(visibility) <= reader.tier` —— 块要求的等级，读者够得着。
+ * - **授权分支**（★ P3b）：该块的 id 在 `grantedBlockIds` 里 —— **放宽方向**。
+ *   被显式授予的块对**任何**足额主体可见（匿名不可能有授予，`policy-service` 对匿名
+ *   直接返回空集）。`granted` 档的块 `blockLevelOf` 返回 `null` ⇒ 等级分支永不命中，
+ *   **只能**靠授权分支放行 —— 这是它存在的全部意义。
+ *
+ * 两条分支**必须用同一条判据**（{@link blockLevelOf}）与同一份授权集合，否则会出现
+ * "搜得到但读不到"或"读得到但搜不到"；后者（读得到但搜不到）只是体验缺陷，
+ * **前者（搜得到但读不到）是泄漏**。
  */
 export function projectBlocks(
   blocks: readonly ProjectableBlock[],
-  reader: { tier: ReaderTier; anonymous: boolean },
+  reader: { tier: ReaderTier; anonymous: boolean; grantedBlockIds?: readonly number[] },
 ): ProjectedContent {
   const out: string[] = []
   let gatedRun = 0
   let gatedCount = 0
+  /*
+   * 集合化一次，避免逐块 `includes` 退化成 O(块数 × 授权数)。
+   * 空集合走 `null` 分支：省掉每块的 Set 查询，也让"没有授权"这条最常见路径零开销。
+   */
+  const granted =
+    reader.grantedBlockIds !== undefined && reader.grantedBlockIds.length > 0
+      ? new Set(reader.grantedBlockIds)
+      : null
 
   /*
    * 连续受限块**合并成一个占位**。
@@ -438,7 +462,9 @@ export function projectBlocks(
 
   for (const b of blocks) {
     const level = blockLevelOf(b.visibility)
-    if (level !== null && level <= reader.tier) {
+    const byTier = level !== null && level <= reader.tier
+    const byGrant = granted !== null && b.id !== undefined && granted.has(b.id)
+    if (byTier || byGrant) {
       flushGated()
       out.push(b.text)
     } else {

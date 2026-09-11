@@ -69,6 +69,17 @@ interface PolicyServiceLike {
     slug: string,
     self?: { visibility: string; inherit: number | boolean; published_at: string | null },
   ): Promise<0 | 1 | null>
+  /**
+   * ★ P3b：该主体被**显式授予**的块 id 集合（`block_grants`）。
+   *
+   * **可选**：P3b 之前的策略实现没有这个方法。缺它时**按空集处理**（失败关闭：
+   * 被授予的 `granted` 块对该主体不可见，而不是"猜一个更宽的可见性"）。
+   * 后者才是危险的 —— `granted` 档存在的意义就是"默认谁都不能看"。
+   *
+   * 约定（与 `authz` 接口注释一致）：**只返回 id，绝不返回文本**；且必须已按
+   * `expires_at` 过滤掉过期授予。匿名主体应返回空集。
+   */
+  grantedBlockIds?(principal: Principal): Promise<readonly number[]>
 }
 
 interface PageAccessLike {
@@ -311,23 +322,40 @@ export const manifest: GeeWikiManifest = {
  */
 async function projectPageContent(
   db: { query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> },
-  args: { pageId: number; content: string; principal: Principal },
+  args: { pageId: number; content: string; principal: Principal; grantedBlockIds?: readonly number[] },
 ): Promise<{ text: string; gatedCount: number }> {
-  const rows = await db.query<{ ordinal: number; text: string; visibility: string }>(
-    'SELECT ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
+  /*
+   * ★ P3b：**必须把 `id` 一起取出来**。授权分支是拿块 id 去查的
+   * （`block_grants.block_id`），少了这一列，被授予的 `granted` 块会**对授权者也
+   * 不可见** —— 症状是"授权明明写进去了却看不到"，而且不报任何错。
+   */
+  const rows = await db.query<{ id: number; ordinal: number; text: string; visibility: string }>(
+    'SELECT id, ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
     [args.pageId],
   )
   const blocks =
     rows.length > 0
       ? rows.map((r) => ({
+          // 块 id 必须原样带过去 —— 它是授权分支唯一的键
+          id: Number(r.id),
           ordinal: r.ordinal,
           text: r.text,
           visibility: r.visibility as BlockVisibility,
         }))
-      : parseBlocks(args.content)
+      : /*
+         * 现场解析的降级路径：**没有块 id** ⇒ 授权分支必然落空
+         * （见 `ProjectableBlock.id` 的说明 —— 拿会漂移的 ordinal 去查权限表是错的）。
+         * 也就是说，**P3a 之前保存、且尚未被回填的历史页面里，`granted` 块对被授权者
+         * 也不可见**，直到该页被重新保存为止。方向是失败关闭。
+         */
+        parseBlocks(args.content)
   const anonymous = args.principal.kind === 'anonymous'
   const tier: ReaderTier = anonymous ? 0 : 1
-  return projectBlocks(blocks, { tier, anonymous })
+  return projectBlocks(blocks, {
+    tier,
+    anonymous,
+    grantedBlockIds: args.grantedBlockIds ?? [],
+  })
 }
 
 interface PageRow {
@@ -580,6 +608,24 @@ export const WikiPlugin = {
     }
 
     /**
+     * ★ P3b：该主体被显式授予的**块 id 集合**（读路径与检索共用的唯一入口）。
+     *
+     * **失败关闭，方向与 `pageLevelOf` 一致**：策略层没实现该方法、或它抛错 ⇒ **空集**。
+     * 空集的后果是"被授予的 `granted` 块对该主体也不可见"（**少给**），
+     * 而绝不是"所有块都可见"（**多给**）。前者是可用性问题，后者是泄漏 ——
+     * 两害相权，只能取前者。
+     */
+    const grantedBlockIdsOf = async (p: Principal): Promise<readonly number[]> => {
+      try {
+        const svc = policy()
+        if (typeof svc.grantedBlockIds !== 'function') return []
+        return await svc.grantedBlockIds(p)
+      } catch {
+        return []
+      }
+    }
+
+    /**
      * 页面的**有效检索等级** —— `blocks.tier` 的输入（§4.3）。
      *
      * **失败关闭**：策略层不可用、没实现该方法、或它抛错 ⇒ 一律 `null`。
@@ -656,6 +702,12 @@ export const WikiPlugin = {
         pageId: page.id,
         content: page.content,
         principal,
+        /*
+         * ★ P3b：授权集合与**投影**必须来自同一次策略调用 —— 否则会出现"判定用了
+         * 这份授权、渲染用了另一份"的窗口（缓存与并发下尤其明显，而且这种不一致
+         * 恰好会以"某次请求多显示一段"的形式出现，最难复现）。
+         */
+        grantedBlockIds: await grantedBlockIdsOf(principal),
       })
       const versions = await adb.query<{ id: number; saved_at: string }>(
         `SELECT id, saved_at FROM page_versions WHERE page_id = ? ORDER BY id DESC LIMIT ?`,

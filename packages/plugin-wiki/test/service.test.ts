@@ -56,16 +56,31 @@ const MEMBER: Principal = {
   groupIds: [],
   sessionId: null,
 }
-const INIT_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0001_init.sql')
-/** `page_grants.granted_by` 有 `REFERENCES users(id)`，故 0010 必须一并加载 */
-const IDENTITY_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0010_identity.sql')
-const ACL_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0012_page_acl.sql')
 /**
- * ★ P3a：`savePage` 现在会在**同一事务里**双写 `blocks` 与 `blocks_fts`（`syncBlocksForPage`），
- * 所以夹具必须把这两张表也建出来 —— 否则每个保存用例都会以 `no such table: blocks_fts` 挂掉。
- * 与 P1 合并时那次夹具缺口是同一类：**新迁移落地后，既有插件的测试夹具要同步**。
+ * ★ 夹具的 schema 来源：**读 db-sqlite 迁移目录下的全部 `.sql`，按文件名序**。
+ *
+ * **为什么从"白名单常量"改成"读全目录"**：此前这里逐个列出 `0001 / 0010 / 0012 / 0015`，
+ * 于是每次有新迁移落地、而新表又恰好被本插件的某条路径读到，夹具就会集体报
+ * `no such table: xxx` —— 这已经发生过**三次**（P1 合并时缺 `0011_org_team.sql`、
+ * P3a 时缺 `blocks_fts`、P3b 时缺 `block_grants`）。逐次补白名单是治标；
+ * 读全目录才是治本：**新增迁移不会再破这个夹具**。
+ *
+ * 顺序与 `db.migrate()` 的 `readdirSync().sort()` **同序**（文件名前缀即依赖顺序：
+ * `0010` 建 users → `0012` 的 `page_grants.granted_by` 才引得到；`0015` 建 blocks →
+ * `0016` 的 `block_grants.block_id` 才引得到）。同款做法见
+ * `packages/plugin-oidc/test/oidc.test.ts` 与 `packages/plugin-wiki/test/slug-hierarchy.test.ts`。
  */
-const BLOCKS_SQL_PATH = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations', '0015_blocks.sql')
+const DB_MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'db-sqlite', 'src', 'migrations')
+const DB_MIGRATION_PATHS = readdirSync(DB_MIGRATIONS_DIR)
+  .filter((f) => f.endsWith('.sql'))
+  .sort()
+  .map((f) => join(DB_MIGRATIONS_DIR, f))
+
+/**
+ * `blocks_fts` 属 `@geewiki/search`（SQLite 专有，见设计文档 §4.3 ★v7），
+ * **不在 db-sqlite 的迁移目录里**，故单独补一条 —— 它是 `savePage` 双写的另一半，
+ * 缺了它每个保存用例都会以 `no such table: blocks_fts` 挂掉（P3a 时正是如此）。
+ */
 const BLOCKS_FTS_SQL_PATH = join(
   import.meta.dirname,
   '..',
@@ -74,14 +89,8 @@ const BLOCKS_FTS_SQL_PATH = join(
   'migrations',
   '0002_blocks_fts.sql',
 )
-/** 夹具要建的全部 schema：顺序即依赖顺序（blocks 建在 pages 之后） */
-const SCHEMA_SQL_PATHS = [
-  INIT_SQL_PATH,
-  IDENTITY_SQL_PATH,
-  ACL_SQL_PATH,
-  BLOCKS_SQL_PATH,
-  BLOCKS_FTS_SQL_PATH,
-] as const
+/** 夹具要建的全部 schema：db-sqlite 全量迁移（按文件名序）+ search 的块索引表 */
+const SCHEMA_SQL_PATHS = [...DB_MIGRATION_PATHS, BLOCKS_FTS_SQL_PATH] as const
 
 /**
  * `node:sqlite`（Node 内置）上的 DatabaseAdapter 实现。
