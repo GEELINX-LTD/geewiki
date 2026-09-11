@@ -711,6 +711,7 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'admin.verify_search',
         'admin.session_revoke',
         'admin.grants_purge',
+        'admin.access_explain',
         'org.group.add_member',
         'org.group.create',
         'org.group.delete',
@@ -890,6 +891,194 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
             }).catch((e: unknown) => console.error('[@geewiki/authz] 回收审计写入失败:', e))
           }
           h.json(200, { ok: true, expired, remaining, at: now })
+        },
+        { access: 'admin' },
+      )
+
+      /*
+       * ---------- GET /api/admin/access-explain：反向展开「谁能看这条」（★ P4b） ----------
+       *
+       * §8.1 P4 的原始要求：**不做递归实现**，只如实展示**三条来源**，并标注每一条是
+       * "正在起作用"还是"可能相关"。设计意图是让人**一眼看出"为什么这个人看得到"**，
+       * 而不是丢回一个还需要二次推导的中间结果。
+       *
+       * 三条来源的**真实强度不同**，这个区分就是本端点的全部价值：
+       *   1. 直接授予（`page_grants` / `block_grants`）—— **确定生效**：`decideNormally`
+       *      里授予分支排在档位之前，授予是"明确指名的例外"（§2.3 优先级表）。
+       *   2. 祖先链 —— 逐级复述 `effectiveRank` 在这个 slug 上的**真实遍历过程**：
+       *      哪一级**真的收紧了**、哪一级因 `inherit=false` **截断了链条**（其以上不再下传，
+       *      故标 `not_consulted`）、哪些祖先**根本不存在**（红链/未建页 —— **不构成收紧、
+       *      也不截断**，见 `effectiveRank` 里那个 `continue`）。
+       *   3. 组织角色 / owner-admin 应急覆盖（D14）—— **与主体有关**，故只标相关、不标生效。
+       *
+       * ⚠️ **复用 `loadVisibilityIndex` / `effectiveRank` / `ancestorsOf` / `decideNormally`，
+       * 绝不重写判定**：第二份实现必然与判定单点漂移，而漂移的后果是
+       * "解释是对的、实际判定却是另一个" —— 那比没有解释更糟。
+       *
+       * ⚠️ 响应**不含正文、不含任何块文本**：本端点是排障与治理工具，不是读取通道。
+       */
+      interface ExplainGrantRow {
+        subject_kind: string
+        subject_id: string
+        role: string
+        granted_at: string | null
+        expires_at: string | null
+      }
+
+      router.register(
+        'GET',
+        '/api/admin/access-explain',
+        async (h: RouteHandlerContext) => {
+          const slug = (h.url.searchParams.get('slug') ?? '').trim()
+          if (slug === '') {
+            h.json(400, { ok: false, error: 'missing_slug', message: '需要 slug 查询参数' })
+            return
+          }
+          const index = await loadVisibilityIndex()
+          const self = index.get(slug)
+          if (self === undefined) {
+            // 不编造：页面不存在就如实说，**不推测**"可能是红链"——那需要调用方自己判断
+            h.json(404, { ok: false, error: 'page_not_found', message: `页面不存在: ${slug}` })
+            return
+          }
+
+          const rank = effectiveRank(slug, index)
+          const publishedAt = self.published_at ?? null
+
+          // ---- 来源 2：祖先链（逐级、如实） ----
+          const ancestors: Record<string, unknown>[] = []
+          let broken = false
+          for (const anc of ancestorsOf(slug)) {
+            if (broken) {
+              ancestors.push({ slug: anc, effect: 'not_consulted', reason: 'chain_break_above' })
+              continue
+            }
+            const row = index.get(anc)
+            if (row === undefined) {
+              ancestors.push({
+                slug: anc,
+                effect: 'not_present',
+                reason: 'missing_ancestor_does_not_tighten',
+              })
+              continue
+            }
+            if (row.inherit !== 1) {
+              broken = true
+              ancestors.push({
+                slug: anc,
+                visibility: row.visibility,
+                inherit: false,
+                effect: 'chain_break',
+                reason: 'inherit=false ⇒ 本级及其以上都不再下传',
+              })
+              continue
+            }
+            ancestors.push({
+              slug: anc,
+              visibility: row.visibility,
+              inherit: true,
+              effect: rankOf(row.visibility) > rankOf(self.visibility) ? 'tightens' : 'no_effect',
+            })
+          }
+
+          // ---- 来源 1：直接授予（页级 + 块级），含过期状态 ----
+          const now = new Date().toISOString()
+          const grantView = (r: ExplainGrantRow): Record<string, unknown> => ({
+            subjectKind: r.subject_kind,
+            subjectId: r.subject_id,
+            role: r.role,
+            grantedAt: r.granted_at,
+            expiresAt: r.expires_at,
+            // 过期判定与 `loadGrants` 逐字同款：`expires_at <= now` ⇒ 视同没有
+            status: r.expires_at !== null && r.expires_at <= now ? 'expired' : 'active',
+          })
+          const pageGrantRows = await db.query<ExplainGrantRow>(
+            `SELECT subject_kind, subject_id, role, granted_at, expires_at
+               FROM page_grants WHERE page_slug = ? ORDER BY granted_at, subject_kind, subject_id`,
+            [slug],
+          )
+          // 块级授予用冗余的 `page_slug` 列查 —— 它存在的理由正是"治理查询与排障"，
+          // 因此**不需要**读 @geewiki/wiki 拥有的 `blocks` 表：判定插件不跨界读别人的表。
+          // （代价：这里给不出块序号 ordinal，调用方需要时配合 wiki 的页面端点自行映射。）
+          //
+          // ⚠️ **表可能不存在**（`block_grants` 是 0016 迁移建的，而 P3b 之前没有它）⇒
+          // 这里**显式区分"没有块级授予"与"查不到块级授予表"**：前者是正常情形（`available: true`
+          // 且列表为空），后者必须如实上报 `available: false`，**不能静默当成空集** ——
+          // 那会让排障的人以为"没人有块级授权"，而真相是"这张表根本没建起来"。
+          // 与 `grantedBlockIds()` 的激活期自检同一条纪律。
+          let blockGrants: Record<string, unknown>[] = []
+          let blockGrantsAvailable = true
+          try {
+            const rows = await db.query<ExplainGrantRow>(
+              `SELECT subject_kind, subject_id, role, granted_at, expires_at
+                 FROM block_grants WHERE page_slug = ? ORDER BY granted_at, subject_kind, subject_id`,
+              [slug],
+            )
+            blockGrants = rows.map(grantView)
+          } catch (err) {
+            blockGrantsAvailable = false
+            console.warn(
+              '[@geewiki/authz] access-explain: 读取 block_grants 失败（该表可能未建）——' +
+                '本次如实上报 available:false，不把它伪装成"空集"。原因:',
+              err,
+            )
+          }
+          const pageGrants = pageGrantRows.map(grantView)
+          const anyActive = (rows: Record<string, unknown>[]): boolean =>
+            rows.some((g) => g['status'] === 'active')
+
+          // ---- 与实际判定同源的可达性 ----
+          // 匿名：直接调 `decideNormally` + 真实的 `anonymousPrincipal()`，逐字同源。
+          const anon = decideNormally(rank, publishedAt, undefined, anonymousPrincipal())
+          // 组织成员：`decideNormally` 需要 `kind === 'user' && orgRole !== null`。
+          // **刻意不构造"假 Principal"** —— 假主体一旦与真实 Principal 形状漂移，
+          // 解释就会开始撒谎。这里如实复述它的两条分支（出处：本文件的 decideNormally）。
+          const orgMemberCanSee = (rank === RANK_PUBLIC && publishedAt !== null) || rank === RANK_ORG
+
+          h.json(200, {
+            ok: true,
+            slug,
+            self: { visibility: self.visibility, inherit: self.inherit === 1, publishedAt },
+            positionalRank: rank,
+            reach: {
+              // "本来会怎样"——**不含** D14 应急覆盖；特权路径见 sources.adminOverride
+              anonymous: anon.level === 'full' ? 'full' : 'none',
+              anonymousReason: anon.reason,
+              orgMember: orgMemberCanSee ? 'full' : 'none',
+            },
+            sources: {
+              ancestors,
+              grants: {
+                pages: pageGrants,
+                blocks: blockGrants,
+                // `available: false` = 查不到块级授予表（区别于"没有块级授予"）
+                blockGrantsAvailable,
+                effective: anyActive(pageGrants) || (blockGrantsAvailable && anyActive(blockGrants)),
+              },
+              orgRole: {
+                // 与主体有关 ⇒ 只标"相关"，不标"生效"（生效与否取决于看的人是不是成员）
+                effective: false,
+                relevant: true,
+                rule:
+                  "rank === org 时，kind === 'user' 且 orgRole !== null 的成员可见" +
+                  '（D8：组织内可见不要求发布）',
+              },
+              adminOverride: {
+                effective: false,
+                relevant: true,
+                rule: 'owner/admin 可应急可见，每次覆盖式访问写 access.admin_override 审计（D14）',
+              },
+            },
+          })
+
+          void writeAuditLog(db, {
+            action: 'admin.access_explain',
+            targetKind: 'page',
+            targetId: slug,
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: { positionalRank: rank, anonymous: anon.level, orgMember: orgMemberCanSee },
+          }).catch((e: unknown) => console.error('[@geewiki/authz] 反向展开的审计写入失败:', e))
         },
         { access: 'admin' },
       )
