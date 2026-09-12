@@ -119,8 +119,11 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 /* ---------- Wiki 正文 ---------- */
 
 /*
-  正文行宽（measure）：66~72ch 是长文阅读的舒适区（一行约 45~75 个西文字符），
-  过宽会导致换行时回扫困难。取 68ch 作为中值，见 tokens.css 的 --spacing-measure。
+  正文行宽（measure）：口径是**每行多少个汉字**，不是多少 ch。
+  中文通行区间见 W3C《中文排版需求》(clreq)：35~45 字/行；`{--spacing-measure}` 取
+  `min(46rem, 45em)` 落在区间上沿（14px 正文下 45em = 630px = 45 字/行）。
+  为什么不能直接写 `68ch`：`ch` 是「数字 0」的宽度（本主题约 8px），与汉字（14px）无关——
+  2026-09-12 实测 `68ch` 得到 734px ⇒ 一行塞 52.4 个汉字，超出中文舒适区。
   只约束 .md-body（正文），不约束表格/代码块——它们可以横向溢出并各自滚动。
 */
 .md-body { line-height: 1.75; overflow-wrap: anywhere; max-width: var(--spacing-measure); }
@@ -204,10 +207,31 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   视口下会把正文挤到 200px 出头（外壳还有 --spacing-gutter 的 22px×2），可读性崩掉。
   故小屏先用 4 档，≥640px 再恢复原值 —— 桌面观感逐像素不变。
 */
-.page-detail > .md-body {
-  background: var(--gw-surface); border: 1px solid var(--gw-line); border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm); padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4);
+/*
+  阅读态外壳：正文**卡片**跟着正文行宽走，而不是撑满整列。
+
+  背景（2026-09-12 实测）：正文 `.md-body` 有 `max-width: var(--spacing-measure)`，但卡片
+  本身此前是撑满栅格列的（约 972px，正文只占 630px）⇒ 卡片右侧空出近一半，观感就是
+  "左右两边空得太多"。外壳宽度解决不了这个问题，因为空洞在**卡片内部**。
+
+  修法：卡片自己限宽到 measure + 两侧内边距，再居中；正文照旧受 measure 约束，所以
+  35~45 字/行的可读性硬指标**没有被牺牲**（这也是为什么不直接放大 `--spacing-measure`）。
+
+  ⚠️ 选择器是 `article.gw-reader`（写在 `WikiPage.tsx` 的阅读卡片上），**不是**
+  `.page-detail > .md-body`：后者是早期版本的类名，现在源码里已无使用点（只剩注释提到），
+  挂在它上面的规则是**死代码**——2026-09-12 实测过一次：写完规则后卡片宽度纹丝不动，
+  正是因为选择器不匹配。
+*/
+@media (min-width: 640px) {
+  article.gw-reader {
+    width: min(100%, calc(var(--spacing-measure) + var(--spacing) * 16));
+    margin-inline: auto;
+  }
 }
+/*
+  扫描态外壳的宽度由 `App.tsx` 以内联样式给出（`data-shell="wide"` 是稳定挂钩）。
+  这里不做重复声明：两处写同一个数值会漂移，而内联样式能盖住 `max-w-[1280px]` 工具类。
+*/
 @media (min-width: 640px) {
   .page-detail > .md-body { padding: calc(var(--spacing) * 6.5) calc(var(--spacing) * 8); }
 }

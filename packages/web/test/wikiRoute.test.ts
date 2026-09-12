@@ -6,12 +6,26 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseWikiRoute, WIKI_RESERVED_FIRST_SEGMENTS, wikiRouteHash } from '../src/lib/wikiRoute'
+import {
+  HOME_SLUG,
+  parseWikiRoute,
+  WIKI_RESERVED_FIRST_SEGMENTS,
+  wikiRouteHash,
+} from '../src/lib/wikiRoute'
 
-test('parseWikiRoute：空 / list → 列表', () => {
-  assert.deepEqual(parseWikiRoute(''), { kind: 'list' })
-  assert.deepEqual(parseWikiRoute('/'), { kind: 'list' })
+test('parseWikiRoute：空 / → 主页（默认落点），list → 列表', () => {
+  // 空路由是**主页**而不是列表：主页是一篇文章，列表退居「全部页面」（`#/wiki/list`）
+  assert.deepEqual(parseWikiRoute(''), { kind: 'home' })
+  assert.deepEqual(parseWikiRoute('/'), { kind: 'home' })
   assert.deepEqual(parseWikiRoute('list'), { kind: 'list' })
+})
+
+test('HOME_SLUG：约定 slug 不得落在保留段里（否则主页会被自己的解析器吃掉）', () => {
+  assert.equal(WIKI_RESERVED_FIRST_SEGMENTS.includes(HOME_SLUG), false)
+  // 反空洞：保留段集合本身还在（防止上面的断言因集合变空而恒真）
+  assert.ok(WIKI_RESERVED_FIRST_SEGMENTS.length >= 4)
+  // `home` 仍能作为普通详情 slug 解析（重定向到 `#/wiki` 由组件负责）
+  assert.deepEqual(parseWikiRoute(HOME_SLUG), { kind: 'detail', slug: 'home' })
 })
 
 test('parseWikiRoute：保留段 new / search / ask', () => {

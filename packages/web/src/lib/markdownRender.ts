@@ -233,6 +233,23 @@ export function renderMarkdownBody(
   const withCopyButtons = opts.withCopyButtons ?? true
   const route = opts.route ?? ''
   const pages = opts.pages ?? null
+  /*
+   * ══════ 无 DOM 环境（SSR / 单测的 renderToString）══════
+   *
+   * 下面整段建立在 `document.createElement('div')` 上（消毒后的 HTML 要先落进一个游离节点，
+   * 才能改写链接、注入标题锚点、加复制按钮）。更关键的是**消毒出口 `mdToHtml` 本身也是 DOM 实现**
+   * （DOMPurify）——在 Node 里跑 `renderToString` 时两者都没有。
+   *
+   * 这里**明确抛错**而不是悄悄降级：本函数是"必须要有 DOM"的，绕过它的唯一安全做法是
+   * 不调用它（`useRenderedMarkdown` 在无 DOM 时直接返回空，正文交给客户端挂载后的 effect）。
+   * 若将来有人忘了这层判断，希望看到一条能读懂的错误，而不是一个"渲染成空字符串"的静默失败。
+   */
+  if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+    throw new Error(
+      'renderMarkdownBody 需要 DOM（消毒出口 DOMPurify 与游离节点都依赖它）。' +
+        'SSR 场景请在调用方判断环境并跳过渲染，不要把"没有 DOM"当成"空内容"。',
+    )
+  }
   const holder = document.createElement('div')
   holder.innerHTML = mdToHtml(markdown)
 

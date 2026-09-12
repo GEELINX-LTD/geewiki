@@ -69,9 +69,28 @@ export function useRenderedMarkdown(
    */
   const pages = opts.pages ?? null
   const attachmentSlug = opts.attachmentSlug ?? null
+  /*
+   * ══════ 无 DOM 环境（SSR / 单测的 renderToString）══════
+   *
+   * 渲染流水线要用 `document.createElement` 造一个游离节点，**且消毒出口 DOMPurify 也是 DOM 实现**，
+   * 在 Node 的 SSR 里两者都没有。此前这条路径从未被走到（默认落点是列表页，列表页不渲染正文），
+   * 主页成为默认落点后必然被走到。
+   *
+   * 处置：服务端**返回空**，正文留给客户端挂载后的 `useEffect`（`MarkdownBody` 本来就是
+   * "命令式注入 + 只在 HTML 变化时写 DOM"，因此"服务端空、客户端填"正是它天然的形状）。
+   * 为什么不在服务端用"正则 + 字符串拼接"凑一份：那等于**绕开消毒出口**（`mdToHtml` 是
+   * 全仓唯一的消毒点），为了 SSR 好看而复制一条未经消毒的渲染路径，是不可接受的交易。
+   *
+   * ⚠️ 这个判断写在 `useMemo` **回调内部**，不能写成提前 return：提前 return 会让本次渲染的
+   * hook 数量变少，React 直接抛 #310（"Rendered fewer hooks than expected"）。
+   */
+  const canRender = typeof document !== 'undefined' && typeof document.createElement === 'function'
   return useMemo(
-    () => renderMarkdownBody(markdown, { withCopyButtons, route, pages, attachmentSlug }),
-    [markdown, withCopyButtons, route, pages, attachmentSlug],
+    () =>
+      canRender
+        ? renderMarkdownBody(markdown, { withCopyButtons, route, pages, attachmentSlug })
+        : { html: '', toc: [] },
+    [canRender, markdown, withCopyButtons, route, pages, attachmentSlug],
   )
 }
 

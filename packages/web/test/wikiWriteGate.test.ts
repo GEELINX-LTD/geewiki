@@ -127,14 +127,23 @@ test('侧栏空态：按钮走共享实现，且登录态在任何 early return 
 test('路由兜底：两条编辑器路径之前都必须有 kind !== \'ready\' 的早返回', () => {
   const gates = [...wiki.matchAll(/kind !== 'ready'/g)].map((m) => m.index ?? -1)
   const editors = [...wiki.matchAll(/<WikiEdit/g)].map((m) => m.index ?? -1)
-  // 反空洞：两条路径都必须抽到，否则下面的循环会空转
-  assert.ok(gates.length >= 2, `应有 ≥2 处写入门控（实际 ${gates.length}）`)
+  // 反空洞：三条路径都必须抽到，否则下面的循环会空转
+  assert.ok(gates.length >= 3, `应有 ≥3 处写入门控（实际 ${gates.length}）`)
+  /*
+   * 三条编辑器渲染路径（新增第三条时**必须**同时补门控，本断言就是提醒）：
+   *   1. `#/wiki/new`            —— `slug=""` + 空 slug 分支的门控
+   *   2. `#/wiki/<slug>/edit`    —— `slug={route.slug}` + 编辑分支的门控
+   *   3. `#/wiki/home/new`       —— 主页创建引导（`prefillSlug={HOME_SLUG}`）+ 主页门控
+   * 第三条是本轮主页重设计引入的：它是**真实可达的 URL**（主页缺失时页面上的按钮就指向它），
+   * 因此与另外两条同罪——没有门控，匿名/无编辑权的人会拿到完整可用的编辑器。
+   */
   assert.equal(
     editors.length,
-    2,
-    `只应有两条编辑器渲染路径（#/wiki/new 与 #/wiki/<slug>/edit，实际 ${editors.length}）——` +
-      '新增第三条时必须同时补门控，本断言就是提醒',
+    3,
+    `应有三条编辑器渲染路径（#/wiki/new、#/wiki/<slug>/edit、#/wiki/home/new，实际 ${editors.length}）`,
   )
+  // 三条路径各自的特征必须都还在（否则"三条"可能来自同一处的复制粘贴）
+  assert.match(wiki, /prefillSlug=\{HOME_SLUG\}/, '主页创建路径必须以 prefillSlug 预填约定 slug')
 
   for (const at of editors) {
     const before = wiki.slice(Math.max(0, at - 3000), at)

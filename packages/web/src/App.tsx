@@ -345,6 +345,34 @@ export function App(): ReactNode {
    */
   const governDests = visibleDests(GOVERN_NAV, auth.capabilities)
 
+  /*
+   * 外壳宽度分档（**按内容类型**，不是按页面）：
+   *   - 阅读态（知识库详情/主页/版本预览）：保持 1280px。长文的可读性由正文的
+   *     `--spacing-measure`（中文 35~45 字/行）把关，外壳再宽只是徒增两侧空白。
+   *   - 扫描态（列表/检索/问答/管理台面）：放宽到 `--spacing-wide`（1552px）。这些页面是
+   *     表格与多列信息，宽度直接等于"一屏能看多少"。
+   * 2026-09-12 实测（修复前）：1920 视口下 `main` 恒为 1280px，左右各 320px 空白，
+   * 列表表格只占视口 50.6%。
+   *
+   * 用内联 `style.maxWidth` 而不是 `max-w-[var(--spacing-wide)]`：Tailwind 对
+   * "任意值里再嵌 var()" 的写法不生成工具类（实测产物 CSS 命中 0 次），静默失效比写死更危险。
+   * `data-shell` 属性同时给出 CSS 侧的稳定挂钩（见 styles.css），供后续按档位加规则。
+   */
+  /*
+   * ⚠️ 变量名不能叫 `wikiSub`：上面（记录"最近访问"那段）已有同名变量，
+   * 同作用域重复声明会让整包 `tsc` 报 TS2451、**类型检查直接不过**。
+   */
+  const wikiSubForShell = route.slice('wiki'.length).replace(/^\/+/, '')
+  const wideShell =
+    active !== 'wiki' ||
+    wikiSubForShell === '' ||
+    wikiSubForShell === 'list' ||
+    wikiSubForShell.startsWith('search') ||
+    wikiSubForShell.startsWith('ask')
+  /** 与 tokens.css 的 `--spacing-wide` 同值。写具体值而不是 var()：`@theme` 里的自定义
+   *  尺寸变量只在被工具类引用时才输出到 `:root`，内联 var() 引用可能落空（静默失效）。 */
+  const WIDE_MAX_WIDTH = '1552px'
+
   let body: ReactNode
   if (active === 'wiki')
     body = (
@@ -578,6 +606,8 @@ export function App(): ReactNode {
       <main
         id={MAIN_CONTENT_ID}
         tabIndex={-1}
+        data-shell={wideShell ? 'wide' : 'read'}
+        style={wideShell ? { maxWidth: WIDE_MAX_WIDTH } : undefined}
         className={cn(
           'mx-auto w-full max-w-[1280px] flex-1 px-[var(--spacing-gutter)] py-[var(--spacing-gutter)]',
           // 程序化聚焦容器（跳转链接的落点）不画焦点环：它没有交互语义，

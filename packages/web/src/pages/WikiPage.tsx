@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { parseWikiRoute } from '../lib/wikiRoute'
+import { HOME_SLUG, parseWikiRoute, wikiRouteHash } from '../lib/wikiRoute'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
-import { ChevronLeft, ChevronRight, FileText, History, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, FileText, History, List as ListIcon, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
 import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary } from '../api'
 import { ApplyAccessDialog } from '../components/access/ApplyAccessDialog'
 import { PageAccessPanel } from '../components/access/PageAccessPanel'
@@ -82,6 +82,7 @@ import {
   LoadingState,
   Skeleton,
   SkeletonTable,
+  focusRing,
   useConfirm,
 } from '../ui'
 import { cn } from '../ui/cn'
@@ -132,8 +133,18 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
   // 这个只在真实浏览器里才暴露的缺陷（未编码路径被当成未知深层跳回列表、
   // 编码路径被双重编码成 404）。
   const route = parseWikiRoute(sub)
+  /*
+   * 主页（`kind === 'home'`）在侧栏里高亮的是**主页那一篇**，所以 activeSlug 取约定 slug；
+   * 否则侧栏在主页上不高亮任何一项，用户会以为"我不在任何地方"。
+   */
   const activeSlug =
-    route.kind === 'detail' ? route.slug : route.kind === 'edit' ? route.slug : null
+    route.kind === 'detail'
+      ? route.slug
+      : route.kind === 'edit'
+        ? route.slug
+        : route.kind === 'home'
+          ? HOME_SLUG
+          : null
   const pages = usePages()
   /*
    * 登录态与能力（本批 R11）：`useAuth()` 必须在**任何 early return 之前**调用
@@ -143,6 +154,99 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
   /** 「新建页面」的入口门控（见 `newPageEntry`）：列表页按钮与 `#/wiki/new` 路由共用同一判据 */
   const newEntry = newPageEntry(auth.user, auth.capabilities)
 
+  /*
+   * `#/wiki/home` 是主页的**另一个写法**，不是第二个页面：重定向到 `#/wiki`。
+   *
+   * 为什么重定向而不是两个 URL 渲染同一篇：两套 URL 会让"复制链接/浏览器历史/面包屑"
+   * 出现两种形态，而且选中态、返回行为都会分叉。用 `replace: true`（改写历史而不是压栈）
+   * 是为了不让"后退"把用户卡在 `/wiki/home` ↔ `/wiki` 之间来回弹。
+   */
+  /*
+   * 「创建主页」走 `#/wiki/home/new` —— 一个**已存在的路由形状**（`new` 是保留段，
+   * 所以它解析成 `detail slug='home/new'` 而不是别的含义），因此不需要动解析器，
+   * 也不会与"编辑已存在的主页"（`#/wiki/home/edit`）混淆。两者在下面的 edit 分支里分流。
+   */
+  const shouldCreateHome = route.kind === 'detail' && route.slug === `${HOME_SLUG}/new`
+  /** `#/wiki/home` → `#/wiki`（同一篇的两种写法归一到一个 URL） */
+  const normalizeHome = route.kind === 'detail' && route.slug === HOME_SLUG
+  useEffect(() => {
+    if (!normalizeHome) return
+    window.location.replace('#/wiki')
+  }, [normalizeHome])
+  if (normalizeHome) return null
+
+  /*
+   * 创建主页也要过**同一道门**：它是一条真实可达的 URL（主页缺失时页面上的按钮就指向它，
+   * 别人也可以直接贴过来）。没有这道门，匿名用户会拿到一个完整可用的编辑器，填完点保存才被 401 弹走。
+   * 判据与 `#/wiki/new` / `#/wiki/<slug>/edit` 完全一致（`newPageEntry` 的 `ready`）。
+   */
+  if (shouldCreateHome && newEntry.kind !== 'ready') {
+    const needLogin = newEntry.kind === 'login'
+    return (
+      <WikiShell activeSlug={HOME_SLUG} pages={pages} onNavigate={onNavigate}>
+        <div className="page">
+          <div className="page-head">
+            <h1>创建主页</h1>
+          </div>
+          <EmptyState
+            icon={needLogin ? <LogIn className="size-8" /> : <ShieldCheck className="size-8" />}
+            title={needLogin ? '创建主页需要先登录' : '你暂时不能创建主页'}
+            hint={
+              needLogin
+                ? '匿名访客可以浏览知识库，但创建主页需要一个账号。去登录，登录成功后会自动回到这里。'
+                : newEntry.reason
+            }
+            action={
+              <div className="flex flex-wrap items-center gap-2">
+                {needLogin && (
+                  <Button variant="primary" icon={<LogIn className="size-3.5" />} onClick={loginForNewPage}>
+                    去登录
+                  </Button>
+                )}
+                <Button variant="secondary" onClick={() => onNavigate('list')}>
+                  全部页面
+                </Button>
+              </div>
+            }
+          />
+        </div>
+      </WikiShell>
+    )
+  }
+  // 有编辑权时：直接进"创建"语义的编辑器（预填 slug `home`）
+  if (shouldCreateHome) {
+    return (
+      <WikiShell activeSlug={HOME_SLUG} pages={pages} onNavigate={onNavigate}>
+        <WikiEdit
+          key={`${HOME_SLUG}/new`}
+          slug=""
+          prefillSlug={HOME_SLUG}
+          onDone={(next) => onNavigate(next)}
+          onCancel={() => onNavigate('home')}
+        />
+      </WikiShell>
+    )
+  }
+
+  if (route.kind === 'home') {
+    /*
+     * 主页 = **一篇文章**，复用详情页的阅读态能力（标题/正文/版本/权限入口/上下篇之外的一切），
+     * 而不是"所有页面的管理表格"。列表页退居次要入口：`#/wiki/list` 保持原样，
+     * 并由侧栏的「全部页面」链接抵达（此前唯一入口是命令面板，等于藏起来了）。
+     */
+    return (
+      <WikiShell activeSlug={activeSlug} pages={pages} onNavigate={onNavigate}>
+        <WikiDetail
+          key={HOME_SLUG}
+          slug={HOME_SLUG}
+          homeMode
+          onEdit={() => onNavigate(`${HOME_SLUG}/edit`)}
+          onDeleted={() => onNavigate('list')}
+          onNavigate={onNavigate}
+        />
+      </WikiShell>
+    )
+  }
   if (route.kind === 'list') {
     return (
       <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
@@ -175,7 +279,7 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
           <div className="page-head">
             <h1>问答</h1>
             <div className="page-actions">
-              <Button onClick={() => onNavigate('')}>返回列表</Button>
+              <Button onClick={() => onNavigate('list')}>返回列表</Button>
             </div>
           </div>
           <AskPanel key={route.q} initialQuery={route.q} onOpenPage={(slug) => onNavigate(slug)} />
@@ -184,6 +288,7 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
     )
   }
   if (route.kind === 'new') {
+
     /*
      * 路由级门控（本批 R11）—— 这一道才是真正的兜底：列表页按钮、侧栏空态按钮、
      * 命令面板、别人贴过来的 `#/wiki/new` 链接都汇到这里。没有它，匿名用户（以及
@@ -214,7 +319,7 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
                       去登录
                     </Button>
                   )}
-                  <Button variant="secondary" onClick={() => onNavigate('')}>
+                  <Button variant="secondary" onClick={() => onNavigate('list')}>
                     返回列表
                   </Button>
                 </div>
@@ -226,7 +331,7 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
     }
     return (
       <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
-        <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
+        <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('list')} />
       </WikiShell>
     )
   }
@@ -237,7 +342,7 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
           key={route.slug}
           slug={route.slug}
           onEdit={() => onNavigate(`${route.slug}/edit`)}
-          onDeleted={() => onNavigate('')}
+          onDeleted={() => onNavigate('list')}
           onNavigate={onNavigate}
         />
       </WikiShell>
@@ -310,6 +415,100 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
  * 响应式：桌面常驻、窄屏收起为抽屉（由 `SidebarDrawer` 承担，复用 Radix Dialog
  * 以获得焦点陷阱 / Escape / aria-modal）。
  */
+/**
+ * 侧栏顶部的「全部页面」入口。
+ *
+ * 为什么必须有：列表页（`#/wiki/list`）此前**唯一**的入口是命令面板里的「浏览全部页面」，
+ * 等于把它藏起来了——主页改成文章之后，没有这个链接就再没有"看得见的"路径去管理所有页面。
+ *
+ * 放在 `Sidebar` 的 `header` 槽（现有契约，零改动）：桌面常驻侧栏与窄屏抽屉共用同一份，
+ * 因此两处都会出现，不需要各写一遍。
+ */
+function SidebarAllPagesLink(props: { onNavigate: (path: string) => void }): ReactNode {
+  return (
+    <a
+      href="#/wiki/list"
+      aria-label="全部页面（列表与检索）"
+      className={cn(
+        'flex items-center gap-1.5 rounded-md px-2 py-1.5 text-note text-muted',
+        'transition-colors duration-150 ease-standard hover:bg-hover hover:text-ink',
+        focusRing,
+      )}
+      onClick={(e) => {
+        // 修饰键放行交给浏览器（中键/⌘ 点击可新开标签页），普通左键走 SPA 路由
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+        e.preventDefault()
+        props.onNavigate('list')
+      }}
+    >
+      <ListIcon className="size-3.5 shrink-0" aria-hidden="true" />
+      全部页面
+    </a>
+  )
+}
+
+/**
+ * 主页右栏的次要区块（`xl` 以上才有右栏）。
+ *
+ * 它是**导航辅助**，不是列表页的复制：只给"最近更新"的几条 + 回列表的入口。
+ * 刻意不在这里放检索框/过滤框/新建按钮——那些属于列表页（"管理"语义），
+ * 主页要回答的是"这里有什么、从哪开始读"。
+ *
+ * 数据来自**共享 store**（`usePages()`），不额外发请求：侧栏用的是同一份。
+ */
+function HomeAside(props: { pages: PageSummary[] | null; onNavigate: (path: string) => void }): ReactNode {
+  const { pages, onNavigate } = props
+  /*
+   * 最近更新 = 列表顺序（后端 `ORDER BY updated_at DESC, id DESC`）的前 5 条。
+   * `pages` 为 null（还在加载或加载失败）时**整块不渲染**：主页正文不受影响，
+   * 没必要为一个"辅助导航"显示骨架或错误——这正是它作为次要区块该有的失败姿态。
+   */
+  const recent = pages === null ? [] : pages.slice(0, 5)
+  if (recent.length === 0) return null
+  return (
+    <aside aria-label="最近更新" className="flex flex-col gap-2">
+      <h2 className="m-0 text-note font-semibold text-ink">最近更新</h2>
+      <ul className="m-0 flex list-none flex-col gap-1 p-0">
+        {recent.map((p) => (
+          <li key={p.slug} className="min-w-0">
+            <a
+              href={wikiHref(p.slug)}
+              title={p.title}
+              className={cn(
+                'block truncate rounded-md px-2 py-1.5 text-note text-ink-soft',
+                'transition-colors duration-150 ease-standard hover:bg-hover hover:text-ink',
+                focusRing,
+              )}
+              onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+                e.preventDefault()
+                onNavigate(p.slug)
+              }}
+            >
+              {p.title}
+            </a>
+          </li>
+        ))}
+      </ul>
+      <a
+        href="#/wiki/list"
+        className={cn(
+          'rounded-md px-2 py-1.5 text-note text-accent-ink',
+          'transition-colors duration-150 ease-standard hover:bg-hover',
+          focusRing,
+        )}
+        onClick={(e) => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+          e.preventDefault()
+          onNavigate('list')
+        }}
+      >
+        全部页面 →
+      </a>
+    </aside>
+  )
+}
+
 function WikiShell(props: {
   activeSlug: string | null
   pages: ReturnType<typeof usePages>
@@ -326,11 +525,11 @@ function WikiShell(props: {
   }
   return (
     <div className="flex items-start gap-[var(--spacing-gutter)]">
-      <Sidebar {...navProps} />
+      <Sidebar {...navProps} header={<SidebarAllPagesLink onNavigate={onNavigate} />} />
       <div className="min-w-0 flex-1">
         {/* 窄屏的目录入口与"全部页面"并列在内容顶部，避免挤占标题行 */}
         <div className="mb-2 lg:hidden">
-          <SidebarDrawer {...navProps} />
+          <SidebarDrawer {...navProps} header={<SidebarAllPagesLink onNavigate={onNavigate} />} />
         </div>
         {children}
       </div>
@@ -662,13 +861,22 @@ function WikiList(props: {
               className="w-full border-collapse text-sm"
             >
               {/*
-                粘性表头：长列表滚到下面时仍能看到列名（`.page` 里没有纵向滚动容器，
-                故这里相对视口吸附）。`top` 用 `--spacing-header`（顶栏高度）—— 粘在顶栏下方
-                而不是被顶栏盖住。
-                ⚠️ `bg-surface` 必须显式给：粘性单元格默认背景透明，滚动时下面的行会**穿透**
-                表头文字（这是最容易漏的一步，视觉上表现为字叠字）。
+                粘性表头：长列表滚到下面时仍能看到列名。
+
+                ⚠️ `top-0` 而不是 `top-[var(--spacing-header)]`：这一层的祖先里有一个
+                `overflow-x: auto` 的包裹 div（见上方容器），它同时把纵向也变成 `auto`
+                （CSS 规范：一轴非 visible 会让另一轴的 visible 计算为 auto），于是它成为
+                **最近的滚动容器**，sticky 的吸附参照系是它、不是视口。参照系换成这个容器后，
+                再写 56px 的顶栏偏移就不再是"避开顶栏"，而是把表头**往下推进表格内部 56px**，
+                正好压住首行 —— 2026-09-12 实测：滚动 0 时表头矩形 y=336、tbody y=312.5，
+                整宽 972px、相交 32.5px 叠在首行文字上。
+                该包裹层纵向不可滚动（clientHeight == scrollHeight），所以容器顶部本身就在
+                顶栏之下，表头贴在容器顶部即可，不需要也不可能靠 top 偏移避开顶栏。
+                ⚠️ 背景必须**不透明**：`bg-surface` 实际解析为 oklab(… / 0.85)（85% 不透明），
+                表头压住行文字时文字会透出来 → 观感就是"字叠字"。这里显式给 `bg-bg`
+                （页面底色，完全不透明），避免半透明背景让下面的内容隐约可见。
               */}
-              <thead className="sticky top-[var(--spacing-header)] z-10 bg-surface">
+              <thead className="sticky top-0 z-10 bg-bg">
                 <tr>
                   {['标题', '页面标识', '版本', '最近更新'].map((h) => (
                     <th
@@ -856,8 +1064,19 @@ function WikiDetail(props: {
   onEdit: () => void
   onDeleted: () => void
   onNavigate: (path: string) => void
+  /**
+   * 主页模式（`#/wiki` 空路由）。
+   *
+   * 存在的唯一理由是**404 那一支**：普通页读不到时说"页面不存在，或你没有访问权限"是对的，
+   * 但主页读不到时这句话毫无用处——用户既没输错地址，也无从知道"这个站点还没有主页"。
+   * 主页模式改成给出可执行的下一步：有编辑权就给「创建主页」，否则给中性面板 + 去哪。
+   *
+   * 为什么不做成"另一个组件"：正文卡片、版本历史、目录、权限入口这些必须与普通页**逐字一致**
+   * （一致才不会漂移）；复制一份出来，两边的正文渲染迟早会分叉。
+   */
+  homeMode?: boolean
 }): ReactNode {
-  const { slug, onEdit, onDeleted, onNavigate } = props
+  const { slug, onEdit, onDeleted, onNavigate, homeMode = false } = props
   // 当前页路由（锚点 href 要用它拼 `#/wiki/<slug>?a=<id>`，见 lib/hashAnchor.ts）
   const route = `wiki/${slug}`
 
@@ -881,6 +1100,12 @@ function WikiDetail(props: {
   const [accessOpen, setAccessOpen] = useState(false)
   /** 只用来判「登录了没」（申请入口对匿名不显示）；**能力判据仍以 page.capabilities 为准** */
   const auth = useAuth()
+  /**
+   * 主页缺失时「创建主页」引导的门控（与列表页/`#/wiki/new` **同一判据**，见 `newPageEntry`）。
+   * 复用它而不是在这里另写一份 `auth.capabilities.editContent === true`：两处判据一旦分叉，
+   * 就会出现"引导说有编辑权、点进编辑器又被路由门禁拦下"的自相矛盾。
+   */
+  const newEntry = newPageEntry(auth.user, auth.capabilities)
   // ══════════════════════════════════════════════════════════════
   /*
    * 同级页面列表（用于"上一篇/下一篇"）：来自**共享 store**，不再是本组件自己的请求。
@@ -1117,24 +1342,74 @@ function WikiDetail(props: {
         <div className="flex flex-col gap-3.5">
           {crumbs}
           {/*
-            ══════ M3：访问申请入口（独立代码块，可整段摘除） ══════
-            为什么挂在这里：读路径对「不存在」与「无权访问」一律 404（防存在性探测），
-            所以这里是"用户明确知道 slug、却读不到"的唯一落点。文案必须**坦诚无法区分**
-            —— 写"你没有权限，请申请"就是把"不存在"说成了"无权"（服务端刻意不给这个信息，
-            前端不许猜）。匿名不显示申请入口：该端点要求已登录（401）。
+            ══════ 主页缺失（homeMode 专属，独立代码块，可整段摘除） ══════
+            为什么这里**必须**与普通页不同：读路径对「不存在」与「无权访问」一律 404
+            （防存在性探测），普通页只能说"无法区分"；但主页是**默认落点**——用户没输错
+            任何地址，却拿到一句"页面不存在，或你没有访问权限"就彻底卡住了。
+            所以主页模式把"可执行的下一步"补上：有编辑权 ⇒ 几乎必然是还没创建（创建是本
+            组织内的正常操作），给「创建主页」引导；否则给中性面板（不猜是哪一种原因）。
+            ⚠️ 不新增"只回布尔的存在性端点"来精确区分：那会泄露"本站是否存在名为 home 的页"，
+            与仓库"置灰即泄露"的既有立场冲突。
           */}
-          <EmptyState
-            icon={<FileText className="size-8" />}
-            title="页面不存在，或你没有访问权限"
-            hint="服务端对「不存在」与「无权访问」返回同一结果，所以这里无法区分。若你确认它存在，可以提交一次访问申请。"
-            action={
-              <>
-                <Button onClick={() => onNavigate('list')}>返回列表</Button>
-                {auth.user !== null && <ApplyAccessDialog slug={slug} />}
-              </>
-            }
-          />
-          {/* ══════════════════════════════════════════════════════ */}
+          {homeMode ? (
+            newEntry.kind === 'ready' ? (
+              <EmptyState
+                icon={<FileText className="size-8" />}
+                title="这个站点还没有主页"
+                hint="主页就是一篇普通文章（slug 为 home）：它可以编辑、有版本历史，也受页面权限管辖。建议先在编辑器里写好草稿，再决定它对谁可见、要不要发布。"
+                action={
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button variant="primary" onClick={() => onNavigate(`${HOME_SLUG}/new`)}>
+                      创建主页
+                    </Button>
+                    <Button variant="secondary" onClick={() => onNavigate('list')}>
+                      先去全部页面
+                    </Button>
+                  </div>
+                }
+              />
+            ) : (
+              <EmptyState
+                icon={<FileText className="size-8" />}
+                title="主页当前不可访问"
+                hint="可能是这个站点还没有主页，也可能是它没有对当前的你开放。两者在服务端返回同一个结果，所以这里无法区分。"
+                action={
+                  <div className="flex flex-wrap items-center gap-2">
+                    {newEntry.kind === 'login' && (
+                      <Button variant="primary" onClick={loginForNewPage}>
+                        去登录
+                      </Button>
+                    )}
+                    <Button variant="secondary" onClick={() => onNavigate('list')}>
+                      全部页面
+                    </Button>
+                    <Button variant="ghost" onClick={load}>
+                      重试
+                    </Button>
+                  </div>
+                }
+              />
+            )
+          ) : (
+            /*
+              ══════ M3：访问申请入口（独立代码块，可整段摘除） ══════
+              为什么挂在这里：读路径对「不存在」与「无权访问」一律 404（防存在性探测），
+              所以这里是"用户明确知道 slug、却读不到"的唯一落点。文案必须**坦诚无法区分**
+              —— 写"你没有权限，请申请"就是把"不存在"说成了"无权"（服务端刻意不给这个信息，
+              前端不许猜）。匿名不显示申请入口：该端点要求已登录（401）。
+            */
+            <EmptyState
+              icon={<FileText className="size-8" />}
+              title="页面不存在，或你没有访问权限"
+              hint="服务端对「不存在」与「无权访问」返回同一结果，所以这里无法区分。若你确认它存在，可以提交一次访问申请。"
+              action={
+                <>
+                  <Button onClick={() => onNavigate('list')}>返回列表</Button>
+                  {auth.user !== null && <ApplyAccessDialog slug={slug} />}
+                </>
+              }
+            />
+          )}
         </div>
       )
     }
@@ -1277,11 +1552,33 @@ function WikiDetail(props: {
         `xl`（1280px）以下回落成单栏，目录改为正文上方的可折叠块（两份 TOC 由组件内部
         用 `xl:hidden` / `hidden xl:block` 互斥显示，因此任何时刻只有一份出现在无障碍树里）。
       */}
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_15rem]">
+      {/*
+        两栏（正文 + 目录）**只在真的有目录时才开**：`TableOfContents` 在标题数不足 2 时
+        返回 `null`，但栅格列仍然会占着 240px —— 右侧于是出现一整条没有任何内容的空白，
+        而正文那一列还被 `minmax(0,1fr)` 压在 710px。2026-09-12 实测：`welcome` 页栅格
+        `710px 240px`，右列 `innerText` 为空、视觉上就是"右边空了一大块"。
+        没有目录时回落单栏，正文列直接拿到全部宽度。
+
+        判定阈值与组件内的 `MIN_ENTRIES = 2` 对齐（组件在 `entries.length < 2` 时返回
+        `null`）；两处必须同步，否则又会留下"列在、内容不在"的空轨道。
+      */}
+      <div
+        className={cn(
+          'grid gap-6',
+          rendered.toc.length >= 2 && 'xl:grid-cols-[minmax(0,1fr)_15rem]',
+        )}
+      >
         <div className="flex min-w-0 flex-col gap-4">
           <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="inline" />
 
-          <article className="rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
+          {/*
+            阅读卡片：`gw-reader` 让卡片宽度**跟着正文行宽走**（styles.css）。
+            此前卡片撑满栅格列（1440 视口下约 974px），而正文 `.md-body` 受
+            `--spacing-measure`（`min(46rem, 45em)`，14px 正文下即 630px = 45 字/行）约束
+            ⇒ 卡片右侧空出 400px 以上，
+            观感即"左右两边空得太多"。空洞在**卡片内部**，加宽外壳解决不了。
+          */}
+          <article className="gw-reader rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
             <h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>
             {page.content.trim() === '' ? (
               <p className="text-sm text-muted">（空白页面 —— 点击「编辑」写入内容）</p>
@@ -1429,7 +1726,15 @@ function WikiDetail(props: {
           </Card>
         </div>
 
-        <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
+        {/*
+          右栏：主页模式优先放「最近更新」这类**导航辅助**；页内目录留在其后。
+          两者都是"没有内容就自己返回 null"（TOC 在标题数不足 `MIN_ENTRIES` 时、HomeAside 在
+          列表为空时），所以既不会出现空栏，也不会有两份内容同时出现。
+        */}
+        <div className="flex min-w-0 flex-col gap-4">
+          {homeMode && <HomeAside pages={siblings} onNavigate={onNavigate} />}
+          <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
+        </div>
       </div>
 
       {/* 危险操作确认（删除页面 / 恢复历史版本）：确认之后才真的调 api */}
@@ -1561,18 +1866,30 @@ function WikiEdit(props: {
   slug: string
   onDone: (slug: string) => void
   onCancel: () => void
+  /**
+   * 「以新建的方式编辑这个 slug」——目前唯一的调用方是主页的**创建引导**。
+   *
+   * 为什么需要它：新建与编辑的判据是 `slug === ''`，而主页有**约定 slug**（`home`），
+   * 于是"创建主页"会被当成"编辑一个不存在的页"，加载必然失败、编辑器根本出不来。
+   * 预填 slug + 跳过加载，就得到"我已经知道要叫什么，只差写内容"的正确语义。
+   *
+   * 只影响这一支：不传时行为与改动前逐字一致。
+   */
+  prefillSlug?: string
 }): ReactNode {
-  const { slug, onDone, onCancel } = props
+  const { slug, onDone, onCancel, prefillSlug } = props
+  /** 新建语义 = 空 slug（`#/wiki/new`）或"预填 slug 的创建"（主页引导） */
+  const newMode = slug === '' || prefillSlug !== undefined
   const isNew = slug === ''
   /** 本编辑页自身的 hash（未保存离开后要退回它） */
   const selfHash = isNew ? '#/wiki/new' : `#/wiki/${slug}/edit`
   const route = isNew ? 'wiki/new' : `wiki/${slug}/edit`
 
-  const [slugInput, setSlugInput] = useState(slug)
+  const [slugInput, setSlugInput] = useState(prefillSlug ?? slug)
   const [title, setTitle] = useState('')
   const [content, setContent] = useState('')
   const [pane, setPane] = useState<'edit' | 'preview'>('edit')
-  const [loading, setLoading] = useState(!isNew)
+  const [loading, setLoading] = useState(!newMode)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
   const [fieldErrors, setFieldErrors] = useState<PageFormErrors>({})
@@ -1637,11 +1954,12 @@ function WikiEdit(props: {
   const load = useCallback((): void => {
     setErr('')
     setFieldErrors({})
-    if (isNew) {
-      const base: PageDraft = { title: '', content: '', slugInput: '' }
+    if (newMode) {
+      // 预填 slug 时基线里的 slugInput 用预填值：否则 slug 一进页面就被判成"有改动"
+      const base: PageDraft = { title: '', content: '', slugInput: prefillSlug ?? '' }
       setOriginal(base)
       setLoading(false)
-      const d = readDraft('')
+      const d = readDraft(prefillSlug ?? '')
       if (d !== null && !isDraftExpired(d, Date.now())) setPendingDraft(d)
       return
     }
@@ -1672,7 +1990,7 @@ function WikiEdit(props: {
         setErr(errorLine(e))
         setLoading(false)
       })
-  }, [slug, isNew])
+  }, [slug, isNew, newMode, prefillSlug])
 
   useEffect(load, [load])
 
@@ -1688,7 +2006,7 @@ function WikiEdit(props: {
   useEffect(() => {
     if (loading || !dirty) return
     const t = window.setTimeout(() => {
-      const ok = writeDraft(isNew ? '' : slug, {
+      const ok = writeDraft(isNew ? (prefillSlug ?? '') : slug, {
         title,
         content,
         savedAt: Date.now(),
@@ -1706,7 +2024,7 @@ function WikiEdit(props: {
       }
     }, DRAFT_DEBOUNCE_MS)
     return () => window.clearTimeout(t)
-  }, [title, content, slugInput, dirty, loading, isNew, slug])
+  }, [title, content, slugInput, dirty, loading, isNew, slug, prefillSlug])
 
   /**
    * 预览防抖。
@@ -1737,7 +2055,7 @@ function WikiEdit(props: {
     route,
     pages: editPageTitles,
     // 新建页面还没有 slug：此时不给「申请访问」入口（占位块仍如实说明破图原因）
-    attachmentSlug: isNew ? null : slug,
+    attachmentSlug: newMode ? null : slug,
   })
 
   /**
@@ -1790,13 +2108,13 @@ function WikiEdit(props: {
         throw e
       }
     },
-    [isNew, slug],
+    [isNew, newMode, slug, prefillSlug],
   )
 
   const save = useCallback(
     async (opts: { force?: boolean } = {}): Promise<void> => {
-      const target = isNew ? slugInput.trim() : slug
-      const errors = validatePageForm({ isNew, slugInput, title })
+      const target = newMode ? slugInput.trim() : slug
+      const errors = validatePageForm({ isNew: newMode, slugInput, title })
       setFieldErrors(errors)
       if (hasErrors(errors)) {
         // 顶部给一句汇总（屏幕阅读器/长页面用户可能看不到字段旁的红字），字段旁给具体原因
@@ -1813,7 +2131,7 @@ function WikiEdit(props: {
        * 代价是每次保存多一次 GET；对本应用的数据规模（单页几百 KB 以内）可接受，
        * 换来的是"丢内容"这种不可逆事故的避免。
        */
-      if (!isNew && opts.force !== true) {
+      if (!newMode && opts.force !== true) {
         try {
           const fresh = await api.page(slug)
           if (serverUpdatedAt.current !== null && fresh.updated_at !== serverUpdatedAt.current) {
@@ -1831,17 +2149,17 @@ function WikiEdit(props: {
         const r = await api.savePage(target, { title: title.trim(), content })
         // 保存成功 ⇒ 草稿使命结束（连同新建页的哨兵键一起清）
         removeDraft(slug)
-        if (isNew) removeDraft('')
+        if (newMode) removeDraft(prefillSlug ?? '')
         // 列表/侧边栏立刻反映新页面（新建）或新标题（改名）——否则要手动刷新才看得到
         void invalidatePages()
         void refreshCapabilitiesIfVisible() // 新建的页可能带来新的编辑权（见 remove() 的说明）
-        onDone(isNew ? r.slug : slug)
+        onDone(newMode ? r.slug : slug)
       } catch (e) {
         setErr(errorLine(e))
         setSaving(false)
       }
     },
-    [content, isNew, slug, slugInput, title, onDone],
+    [content, isNew, newMode, slug, slugInput, title, onDone, prefillSlug],
   )
 
   /** ⌘/Ctrl+S 全局保存：焦点可能在标题输入框，不能只靠编辑器的 keymap */
@@ -1872,7 +2190,7 @@ function WikiEdit(props: {
   }
 
   const discardDraft = (): void => {
-    removeDraft(isNew ? '' : slug)
+    removeDraft(isNew ? (prefillSlug ?? '') : slug)
     setPendingDraft(null)
   }
 
@@ -1923,15 +2241,15 @@ function WikiEdit(props: {
    */
   const previewEmpty = projected.markdown.trim() === ''
 
-  const editSlug = isNew ? '' : origSlug !== '' ? origSlug : slug
+  const editSlug = newMode ? '' : origSlug !== '' ? origSlug : slug
 
   return (
     <div className="flex flex-col gap-4">
-      <Breadcrumb slug={editSlug} title={isNew ? '新建页面' : editSlug} pages={editPages} />
+      <Breadcrumb slug={editSlug} title={newMode ? '新建页面' : editSlug} pages={editPages} />
 
       {/* 操作条 */}
       <div className="flex flex-wrap items-center gap-2">
-        <h1 className="m-0 text-xl font-semibold">{isNew ? '新建页面' : '编辑页面'}</h1>
+        <h1 className="m-0 text-xl font-semibold">{newMode ? '新建页面' : '编辑页面'}</h1>
         {dirty && (
           /*
            * 三态，优先级：失败 > 已保存 > 有改动。
@@ -1980,7 +2298,7 @@ function WikiEdit(props: {
       {/* 字段：错误就地显示（`aria-describedby` 把错误与控件关联，屏幕阅读器才能读到） */}
       <div className="rounded-lg border border-line bg-surface px-5 py-4 shadow-sm">
         <div className="flex flex-col gap-4">
-          {isNew && (
+          {newMode && (
             <div className="flex flex-col gap-1.5">
               <label htmlFor="gw-page-slug" className="text-xs font-semibold text-ink-soft">
                 页面标识（URL 里的路径，如 getting-started）
@@ -2081,7 +2399,7 @@ function WikiEdit(props: {
              */
             <EditorSlotOutlet
               value={content}
-              mode={isNew ? 'create' : 'edit'}
+              mode={newMode ? 'create' : 'edit'}
               slug={slugInput}
               readOnly={saving}
               onChange={setContent}

@@ -23,12 +23,28 @@
 export const WIKI_RESERVED_FIRST_SEGMENTS: readonly string[] = ['search', 'ask', 'new', 'list']
 
 export type WikiRoute =
+  /** 默认落点：主页文章（约定 slug `home`），见 `HOME_SLUG` */
+  | { kind: 'home' }
   | { kind: 'list' }
   | { kind: 'new' }
   | { kind: 'search'; q: string }
   | { kind: 'ask'; q: string }
   | { kind: 'detail'; slug: string }
   | { kind: 'edit'; slug: string }
+
+/**
+ * 主页文章的约定 slug。
+ *
+ * 为什么用约定 slug 而不是"站点设置里指向某一页"：**零迁移、零新表**。
+ * 已有部署不需要任何数据变更——没有这一页时首页给出「创建主页」引导。
+ * 将来若要"管理员可换主页"，把这里当成**默认值**再读一处 `homeSlug()` 即可，
+ * 不必推翻本方案。
+ *
+ * 为什么是 `home`：它**不在** `WIKI_RESERVED_FIRST_SEGMENTS` 里，因此不需要改动
+ * 前后端镜像的保留段集合（动了就要同步后端 `RESERVED_FIRST_SEGMENTS`，那是
+ * 有守卫测试钉住的约定）；`index` 有"目录页"歧义、`_home` 不符合既有 slug 惯例。
+ */
+export const HOME_SLUG = 'home'
 
 /**
  * 单个路径段的解码：坏转义（如 `%E0%A4%A`）不抛错，退回原串（否则整页白屏）。
@@ -58,7 +74,13 @@ export function parseWikiRoute(sub: string): WikiRoute {
   const seg = decoded.split('/').filter((s) => s !== '')
   const first = seg[0] ?? ''
 
-  if (seg.length === 0 || first === 'list') return { kind: 'list' }
+  /*
+   * 空路由 = **主页**（默认落点），不再与 `list` 合并：
+   * `#/`、`#/wiki`、空 hash 三种写法都落到主页那篇文章；列表退居 `#/wiki/list`。
+   * 合并成一支的实现是上一版的做法，它让"主页"这个词在路由层根本不存在。
+   */
+  if (seg.length === 0) return { kind: 'home' }
+  if (first === 'list') return { kind: 'list' }
   if (first === 'new') return { kind: 'new' }
   // 检索/问答的查询串可能自身含 `/`（被编码过），故取"首段之后的全部"再拼回
   if (first === 'search') return { kind: 'search', q: seg.slice(1).join('/') }
