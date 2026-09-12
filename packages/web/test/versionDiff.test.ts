@@ -14,6 +14,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { changedSections, diffLines, diffStats, statsLabel } from '../src/lib/textDiff'
 import { absoluteTime, relativeTime } from '../src/lib/timePlan'
+import { authorText, HIDDEN_AUTHOR, UNKNOWN_AUTHOR } from '../src/lib/authorText'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -176,6 +177,21 @@ test('守卫：textDiff 不得依赖 DOM/React/网络（纯函数模块）', () 
   assert.doesNotMatch(src, /from 'react'|document\.|window\.|fetch\(/, 'textDiff 必须是纯函数模块')
 })
 
+test('作者文案三档：缺信息、名字被权限收走、真名 —— 三件事各说各的', () => {
+  // ① 服务端连 id 都没给（0019 前的旧行 / 跨插件代调用 / 账号已删）⇒「未记录」
+  assert.equal(authorText(null), UNKNOWN_AUTHOR)
+  assert.equal(authorText(undefined), UNKNOWN_AUTHOR)
+  // ② 记了作者、但名字没下发（版本列表端点的三档规则：其余主体只给 id）⇒「另一位成员」。
+  //    这一档**最容易写错**：把 null 直接当"缺信息"，会把"权限上收"讲成"当时没记"。
+  assert.equal(authorText({ id: 7, displayName: null }), HIDDEN_AUTHOR)
+  assert.equal(authorText({ id: 7, displayName: '   ' }), HIDDEN_AUTHOR)
+  // ③ 有名字 ⇒ 显名字（含"就是你自己"与 owner/admin 两档）
+  assert.equal(authorText({ id: 7, displayName: '版本管理员' }), '版本管理员')
+  // 反空洞：id 缺失（形状不合契约）时不能误报成"有人改过但名字被藏"
+  assert.equal(authorText({ displayName: null }), UNKNOWN_AUTHOR)
+  assert.notEqual(HIDDEN_AUTHOR, UNKNOWN_AUTHOR)
+})
+
 test('守卫：对比弹窗必须容忍缺失的作者字段（显示「未记录」，不得写"匿名"）', () => {
   const diffSrc = readFileSync(join(here, '../src/components/VersionDiffDialog.tsx'), 'utf8')
   const pickerSrc = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
@@ -209,7 +225,23 @@ test('守卫：对比弹窗必须容忍缺失的作者字段（显示「未记�
       /匿名/,
       `${name} 不得把"没有作者信息"写成"匿名"（那是另一种事实主张，注释里说明原因不算）`,
     )
+    // 「另一位成员」同理：它是**权限收走名字**那一档的措辞，也只能有一处定义
+    assert.doesNotMatch(
+      codeOnly(src),
+      /另一位成员/,
+      `${name} 不得自己拼"名字被收走"的措辞（走 authorText，否则两处口径会分叉）`,
+    )
   }
+  assert.match(
+    authorSrc,
+    /export const HIDDEN_AUTHOR = '另一位成员'/,
+    '「记了作者但名字不对你显示」必须有独立措辞（不能复用「未记录」）',
+  )
+  assert.equal(
+    (authorSrc.match(/'另一位成员'/g) ?? []).length,
+    1,
+    '「另一位成员」的字面量在 authorText.ts 里只应出现一次',
+  )
   /*
    * 下拉与时间线都必须走**同一份**作者文案（否则两处口径会漂移）。
    *

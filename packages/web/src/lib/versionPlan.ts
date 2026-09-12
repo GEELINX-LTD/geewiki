@@ -139,10 +139,19 @@ export function previewBarText(versionNumber: number, savedAt: string): string {
 export const PREVIEW_ATTACHMENT_NOTE =
   '历史快照按保存时的原文显示；其中的附件按**当前**正文引用判定，可能无法下载。'
 
-/** 菜单项右侧的"何时 / 谁"（与时间线共用格式，避免两处漂移）。 */
-export function versionMetaText(savedAt: string, author: { displayName: string | null } | null): string {
+/**
+ * 菜单项右侧的"何时 / 谁"（与时间线共用格式，避免两处漂移）。
+ *
+ * `author` 的类型带 `id`：作者文案要区分「没有作者信息」（`author === null`）与
+ * 「记了作者、但名字被权限收走」（`{ id, displayName: null }`）—— 后者显示「另一位成员」。
+ * 只传 `displayName` 的话这一层信息在路上就丢了，两处又得各写一遍判断。
+ */
+export function versionMetaText(
+  savedAt: string,
+  author: { id: number; displayName: string | null } | null,
+): string {
   /*
-   * 作者文案经 `VersionDiffDialog.authorText` —— **「未记录」这个措辞全站只有一处定义**。
+   * 作者文案经 `lib/authorText.ts` —— **「未记录」这个措辞全站只有一处定义**。
    * 在这里重写一遍判断（`displayName ?? '未记录'`）会让"空字符串算不算未记录"这类
    * 边界在两处慢慢分叉，而这类分叉的表现是"同一个人在两个地方显示不同"。
    */

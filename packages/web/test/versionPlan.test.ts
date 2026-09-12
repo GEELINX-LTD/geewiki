@@ -157,12 +157,14 @@ test('预览附注说清附件的判定口径与正文不同', () => {
   assert.match(PREVIEW_ATTACHMENT_NOTE, /附件/)
 })
 
-test('versionMetaText：作者缺失显示「未记录」，不编造名字', () => {
+test('versionMetaText：无作者信息「未记录」、名字被收走「另一位成员」、有名字显示名字', () => {
   const iso = new Date(Date.now() - 5 * 60_000).toISOString()
   assert.match(versionMetaText(iso, null), /未记录$/)
-  assert.match(versionMetaText(iso, { displayName: null }), /未记录$/)
-  assert.match(versionMetaText(iso, { displayName: '   ' }), /未记录$/, '空白名字也算未记录')
-  assert.match(versionMetaText(iso, { displayName: '爱丽丝' }), /爱丽丝$/)
+  // 有 id、没名字 = 服务端记了作者但没对**你**下发（版本列表三档规则）—— 不能写成「未记录」，
+  // 那会把"权限上收"讲成"当时没记"。措辞由 `lib/authorText.ts` 单点定义。
+  assert.match(versionMetaText(iso, { id: 7, displayName: null }), /另一位成员$/)
+  assert.match(versionMetaText(iso, { id: 7, displayName: '   ' }), /另一位成员$/, '空白名字也算"没下发"')
+  assert.match(versionMetaText(iso, { id: 7, displayName: '爱丽丝' }), /爱丽丝$/)
 })
 
 test('versionChangeSummary：三种形态与降级', () => {
