@@ -1,0 +1,224 @@
+/**
+ * versionPlan —— 版本选择与快照预览的**纯逻辑**（无 React、无 DOM、无 fetch）。
+ *
+ * 存在的理由：版本相关的文案与判据散落过三处（`VersionPicker` 的行标签、
+ * `VersionDiffDialog` 的 `versionLabelOf`、`WikiPage` 的恢复确认框），
+ * 三份实现迟早会漂移。这里做**唯一真源**，组件只负责渲染。
+ *
+ * ⚠️ 本文件的函数必须保持纯：可单测、可在 SSR 下跑（仓库有 SSR 渲染测试的既有做法）。
+ */
+import type { PageDetail, VersionMeta } from '../api'
+import { absoluteTime, relativeTime } from './timePlan'
+
+/** 版本列表里一项的展示模型（把"算出来的标签"与"接口给的事实"分开）。 */
+export interface VersionOption {
+  id: number
+  /** 该快照的版本号（v1、v2 …）；由 `versionNumberOf` 计算，不用数组下标硬推 */
+  number: number
+  saved_at: string
+  author: { id: number; displayName: string | null } | null
+  /** 该版本是否是"当前版本"（当前版本**没有**快照行，故恒为 false；保留字段供调用方判断） */
+  isCurrent: boolean
+}
+
+/* ------------------------------------------------------------------ *
+ * 版本号
+ * ------------------------------------------------------------------ */
+
+/**
+ * 快照数组只给"最近 N 条"（`recentVersions` 默认 10，被截断时 `versions.length` 小于
+ * 历史总数）⇒ **不能用 `version - index - 1` 数下标**：
+ *
+ * - `page.version` 是**当前**版本号，历史快照总数 = `page.version - 1`。
+ * - 截断时数组里第 0 项并不是最新的历史版本，而是"最近 N 条里最新的那条"，
+ *   它的版本号仍然是 `page.version - 1`（倒数第 1 条历史）。
+ * - 所以正确算法是**从总数往下数**：第 i 项 = `page.version - 1 - i`。
+ *
+ * 当 `versions.length === page.version - 1`（未截断）时，两种算法等价；
+ * 截断时只有这一种是对的。**绝不能**让"当前版本"被标低成历史版本。
+ */
+export function versionNumberOf(page: Pick<PageDetail, 'version'>, index: number): number {
+  return page.version - 1 - index
+}
+
+/**
+ * 历史快照是否被截断（数组没覆盖到 v1）。
+ *
+ * `page.version - 1` 是历史总数（当前版本号 1 不算快照）；数组长度小于它即为截断。
+ */
+export function isTruncated(page: Pick<PageDetail, 'version' | 'versions'>): boolean {
+  return page.version - 1 > page.versions.length
+}
+
+/** 把页面的 `versions[]` 映射成展示模型（顺序与接口一致：新 → 旧）。 */
+export function versionOptions(page: Pick<PageDetail, 'version' | 'versions'>): VersionOption[] {
+  return page.versions.map((v: VersionMeta, i: number) => ({
+    id: v.id,
+    number: versionNumberOf(page, i),
+    saved_at: v.saved_at,
+    author: v.author ?? null,
+    isCurrent: false,
+  }))
+}
+
+/* ------------------------------------------------------------------ *
+ * 判据
+ * ------------------------------------------------------------------ */
+
+/**
+ * 页头是否该渲染**版本下拉**。
+ *
+ * 判据用 `canEdit`：历史快照端点（`GET …/versions/:id`）要求 `canEdit`，
+ * 非 `canEdit` 时展开菜单点任何一项都必然 404 ⇒ 给一个"点了必然失败"的入口是反模式，
+ * 故只读用户退化为静态徽标（存在性信息仍然给，见 `VersionHistorySummary`）。
+ */
+export function canPickVersion(page: Pick<PageDetail, 'capabilities'> | null): boolean {
+  return page?.capabilities.canEdit === true
+}
+
+/**
+ * 是否该显示「恢复此版本」。
+ *
+ * 判据是 `canManageVisibility` 而**不是** `canEdit`：恢复会改页面状态
+ * （正文 + 块级权限 + 档位 + 发布态四位一体），服务端的 restore 端点正是要求这个能力。
+ * 让只有编辑权的人看到恢复按钮，等于给出一个点了必然 403 的入口。
+ */
+export function canRestoreVersion(page: Pick<PageDetail, 'capabilities'> | null): boolean {
+  return page?.capabilities.canManageVisibility === true
+}
+
+/* ------------------------------------------------------------------ *
+ * 预览态（`?v=<版本 id>`）
+ * ------------------------------------------------------------------ */
+
+/** `?v=` 的解析结果：合法就带 id，非法就带一个**可读原因**（不静默吞掉）。 */
+export type PreviewParam = { kind: 'none' } | { kind: 'ok'; id: number } | { kind: 'invalid' }
+
+/**
+ * 解析裸查询串（`App.tsx` 把 `?` 之后的部分原样传给 `WikiPage` 的 `query` prop）。
+ *
+ * 非法形态一律归 `invalid`，由调用方**静默回到最新 + 从 URL 清掉 `?v=`**：
+ * - 空串 / 非数字 / 非正整数 / 超出安全整数：都不是"某一版"
+ * - 允许前导零（`0007`）与前后空白：那是同一个 id，不必当成错误
+ * - **不接受负数与 0**：服务端的 id 是自增正整数，0/负数是伪造的
+ */
+export function parsePreviewParam(query: string): PreviewParam {
+  const raw = new URLSearchParams(query).get('v')
+  if (raw === null) return { kind: 'none' }
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) return { kind: 'invalid' }
+  const id = Number(trimmed)
+  if (!Number.isSafeInteger(id) || id <= 0) return { kind: 'invalid' }
+  return { kind: 'ok', id }
+}
+
+/** 拼预览态的路由（`onNavigate` 收的是裸 slug + 裸查询串，`App.tsx` 会拼成 `#/wiki/…`）。 */
+export function previewRoute(slug: string, versionId: number): string {
+  return `${encodeURIComponent(slug)}?v=${versionId}`
+}
+
+/** 非法 `?v=` 的提示语。**必须同时说出两种可能** —— 服务端对"不存在"与"无权"都回 404。 */
+export const PREVIEW_INVALID_TEXT = '该版本不存在或你无权查看'
+
+/* ------------------------------------------------------------------ *
+ * 文案
+ * ------------------------------------------------------------------ */
+
+/** 页头触发按钮的两种文案：最新态 / 预览历史态。 */
+export function pickerTriggerText(pageVersion: number, previewNumber: number | null): string {
+  return previewNumber === null ? `v${pageVersion} · 最新` : `v${previewNumber} · 历史 · 只读`
+}
+
+/** 预览态状态条的主文案（时间用绝对时间：分享出去的链接要能被别人读懂）。 */
+export function previewBarText(versionNumber: number, savedAt: string): string {
+  return `正在查看 v${versionNumber}（保存于 ${absoluteTime(savedAt)}）· 只读`
+}
+
+/** 预览态状态条的附注 —— 附件的判定口径与正文不同，必须说明。 */
+export const PREVIEW_ATTACHMENT_NOTE =
+  '历史快照按保存时的原文显示；其中的附件按**当前**正文引用判定，可能无法下载。'
+
+/** 菜单项右侧的"何时 / 谁"（与时间线共用格式，避免两处漂移）。 */
+export function versionMetaText(savedAt: string, author: { displayName: string | null } | null): string {
+  const name = author?.displayName
+  const who = typeof name === 'string' && name.trim() !== '' ? name : '未记录'
+  return `${relativeTime(savedAt)} · ${who}`
+}
+
+/**
+ * 改动摘要：把后端 `change` 结构压成一句话。
+ *
+ * 真实键名以 `packages/plugin-wiki/src/index.ts` 的 `/versions` 响应为准：
+ * `{ contentChanged, blocksDelta, grantsDelta }`。三个字段的语义：
+ * - `contentChanged === false && blocksDelta === 0 && grantsDelta === 0` ⇒ **没改动**
+ *   （只有标题变了这种情况也走这里 —— 后端明确"比正文不比块快照"）
+ * - `contentChanged === false` 但块/授权有变化 ⇒ **仅权限变更**
+ * - 其余按块数增减给 `+N / −M 段`
+ *
+ * ⚠️ 契约未就绪（`change === null`）或字段缺失时返回 `null`，界面**不显示摘要** ——
+ * 编一个"0 段改动"比不显示更糟（那是在声称一件没根据的事）。
+ */
+export function versionChangeSummary(
+  change: { contentChanged?: boolean; blocksDelta?: number; grantsDelta?: number } | null | undefined,
+): string | null {
+  if (!change || typeof change.contentChanged !== 'boolean') return null
+  const blocks = typeof change.blocksDelta === 'number' ? change.blocksDelta : 0
+  const grants = typeof change.grantsDelta === 'number' ? change.grantsDelta : 0
+  if (!change.contentChanged && blocks === 0 && grants === 0) return '仅标题或权限变更'
+  const parts: string[] = []
+  if (blocks > 0) parts.push(`+${blocks} 段`)
+  else if (blocks < 0) parts.push(`−${Math.abs(blocks)} 段`)
+  if (grants !== 0) parts.push(grants > 0 ? `+${grants} 条授权` : `−${Math.abs(grants)} 条授权`)
+  if (change.contentChanged && parts.length === 0) parts.push('正文已改')
+  return parts.join(' · ')
+}
+
+/* ------------------------------------------------------------------ *
+ * 恢复
+ * ------------------------------------------------------------------ */
+
+/**
+ * 恢复确认框的正文（三行，逐条说清后果）。
+ *
+ * 为什么必须写"会新生成一个版本，不会回到旧编号"：用户对"恢复"的直觉是
+ * "时光倒流"，而实现是**追加一次新版本**。不写清楚，用户会以为历史被抹掉了。
+ */
+export function restoreConfirmBody(
+  target: number,
+  current: number,
+  targetSavedAt: string,
+): string {
+  return [
+    `当前内容（v${current}）会被 v${target}（保存于 ${absoluteTime(targetSavedAt)}）的正文覆盖，并新生成一个版本（不会回到旧编号）。`,
+    `v${target} 的块级权限、页面档位与发布状态会一并回滚；之后仍可再恢复回来。`,
+    `若该版本早于块级权限功能，则只恢复正文，块级权限不动。`,
+  ].join('\n')
+}
+
+/**
+ * 恢复后的提示语。
+ *
+ * ⚠️ 服务端的恢复响应**只回 `restored`（被恢复那一版的 id）与 `acl_revision`，
+ * 不回新版本号** —— 新版本号在重新拉取页面数据后由页头显示。所以这里**不编版本号**，
+ * 只说"已恢复"与"这次没做到的部分"。
+ *
+ * `warnings` 是服务端如实回报的"这次恢复没能做到的事"（例如老快照没有块级权限数据
+ * ⇒ `block_acls_not_restored`）。**必须翻译出来**：只显示"已恢复"而吞掉警告，
+ * 会让用户以为权限也回滚了。
+ */
+export function restoreDoneText(warnings: readonly string[] | undefined): string {
+  if (!warnings || warnings.length === 0) return '已恢复到该版本（正文、块级权限、档位与发布状态均已回滚）'
+  const known: Record<string, string> = {
+    block_acls_not_restored: '该版本早于块级权限功能，块级权限未回滚（只恢复了正文）',
+  }
+  const texts = warnings.map((w) => known[w] ?? `未识别的警告：${w}`)
+  return `已恢复，但注意：${texts.join('；')}`
+}
+
+/** 恢复被拒时，把服务端的 `details.blockedOrdinals` 翻成人话。 */
+export function restoreErrorText(err: { details?: unknown } | null | undefined): string | null {
+  const details = err?.details as { blockedOrdinals?: unknown } | undefined
+  const ordinals = details?.blockedOrdinals
+  if (!Array.isArray(ordinals) || ordinals.length === 0) return null
+  return `该版本含 ${ordinals.length} 个当前你无权查看的段落，无法恢复`
+}
