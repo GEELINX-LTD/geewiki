@@ -33,7 +33,12 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
-    chunkSizeWarningLimit: 800,
+    /*
+      这里曾写 `chunkSizeWarningLimit: 800` —— 那是**掩盖**警告而不是解决问题：
+      当时主包 832 kB（gzip 266 kB），把阈值抬到 800 kB 之后构建不再提示，但匿名读者
+      依然要下载整包。本批把 `@xyflow/react`（依赖图）拆成独立 chunk 后主包明显回落，
+      故删掉这行、恢复 Vite 默认阈值作为**真实告警**（超过就是又一次依赖进错包）。
+    */
   },
   base: '/',
 })

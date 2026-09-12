@@ -30,6 +30,8 @@ export interface ErrorView {
 const API_PATH_RE = /\/api\/[A-Za-z0-9_\-./%:]*/g
 /** 看起来像英文堆栈/内部错误的片段（避免把技术细节糊到用户脸上） */
 const STACKISH_RE = /\b(?:TypeError|ReferenceError|SyntaxError|Error):\s?|at\s+\S+\s+\(|https?:\/\/\S+/g
+/** 中日韩字符（含扩展 A 区、兼容表意文字、假名、谚文）：判断"这段话是不是给中文读者看的" */
+const CJK_RE = /[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/
 const MAX_HINT = 140
 
 /**
@@ -37,21 +39,66 @@ const MAX_HINT = 140
  * 不做"智能改写"（那是臆造），只做**删除明显不该出现的部分**与截断。
  */
 export function cleanHint(raw: unknown): string {
-  if (typeof raw !== 'string') return ''
-  let s = raw.replace(API_PATH_RE, '').replace(STACKISH_RE, '')
-  s = s.replace(/\s{2,}/g, ' ').trim()
-  // 清掉清洗后残留的分隔符噪声，例如 "not_found: " 或 "加载失败: "
-  s = s.replace(/^[\s:：,，-]+/, '').replace(/[\s:：,，-]+$/, '')
-  if (s.length > MAX_HINT) s = `${s.slice(0, MAX_HINT - 1)}…`
+  const s = cleanSummary(raw)
   /*
     最后一道筛：**整段没有任何中日韩字符的解释文本，一律不当提示展示**。
     理由：本产品界面是中文，而"需要展示给用户的解释"必然含中文（我们自己的文案都是中文）；
     反过来，`Failed to fetch`、`Unknown error`、`ECONNREFUSED` 这类**纯技术串**没有中文，
     对用户零信息量，展示它们正是"开发味"。这不是"翻译"（那会臆造），只是**决定不显示**。
     保留含中文的混排（例如 "密钥无效 sk-…"），因为其中的中文部分是有用的。
+
+    ⚠️ 本函数**不负责兜底**：真的一个中文都没有时它返回空串，由调用方决定要不要用
+    {@link hintWithFallback}（`describeError` 就是这么做的 —— 早先没有这一层，
+    于是服务端返回英文/技术串时错误提示只剩一个人话标题，用户与客服都拿不到任何线索）。
   */
-  if (!/[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/.test(s)) return ''
+  if (!CJK_RE.test(s)) return ''
   return s
+}
+
+/**
+ * 清洗（剥 API 路径 / 英文堆栈 + 截断），但**不做中文筛选**。
+ * 与 {@link cleanHint} 的唯一差别就是少了最后那道筛，供兜底文案使用。
+ */
+function cleanSummary(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  let s = raw.replace(API_PATH_RE, '').replace(STACKISH_RE, '')
+  s = s.replace(/\s{2,}/g, ' ').trim()
+  // 清掉清洗后残留的分隔符噪声，例如 "not_found: " 或 "加载失败: "
+  s = s.replace(/^[\s:：,，-]+/, '').replace(/[\s:：,，-]+$/, '')
+  if (s.length > MAX_HINT) s = `${s.slice(0, MAX_HINT - 1)}…`
+  return s
+}
+
+/**
+ * 提示文案的**兜底**：优先给中文（`cleanHint`），没有中文时给 `错误详情：` + 已清洗摘要。
+ *
+ * 为什么需要兜底：`cleanHint` 为空时，错误提示就只剩一个稳定标题（"请求未被接受"），
+ * 用户不知道发生了什么、客服也拿不到可复现的线索 —— 而服务端确实说了点什么。
+ * 这里把**已清洗**（去掉 API 路径与堆栈形态、并按 MAX_HINT 截断）的那句话以
+ * "错误详情：…"的形态交出来：既保住了"界面不出现路径/堆栈"的硬约束，
+ * 又不再让信息凭空消失。可达性判据（`isUnreachable`）与 URL/堆栈清洗的优先级不变。
+ */
+export function hintWithFallback(raw: unknown): string {
+  const cleaned = cleanHint(raw)
+  if (cleaned !== '') return cleaned
+  const summary = cleanSummary(raw)
+  return summary === '' ? '' : `错误详情：${summary}`
+}
+
+/**
+ * **排障用**的原始错误摘要 —— 只给 console 与 `data-*` 属性用，**绝不进界面文案**。
+ *
+ * 为什么需要它：有些失败（插件界面 bundle 加载失败）的原始串是唯一可用的线索
+ * （"Failed to fetch dynamically imported module: …"），丢掉它，排障就只能靠猜。
+ * 但它**不能**被渲染 —— 那正是 `cleanHint` 要拦的"开发味"。故这里把两种用途分开：
+ * 给人看的走 {@link describeError} / {@link errorLine} / {@link cleanHint}，
+ * 给排障看的走这里，并且调用点必须保证它只落在 console 或 `data-*` 上
+ * （守卫见 `test/areaState.test.ts`：界面代码不得把原始错误串转成显示文本）。
+ */
+export function errorDetail(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (typeof err === 'string') return err
+  return String(err)
 }
 
 function isUnreachable(err: unknown): boolean {
@@ -67,6 +114,11 @@ function isUnreachable(err: unknown): boolean {
  *
  * 分支顺序即优先级：**连不上服务**先判（它是环境问题，比业务状态更该先说），
  * 然后才是 HTTP 语义。
+ *
+ * 提示的兜底判据（本批 T6）：**只有"本来会剩空 hint"的分支**才走 {@link hintWithFallback}
+ * （404 / 通用 4xx / 未知 —— 它们此前会在服务端给英文串时退化成"只剩一个标题"）。
+ * 5xx、401、403 已经各自带一句稳定的中文下一步（"请稍后重试。""登录后才能继续。"…），
+ * 那不是"只剩标题"，用兜底反而不如这句中文有用，故保持原样。
  */
 export function describeError(err: unknown): ErrorView {
   if (isUnreachable(err)) {
@@ -82,7 +134,7 @@ export function describeError(err: unknown): ErrorView {
       return {
         kind: 'notFound',
         title: '内容不存在或已被删除',
-        hint: cleanHint(err.message),
+        hint: hintWithFallback(err.message),
         retryable: true,
       }
     }
@@ -125,7 +177,7 @@ export function describeError(err: unknown): ErrorView {
       return {
         kind: 'client',
         title: '请求未被接受',
-        hint: cleanHint(err.message),
+        hint: hintWithFallback(err.message),
         // 参数/校验类错误：重试同样的请求不会成功，不该给"重试"按钮误导用户
         retryable: false,
       }
@@ -134,7 +186,7 @@ export function describeError(err: unknown): ErrorView {
   return {
     kind: 'unknown',
     title: '出了点问题',
-    hint: cleanHint(err instanceof Error ? err.message : err) || '请重试。',
+    hint: hintWithFallback(err instanceof Error ? err.message : err) || '请重试。',
     retryable: true,
   }
 }

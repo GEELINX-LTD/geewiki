@@ -1,4 +1,11 @@
 import { Component, useSyncExternalStore, type ComponentType, type ReactNode } from 'react'
+/*
+  ⚠️ 这里与 `pluginUi.ts` 是**双向 import**（那边要 `registerSlotByName`），刻意接受：
+  两边的引用都只发生在**函数体内**（本文件只在渲染时读失败清单，那边只在加载完成时注册插槽），
+  而 `pluginUiFailed` / `subscribePluginUiState` 都是函数声明（提升），故模块求值顺序无关、
+  不存在 TDZ 风险。拆成第三个模块只会把"失败记录"这份状态的所有权切碎。
+*/
+import { pluginUiFailed, subscribePluginUiState } from './pluginUi'
 
 /**
  * 前端插槽注册表：插件通过宿主 SDK 把 UI 组件注册到命名插槽，宿主在固定位置渲染 `<SlotOutlet>`。
@@ -209,8 +216,27 @@ export function SlotOutlet({ name }: { name: SlotName }): ReactNode {
     () => entriesOf(name),
     () => EMPTY,
   )
+  /*
+    插件界面**加载期**失败的可见提示（本批 T4）。
+    为什么必须在这里渲染：失败发生在 `loadPluginUi` 的 import 阶段 —— 那时**没有任何插槽注册**，
+    所以这一块此前是彻底沉默的：用户只看到"某个功能不见了"（页脚少一块、编辑器退回纯文本），
+    既不知道原因也不知道下一步。`pluginUiFailed()` 是引用稳定的快照，配合同一个 store 的订阅，
+    失败一发生这里就会重渲染。
+    文案刻意给出**可执行的下一步**（去插件管理检查），而不是只说"加载失败"。
+  */
+  const failures = useSyncExternalStore(subscribePluginUiState, pluginUiFailed, pluginUiFailed)
   return (
     <div className="slot-outlet" data-slot={name} data-count={entries.length}>
+      {failures.map((f) => (
+        /*
+          `data-*` 上带排障摘要（与上面错误边界的 `data-error` 同一形态），**不放进可见文案**：
+          原始串可能是英文/含路径，`lib/errorText.ts` 的 `cleanHint` 之所以拦掉它们，
+          就是为了不让界面出现这种文本。用户看到的是下一行的固定中文句子。
+        */
+        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
+          {`插件界面「${f.name}」加载失败，相关功能在本页不可用。作者可能漏发产物，请在插件管理中检查。`}
+        </p>
+      ))}
       {entries.map((entry, index) => {
         // 零属性出口：这里只渲染 app-header / app-footer 这类零属性插槽，
         // 但注册表内部存的是联合类型，故收窄一次（editor 走 EditorSlotOutlet）。

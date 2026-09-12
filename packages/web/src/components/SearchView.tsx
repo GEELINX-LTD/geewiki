@@ -7,12 +7,17 @@
  * - 空/超长查询本地先拦一次并给明确提示，同时仍容忍后端 400；
  * - 检索插件未启用时端点 404 → 不报 error，只在结果区给出"未启用"提示。
  */
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ApiError, api, type SearchResponse } from '../api'
 import { checkQuery, scoreBadges, snippetToHtml } from '../lib/searchPlan'
 import { SearchX } from 'lucide-react'
 import { describeError, errorLine } from '../lib/errorText'
 import { Button, EmptyState, ErrorState } from '../ui'
+
+/** 首屏条数（与后端默认一致）、每次「加载更多」的增量、以及后端 `MAX_LIMIT`（超过会被判 invalid_limit） */
+const PAGE_FIRST = 20
+const PAGE_STEP = 40
+const PAGE_MAX = 100
 
 function fmtTime(iso: string): string {
   const d = new Date(iso)
@@ -34,6 +39,17 @@ export function SearchView(props: {
   /** 重试信号：查询串本身没变，靠它让下面的 effect 重新跑一次（比手动调函数更可靠，
    *  因为校验、清错、busy 全在那条路径上） */
   const [retryNonce, setRetryNonce] = useState(0)
+  /**
+   * 本轮查询请求的条数上限（初始 = 后端默认 20）。
+   *
+   * 服务端一次最多给 100 条（`packages/plugin-search/src/index.ts` 的 MAX_LIMIT），
+   * 所以这里按 20 → 60 → 100 递增，**不做真正的翻页**：后端按相关度整体排序，
+   * offset 分页在"边搜边改"的场景下会让用户看到重复/漏掉的条目，而 100 条以内
+   * 直接放大 limit 更简单也更可预期。
+   */
+  const [limit, setLimit] = useState(PAGE_FIRST)
+  /** 上一次发起取数的查询串：用来识别"查询变了 ⇒ limit 必须复位"，见下面的 effect */
+  const lastQuery = useRef<string | null>(null)
 
   useEffect(() => {
     setInput(query)
@@ -43,11 +59,24 @@ export function SearchView(props: {
       setData(null)
       return
     }
+    /*
+      查询串变了 ⇒ **分页复位到首屏**（否则新关键词会直接带着上一轮的 limit 去取，
+      首屏就变成"已显示 100 / N"，既慢又把"这只是第一屏"这件事藏了起来）。
+      实现上提前 return 一次、由 `setLimit` 触发本 effect 再跑一遍：这样同一轮里
+      只会发**一次**请求（若在这里直接继续，旧 limit 与新 limit 两次请求会并发，
+      先到的那次可能覆盖后到的）。
+    */
+    if (lastQuery.current !== query && limit !== PAGE_FIRST) {
+      lastQuery.current = query
+      setLimit(PAGE_FIRST)
+      return
+    }
+    lastQuery.current = query
     setErr('')
     setErrValue(null)
     setBusy(true)
     api
-      .search(checked.value)
+      .search(checked.value, limit)
       .then((r) => setData(r))
       .catch((e: unknown) => {
         setData(null)
@@ -69,7 +98,7 @@ export function SearchView(props: {
         }
       })
       .finally(() => setBusy(false))
-  }, [query, retryNonce])
+  }, [query, retryNonce, limit])
 
   const submit = (): void => {
     const checked = checkQuery(input)
@@ -137,7 +166,7 @@ export function SearchView(props: {
             <EmptyState
               icon={<SearchX className="size-8" />}
               title={`没有找到与「${data.query}」相关的内容`}
-              hint="换个关键词试试，或者先把这个主题写进知识库。"
+              hint="换个关键词，或缩短到 2–4 个字试试短查询兜底。也可以先把这个主题写进知识库。"
               action={
                 onSearch !== undefined ? (
                   <Button variant="secondary" size="sm" onClick={() => onSearch('')}>
@@ -154,9 +183,25 @@ export function SearchView(props: {
                   return (
                     <li key={hit.slug} className="search-hit">
                       <div className="search-hit-head">
-                        <button className="search-hit-title" onClick={() => onOpen(hit.slug)} title={`打开 ${hit.slug}`}>
+                        {/*
+                          结果是**真链接**（`<a href="#/wiki/<slug>">`）而不是 `<button onClick>`：
+                          按钮无法中键新开、无法右键复制链接、也无法被读屏当链接播报。
+                          普通左键点击仍走宿主路由（`onOpen`）——`preventDefault` 只拦这一种，
+                          带修饰键的点击（⌘/Ctrl/Shift）与中键一律放行给浏览器原生行为。
+                          Tab 可达性与焦点环由 `.search-hit-title` 的样式负责（见 styles.css）。
+                        */}
+                        <a
+                          className="search-hit-title"
+                          href={`#/wiki/${encodeURIComponent(hit.slug)}`}
+                          title={`打开 ${hit.slug}`}
+                          onClick={(e) => {
+                            if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+                            e.preventDefault()
+                            onOpen(hit.slug)
+                          }}
+                        >
                           {hit.title}
-                        </button>
+                        </a>
                         <code className="chip">{hit.slug}</code>
                         <span className="muted small">{fmtTime(hit.updated_at)}</span>
                         {badge && (
@@ -174,6 +219,29 @@ export function SearchView(props: {
               </ul>
             </section>
           )}
+
+          {/*
+            分页（本批 T2）：「加载更多」每次 +40、上限 100（后端 MAX_LIMIT）。
+            两种情况各有**不同**的下一步：
+            - 还有更多 ⇒ 给按钮，并把"已显示/总命中"如实写在按钮上；
+            - 已经到 100 条上限 ⇒ 不给按钮（点了也不会更多），改为引导缩小关键词 ——
+              否则用户会以为"结果就这些"，而实际上是上限截断。
+          */}
+          {data.hits.length > 0 &&
+            (data.hits.length < data.total && data.hits.length < PAGE_MAX ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  loading={busy}
+                  onClick={() => setLimit((n) => Math.min(n + PAGE_STEP, PAGE_MAX))}
+                >
+                  {`加载更多（已显示 ${data.hits.length} / ${data.total}）`}
+                </Button>
+              </div>
+            ) : data.hits.length < data.total ? (
+              <p className="notice">{`命中 ${data.total} 条，已达上限 ${PAGE_MAX} 条 —— 请用更具体的关键词缩小范围。`}</p>
+            ) : null)}
         </>
       )}
     </div>

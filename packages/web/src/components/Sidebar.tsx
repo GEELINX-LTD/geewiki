@@ -30,6 +30,8 @@ import { ancestorPaths, buildNavTree, containsSlug, countPages, navLabelOf, type
 import type { PageSummary } from '../api'
 import { cn } from '../ui/cn'
 import { Button } from '../ui/Button'
+import { useAuth } from '../lib/authStore'
+import { NewPageAction, newPageEntry } from '../lib/newPageGate'
 import { Dialog, DialogContent } from '../ui/Dialog'
 import { EmptyState } from '../ui/EmptyState'
 import { Skeleton } from '../ui/Skeleton'
@@ -162,6 +164,14 @@ function SidebarBody(props: SidebarProps & { closeOnNavigate?: boolean }): React
   const { pages, error, activeSlug, onOpen } = props
   const tree = useMemo(() => buildNavTree(pages ?? []), [pages])
   const total = useMemo(() => countPages(tree), [tree])
+  /*
+   * 空态里的「新建页面」也必须过门控（本批 G1）：侧栏此前是无条件可点的，
+   * 匿名点进去会拿到完整编辑器、填完一屏、保存才 401 —— 与列表页当初那个缺陷同形。
+   * 判据与列表页/路由**同一来源**（`lib/newPageGate.tsx`），不在这里自己写一套。
+   * `useAuth()` 必须在任何 early return 之前调用（hook 顺序不能随分支改变，React #310）。
+   */
+  const auth = useAuth()
+  const newEntry = newPageEntry(auth.user, auth.capabilities)
 
   // 展开态：默认展开当前页的祖先链；用户手动开合后以用户为准
   const [manual, setManual] = useState<ReadonlySet<string>>(new Set())
@@ -223,9 +233,7 @@ function SidebarBody(props: SidebarProps & { closeOnNavigate?: boolean }): React
         title="还没有页面"
         hint="创建第一个页面后，它会出现在这里。"
         action={
-          <Button size="sm" variant="primary" onClick={() => props.onNavigate('new')}>
-            新建页面
-          </Button>
+          <NewPageAction entry={newEntry} onNew={() => props.onNavigate('new')} size="sm" />
         }
       />
     )

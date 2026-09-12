@@ -2,8 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { parseWikiRoute } from '../lib/wikiRoute'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
-import { ChevronLeft, ChevronRight, FileText, History, MessageSquareText, Pencil, Plus, RefreshCw, RotateCcw, Save, Search, SearchX, Trash2 } from 'lucide-react'
-import { api, type PageDetail, type PageSummary } from '../api'
+import { ChevronLeft, ChevronRight, FileText, History, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
+import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary } from '../api'
+import { ApplyAccessDialog } from '../components/access/ApplyAccessDialog'
+import { PageAccessPanel } from '../components/access/PageAccessPanel'
+import { refreshCapabilitiesIfVisible, useAuth } from '../lib/authStore'
+import {
+  NewPageAction,
+  loginForEditPage,
+  loginForNewPage,
+  newPageEntry,
+  type NewPageEntry,
+} from '../lib/newPageGate'
 import { AskPanel } from '../components/AskPanel'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
@@ -47,6 +57,7 @@ import {
   intermediateCrumbCount,
   neighborsOf,
 } from '../lib/navTree'
+import { attachmentMarkdown } from '../lib/attachmentPlan'
 import { describeError, errorLine } from '../lib/errorText'
 import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
@@ -61,6 +72,7 @@ import {
   Card,
   CardBody,
   CardHeader,
+  ConfirmDialog,
   Dialog,
   DialogClose,
   DialogContent,
@@ -70,6 +82,7 @@ import {
   LoadingState,
   Skeleton,
   SkeletonTable,
+  useConfirm,
 } from '../ui'
 import { cn } from '../ui/cn'
 
@@ -97,6 +110,15 @@ const PREVIEW_AUDIENCES: ReadonlyArray<{ id: PreviewAudience; label: string; hin
 /** 草稿写入 localStorage 的防抖时长：比预览更长——写盘是"防丢失"，不必跟手 */
 const DRAFT_DEBOUNCE_MS = 900
 
+/* ===================== 写入口的门控（R11 建立，G1 补齐侧栏与编辑路由） ===================== */
+
+/*
+ * 三态判据（`newPageEntry`）与按钮实现（`NewPageAction`）都抽到 `lib/newPageGate.tsx` ——
+ * **列表页页头、列表页空态、侧栏空态（含窄屏抽屉）、两个路由兜底（`#/wiki/new` 与
+ * `#/wiki/<slug>/edit`）共用同一份**。放在一处是因为分散判定必然漂移：侧栏空态那个
+ * 按钮就曾是漏网的一处（匿名点进去照样拿到完整编辑器，填完一屏、保存才 401）。
+ */
+
 /** hash 段里的查询串解码（用户可能在地址栏手输，容错返回原文） */
 /**
  * Wiki 页：sub 为 hash 中 'wiki/' 之后的子路径。
@@ -113,11 +135,19 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
   const activeSlug =
     route.kind === 'detail' ? route.slug : route.kind === 'edit' ? route.slug : null
   const pages = usePages()
+  /*
+   * 登录态与能力（本批 R11）：`useAuth()` 必须在**任何 early return 之前**调用
+   * （hook 顺序不能随分支改变，否则 React 抛 #310）。
+   */
+  const auth = useAuth()
+  /** 「新建页面」的入口门控（见 `newPageEntry`）：列表页按钮与 `#/wiki/new` 路由共用同一判据 */
+  const newEntry = newPageEntry(auth.user, auth.capabilities)
 
   if (route.kind === 'list') {
     return (
       <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
         <WikiList
+          newEntry={newEntry}
           onOpen={(slug) => onNavigate(slug)}
           onNew={() => onNavigate('new')}
           onSearch={(q) => onNavigate(`search/${encodeURIComponent(q)}`)}
@@ -154,6 +184,46 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
     )
   }
   if (route.kind === 'new') {
+    /*
+     * 路由级门控（本批 R11）—— 这一道才是真正的兜底：列表页按钮、侧栏空态按钮、
+     * 命令面板、别人贴过来的 `#/wiki/new` 链接都汇到这里。没有它，匿名用户（以及
+     * 没有编辑权的 viewer）会拿到一个**完整可用**的编辑器，填完点保存才被 401/403
+     * 弹走。这里不给编辑器挂"禁用"状态，而是根本不渲染它 —— 半禁用的编辑器仍然会
+     * 让人以为"再试试就能保存"。
+     */
+    if (newEntry.kind !== 'ready') {
+      const needLogin = newEntry.kind === 'login'
+      return (
+        <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+          <div className="page">
+            <div className="page-head">
+              <h1>新建页面</h1>
+            </div>
+            <EmptyState
+              icon={needLogin ? <LogIn className="size-8" /> : <ShieldCheck className="size-8" />}
+              title={needLogin ? '新建页面需要先登录' : '你暂时不能新建页面'}
+              hint={
+                needLogin
+                  ? '匿名访客可以浏览知识库，但保存新页面需要一个账号。去登录，登录成功后会自动回到这个新建页 —— 现在写的内容还不会丢在编辑器里。'
+                  : newEntry.reason
+              }
+              action={
+                <div className="flex flex-wrap items-center gap-2">
+                  {needLogin && (
+                    <Button variant="primary" icon={<LogIn className="size-3.5" />} onClick={loginForNewPage}>
+                      去登录
+                    </Button>
+                  )}
+                  <Button variant="secondary" onClick={() => onNavigate('')}>
+                    返回列表
+                  </Button>
+                </div>
+              }
+            />
+          </div>
+        </WikiShell>
+      )
+    }
     return (
       <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
         <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('')} />
@@ -170,6 +240,52 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
           onDeleted={() => onNavigate('')}
           onNavigate={onNavigate}
         />
+      </WikiShell>
+    )
+  }
+  /*
+   * 路由级门控（G1，与 `#/wiki/new` **同一道门、同一判据**）：`route.kind === 'edit'`
+   * 此前对匿名（以及无编辑权的角色）同样会渲染出**完整可用**的编辑器 —— 填完一屏、
+   * 点保存才被 401/403 弹走。这里直接不渲染编辑器，而不是给它挂"禁用"：
+   * 半禁用的编辑器仍会让人以为"再试试就能保存"。
+   *
+   * 与 `new` 的两点差别仅在文案：动作名是"编辑"，"返回"回本页详情（而不是回列表）。
+   */
+  const editEntry = newPageEntry(auth.user, auth.capabilities, 'edit')
+  if (editEntry.kind !== 'ready') {
+    const needLogin = editEntry.kind === 'login'
+    return (
+      <WikiShell activeSlug={activeSlug} pages={pages} onNavigate={onNavigate}>
+        <div className="page">
+          <div className="page-head">
+            <h1>编辑页面</h1>
+          </div>
+          <EmptyState
+            icon={needLogin ? <LogIn className="size-8" /> : <ShieldCheck className="size-8" />}
+            title={needLogin ? '编辑页面需要先登录' : '你暂时不能编辑这个页面'}
+            hint={
+              needLogin
+                ? '匿名访客可以浏览知识库，但保存改动需要一个账号。去登录，登录成功后会自动回到这个编辑页 —— 现在写的内容还不会丢在编辑器里。'
+                : editEntry.reason
+            }
+            action={
+              <div className="flex flex-wrap items-center gap-2">
+                {needLogin && (
+                  <Button
+                    variant="primary"
+                    icon={<LogIn className="size-3.5" />}
+                    onClick={() => loginForEditPage(route.slug)}
+                  >
+                    去登录
+                  </Button>
+                )}
+                <Button variant="secondary" onClick={() => onNavigate(route.slug)}>
+                  返回页面
+                </Button>
+              </div>
+            }
+          />
+        </div>
       </WikiShell>
     )
   }
@@ -225,12 +341,14 @@ function WikiShell(props: {
 /* ============================ 列表 ============================ */
 
 function WikiList(props: {
+  /** 「新建页面」入口的门控结果（由 `WikiPage` 统一算好，本组件不再自己判一遍） */
+  newEntry: NewPageEntry
   onOpen: (slug: string) => void
   onNew: () => void
   onSearch: (q: string) => void
   onAsk: (q: string) => void
 }): ReactNode {
-  const { onOpen, onNew, onSearch, onAsk } = props
+  const { newEntry, onOpen, onNew, onSearch, onAsk } = props
   // 列表数据来自共享 store（与侧边栏、详情页的上一篇/下一篇同源）
   const pagesState = usePages()
   const pages = pagesState.pages
@@ -287,6 +405,12 @@ function WikiList(props: {
       .catch((e: unknown) => {
         // 列表本身失败：不阻塞页面，入口按"不可用"处理（用户仍能正常读写页面）
         console.debug('[geewiki-wiki] 插件列表不可用，隐藏检索/问答入口：', e instanceof Error ? e.message : e)
+        /*
+          日志还不够（本批 T4）：入口消失是**用户可见的变化** —— 检索框变灰、问答按钮没了，
+          而此前界面上一个字都不说，用户只会以为"这版没有这个功能"或"我的权限没了"。
+          这里复用既有的 `queryNotice` 提示位（就在入口那一行里，不是弹窗）说明原因。
+        */
+        setQueryNotice('检索/问答插件当前不可用（插件列表读取失败），入口已隐藏')
         setSearchReady(false)
         setAiReady(false)
       })
@@ -351,9 +475,8 @@ function WikiList(props: {
           <Button icon={<RefreshCw className="size-3.5" />} onClick={load}>
             刷新
           </Button>
-          <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={onNew}>
-            新建页面
-          </Button>
+          {/* 新建入口按登录态/能力三态渲染（本批 R11）：匿名时它是"去登录"的入口 */}
+          <NewPageAction entry={newEntry} onNew={onNew} />
         </div>
       </div>
 
@@ -388,18 +511,32 @@ function WikiList(props: {
         </form>
 
         {aiReady === true && (
-          <Button
-            icon={<MessageSquareText className="size-3.5" />}
-            onClick={() => onAsk('')}
-            title={
-              modelReady === false
-                ? '未配置模型密钥：问答将以检索结果与抽取式摘要形式提供'
-                : '基于知识库检索的问答'
-            }
-          >
-            AI 问答
-            {modelReady === false && <span className="text-xs text-muted">（无模型）</span>}
-          </Button>
+          <>
+            <Button
+              icon={<MessageSquareText className="size-3.5" />}
+              onClick={() => onAsk('')}
+              title={
+                modelReady === false
+                  ? '未配置模型密钥：问答将以检索结果与抽取式摘要形式提供'
+                  : '基于知识库检索的问答'
+              }
+            >
+              AI 问答
+              {modelReady === false && <span className="text-xs text-muted">（无模型）</span>}
+            </Button>
+            {/*
+              降级原因必须**可见**（本批 T4）。此前它只挂在 `title` 上 —— 触屏用户没有 hover、
+              读屏用户也不会把 title 当作控件的说明读出来，于是"为什么回答看起来不像模型答的"
+              这件事只对鼠标用户可见。
+              用 `role="status"` 播报（降级不是错误，`.notice.err` 那种红条会过度惊吓），
+              `title` 保留作补充说明。
+            */}
+            {modelReady === false && (
+              <span className="text-note text-warn-ink" role="status">
+                未配置模型密钥：将以检索结果与抽取式摘要作答
+              </span>
+            )}
+          </>
         )}
         {aiReady === false && (
           <span
@@ -497,9 +634,8 @@ function WikiList(props: {
             title="还没有任何页面"
             hint="知识库是空的。创建第一个页面来记录团队知识——保存后会自动生成版本历史，随时可以回溯。"
             action={
-              <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={onNew}>
-                新建页面
-              </Button>
+              /* 空态里的新建入口与页头用**同一个**动作组件（同一份门控，不会一处理一处漏） */
+              <NewPageAction entry={newEntry} onNew={onNew} />
             }
           />
         ) : filtered.length === 0 ? (
@@ -525,7 +661,14 @@ function WikiList(props: {
               aria-label="知识库页面列表"
               className="w-full border-collapse text-sm"
             >
-              <thead>
+              {/*
+                粘性表头：长列表滚到下面时仍能看到列名（`.page` 里没有纵向滚动容器，
+                故这里相对视口吸附）。`top` 用 `--spacing-header`（顶栏高度）—— 粘在顶栏下方
+                而不是被顶栏盖住。
+                ⚠️ `bg-surface` 必须显式给：粘性单元格默认背景透明，滚动时下面的行会**穿透**
+                表头文字（这是最容易漏的一步，视觉上表现为字叠字）。
+              */}
+              <thead className="sticky top-[var(--spacing-header)] z-10 bg-surface">
                 <tr>
                   {['标题', '页面标识', '版本', '最近更新'].map((h) => (
                     <th
@@ -727,6 +870,18 @@ function WikiDetail(props: {
   */
   const [loadError, setLoadError] = useState<unknown>(null)
   const [notice, setNotice] = useState('')
+  // ══════════ M1：权限治理弹窗（独立代码块，可整段摘除） ══════════
+  /**
+   * 详情页的「权限…」入口。面板本体与 `#/access/<slug>` 治理台**共用同一个组件**
+   * （`PageAccessPanel`）—— 两处各写一份必然漂移，而漂移的后果是权限被改错。
+   *
+   * 状态放在这里（而不是让面板自己带触发器）是为了让 `Dialog` 成为受控组件：
+   * 关闭后 Radix 会卸载内容，面板随之下车，下次打开时重新取数（不会看到过期的档位）。
+   */
+  const [accessOpen, setAccessOpen] = useState(false)
+  /** 只用来判「登录了没」（申请入口对匿名不显示）；**能力判据仍以 page.capabilities 为准** */
+  const auth = useAuth()
+  // ══════════════════════════════════════════════════════════════
   /*
    * 同级页面列表（用于"上一篇/下一篇"）：来自**共享 store**，不再是本组件自己的请求。
    *
@@ -771,6 +926,12 @@ function WikiDetail(props: {
   } | null>(null)
   const [restoring, setRestoring] = useState(false)
   const anchor = useHashAnchor()
+  /*
+   * 危险操作（删除页面 / 恢复历史版本）走统一的确认框：请求先进 state，
+   * 真正的 api 调用留在 `onConfirm` 里 —— "先确认、后执行"的先后顺序
+   * 在源码里也是这么排的。⚠️ 必须在下面的任何 early return 之前（React #310）。
+   */
+  const { request, confirm, close } = useConfirm()
 
   // 详情页标题需要页面数据（异步）：拿到后覆盖 App 设的路由级基线标题
   useDocumentTitle(titleForRoute(route, page?.title ?? null))
@@ -819,7 +980,12 @@ function WikiDetail(props: {
         : new Map(pagesState.pages.map((p) => [p.slug, p.title] as const)),
     [pagesState.pages],
   )
-  const rendered = useRenderedMarkdown(bodyMarkdown, { route, pages: pageTitles })
+  const rendered = useRenderedMarkdown(bodyMarkdown, {
+    route,
+    pages: pageTitles,
+    // 附件破图占位里的「申请访问」按**页面**提交（附件没有独立申请端点）
+    attachmentSlug: slug,
+  })
   const tocIds = useMemo(() => rendered.toc.map((t) => t.id), [rendered.toc])
   const activeId = useActiveHeading(tocIds)
 
@@ -838,15 +1004,36 @@ function WikiDetail(props: {
   }, [anchor, rendered.html])
 
   const remove = (): void => {
-    if (!window.confirm(`确定删除页面「${page?.title ?? slug}」？版本历史将一并清除。`)) return
-    api
-      .deletePage(slug)
-      .then(() => {
-        // 列表/侧边栏必须立刻反映删除（否则会出现"点得到但打不开"的幽灵条目）
-        void invalidatePages()
-        onDeleted()
-      })
-      .catch((e: unknown) => setErr(errorLine(e)))
+    /*
+     * 删除是**不可恢复**的，所以确认框里必须说清"会连带清掉多少个历史快照" ——
+     * 这正是原生 `window.confirm` 表达不了的信息。
+     *
+     * 版本数语义已核对（`packages/plugin-wiki/src/index.ts`）：`version = COUNT(page_versions) + 1`，
+     * 即当前版本号；故历史快照数 = `version - 1`（不是 `versions.length` —— 那个数组有 LIMIT，
+     * 且受限主体拿到的是空数组）。
+     */
+    const historyCount = page === null ? 0 : page.version - 1
+    confirm({
+      title: `删除页面「${page?.title ?? slug}」？`,
+      body: `该页面与其全部版本历史（共 ${historyCount} 条）将被永久清除，无法恢复。`,
+      confirmLabel: '删除页面',
+      danger: true,
+      onConfirm: () =>
+        api
+          .deletePage(slug)
+          .then(() => {
+            // 列表/侧边栏必须立刻反映删除（否则会出现"点得到但打不开"的幽灵条目）
+            void invalidatePages()
+            /*
+              写操作之后**顺带重取一次能力**（本批 T5）：角色/权限可能刚被改过（自己删了页、
+              或管理员在别的标签页降了你的档），而旧入口残留会让用户"点得动、点了必然失败"。
+              完整理由见 `lib/authStore.ts` 的 `refreshCapabilitiesIfVisible`。
+            */
+            void refreshCapabilitiesIfVisible()
+            onDeleted()
+          })
+          .catch((e: unknown) => setErr(errorLine(e))),
+    })
   }
 
   const showVersion = (id: number, savedAt: string, label: number): void => {
@@ -855,23 +1042,55 @@ function WikiDetail(props: {
     api
       .version(slug, id)
       .then((v) => setVersionContent({ id, saved_at: v.saved_at, content: v.content, label }))
-      .catch((e: unknown) => setErr(errorLine(e)))
+      .catch((e: unknown) => {
+        /*
+         * 404 在这里有**两种**成因，而服务端**刻意不区分**它们
+         * （`packages/plugin-wiki/src/index.ts`：快照端点既在 `!access.canEdit` 时 404，
+         * 也在 `版本不存在: <id>` 时 404 —— 与读路径一样防"这条存不存在"的探测）。
+         *
+         * 所以文案**不能**断言其中一种：断言"没有权限"会把"版本真的没了/页面被删了"
+         * 说成权限问题（用户跑了半天要权限，其实该刷新或换一条快照）；断言"版本不存在"
+         * 则反过来把权限问题说成数据问题（用户会去怀疑数据损坏）。
+         * 两种可能都要说，并给出**可执行**的下一步：先刷新重试，仍失败再找管理员确认权限。
+         * 顺带一提，这个按钮只在 `page.capabilities.canEdit` 为真时渲染，因此"版本已不存在"
+         * 的可能性并不比"没有权限"低。
+         */
+        setErr(
+          e instanceof ApiError && e.status === 404
+            ? '无法查看该历史版本：可能你没有查看历史快照的权限，或该版本已不存在 —— 刷新后重试，仍失败请向管理员确认权限。'
+            : errorLine(e),
+        )
+      })
   }
 
   const restore = (): void => {
     if (!versionContent || !page) return
-    if (!window.confirm(`将 v${versionContent.label} 的内容保存为最新版本？当前正文将先写入历史。`)) return
-    setRestoring(true)
-    api
-      .savePage(slug, { title: page.title, content: versionContent.content })
-      .then((r) => {
-        setNotice(`已恢复 v${versionContent.label} 内容（当前 v${r.version}）`)
-        setVersionContent(null)
-        load()
-        void invalidatePages() // 版本变了 ⇒ 列表里的"版本"列与排序都要更新
-      })
-      .catch((e: unknown) => setErr(errorLine(e)))
-      .finally(() => setRestoring(false))
+    /*
+     * 恢复是"用旧内容覆盖当前内容"，而确认框会盖住页面 —— 用户看不见自己选的是哪一版。
+     * 故标题/正文都带上版本号与快照时间（同批的删除页面那处已带标题，本批 R6 对齐）。
+     */
+    confirm({
+      title: `恢复到 v${versionContent.label}？`,
+      body:
+        `当前内容（v${page.version}）会被 v${versionContent.label}（保存于 ` +
+        `${fmtTime(versionContent.saved_at)}）覆盖，并生成一个新版本。`,
+      confirmLabel: '恢复此版本',
+      danger: false,
+      onConfirm: () => {
+        setRestoring(true)
+        return api
+          .savePage(slug, { title: page.title, content: versionContent.content })
+          .then((r) => {
+            setNotice(`已恢复 v${versionContent.label} 内容（当前 v${r.version}）`)
+            setVersionContent(null)
+            load()
+            void invalidatePages() // 版本变了 ⇒ 列表里的"版本"列与排序都要更新
+            void refreshCapabilitiesIfVisible() // 写操作后能力可能已变（见 remove() 的说明）
+          })
+          .catch((e: unknown) => setErr(errorLine(e)))
+          .finally(() => setRestoring(false))
+      },
+    })
   }
 
   /*
@@ -897,12 +1116,25 @@ function WikiDetail(props: {
       return (
         <div className="flex flex-col gap-3.5">
           {crumbs}
+          {/*
+            ══════ M3：访问申请入口（独立代码块，可整段摘除） ══════
+            为什么挂在这里：读路径对「不存在」与「无权访问」一律 404（防存在性探测），
+            所以这里是"用户明确知道 slug、却读不到"的唯一落点。文案必须**坦诚无法区分**
+            —— 写"你没有权限，请申请"就是把"不存在"说成了"无权"（服务端刻意不给这个信息，
+            前端不许猜）。匿名不显示申请入口：该端点要求已登录（401）。
+          */}
           <EmptyState
             icon={<FileText className="size-8" />}
-            title="页面不存在"
-            hint="它可能已被删除，或者链接里的标识有误。"
-            action={<Button onClick={() => onNavigate('list')}>返回列表</Button>}
+            title="页面不存在，或你没有访问权限"
+            hint="服务端对「不存在」与「无权访问」返回同一结果，所以这里无法区分。若你确认它存在，可以提交一次访问申请。"
+            action={
+              <>
+                <Button onClick={() => onNavigate('list')}>返回列表</Button>
+                {auth.user !== null && <ApplyAccessDialog slug={slug} />}
+              </>
+            }
           />
+          {/* ══════════════════════════════════════════════════════ */}
         </div>
       )
     }
@@ -974,6 +1206,7 @@ function WikiDetail(props: {
         stripDuplicateLeadingTitle(versionContent.content, page.title),
         route,
         pageTitles,
+        slug,
       )
     : ''
 
@@ -1003,6 +1236,23 @@ function WikiDetail(props: {
             这里隐藏只是体验，安全判定在服务端（写路径另有强制）—— 把隐藏当判定
             是本设计通篇点名的反模式。
           */}
+          {/* ══════ M1：权限治理入口（独立代码块，可整段摘除） ══════ */}
+          {/*
+            门控 `canManageVisibility`（**不是** canEdit）：能编辑不等于能改"谁能看"，
+            两者是服务端下发的两个字段。无权限时**不渲染**（不是置灰 —— 置灰本身
+            就在暗示"这里有个你够不着的能力"）。
+          */}
+          {page.capabilities.canManageVisibility && (
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<ShieldCheck className="size-3.5" />}
+              onClick={() => setAccessOpen(true)}
+            >
+              权限…
+            </Button>
+          )}
+          {/* ══════════════════════════════════════════════════════ */}
           {page.capabilities.canDelete && (
             <Button
               variant="danger"
@@ -1061,9 +1311,29 @@ function WikiDetail(props: {
             <CardHeader
               title="版本历史"
               description={
-                page.versions.length === 0
-                  ? '暂无历史版本 —— 每次保存正文变化都会在此留档'
-                  : `当前为 v${page.version}（上方正文）；以下是 ${page.versions.length} 个历史快照，查看快照不会改动当前内容`
+                page.versions.length === 0 ? (
+                  '暂无历史版本 —— 每次保存正文变化都会在此留档'
+                ) : (
+                  <>
+                    {/*
+                      两个数字的**口径必须分开说**（本批 T1）：
+                      · `page.version` 是当前版本号，后端语义为「历史快照总数 + 1」
+                        （`packages/plugin-wiki/src/index.ts` 的 `Number(totalVersions.n) + 1`）；
+                      · `page.versions.length` 只是**已列出的最近若干条**，受 `recentVersions`
+                        配置限制（默认 10）。
+                      旧文案把后者写成"共 N 个历史快照"，历史上限一被截断就自相矛盾
+                      （明明存过 30 次，却说"以下是 10 个快照"）。
+                    */}
+                    {`当前为 v${page.version}（最新）；共 ${page.version - 1} 个历史快照，下面显示最近 ${page.versions.length} 个`}
+                    {page.version - 1 > page.versions.length ? '（更早的未列出）' : ''}
+                    {'。'}
+                    {page.capabilities.canEdit ? (
+                      '查看快照不会改动当前内容'
+                    ) : (
+                      <span className="text-muted">需编辑权限才能查看快照内容</span>
+                    )}
+                  </>
+                )
               }
               actions={<History className="size-4 text-muted" aria-hidden="true" />}
             />
@@ -1076,7 +1346,16 @@ function WikiDetail(props: {
                 >
                   <thead>
                     <tr>
-                      {['版本', '保存时间', '操作'].map((h) => (
+                      {/*
+                        「操作」列只在 `canEdit` 时存在。无编辑权的人点"查看内容"必然失败
+                        （历史正文端点要求编辑权）—— 与其给一个点了就报错的入口，
+                        不如不显示这一列；提示改在 CardHeader 的说明里给（见上）。
+                        表头与单元格必须用**同一个判据**同步隐藏，否则列会错位。
+                      */}
+                      {(page.capabilities.canEdit
+                        ? ['版本', '保存时间', '操作']
+                        : ['版本', '保存时间']
+                      ).map((h) => (
                         <th
                           key={h}
                           scope="col"
@@ -1099,28 +1378,30 @@ function WikiDetail(props: {
                           <td className="border-b border-line px-4 py-2.5 align-top text-muted">
                             {fmtTime(v.saved_at)}
                           </td>
-                          <td className="border-b border-line px-4 py-2.5 align-top">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => showVersion(v.id, v.saved_at, label)}
-                                aria-expanded={selected}
-                              >
-                                {selected ? '收起内容' : '查看内容'}
-                              </Button>
-                              {selected && (
+                          {page.capabilities.canEdit && (
+                            <td className="border-b border-line px-4 py-2.5 align-top">
+                              <div className="flex flex-wrap items-center gap-2">
                                 <Button
                                   size="sm"
-                                  loading={restoring}
-                                  icon={<RotateCcw className="size-3.5" />}
-                                  onClick={restore}
+                                  variant="ghost"
+                                  onClick={() => showVersion(v.id, v.saved_at, label)}
+                                  aria-expanded={selected}
                                 >
-                                  恢复此版本
+                                  {selected ? '收起内容' : '查看内容'}
                                 </Button>
-                              )}
-                            </div>
-                          </td>
+                                {selected && (
+                                  <Button
+                                    size="sm"
+                                    loading={restoring}
+                                    icon={<RotateCcw className="size-3.5" />}
+                                    onClick={restore}
+                                  >
+                                    恢复此版本
+                                  </Button>
+                                )}
+                              </div>
+                            </td>
+                          )}
                         </tr>
                       )
                     })}
@@ -1150,6 +1431,30 @@ function WikiDetail(props: {
 
         <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
       </div>
+
+      {/* 危险操作确认（删除页面 / 恢复历史版本）：确认之后才真的调 api */}
+      <ConfirmDialog
+        request={request}
+        onOpenChange={(open) => {
+          if (!open) close()
+        }}
+      />
+
+      {/* ══════ M1：权限治理弹窗（独立代码块，可整段摘除） ══════ */}
+      {/*
+        与 `#/access/<slug>` 治理台**同一个面板**。这里不传 `onNavigate`：
+        弹窗内的"返回入口"没有意义（关掉弹窗就回到了详情页）。
+      */}
+      <Dialog open={accessOpen} onOpenChange={setAccessOpen}>
+        <DialogContent
+          title="权限设置"
+          description="档位、例外授予、块级授权与访问申请 —— 与「权限治理」台面同一份实现。"
+          className="w-[min(48rem,calc(100vw-2rem))]"
+        >
+          {accessOpen && <PageAccessPanel slug={slug} />}
+        </DialogContent>
+      </Dialog>
+      {/* ══════════════════════════════════════════════════════ */}
     </div>
   )
 }
@@ -1159,8 +1464,14 @@ function renderMarkdownBodyForPreview(
   markdown: string,
   route: string,
   pages: ReadonlyMap<string, string> | null,
+  attachmentSlug: string | null,
 ): string {
-  return renderMarkdownBody(markdown, { withCopyButtons: false, route, pages }).html
+  return renderMarkdownBody(markdown, {
+    withCopyButtons: false,
+    route,
+    pages,
+    attachmentSlug,
+  }).html
 }
 
 function SiblingLink({
@@ -1220,11 +1531,21 @@ function readDraft(slug: string): DraftRecord | null {
   }
 }
 
-function writeDraft(slug: string, draft: DraftRecord): void {
+/**
+ * 写草稿。**返回是否真的写进去了**。
+ *
+ * 为什么必须返回布尔：`localStorage.setItem` 在配额满或隐私模式下会**抛异常**。
+ * 早先这里吞掉异常、调用方照样显示"草稿已自动保存"——那是最坏的一种谎报：
+ * 用户据此认为改动已经保住，然后放心关掉页面，改动就真的没了。
+ * 现在失败会被如实报出来（见 WikiEdit 的 `draftFailed`）。
+ */
+function writeDraft(slug: string, draft: DraftRecord): boolean {
   try {
     window.localStorage.setItem(draftKey(slug), serializeDraft(draft))
+    return true
   } catch {
-    /* 配额满/被禁用：放弃这次草稿，不影响编辑 */
+    /* 配额满/被禁用：放弃这次草稿，不影响编辑（由调用方提示用户手动保存） */
+    return false
   }
 }
 
@@ -1259,6 +1580,8 @@ function WikiEdit(props: {
   const [pendingDraft, setPendingDraft] = useState<DraftRecord | null>(null)
   /** 草稿最近一次落盘时间（0 = 尚未写过），给用户"到底存没存"的确定性 */
   const [draftSavedAt, setDraftSavedAt] = useState(0)
+  /** 最近一次草稿落盘**失败**（localStorage 不可用/配额满）—— 必须如实告知，不能显示成"已保存" */
+  const [draftFailed, setDraftFailed] = useState(false)
   /*
    * 面包屑要展示完整层级，这需要"哪些前缀真的有页面"。编辑页同样从**共享 store** 取，
    * 不额外发请求（与侧栏、详情页同一份数据）。
@@ -1276,6 +1599,16 @@ function WikiEdit(props: {
   /** 保存冲突：服务端的 updated_at 与本页加载时不同 */
   const [conflictAt, setConflictAt] = useState<string | null>(null)
   const [origSlug, setOrigSlug] = useState('')
+  /**
+   * 附件上传的可见提示（M4）。
+   *
+   * 为什么**不复用** `err`（保存失败那条）：`save()` 一开始就 `setErr('')`，一次保存会把
+   * 上传的失败原因顺手抹掉；而"请先修正下面标出的问题"与"这个文件太大"是两件事，
+   * 挤在同一行会互相盖掉。故另起一格，但**沿用同一套配色与语义**：
+   * `err` 用 `role="alert"` + 危险色，成功用 `role="status"` + 成功色。
+   * 静默是绝对不允许的 —— 拖进来一个文件然后什么都没发生，用户只会以为功能坏了。
+   */
+  const [uploadNotice, setUploadNotice] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
 
   /** 加载时的基线（脏值比较用 state 而非 ref：比较结果要参与渲染） */
   const [original, setOriginal] = useState<PageDraft>({ title: '', content: '', slugInput: slug })
@@ -1355,13 +1688,22 @@ function WikiEdit(props: {
   useEffect(() => {
     if (loading || !dirty) return
     const t = window.setTimeout(() => {
-      writeDraft(isNew ? '' : slug, {
+      const ok = writeDraft(isNew ? '' : slug, {
         title,
         content,
         savedAt: Date.now(),
         baseUpdatedAt: serverUpdatedAt.current,
       })
-      setDraftSavedAt(Date.now())
+      /*
+       * 只有 `ok` 为真才算"已保存"：写盘失败（配额满/隐私模式）时若照样显示时间戳，
+       * 用户会以为改动保住了 —— 于是放心离开，改动就丢了。
+       */
+      if (ok) {
+        setDraftSavedAt(Date.now())
+        setDraftFailed(false)
+      } else {
+        setDraftFailed(true)
+      }
     }, DRAFT_DEBOUNCE_MS)
     return () => window.clearTimeout(t)
   }, [title, content, slugInput, dirty, loading, isNew, slug])
@@ -1394,7 +1736,62 @@ function WikiEdit(props: {
     withCopyButtons: false,
     route,
     pages: editPageTitles,
+    // 新建页面还没有 slug：此时不给「申请访问」入口（占位块仍如实说明破图原因）
+    attachmentSlug: isNew ? null : slug,
   })
+
+  /**
+   * 附件上传（M4）：编辑器只把 `File` 交过来，网络、错误与人话提示都在这里。
+   *
+   * ## 为什么"新建页面"不自动保存再上传
+   *
+   * 上传端点是 `PUT /api/attachments/:slug` —— 挂在一个**已存在**的页面上。而本组件的
+   * `save()` 成功后会 `onDone(r.slug)` **导航离开编辑态**（详情页），编辑器组件随之卸载，
+   * 这次拖放会半途而废（占位与结果都写进了即将被丢弃的文档）；要改成"保存后留在原地继续编辑"
+   * 属于改保存语义，超出本批范围。因此这里给一句**可执行**的提示，而不是自作聪明地存盘。
+   *
+   * ## 返回值契约
+   *
+   * 与入参**一一对应**的 Markdown 文本（`![名](url)` / `[名](url)`）；抛错即"这个文件没上去"，
+   * 由编辑器把该文件那一行占位替换成失败说明并保留 File 供重试。
+   */
+  const uploadFiles = useCallback(
+    async (files: File[]): Promise<string[]> => {
+      if (isNew) {
+        setUploadNotice({
+          tone: 'err',
+          text: '请先保存页面，再插入附件（附件必须挂在一个已存在的页面上）',
+        })
+        // 用 ApiError 而不是裸 Error：`errorLine` 对它的处置是稳定的（不会退化成"出了点问题"）
+        throw new ApiError(409, 'page_not_saved', '请先保存页面，再插入附件')
+      }
+      setUploadNotice({
+        tone: 'ok',
+        text: files.length === 1 ? '正在上传 1 个附件…' : `正在上传 ${files.length} 个附件…`,
+      })
+      try {
+        const out: string[] = []
+        for (const file of files) {
+          const r = await uploadAttachment(slug, file)
+          /*
+            插入的是后端返回的**相对路径**（`/api/attachments/<id>`）：同源 cookie 自动带，
+            前端不拼绝对地址、不携带任何 token（详见 `api.ts` 的 uploadAttachment 说明）。
+          */
+          out.push(attachmentMarkdown(file.name, r.url))
+        }
+        setUploadNotice({
+          tone: 'ok',
+          text: `已插入 ${files.length} 个附件（保存页面后其他人才能看到）`,
+        })
+        return out
+      } catch (e: unknown) {
+        // 失败必须落到屏幕上：拖进来一个文件然后什么都没发生，用户只会以为功能坏了
+        setUploadNotice({ tone: 'err', text: `附件上传失败：${errorLine(e)}` })
+        throw e
+      }
+    },
+    [isNew, slug],
+  )
 
   const save = useCallback(
     async (opts: { force?: boolean } = {}): Promise<void> => {
@@ -1437,6 +1834,7 @@ function WikiEdit(props: {
         if (isNew) removeDraft('')
         // 列表/侧边栏立刻反映新页面（新建）或新标题（改名）——否则要手动刷新才看得到
         void invalidatePages()
+        void refreshCapabilitiesIfVisible() // 新建的页可能带来新的编辑权（见 remove() 的说明）
         onDone(isNew ? r.slug : slug)
       } catch (e) {
         setErr(errorLine(e))
@@ -1535,10 +1933,20 @@ function WikiEdit(props: {
       <div className="flex flex-wrap items-center gap-2">
         <h1 className="m-0 text-xl font-semibold">{isNew ? '新建页面' : '编辑页面'}</h1>
         {dirty && (
-          <span className="text-xs text-muted" role="status">
-            {draftSavedAt > 0
-              ? `草稿已自动保存（${new Date(draftSavedAt).toLocaleTimeString('zh-CN', { hour12: false })}）`
-              : '有未保存的改动'}
+          /*
+           * 三态，优先级：失败 > 已保存 > 有改动。
+           * 失败态用 `text-danger-ink`：它是"你的改动**没有**被保住"的告警，
+           * 不能让它在视觉上跟"已保存"长得一样。
+           */
+          <span
+            className={cn('text-xs', draftFailed ? 'text-danger-ink' : 'text-muted')}
+            role="status"
+          >
+            {draftFailed
+              ? '草稿无法自动保存（浏览器存储不可用或已满）—— 请手动保存，离开本页会丢失改动'
+              : draftSavedAt > 0
+                ? `草稿已自动保存（${new Date(draftSavedAt).toLocaleTimeString('zh-CN', { hour12: false })}）`
+                : '有未保存的改动'}
           </span>
         )}
         <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -1688,8 +2096,32 @@ function WikiEdit(props: {
               disabled={saving}
               ariaLabel="Markdown 正文编辑器"
               minHeight="480px"
+              /*
+                附件上传（M4）：粘贴截图 / 拖入文件都由编辑器接住，这里只负责"真发请求"。
+                插槽路径（上面的 `EditorSlotOutlet`）**没有**这个能力——插件的编辑区接口
+                不含上传，这是本批明确的边界（见 slots.tsx 的 EditorSlotProps）。
+              */
+              onUploadFiles={uploadFiles}
               placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
             />
+          )}
+          {/*
+            附件上传的可见提示（M4）。放在编辑区**下方**而不是页头：动作发生在这里，
+            反馈就该在这里（页头那条 `err` 是保存错误的固定位置，两者互不覆盖）。
+            `role`：失败 = `alert`（用户必须有感知），进行中/成功 = `status`（礼貌播报）。
+          */}
+          {uploadNotice !== null && (
+            <p
+              role={uploadNotice.tone === 'err' ? 'alert' : 'status'}
+              className={cn(
+                'm-0 rounded-md border px-3 py-1.5 text-note',
+                uploadNotice.tone === 'err'
+                  ? 'border-danger-line bg-danger-bg text-danger-ink'
+                  : 'border-ok-line bg-ok-bg text-ok-ink',
+              )}
+            >
+              {uploadNotice.text}
+            </p>
           )}
         </section>
 

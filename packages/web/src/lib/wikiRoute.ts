@@ -30,8 +30,15 @@ export type WikiRoute =
   | { kind: 'detail'; slug: string }
   | { kind: 'edit'; slug: string }
 
-/** 单个路径段的解码：坏转义（如 `%E0%A4%A`）不抛错，退回原串（否则整页白屏） */
-function safeDecode(raw: string): string {
+/**
+ * 单个路径段的解码：坏转义（如 `%E0%A4%A`）不抛错，退回原串（否则整页白屏）。
+ *
+ * 导出供**权限治理路由**（`#/access/<encodeURIComponent(slug)>`）复用：
+ * 那里同样要"先整体解码再按 `/` 切分"，否则 `guide%2Fintro` 这种编码过的分层 slug
+ * 会被当成"段内斜杠"而不是分隔符，于是同一个页面在两条路由下解析出不同的 slug。
+ * 两处必须用同一个解码器，不能各写一份。
+ */
+export function safeDecodeSegment(raw: string): string {
   try {
     return decodeURIComponent(raw)
   } catch {
@@ -47,7 +54,7 @@ function safeDecode(raw: string): string {
  * 当成未知深层）。先解码再切分让两者归一。
  */
 export function parseWikiRoute(sub: string): WikiRoute {
-  const decoded = safeDecode(sub)
+  const decoded = safeDecodeSegment(sub)
   const seg = decoded.split('/').filter((s) => s !== '')
   const first = seg[0] ?? ''
 

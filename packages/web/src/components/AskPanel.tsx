@@ -13,6 +13,8 @@
  *    消毒既慢又会在半截表格/代码块上抖动），到 `done` 再用权威文本走正式渲染。
  * 4. **后端插件未启用时端点 404**——先**静默回退**到一次性端点 `POST /api/ai/ask`（旧版本/
  *    未启用都能工作）；回退也 404 才提示"未启用"。全程**不得产生 console error**。
+ *    两条都 404 是**终态**（本批 R12）：必须把 phase 落回 `idle`，让按钮回到可用的「提问」，
+ *    否则界面永久停在「生成中…」+ 按钮禁用，用户只能刷新页面。
  *
  * 取消：组件卸载、路由切换、再次提交都会 `abort()`，**取消不渲染成错误**。
  */
@@ -54,6 +56,17 @@ function fromAskResponse(r: AskResponse): AiStreamState {
   }
 }
 
+/**
+ * 问答端点**根本不存在**（`@geewiki/ai` 未启用）时的终态文案（本批 R12）。
+ *
+ * 为什么单独一条常量而不是复用 `preStreamNotice` 的那句短话：这句要同时回答三件事 ——
+ * ① 现在为什么没有回答（服务未启用，不是你的问题问错了）；② 该做什么（去插件管理里启用）；
+ * ③ 启用了但没有模型密钥时会得到什么（检索结果 + 抽取式摘要，即"降级但可用"）。
+ * 少了 ③，用户会以为"必须配好模型才能用"，从而放弃一个本来可用的功能。
+ */
+const AI_DISABLED_NOTICE =
+  '问答服务未启用：请先在插件管理中启用 @geewiki/ai（未配置模型密钥时将以检索结果与抽取式摘要作答）。'
+
 /** 流开始前失败的提示文案（输入问题 / 未启用 / 并发超限 / 其它） */
 function preStreamNotice(err: unknown): string {
   if (err instanceof ApiError) {
@@ -65,11 +78,23 @@ function preStreamNotice(err: unknown): string {
       // 仍走 cleanHint 保证不会把技术串带出来。
       return cleanHint(err.message) === '' ? '请求参数不合法' : `请求参数不合法：${cleanHint(err.message)}`
     }
-    if (err.status === 404) return '问答服务未启用（请先在插件管理中启用 @geewiki/ai）'
+    if (err.status === 404) return AI_DISABLED_NOTICE
     // 其它情况**绝不回显原始 message**（可能带 API 路径/英文）——统一走人话映射。
     return errorLine(err)
   }
   return errorLine(err)
+}
+
+/**
+ * 两条端点（`/api/ai/stream` 与回退用的 `/api/ai/ask`）**都**404 时的处置（本批 R12）。
+ *
+ * 404 在本应用里只有一个含义：**这个端点不存在**（`@geewiki/ai` 未启用 / 版本较旧），
+ * 而不是"这次提问失败"——所以它是**终态**：必须让按钮回到可用的「提问」，
+ * 并把"未启用"和"怎么启用"说清楚。不落终态就会永久停在「生成中…」+ 按钮禁用
+ * （这是真实浏览器取证发现的缺陷：12 秒后仍然如此，用户只能刷新页面）。
+ */
+function endpointMissing(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 404
 }
 
 /** 一条来源：标题（可点）+ 高亮片段 + 引用状态 */
@@ -101,9 +126,16 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
   const { initialQuery = '', onOpenPage } = props
   const [input, setInput] = useState(initialQuery)
   const [notice, setNotice] = useState('')
+  /**
+   * 停止生成后的提示。**刻意与 `notice` 分开**：那条渲染成 `.notice err`（错误样式），
+   * 而"用户主动停止"是正常操作、不是失败，用错误配色会让人以为出了问题。
+   */
+  const [stopNotice, setStopNotice] = useState('')
   const [state, setState] = useState<AiStreamState>(() => initialAiStreamState())
   /** 在途请求的取消句柄：卸载/切换/再次提交都要 abort，避免连接泄漏 */
   const abortRef = useRef<AbortController | null>(null)
+  /** 本次生成的起始时刻：用户中途停止时没有服务端的 `done.elapsedMs`，用它算耗时 */
+  const startedAtRef = useRef(0)
   const aliveRef = useRef(true)
 
   useEffect(() => {
@@ -121,10 +153,12 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
       return
     }
     setNotice('')
+    setStopNotice('')
     // 重新提交：先取消上一次在途的流
     abortRef.current?.abort()
     const ac = new AbortController()
     abortRef.current = ac
+    startedAtRef.current = Date.now()
     setState(markAiStreamStarted(initialAiStreamState()))
 
     const onEvent = (ev: Parameters<typeof applyAiStreamEvent>[1]): void => {
@@ -138,14 +172,25 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
       } catch (err) {
         if (ac.signal.aborted || !aliveRef.current) return // 取消：不当作失败
         // 404 = 端点不存在（插件未启用 / 版本较旧）→ 静默回退到一次性端点
-        if (err instanceof ApiError && err.status === 404) {
+        if (endpointMissing(err)) {
           try {
             const r = await api.aiAsk(checked.value)
             if (ac.signal.aborted || !aliveRef.current) return
             setState(fromAskResponse(r))
           } catch (fallbackErr) {
             if (ac.signal.aborted || !aliveRef.current) return
-            setNotice(preStreamNotice(fallbackErr))
+            /*
+             * 回退也失败 ⇒ 两条端点都不存在 ⇒ **终态**（本批 R12）：
+             * 1. 文案：说清"未启用 + 怎么启用 + 启用后没模型密钥也能用"（`AI_DISABLED_NOTICE`）；
+             * 2. 状态：必须把 phase 从 `streaming` 落回去，否则按钮永久 `disabled`（「生成中…」）。
+             *    `markAiStreamStarted` 把 phase 置成 `streaming`，而本分支原先只 `setNotice(...)`——
+             *    于是提交按钮永远禁用、`{streaming && …}` 的「停止生成」也永远挂着，
+             *    无论等多久都不会自愈（真实浏览器取证：12 秒后仍如此，网络里两条请求都是 404）。
+             * 3. **保留已拿到的 sources**：这里只改 phase，不碰 `sources`/`mode`/`retrieval`——
+             *    万一流已经下发过 `status` 帧（多来源场景），那些来源仍会列在下方。
+             */
+            setNotice(endpointMissing(fallbackErr) ? AI_DISABLED_NOTICE : preStreamNotice(fallbackErr))
+            setState((s) => (s.phase === 'streaming' ? { ...s, phase: 'idle' } : s))
           }
           return
         }
@@ -166,6 +211,34 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
     if (initialQuery.trim() !== '') submit(initialQuery)
     // 仅在初始查询变化时触发（submit 已在 useCallback 里固定）
   }, [initialQuery, submit])
+
+  /**
+   * 停止生成（本批 T3）。
+   *
+   * ⚠️ **必须在这里显式把状态落到 `done` + `partial: true`**，这是本功能最容易做错的地方：
+   * `abort()` 之后 `submit` 的 catch 首行就是 `if (ac.signal.aborted) return`（取消不当失败，
+   * 见那里的注释），而 `onEvent` 也会因同一个判据丢弃后续帧 —— 也就是说**没有任何一条路径**
+   * 会把 phase 从 `streaming` 改走。不落地状态，界面就永久停在"生成中…"：提交按钮一直禁用、
+   * 光标一直闪，用户只能刷新页面。
+   *
+   * `partial: true` 让 ask-meta 里既有的那句「（回答被中断）」如实出现
+   * （`lib/aiStreamPlan.ts` 的字段，这里不新造状态）；耗时用本地起始时刻补上 ——
+   * 中途停止时没有服务端的 `done.elapsedMs`，不补就会显示"耗时 0ms"这种假信息。
+   */
+  const stop = useCallback((): void => {
+    const ac = abortRef.current
+    if (ac === null) return
+    ac.abort()
+    const startedAt = startedAtRef.current
+    if (startedAt > 0) {
+      setState((s) =>
+        s.phase === 'streaming'
+          ? { ...s, phase: 'done', partial: true, elapsedMs: Date.now() - startedAt }
+          : s,
+      )
+    }
+    setStopNotice('已停止生成（下面保留已收到的内容）')
+  }, [])
 
   const degraded = degradedNotice(state.degraded)
   const sources = state.sources
@@ -197,9 +270,29 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
         <button className="btn primary" type="submit" disabled={streaming}>
           {streaming ? '生成中…' : '提问'}
         </button>
+        {/*
+          停止生成（本批 T3）：与提交按钮**并列的独立按钮**，生成中才出现。
+          `type="button"` 是硬要求：它在这个 `<form>` 里，默认类型 submit 会让"点停止"
+          顺带提交一次 —— 等于刚 abort 又立刻开一条新流，是最坏的结果。
+        */}
+        {streaming && (
+          <button className="btn" type="button" onClick={stop}>
+            停止生成
+          </button>
+        )}
       </form>
 
       {notice && <p className="notice err">{notice}</p>}
+
+      {/*
+        停止提示：用 `role="status"`（读屏会在停止后播报一次，但**不打断**当前朗读——
+        它不是一个 alert）。这是"内容仍在下方"的确认，避免用户以为停止把回答清空了。
+      */}
+      {stopNotice !== '' && (
+        <p className="notice ok" role="status">
+          {stopNotice}
+        </p>
+      )}
 
       {/* 降级提示条：信息性，不是错误（不用 error 样式淹没结果） */}
       {degraded && (
@@ -276,6 +369,12 @@ export function AskPanel(props: { initialQuery?: string; onOpenPage: (slug: stri
             </div>
           ) : (
             state.phase === 'done' &&
+            /*
+              用户**主动停止**且一条来源、一个字都还没到时，不能说"没有找到能回答这个问题的资料"
+              —— 那是一次被打断的提问，不是检索结论（空态意味着"知识库里没有依据"，
+              是对数据的断言）。此时下方已有"已停止生成"的提示条，这里不再重复。
+            */
+            !state.partial &&
             sources.length === 0 && (
               <EmptyState
                 icon={<SearchX className="size-8" />}

@@ -33,7 +33,9 @@ import {
   GitBranch,
   List,
   Puzzle,
+  ShieldCheck,
   SunMoon,
+  Users,
 } from 'lucide-react'
 import { cn } from '../ui/cn'
 import { focusRing } from '../ui/a11y'
@@ -199,6 +201,45 @@ export function CommandPalette({
         keywords: 'theme dark light',
         icon: <SunMoon className="size-4" aria-hidden="true" />,
         run: onToggleTheme,
+      },
+      /*
+       * 权限治理（M1）。
+       *
+       * ⚠️ **必须追加在 `action:theme` 之后**：`navPlan.test.ts` 的 `actionBlock(id)`
+       * 把一段声明切片到"下一个 `id: 'action:`"为止，并断言 `action:theme` 那一段里
+       * **不含** `requires:`（公开动作不得加能力限制）。插在中间会让 `action:theme`
+       * 的片段吞掉下面这项的 `requires`，把公开动作的守卫测红。
+       *
+       * 判据与顶栏**同一来源**（同一个 `visibleDests`）：`manageVisibility` 对
+       * 组织成员也为真，所以它不是"运维专属"动作 —— 与「插件管理」「依赖图」不同。
+       */
+      {
+        id: 'action:access',
+        label: '权限治理',
+        hint: '设置页面档位、例外授予与访问申请',
+        keywords: 'visibility access grant permission acl',
+        icon: <ShieldCheck className="size-4" aria-hidden="true" />,
+        requires: 'manageVisibility',
+        run: () => go('access'),
+      },
+      /*
+       * 组织与邀请管理（P5-B M4/M5）。
+       *
+       * ⚠️ **同样必须追加在最后**（理由见上面 `action:access` 的注释）：`actionBlock(id)`
+       * 的切片到"下一个 `id: 'action:`"为止，插在中间会把别人的 `requires` 吞进上一个动作
+       * 的片段里 —— `navPlan.test.ts` 的"公开动作不得加能力限制"守卫会因此变红。
+       *
+       * 判据是 `administer`（owner / admin）：这批端点里只有 `GET /api/org` 对普通成员开放，
+       * 其余全部要 admin，故它与顶栏「管理 ▾」里的「组织」是同一判据、同一来源。
+       */
+      {
+        id: 'action:org',
+        label: '组织与邀请',
+        hint: '管理成员、用户组与邀请令牌',
+        keywords: 'org members groups invitations invite team',
+        icon: <Users className="size-4" aria-hidden="true" />,
+        requires: 'administer',
+        run: () => go('org'),
       },
     ]
     return visibleDests(all, auth.capabilities)

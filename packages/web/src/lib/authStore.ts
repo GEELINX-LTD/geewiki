@@ -160,6 +160,41 @@ export function invalidateAuth(): Promise<void> {
   return loadAuth({ force: true })
 }
 
+/**
+ * **页面可见时**重取一次能力（角色可能已在别处被改）。
+ *
+ * 缺陷（本批 T5）：`capabilities` 此前**只有一个写点** —— `loadAuth()`（首帧 / 登录 / 登出）。
+ * 于是标签页一直开着的用户被管理员降级后，运维台面与治理入口仍留在界面上：服务端还有
+ * 独立判定（不会真的越权），但用户看到的是"点得动、点了必然失败"，比不显示更坏。
+ *
+ * 三条刻意的取舍：
+ * 1. **可见性判据在函数内**：隐藏的标签页重取没有意义（用户看不见结果），白白多一次请求；
+ *    而且 `document` 在 SSR / 单测环境下不存在，故先判 `typeof document`。
+ * 2. **只更新能力相关字段，失败静默**：这是**增强**，不是用户主动发起的请求 ——
+ *    失败时保留当前能力（不把界面清空、不弹错误），让用户手上的操作照常进行。
+ * 3. **不重取页面列表**：本函数只负责"我能做什么"，列表缓存归 `invalidatePages()`。
+ *    身份真的变了（登录/登出/401）走的是 `loadAuth` / `resetToAnonymous` 那几条既有路径。
+ */
+export async function refreshCapabilitiesIfVisible(): Promise<void> {
+  if (typeof document === 'undefined' || document.visibilityState !== 'visible') return
+  try {
+    const r = await api.authState()
+    setState({
+      ...state,
+      user: r.user,
+      capabilities: r.capabilities,
+      oidc: r.oidc,
+      setupRequired: r.setupRequired,
+      authenticated: r.authenticated,
+      loading: false,
+      error: null,
+      errorValue: null,
+    })
+  } catch {
+    // 静默：能力重取失败不影响任何正在进行的操作，也不该用错误条打断用户
+  }
+}
+
 /* ----------------------------- 写入 ----------------------------- */
 
 /**

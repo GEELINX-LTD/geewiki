@@ -6,6 +6,9 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import {
   DRAFT_KEY_PREFIX,
   DRAFT_MAX_AGE_MS,
@@ -123,4 +126,41 @@ test('formatDraftAge：时钟回拨（savedAt 在未来）不产出负数', () =
 test('formatDraftAge：非法/缺失时间给"未知时间"（不显示 NaN）', () => {
   assert.equal(formatDraftAge(0, NOW), '未知时间')
   assert.equal(formatDraftAge(Number.NaN, NOW), '未知时间')
+})
+
+/* ---------- 源码守卫：写盘失败不得谎报"草稿已自动保存" ---------- */
+
+/** 剥掉块注释与行注释（注释里会引用被禁的写法，会让负向/位置断言假阳性） */
+function codeOnly(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+}
+
+/*
+ * 为什么这条必须做成源码级：`localStorage.setItem` 在**配额满或隐私模式**下会抛异常，
+ * 而"草稿已自动保存"是用户判断"能不能放心关掉页面"的唯一依据。谎报的代价是丢内容，
+ * 且它在开发机上**永远复现不出来**（写盘一直是成功的）。所以只能靠结构断言钉住两件事：
+ *  1. 调用点必须真的接住返回值（`const ok = writeDraft(`）；
+ *  2. 渲染"已保存"时间戳的 `setDraftSavedAt(...)` 必须紧跟 `if (ok)` —— 判断一旦被拆掉，
+ *     最近的 `if (ok)` 就会离它远超过 200 字符，测试立刻变红。
+ */
+test('源码守卫：WikiPage 只在草稿真的落盘后才显示「已保存」', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const raw = readFileSync(join(here, '..', 'src', 'pages', 'WikiPage.tsx'), 'utf8')
+  const src = codeOnly(raw)
+  // 反空洞：读空了（路径改动）会让下面"每次出现都在 if (ok) 之后"恒真
+  assert.ok(src.length > 5000, `WikiPage.tsx 读入异常（仅 ${src.length} 字符），路径可能不对`)
+
+  assert.match(src, /const ok = writeDraft\(/, '写草稿的返回值必须被接住（writeDraft 返回 boolean）')
+
+  const marks = [...src.matchAll(/setDraftSavedAt\(/g)].map((m) => m.index ?? -1)
+  assert.ok(marks.length >= 1, '应至少有一处 setDraftSavedAt，否则时间戳根本不会更新')
+  for (const at of marks) {
+    assert.ok(at > 0, '无法定位 setDraftSavedAt 的偏移')
+    const before = src.slice(Math.max(0, at - 200), at)
+    assert.match(
+      before,
+      /if \(ok\)/,
+      `setDraftSavedAt 未受 if (ok) 守卫（前后文：${src.slice(Math.max(0, at - 60), at + 30)}）`,
+    )
+  }
 })

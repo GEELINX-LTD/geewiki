@@ -1,5 +1,6 @@
 import { registerSlotByName, type AnySlotComponent } from './slots'
 import { hostSdk, type GeeWikiHostSdk } from './hostSdk'
+import { errorDetail } from './errorText'
 import {
   PLUGIN_UI_TABLE_PATH,
   SLOT_TABLE_PATH,
@@ -92,6 +93,50 @@ const EMPTY_NAMES: readonly string[] = Object.freeze([])
 
 const failed = new Map<string, string>()
 /**
+ * **加载失败备忘（要给人看的那一份）**：插件名 → 失败原因。
+ *
+ * 与 {@link failed} 的分工：那个存"失败时的 rev"，只用于"同一 rev 不重复重试"的短路判断；
+ * 这一份是**界面事实** —— "这个插件的界面此刻是不可用的"。此前加载失败只打一条 `console.warn`，
+ * 用户看到的是"某个功能凭空不见了"（页脚少了一块、编辑器退回纯文本）而没有任何解释，
+ * 也不知道该找谁。现在由 `slots.tsx` 的 `SlotOutlet` 读 {@link pluginUiFailed} 渲染一条
+ * `role="status"` 提示条（用 `lib/pluginUiPlan.ts` 之外的这一份状态，不再重复 console 之外的信息）。
+ *
+ * 失败记录是**可自愈**的：reset（成功加载 / 卸载 / rev 变化后重试）时删除，
+ * 故提示条不会在问题解决后残留。
+ */
+const failedLoads = new Map<string, string>()
+
+/** 一条"插件界面加载失败"（name 用于文案，message 只作排障线索，不进正文） */
+export interface PluginUiFailure {
+  readonly name: string
+  readonly message: string
+}
+
+const EMPTY_FAILURES: readonly PluginUiFailure[] = Object.freeze([])
+let cachedFailures: readonly PluginUiFailure[] = EMPTY_FAILURES
+
+/**
+ * 失败清单的**稳定快照**（按插件名排序）。
+ *
+ * 为什么必须缓存引用：`useSyncExternalStore` 要求 getSnapshot 在状态未变时返回**同一个对象**，
+ * 否则每次读取都算"变了" ⇒ 无限重渲染。这里的比对按内容做，内容不变就复用上一次的数组。
+ */
+function failureSnapshot(): readonly PluginUiFailure[] {
+  const next = [...failedLoads]
+    .map(([name, message]) => ({ name, message }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  const same =
+    next.length === cachedFailures.length &&
+    next.every((x, i) => x.name === cachedFailures[i]?.name && x.message === cachedFailures[i]?.message)
+  if (!same) cachedFailures = Object.freeze(next)
+  return cachedFailures
+}
+
+/** 当前**界面加载失败**的插件（引用稳定；供 SlotOutlet 与测试读）。 */
+export function pluginUiFailed(): readonly PluginUiFailure[] {
+  return cachedFailures
+}
+/**
  * 已按需推迟的条目（插件名 → 决定推迟时的 rev）。
  *
  * 与 {@link failed} 同构：用于让 {@link isSettled} 把"刻意推迟"视为已收敛，
@@ -122,10 +167,17 @@ export interface PluginUiState {
   skipped: readonly UiSkipped[]
   /** 当前已成功挂载界面的插件名（已排序，便于断言） */
   loaded: readonly string[]
+  /** 界面**加载失败**的插件（已排序）。此前只进 console，现由 SlotOutlet 渲染成可见提示条 */
+  failed: readonly PluginUiFailure[]
 }
 
 const stateListeners = new Set<() => void>()
-let cachedState: PluginUiState = { revision: undefined, skipped: EMPTY_SKIPPED, loaded: EMPTY_NAMES }
+let cachedState: PluginUiState = {
+  revision: undefined,
+  skipped: EMPTY_SKIPPED,
+  loaded: EMPTY_NAMES,
+  failed: EMPTY_FAILURES,
+}
 
 /** 按当前内部状态构造一份快照 */
 function snapshotState(): PluginUiState {
@@ -133,6 +185,7 @@ function snapshotState(): PluginUiState {
     revision: lastRevision,
     skipped: lastSkipped,
     loaded: Object.freeze([...loaded.keys()].sort()),
+    failed: failureSnapshot(),
   }
 }
 
@@ -146,6 +199,14 @@ function sameState(a: PluginUiState, b: PluginUiState): boolean {
     const x = a.skipped[i] as UiSkipped
     const y = b.skipped[i] as UiSkipped
     if (x.name !== y.name || x.reason !== y.reason) return false
+  }
+  // 失败清单也要参与比对：否则"只有失败变了"时 emitState 会提前返回、订阅者收不到通知，
+  // 提示条就永远不出现（SlotOutlet 不因插槽注册变化而重渲染——失败时根本没有注册发生）。
+  if (a.failed.length !== b.failed.length) return false
+  for (let i = 0; i < a.failed.length; i++) {
+    const x = a.failed[i]
+    const y = b.failed[i]
+    if (x === undefined || y === undefined || x.name !== y.name || x.message !== y.message) return false
   }
   return true
 }
@@ -243,6 +304,15 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
     // 入口已声明却加载失败属于真实故障（作者漏发产物的典型症状），但不该打断宿主启动
     console.warn(`[geewiki-plugin-ui] 插件界面加载失败：${name}`, err instanceof Error ? err.message : err)
     failed.set(name, meta.rev)
+    /*
+      记进**要给人看的那一份**并广播：否则界面上的表现只是"这块功能不见了"，
+      用户既不知道原因，也不知道该去插件管理里检查产物。emitState 必须显式调用 ——
+      失败路径上没有任何插槽注册发生，不广播就永远不会有订阅者重渲染。
+      存的是**排障摘要**（`errorDetail`），它只会落在 console 与 `data-*` 上：
+      给用户看的正文是 `slots.tsx` 里那句固定中文（原始串可能含英文/路径，不能直接展示）。
+    */
+    failedLoads.set(name, errorDetail(err))
+    emitState()
     return
   }
   // 迟到检查：await 期间该插件可能已被卸载，或已不再被入口表需要（例如用户刚点了停用）
@@ -312,6 +382,8 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
   }
   const link = meta.css ? injectCss(name, `${base}/${meta.css}`) : undefined
   loaded.set(name, { plugin: name, rev: meta.rev, disposers, link })
+  // 成功即自愈：清掉这个插件此前可能留下的失败记录，否则提示条会在问题已解决后继续挂着
+  failedLoads.delete(name)
   emitState()
   console.debug(`[geewiki-plugin-ui] 已加载插件界面：${name}`)
 }
@@ -320,8 +392,17 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
 export function unloadPluginUi(name: string): boolean {
   // 无论此前是否真的加载过，都要推进代次：可能有在途 import 尚未结算
   epochs.set(name, (epochs.get(name) ?? 0) + 1)
+  /*
+    失败记录**先清**（且不看 loaded 里有没有）：插件被停用/移出入口表之后，
+    "它的界面加载失败"这条提示就过期了 —— 留着会让用户对着一条无法处理的红字。
+    若是 rev 变化导致的重试，紧接着的加载失败会重新写入，语义仍然正确。
+  */
+  const hadFailure = failedLoads.delete(name)
   const entry = loaded.get(name)
-  if (!entry) return false
+  if (!entry) {
+    if (hadFailure) emitState()
+    return false
+  }
   for (const off of entry.disposers.splice(0)) {
     try {
       off()
