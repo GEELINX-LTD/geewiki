@@ -374,6 +374,14 @@ export interface VersionMeta {
   saved_at: string
   /** 保存前的旧标题（`null` 时不显示标题差异，**不猜**） */
   title: string | null
+  /**
+   * 这一版是什么性质的改动（0021）：`'content'`（正文/标题被改）、
+   * `'acl'`（**只动了权限**：改档位/发布/发撤授权）、`null`（该列出现之前的历史行）。
+   *
+   * 为什么必须有：`origin === 'acl'` 的那一版通常**没有 `change` 对象**（正文与块都没动），
+   * 不看这一列就只能显示成"没有任何变化"，把"有人改了可见性"讲成"什么都没发生"。
+   */
+  origin?: string | null
   /** 该版本的作者；`null` ⇒ 界面显示「未记录」 */
   author: { id: number; displayName: string | null } | null
 }

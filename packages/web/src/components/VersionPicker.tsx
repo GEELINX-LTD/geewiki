@@ -9,11 +9,14 @@
  * - 选中历史版本 **不**把内容插到正文下面，而是交给 `VersionDiffDialog` —— 对比是"看一眼"
  *   的动作，不该改变页面布局。
  *
- * ## 为什么紧凑区默认只展示最近 3 条
- * 版本多起来（`recentVersions` 最多 100）时，"每次改动都列出来"就又把版面撑回原样了 ——
- * 那正是用户抱怨的问题。所以紧凑区**只列最近 `COMPACT_VERSIONS` 条**，其余走
- * 「查看全部改动…」弹窗（弹窗是用户主动打开的，占版面是合理的）。两条路径**共用同一行组件**
- * （`VersionRowButton`），避免"列表里长这样、弹窗里长那样"的漂移。
+ * ## 紧凑区列多少条
+ * 下拉列的是页详情里已有的 `versions[]`（受 `recentVersions` 限制，默认最近 10 条）；
+ * 更早的走「浏览全部历史…」弹窗（那里拉分页端点、最多 100 条）。
+ *
+ * ⚠️ 这里曾经有一个 `COMPACT_VERSIONS = 3` 的常量与"只列最近 3 条"的注释，但**没有任何代码
+ * 引用它** —— 菜单一直列的是全部 10 条。设计与实现不一致比"条数多几条"更坏（下一位读者会
+ * 按注释去改代码），所以常量已删、注释按实现改。要真的改成 3 条请连同 `versions.slice` 一起改。
+ * 两条路径**共用同一行组件**（`VersionRowButton`），避免"列表里长这样、弹窗里长那样"的漂移。
  *
  * ## 为什么时间线里不默认算 `+N / −M`
  * 算一次差异要读两份全文（当前正文 + 该快照），10 条就是 10 次拉取 + 10 次 diff。
@@ -41,12 +44,6 @@ import { authorText } from './VersionDiffDialog'
 import { cn } from '../ui/cn'
 import { focusRing } from '../ui/a11y'
 
-/**
- * 紧凑区默认展示几条。
- *
- * 3 是"够看出最近在动什么"与"不占版面"的折中：1 条看不出节奏，10 条就接近原来那张卡片了。
- */
-export const COMPACT_VERSIONS = 3
 
 /**
  * 标签：历史条目按倒序数下来是 `v{总数 - i}`。
@@ -69,20 +66,24 @@ export function VersionRowButton({
   version,
   label,
   onPick,
+  canCompare = true,
 }: {
   version: VersionMeta
   label: number
   onPick: (version: VersionMeta, label: number) => void
+  /**
+   * 是否给「对比」入口。
+   *
+   * 只读视角必须传 `false`：快照端点（`GET …/versions/:id`）要求 `canEdit`，
+   * 对只读者一律 404 ⇒ 给了按钮就是"点了什么都不会发生"。实测过这个形态：
+   * 匿名在弹窗里点「对比」，弹窗直接关掉、**没有任何提示**，看起来像界面坏了。
+   * 这与本仓库"不给必然失败的入口"是同一纪律，也与 `ServerVersionList` 的
+   * `canCompare` 同款处理保持一致。
+   */
+  canCompare?: boolean
 }): ReactNode {
-  return (
-    <button
-      type="button"
-      onClick={() => onPick(version, label)}
-      className={cn(
-        focusRing,
-        'flex w-full cursor-pointer items-center gap-3 rounded-md border border-line px-3 py-1.5 text-left text-note hover:bg-hover',
-      )}
-    >
+  const inner = (
+    <>
       <Badge tone="neutral">v{label}</Badge>
       <span className="text-ink" title={absoluteTime(version.saved_at)}>
         {relativeTime(version.saved_at)}
@@ -93,10 +94,32 @@ export function VersionRowButton({
           {version.title}
         </span>
       )}
-      <span className="ml-auto flex shrink-0 items-center gap-1 text-accent">
-        <RotateCcw className="size-3" aria-hidden="true" />
-        对比
+      {canCompare && (
+        <span className="ml-auto flex shrink-0 items-center gap-1 text-accent">
+          <RotateCcw className="size-3" aria-hidden="true" />
+          对比
+        </span>
+      )}
+    </>
+  )
+  // 只读：**纯文本行**而不是禁用按钮 —— 禁用按钮仍在暗示"这里有个能力"
+  if (!canCompare) {
+    return (
+      <span className="flex w-full items-center gap-3 rounded-md border border-line px-3 py-1.5 text-left text-note">
+        {inner}
       </span>
+    )
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => onPick(version, label)}
+      className={cn(
+        focusRing,
+        'flex w-full cursor-pointer items-center gap-3 rounded-md border border-line px-3 py-1.5 text-left text-note hover:bg-hover',
+      )}
+    >
+      {inner}
     </button>
   )
 }
@@ -110,17 +133,20 @@ export function VersionList({
   page,
   onPick,
   limit,
+  canCompare = true,
 }: {
   page: Pick<PageDetail, 'version' | 'versions'>
   onPick: (version: VersionMeta, label: number) => void
   limit?: number
+  /** 只读视角传 `false` ⇒ 行渲染成纯文本，不给必然失败的「对比」（见 `VersionRowButton`） */
+  canCompare?: boolean
 }): ReactNode {
   const shown = limit === undefined ? page.versions : page.versions.slice(0, limit)
   return (
     <ul className="m-0 flex list-none flex-col gap-1 p-0">
       {shown.map((v, i) => (
         <li key={v.id}>
-          <VersionRowButton version={v} label={versionLabel(page, i)} onPick={onPick} />
+          <VersionRowButton version={v} label={versionLabel(page, i)} onPick={onPick} canCompare={canCompare} />
         </li>
       ))}
     </ul>
@@ -178,9 +204,36 @@ export function VersionPicker({
    * 摘要/额外行按 id 索引。**以 `rows` 为准**（它带服务端算好的版本号与 `change`），
    * 页内 `versions[]` 只在 `rows` 还没到货时兜底 —— 两条来源同时用会让"版本号"出现两套说法。
    */
-  const rowById = useMemo(() => new Map(rows.map((r) => [r.id, r])), [rows])
-  const missing = rows.length === 0
   const lastLoadedNumber = rows.length === 0 ? null : rows[rows.length - 1]!.number
+  /**
+   * 下拉里要列的行：**`rows`（分页端点）到货就用它，否则退回页内 `versions[]`**。
+   *
+   * 统一成"只含渲染需要的字段"的同一个形状，是为了让下面那段 JSX 只有一份
+   * —— 两处各写一遍日期/作者/摘要的拼装，就是"列表里长这样、别处长那样"的经典来源。
+   */
+  const compactRows: {
+    id: number
+    saved_at: string
+    author: { id: number; displayName: string | null } | null
+    change?: VersionPageItem['change']
+    origin?: string | null
+    /** 分页端点给了权威版本号；页内那份没有（按名次算） */
+    number?: number
+  }[] = rows.length > 0 ? rows : versions
+  /*
+   * ★ 历史**总数**（权威来源是页详情的 `page.version`：`version = COUNT(page_versions) + 1`，
+   * 即当前版本号，故历史总数 = `version - 1`）。
+   *
+   * 为什么不能只看接口的 `hasMore` 来判断"已到最早"：`hasMore` 说的是
+   * "**这一页之外还有没有**"，而不是"页内这份截断数组之外的有没有"。两者在
+   * `rows` 一次能装下全部历史时**恰好相反** —— 实测 `welcome`：历史共 12 条、
+   * 接口一次回全 12 条且 `hasMore=false`，而页内 `versions[]` 有 LIMIT 只给最近 10 条。
+   * 于是旧判据在那 10 条之后直接打印「已到最早版本（v1）」，而同一屏底部的条数摘要
+   * 又写着「更早的见「浏览全部历史…」」—— **同一屏自相矛盾**，且用户被告知"到最早了"
+   * 而 v2/v1 根本没列出来。
+   */
+  const historyTotal = page.version - 1
+  const reachedEarliest = rows.length > 0 && rows.length >= historyTotal
 
   return (
     <>
@@ -210,32 +263,49 @@ export function VersionPicker({
             <span className="ml-auto pl-3 text-2xs text-muted">最新{previewNumber === null ? ' · 正在查看' : ''}</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          {versions.length === 0 ? (
-            <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">暂无历史版本</p>
-          ) : (
-            versions.map((v, i) => {
-              const label = versionNumberOf(page, i)
-              const active = previewNumber === label
-              const summary = versionChangeSummary(rowById.get(v.id)?.change)
-              return (
-                <DropdownMenuItem key={v.id} active={active} onSelect={() => onPreview(v.id, label)}>
-                  v{label}
-                  {active && <span className="ml-1 text-2xs text-accent">正在预览</span>}
-                  <span className="ml-auto flex items-center gap-2 pl-3">
-                    {/* 摘要拉不到就不显示 —— 编一句"0 段改动"比不显示更糟 */}
-                    {summary !== null && <span className="text-2xs text-muted">{summary}</span>}
-                    <span className="text-2xs text-muted" title={absoluteTime(v.saved_at)}>
-                      {versionMetaText(v.saved_at, v.author)}
-                    </span>
+          {/*
+            ★ 列表**以 `rows`（分页端点）为准**，页内 `versions[]` 只在 `rows` 没到货时兜底。
+
+            此前这里直接渲 `versions.map(...)`（页详情那份，受 `recentVersions` 截断），
+            于是「加载更早的版本…」把更早的行取回来了、`rows` 也涨了，**列表却纹丝不动**
+            —— 用户点了半天什么也没多出来（真机验收抓到的）。摘要按 id 从 `rows` 关联这一点
+            原本就写对了，错的只是"列哪些行"。
+          */}
+          {compactRows.map((r) => {
+            /*
+             * 行有两套来源、字段名不同：`rows`（分页端点）带权威 `number`；
+             * 页内 `versions[]` 只有 id/时间/作者，版本号得按名次算。
+             * 两者都映射成同一组字段后再渲染，避免"两处各写一遍"。
+             */
+            const fromPage = 'saved_at' in r && !('number' in r)
+            const idx = fromPage ? versions.findIndex((v) => v.id === r.id) : -1
+            const label = fromPage ? versionNumberOf(page, Math.max(0, idx)) : (r as VersionPageItem).number
+            const active = previewNumber === label
+            const summary = versionChangeSummary(r.change, r.origin)
+            return (
+              <DropdownMenuItem key={r.id} active={active} onSelect={() => onPreview(r.id, label)}>
+                v{label}
+                {active && <span className="ml-1 text-2xs text-accent">正在预览</span>}
+                <span className="ml-auto flex items-center gap-2 pl-3">
+                  {/* 摘要拉不到就不显示 —— 编一句"0 段改动"比不显示更糟 */}
+                  {summary !== null && <span className="text-2xs text-muted">{summary}</span>}
+                  <span className="text-2xs text-muted" title={absoluteTime(r.saved_at)}>
+                    {versionMetaText(r.saved_at, r.author)}
                   </span>
-                </DropdownMenuItem>
-              )
-            })
-          )}
+                </span>
+              </DropdownMenuItem>
+            )
+          })}
           <DropdownMenuSeparator />
           {/*
             「加载更早的版本」用**游标**（`before` = 已加载的最后一条 id）而不是 offset：
             并发保存时 offset 会跳条/重复。
+          */}
+          {/*
+            三条分支各自的**事实主张**必须与 `rows` 实际装了多少条一致（见 `historyTotal` 的注释）：
+              · 还有没加载的 ⇒ 给「加载更早的版本…」；
+              · 全加载完了 ⇒ 才敢说「已到最早版本（v1）」；
+              · 没加载完但接口说没有更早的 ⇒ 如实说"更早的未在此列出"，**不谎称到最早**。
           */}
           {hasMore ? (
             <DropdownMenuItem
@@ -252,10 +322,13 @@ export function VersionPicker({
               {loadingMore && <Spinner label="正在加载更早的版本" />}
               {loadingMore ? '正在加载…' : '加载更早的版本…'}
             </DropdownMenuItem>
+          ) : reachedEarliest ? (
+            <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">已到最早版本（v1）</p>
           ) : (
-            rows.length > 0 &&
-            missing === false && (
-              <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">已到最早版本（v1）</p>
+            rows.length > 0 && (
+              <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">
+                更早的版本未在此列出（这一屏最多取 100 条）—— 用「浏览全部历史…」看全部。
+              </p>
             )
           )}
           <DropdownMenuSeparator />
@@ -269,7 +342,8 @@ export function VersionPicker({
             而这行只依赖页面详情里已经有的 `page.version` 与 `versions.length`。
           */}
           <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">
-            {versionCountText(page)}
+            {/* 传**实列条数**：下拉以 `rows` 为准，比页内那份被截断的数组通常更多 */}
+            {versionCountText(page, compactRows.length)}
           </p>
           <DropdownMenuItem onSelect={() => setTimelineOpen(true)}>
             <History className="size-3.5" />
@@ -279,9 +353,12 @@ export function VersionPicker({
       </DropdownMenu>
 
       <TimelineDialog
+        slug={slug}
         open={timelineOpen}
         onOpenChange={setTimelineOpen}
         page={page}
+        /* 版本下拉只在有编辑权时渲染 ⇒ 这条路走的是有会话的主体，分页端点可用 */
+        canLoadMore
         onPick={(v, label) => {
           setTimelineOpen(false)
           onCompare(v, label)
@@ -303,6 +380,7 @@ export function TimelineDialog({
   onOpenChange,
   page,
   onPick,
+  canLoadMore,
 }: {
   /** 拉全量历史（分页端点）；给了才能在弹窗里看到**更早的**改动，而不只是最近 N 条 */
   slug?: string
@@ -310,6 +388,19 @@ export function TimelineDialog({
   onOpenChange: (open: boolean) => void
   page: Pick<PageDetail, 'version' | 'versions'>
   onPick: (version: VersionMeta, label: number) => void
+  /**
+   * 是否**允许**去拉分页端点（`GET …/versions`）。
+   *
+   * 该端点声明的是 `{access:'user'}` ⇒ **匿名请求必然是 401**，而 401 会触发
+   * `lib/authFailure.ts` 的全局策略把人**跳去登录页**（两条 `…/versions?limit=100 → 401`
+   * 实测就是这么来的）。一个必然失败的请求不该被发出去 —— 这与仓库"不给必然失败的入口"
+   * 是同一纪律。
+   *
+   * 所以判据必须由调用方给出：**有编辑权**（版本下拉那条路径）⇒ `true`；
+   * 只读视角（`ReadonlyHistoryButton`）⇒ `false`，此时弹窗只列页详情里已经有的那 N 条，
+   * 并如实说明"更早的没有列出"，而不是去讨一个 401。
+   */
+  canLoadMore: boolean
 }): ReactNode {
   const versions = page.versions
   const total = page.version - 1
@@ -322,7 +413,7 @@ export function TimelineDialog({
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    if (!open || slug === undefined || rows.length > 0) return
+    if (!open || !canLoadMore || slug === undefined || rows.length > 0) return
     let cancelled = false
     setLoading(true)
     api
@@ -371,12 +462,12 @@ export function TimelineDialog({
            */
           <ServerVersionList
             rows={rows}
-            canCompare
+            canCompare={canLoadMore}
             onPick={(r) => onPick({ id: r.id, saved_at: r.saved_at, title: r.title, author: r.author }, r.number)}
           />
         ) : (
-          /* 降级：分页端点还没到货（或失败）时，退回页内那 N 条 */
-          <VersionList page={page} onPick={onPick} />
+          /* 降级：分页端点还没到货（或失败、或本就不允许拉）时，退回页内那 N 条 */
+          <VersionList page={page} onPick={onPick} canCompare={canLoadMore} />
         )}
         {loading && (
           <p className="m-0 mt-3 flex items-center gap-2 text-2xs text-muted">
@@ -386,7 +477,9 @@ export function TimelineDialog({
         )}
         {stillTruncated && (
           <p className="m-0 mt-3 text-2xs text-muted">
-            更早的改动未列出（这一屏最多取 100 条）—— 这不代表它们不存在，只是这一屏没取。
+            {canLoadMore
+              ? '更早的改动未列出（这一屏最多取 100 条）—— 这不代表它们不存在，只是这一屏没取。'
+              : '更早的改动未在此列出 —— 完整历史需要登录后查看。'}
           </p>
         )}
       </DialogContent>
@@ -421,7 +514,7 @@ function ServerVersionList({
     <ul className="m-0 flex list-none flex-col gap-1 p-0">
       {rows.map((r) => {
         /* 摘要拉不到就整段不显示 —— 编一句"0 段改动"比不显示更糟 */
-        const summary = versionChangeSummary(r.change)
+        const summary = versionChangeSummary(r.change, r.origin)
         const meta = versionMetaText(r.saved_at, r.author)
         const inner = (
           <>
@@ -499,6 +592,13 @@ export function ReadonlyHistoryButton({
         open={open}
         onOpenChange={setOpen}
         page={page}
+        /*
+         * ★ **不拉分页端点**：本入口给的是只读视角（无编辑权，可能正是匿名访客），
+         * 而那个端点是 `{access:'user'}` ⇒ 匿名请求必然 401，401 又会触发全局策略
+         * 把人跳去登录页。公开页的读者不该被登录墙拦住，也**不该产生必然失败的请求**。
+         * 弹窗只列页详情里已有的那 N 条，并在下方如实说明"更早的未列出"。
+         */
+        canLoadMore={false}
         onPick={() => setOpen(false)}
       />
     </>

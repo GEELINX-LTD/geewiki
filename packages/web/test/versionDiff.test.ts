@@ -243,6 +243,31 @@ test('守卫：对比弹窗必须容忍缺失的作者字段（显示「未记�
     '「另一位成员」的字面量在 authorText.ts 里只应出现一次',
   )
   /*
+   * ★ 作者字段**不得被组件直接读**。
+   *
+   * 这条钉的是本轮修掉的那个洞的另一半：作者三档规则此前只落在分页端点上，
+   * 页详情端点的 `versions[]` **无条件**回真名 —— 而版本下拉读的正是那份数据，
+   * 于是普通成员与匿名访客经由下拉拿到了同事真名。
+   *
+   * 服务端已抽成唯一真源（`authorFor`），前端这一侧的对应纪律是：组件**只**把
+   * `author` 整个对象交给 `authorText` 判档，绝不自己去读 `displayName`
+   * —— 组件一旦直接读那个字段，就等于把"能不能看名字"的判断搬到了 UI 层，
+   * 而后端再收紧档位时前端会**静默**渲染出一个名字。
+   */
+  for (const [name, src] of [
+    ['VersionDiffDialog', diffSrc],
+    ['VersionPicker', pickerSrc],
+  ] as const) {
+    assert.doesNotMatch(
+      codeOnly(src),
+      /\.displayName/,
+      `${name} 不得直接读 displayName —— 作者展示必须整个交给 authorText 判档`,
+    )
+  }
+  // 正面对照：两条渲染路径都真的经由 authorText / versionMetaText，否则上面的禁令可能只是"没渲染作者"
+  assert.match(codeOnly(diffSrc), /authorText\(/, '对比弹窗必须用 authorText 渲染作者')
+  assert.match(codeOnly(pickerSrc), /versionMetaText\(/, '时间线必须用 versionMetaText 渲染作者与时间')
+  /*
    * 下拉与时间线都必须走**同一份**作者文案（否则两处口径会漂移）。
    *
    * 判据说的是"同一份"，不是"必须直接调 authorText"：本轮把菜单项的文案抽到了
@@ -308,12 +333,21 @@ test('守卫：条数摘要随列表一起搬进了下拉（信息不得随版�
   const picker = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
   const plan = readFileSync(join(here, '../src/lib/versionPlan.ts'), 'utf8')
   assert.ok(picker.length > 5000 && plan.length > 5000, '文件读不到内容？反空洞')
-  assert.match(picker, /versionCountText\(page\)/, '下拉里必须渲染条数摘要')
+  /*
+   * ★ 本轮改过这里的判据，原因是真机验收发现"摘要与屏幕不一致"：
+   *
+   * 下拉的行以**分页端点的 `rows`** 为准（到货后条数比页内那份被 `recentVersions` 截断的
+   * 数组更多），而摘要原先写死用 `page.versions.length` ⇒ 下拉已经列全 12 条、摘要却还写着
+   * "仅列最近 10 次"。所以现在**实列条数必须由调用方传进来**，截断判据也从
+   * `isTruncated(page)`（比页内数组）换成 `listed < history`（比屏幕实际）。
+   */
+  assert.match(picker, /versionCountText\(page, compactRows\.length\)/, '必须把**实列条数**传进摘要')
   assert.match(plan, /export function versionCountText/, '摘要必须是可单测的纯函数')
+  assert.match(plan, /listedCount\?: number/, '实列条数必须可传（否则摘要只能按页内数组算，会与屏幕不符）')
   // 摘要必须说清"共几次"与"是否只列了一部分"，两者缺一都会让读者误判完整性
   assert.match(plan, /共 \$\{history\} 次改动/, '摘要要给出改动总数')
-  assert.match(plan, /仅列最近 \$\{page\.versions\.length\} 次/, '被截断时必须说明只列了最近几次')
-  assert.match(plan, /isTruncated\(page\)/, '截断判据必须与 isTruncated 同源，不得另起一套')
+  assert.match(plan, /`\$\{base\}（下拉里仅列最近 \$\{listed\} 次/, '被截断时必须说明只列了最近几次（用实列条数）')
+  assert.match(plan, /listed < history/, '截断判据必须比"实列条数 vs 总数"，不得退回比页内数组')
 })
 
 test('守卫：紧凑列表仍与「浏览全部历史」弹窗共用同一行组件（避免两处漂移）', () => {

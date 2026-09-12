@@ -314,6 +314,24 @@ grab_author() { # grab_author <文件> <作者 id> [字段] —— 打印该行�
     }
   ' "$1" "$2" "${3:-name}"
 }
+# 页详情端点里的 author.displayName 计数：>0 即"泄露了真名"。
+# 存在的理由：作者三档规则此前**只**落在分页端点上，页详情无条件回真名 ——
+# 而版本下拉读的正是页详情那份 `versions[]`，于是普通成员与匿名访客经由下拉拿到了真名。
+# 所以这一项必须对着**页详情**断言，而不是只对着版本列表。
+detail_author_names() { # detail_author_names <文件> —— 打印该文件 versions[].author.displayName 的个数
+  node -e '
+    const fs = require("fs")
+    let s = ""
+    try { s = fs.readFileSync(process.argv[1], "utf8") } catch { console.log("-1"); process.exit(0) }
+    const i = s.indexOf("{")
+    let o
+    try { o = JSON.parse(i >= 0 ? s.slice(i) : s) } catch { console.log("-1"); process.exit(0) }
+    const vs = Array.isArray(o.versions) ? o.versions : []
+    const named = vs.filter((v) => v && v.author && typeof v.author.displayName === "string" && v.author.displayName !== "")
+    // 反空洞：把"扫了几行"一起报出来，否则 versions 为空时"零个真名"恒真
+    console.log(named.length + "/" + vs.length)
+  ' "$1"
+}
 if [[ -n "${ACTOR_ID:-}" ]]; then
   sess GET "/api/pages/$SLUG/versions?limit=20" > /dev/null
   cp "$TMP/body" "$TMP/versions-author.json"
@@ -325,6 +343,35 @@ if [[ -n "${ACTOR_ID:-}" ]]; then
     bad "管理员读版本列表看不到作者真名，实际：$ADMIN_AUTHOR_NAME"
   fi
   check_field_absent "★ 版本列表不下发 users 表原字段（只应给 author 对象）" "$TMP/versions-author.json" "display_name"
+  # ---- 反空洞：管理员读**页详情**必须看得到真名，否则下面"匿名看不到"可能只是这一档没实现 ----
+  sess GET "/api/pages/$SLUG" > /dev/null
+  cp "$TMP/body" "$TMP/detail-admin.json"
+  ADMIN_DETAIL_NAMES="$(detail_author_names "$TMP/detail-admin.json")"
+  check_ge "反空洞：管理员读页详情能看到作者真名（否则下面'看不到'是恒真的）" \
+    "${ADMIN_DETAIL_NAMES%%/*}" 1
+  # ---- 匿名：页详情的 versions[] 不得给出任何真名（这正是被漏掉的那条路径）----
+  #
+  # 主探针页此刻是 `org` 档（匿名读会 404）⇒ 匿名的**页详情**路径覆盖不到。
+  # 而"页详情无条件回真名"正是这次修的那个洞，且它对**匿名**尤其致命（公开页的任何
+  # 访客都能读到同事真名）。所以另起一条**公开 + 已发布**的探针，把这条路径真正走一遍。
+  APROBE='vmeta-anon-probe'
+  check "建公开探针页（匿名档专用）⇒ 200" "200" "$(put_page "$APROBE" "$BODY1")"
+  sess PUT "/api/pages/$APROBE/visibility" '{"visibility":"public","published":true}' > /dev/null
+  AN_CODE="$(anon "/api/pages/$APROBE")"
+  cp "$TMP/body" "$TMP/detail-anon.json"
+  if [[ "$AN_CODE" == "200" ]]; then
+    AN_NAMES="$(detail_author_names "$TMP/detail-anon.json")"
+    AN_NAMED="${AN_NAMES%%/*}"
+    AN_TOTAL="${AN_NAMES##*/}"
+    check "★ 匿名读页详情 ⇒ versions[].author 里没有任何真名（与分页端点同源）" "0" "$AN_NAMED"
+    # 反空洞：这一档必须真的扫到了行，否则"零个真名"没有意义
+    check_ge "反空洞：匿名读页详情确实拿到了版本行（否则上一条恒真）" "$AN_TOTAL" 1
+    check_field_absent "★ 匿名读页详情不下发 users 表原字段" "$TMP/detail-anon.json" "display_name"
+  else
+    skip "匿名读公开探针页失败（$AN_CODE）⇒ 匿名档未覆盖"
+  fi
+  # 清理：探针页不留痕（失败也不阻断后续阶段）
+  sess DELETE "/api/pages/$(urlenc "$APROBE")" > /dev/null
   if [[ -n "${JAR2:-}" ]]; then
     V_CODE="$(vreq GET "/api/pages/$SLUG/versions?limit=20")"
     if [[ "$V_CODE" == "200" ]]; then
@@ -338,6 +385,18 @@ if [[ -n "${ACTOR_ID:-}" ]]; then
       check "同一时刻 author.id 仍然下发（不把可用信息一起砍掉）" "$ACTOR_ID" "$(grab_author "$TMP/versions-author-viewer.json" "$ACTOR_ID" id)"
       # 反空洞：不存在的作者 id 必须取不到行 —— 否则"找到行"这件事本身是恒真的
       check "反空洞：不存在的作者 id 取不到行" "<找不到该行>" "$(grab_author "$TMP/versions-author-viewer.json" 99999999)"
+      # ---- 页详情也必须遵守三档：viewer 对**他人**那条同样不该拿到真名 ----
+      V_D_CODE="$(vreq GET "/api/pages/$SLUG")"
+      if [[ "$V_D_CODE" == "200" ]]; then
+        cp "$TMP/body" "$TMP/detail-viewer.json"
+        V_DETAIL_NAME="$(grab_author "$TMP/detail-viewer.json" "$ACTOR_ID")"
+        check "★ viewer 读页详情 ⇒ 他人那条同样只有 id、没有真名" "null" "$V_DETAIL_NAME"
+        # 两个端点必须给出**同一个**结论 —— 这条正是"规则写成两份"会漏掉的
+        check "★ 页详情与分页端点的作者档位一致（同一个主体、同一条快照）" \
+          "$VIEWER_AUTHOR_NAME" "$V_DETAIL_NAME"
+      else
+        skip "viewer 读不到页详情（$V_D_CODE）⇒ 页详情档位未覆盖"
+      fi
     else
       skip "组织内 viewer 读不到版本列表（$V_CODE）⇒ 作者名第 3 档未覆盖（authz 缺口定案后应改期望）"
     fi

@@ -29,6 +29,7 @@ import {
   restoreDoneText,
   restoreErrorText,
   versionChangeSummary,
+  versionCountText,
   versionMetaText,
   versionNumberOf,
   versionOptions,
@@ -76,6 +77,73 @@ test('isTruncated：只有历史总数超过数组长度时为真', () => {
   assert.equal(isTruncated(page(5, 4)), false)
   assert.equal(isTruncated(page(15, 10)), true)
   assert.equal(isTruncated(page(1, 0)), false, '零历史不算截断')
+})
+
+/* --------------------------- 条数摘要（空态） --------------------------- */
+
+test('★ versionCountText：零历史时是唯一那句「暂无历史版本」', () => {
+  /*
+   * 这条钉住的是一个**重复文案**缺陷：下拉里曾同时渲染两处空态 ——
+   * 一处来自组件里的 `versions.length === 0` 分支，一处来自本函数 —— 于是
+   * 「暂无历史版本」在同一个菜单里出现两次、中间还夹着两个分隔符。
+   *
+   * 现在组件那处已删，空态只有本函数这一句；这条断言保证它**确实**会给出一句
+   * （而不是"两处都删了导致零历史时菜单一片空白"）。
+   */
+  assert.equal(versionCountText(page(1, 0)), '暂无历史版本')
+})
+
+test('★ versionCountText：截断说明必须按"屏幕上实列几条"算，不能按页内数组算', () => {
+  /*
+   * 真机验收抓到的第二处"摘要与屏幕不符"：下拉的行以分页端点的 `rows` 为准，
+   * 到货后条数**多于**页内那份被 `recentVersions` 截断的数组。此时若摘要仍按
+   * `page.versions.length`（10）算，就会出现"屏幕上明明列全了 12 条，摘要却说仅列最近 10 次"。
+   */
+  const p = page(13, 10) // 页内只有 10 条，历史总数 12
+  assert.match(versionCountText(p), /仅列最近 10 次/, '不传实列条数时退回页内数组（旧行为保留）')
+  assert.match(versionCountText(p, 10), /仅列最近 10 次/)
+  // 实列 12 条 = 全部 ⇒ 不能再写"仅列最近"
+  const full = versionCountText(p, 12)
+  assert.match(full, /共 12 次改动/)
+  assert.doesNotMatch(full, /仅列最近/, '已列全时不得再说"仅列最近 N 次"')
+  assert.notEqual(versionCountText(p, 10), full, '反空洞：两种实列条数必须给出不同结论')
+})
+
+test('versionCountText：非空时给总数，截断时点明"更早的见「浏览全部历史…」"', () => {
+  const full = versionCountText(page(5, 4)) // 当前 v5，历史 4 条且全部列出
+  assert.match(full, /当前 v5/)
+  assert.match(full, /共 4 次改动/)
+  assert.doesNotMatch(full, /仅列最近/, '没截断时不该说"仅列最近"')
+
+  const cut = versionCountText(page(15, 10)) // 历史 14 条，只列 10 条
+  assert.match(cut, /共 14 次改动/)
+  assert.match(cut, /仅列最近 10 次/, '截断时必须点明只列了最近几条')
+  assert.match(cut, /浏览全部历史/, '并且要指出更早的去哪看')
+  // 反空洞：两句必须真的不同，否则上面的 matches 可能只是同一句都能命中
+  assert.notEqual(full, cut)
+})
+
+test('守卫：下拉里的空态文案只有一处（不得再冒出第二句「暂无历史版本」）', () => {
+  const picker = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
+  const plan = readFileSync(join(here, '../src/lib/versionPlan.ts'), 'utf8')
+  assert.ok(picker.length > 5000 && plan.length > 5000, '文件读不到内容？反空洞')
+  // 唯一真源在 versionPlan；组件只消费，不再自己写一遍
+  const inPlan = (plan.match(/暂无历史版本/g) ?? []).length
+  assert.equal(inPlan, 1, `versionPlan 里应当恰好一处定义，实际 ${inPlan}`)
+  /*
+   * 组件侧的判据看的是**空态渲染**（`{versions.length === 0 ? <p…>…</p> : …}`），
+   * 不是"这个字符串有没有被提到" —— 文件头注释里正当地讲解着这段历史，
+   * 按字面量数会把它误判成第二处空态（第一版就是这么误红的）。
+   *
+   * 注意：下拉与**弹窗**各有一处 `versions.length === 0`，那是两件不同的事
+   * （弹窗的空态文案是「还没有可对比的历史版本。」，不是这句），所以判据必须
+   * 盯住"这个判断旁边紧跟的就是那句重复文案"。
+   */
+  assert.doesNotMatch(
+    picker,
+    /\{versions\.length === 0 \?\s*\(\s*<p[^>]*>暂无历史版本/,
+    '下拉不得再自己渲染一份「暂无历史版本」（空态只有 versionCountText 那一句）',
+  )
 })
 
 test('versionOptions：顺序与接口一致（新 → 旧），标签从总数往下数', () => {
@@ -175,11 +243,35 @@ test('versionChangeSummary：三种形态与降级', () => {
     versionChangeSummary({ contentChanged: true, blocksDelta: 2, grantsDelta: -1 }),
     '+2 段 · −1 条授权',
   )
+  /*
+   * 这一句本轮改过：原来是「仅标题**或权限**变更」，把两件不同的事并成一句。
+   * 现在"只改权限"由 `origin === 'acl'` 那一档负责，这里就只剩"只改了标题"。
+   */
   assert.equal(
     versionChangeSummary({ contentChanged: false, blocksDelta: 0, grantsDelta: 0 }),
-    '仅标题或权限变更',
+    '仅标题变更',
   )
   assert.equal(versionChangeSummary({ contentChanged: false, blocksDelta: 0, grantsDelta: 2 }), '+2 条授权')
+})
+
+test('★ versionChangeSummary：origin="acl" 必须说出「只动了权限」（否则那一版看起来毫无变化）', () => {
+  /*
+   * 真机验收抓到的缺陷：只改权限的那一版**恰好也是 `change === null`**
+   * （正文与块都没动，服务端不给 change 对象）⇒ 旧实现下它**一个字的摘要都没有**，
+   * 用户会读成"这一版没什么变化"，实际是"有人改了这条的可见性/发布状态"。
+   *
+   * `change === null` 本身有歧义（也可能只是"最早的一版，没有对照对象"），
+   * 只有 `origin` 能分开 —— 所以这条断言必须钉住"看 origin、不看 change"。
+   */
+  assert.equal(versionChangeSummary(null, 'acl'), '仅权限变更（档位/发布）')
+  assert.equal(versionChangeSummary(undefined, 'acl'), '仅权限变更（档位/发布）')
+  assert.equal(versionChangeSummary({ contentChanged: false, blocksDelta: 0, grantsDelta: 3 }, 'acl'), '+3 条授权')
+  assert.equal(versionChangeSummary({ contentChanged: false, blocksDelta: 0, grantsDelta: -2 }, 'acl'), '−2 条授权')
+  // 对照面：同为 null，`origin='content'`（最早那版）不该被说成权限变更
+  assert.equal(versionChangeSummary(null, 'content'), null)
+  // 对照面：origin 缺失（升级前的老行）同样不表态，不猜
+  assert.equal(versionChangeSummary(null, null), null)
+  assert.equal(versionChangeSummary(null), null)
 })
 
 test('★ versionChangeSummary：契约未就绪或字段缺失时返回 null（不编数字）', () => {

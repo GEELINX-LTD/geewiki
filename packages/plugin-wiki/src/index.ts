@@ -891,10 +891,11 @@ export const WikiPlugin = {
         id: number
         saved_at: string
         title: string | null
+        origin: string | null
         author_id: number | null
         author_name: string | null
       }>(
-        `SELECT v.id, v.saved_at, v.title, v.saved_by AS author_id, u.display_name AS author_name
+        `SELECT v.id, v.saved_at, v.title, v.origin, v.saved_by AS author_id, u.display_name AS author_name
            FROM page_versions v
            LEFT JOIN users u ON u.id = v.saved_by
           WHERE v.page_id = ? ORDER BY v.id DESC LIMIT ?`,
@@ -928,14 +929,22 @@ export const WikiPlugin = {
           saved_at: v.saved_at,
           title: v.title ?? null,
           /*
-           * `author` 只在**两列都拿得到**时给对象：`saved_by` 有值但 `users` 查不到
-           * （账号已删，0019 刻意不加外键）时返回 `null` 而不是 `{ id, displayName: null }`
-           * —— 后者会让界面渲染出"某人（名字缺失）"这种半截信息，不如统一按「未记录」。
+           * `origin`（0021）与分页端点同源：'content'（正文/标题被改）| 'acl'（只动了权限）
+           * | null（该列出现之前的历史行）。**必须与分页端点一起下发** —— 否则下拉在
+           * 分页数据到货前那一瞬间（以及它拉失败时）无法说明"这一版只改了权限"，
+           * 那一行就会显示成"没有任何变化"。
            */
-          author:
-            v.author_id === null || v.author_id === undefined || v.author_name === null
-              ? null
-              : { id: Number(v.author_id), displayName: v.author_name },
+          origin: v.origin ?? null,
+          /*
+           * ★ 作者走 `authorFor`（本插件内的**唯一真源**），与分页端点逐字同源。
+           *
+           * 这里曾经是 `v.author_id === null ? null : { id, displayName: v.author_name }`
+           * —— 也就是**无条件**回真名。后果是版本下拉（读的正是这份 `versions[]`）把
+           * 同事的真名漏给了普通成员与匿名访客，而分页端点给的是 `displayName: null`：
+           * 同一页、同一主体，两个端点的 `author` 不一致，且没有任何测试会发现。
+           * 「置灰即泄露」的立场要求这条规则**只能有一份实现**。
+           */
+          author: authorFor(principal, v.author_id, v.author_name),
         })),
         capabilities: {
           canEdit: access.canEdit,
@@ -977,6 +986,53 @@ export const WikiPlugin = {
     /** 页面是否存在（比 getPage 轻：不取正文、不取版本历史） */
     const pageExists = async (slug: string): Promise<boolean> =>
       (await adb.query<{ slug: string }>('SELECT slug FROM pages WHERE slug = ?', [slug])).length > 0
+
+    /**
+     * ★ 版本作者的**唯一真源**（页详情 `versions[]` 与分页 `/versions` 共用）。
+     *
+     * ## 为什么作者名只对**有权知道它**的人显示
+     *
+     * `GET /api/org/members` 是 `{access:'admin'}` + 组织管理员闸门 —— 普通成员
+     * **本来无权枚举组织成员**。而在版本列表里一律回真名等于开了一条旁路：作者 id 是
+     * 可枚举的整数，逐个翻页就能拼出成员名单。这与仓库既有的"置灰即泄露"立场冲突。
+     *
+     * ## 三档规则
+     *   1. 就是你自己 ⇒ 回你自己的名字（本来就知道）；
+     *   2. 你是 owner/admin ⇒ 回真名（你本来就有成员目录的读取权）；
+     *   3. 其余（含匿名、viewer、`orgRole` 为 null 的主体）⇒ `displayName: null`，
+     *      界面显示「另一位成员」。
+     *
+     * `id` 一律照回：它是"同一人的多次改动"能聚在一起的最小信息，而单看一个不透明的
+     * 整数并不能得到姓名。
+     *
+     * ## 为什么必须有这个函数（而不是两处各写一遍）
+     *
+     * 这条规则此前**只**落在分页端点上，页详情端点无条件回 `display_name` —— 于是版本
+     * 下拉（读页详情那份数据）把真名漏给了普通成员与匿名访客，而分页端点给的是 `null`。
+     * 同一个 bob、同一页，两个端点的 `author` 不一致，且**没有任何测试会发现**。
+     * 规则一旦写成两份，「唯一真源」就只剩一句口号。
+     *
+     * ## 两个易踩的边界
+     *   - `authorId` 为 null/undefined（0019 之前的历史行、跨插件代调用）⇒ 回 `null`，
+     *     界面显示「未记录」；
+     *   - `displayName` 为 null（账号已删，0019 刻意不加外键）⇒ **也回 `null`**。
+     *     返回 `{ id, displayName: null }` 会让界面渲染出"某人（名字缺失）"这种半截信息，
+     *     与「另一位成员」这一档（**记了人、只是名字不给你看**）混淆 —— 两件事完全不同。
+     */
+    const authorFor = (
+      viewer: Principal,
+      authorId: number | null | undefined,
+      displayName: string | null | undefined,
+    ): { id: number; displayName: string | null } | null => {
+      if (authorId === null || authorId === undefined) return null
+      if (displayName === null || displayName === undefined) return null
+      const viewerIsAdmin = viewer.orgRole === 'owner' || viewer.orgRole === 'admin'
+      const isSelf = viewer.userId !== null && Number(authorId) === viewer.userId
+      return {
+        id: Number(authorId),
+        displayName: viewerIsAdmin || isSelf ? displayName : null,
+      }
+    }
 
     /**
      * ★ P4：记录一次**越权尝试**（`access.denied`）。这是它的**唯一出口**。
@@ -1672,21 +1728,12 @@ export const WikiPlugin = {
         // `Number()` 不可省：PG 把 COUNT(*)（bigint）当字符串回（与 getPage 同款理由）
         const total = Number(totalRow.n)
         /*
-         * ★ 作者名只对**有权知道它**的人显示。
+         * ★ 作者名的三档规则**已上移到 `authorFor`**（本插件内的唯一真源）：
+         * 页详情端点的 `versions[]` 与本端点必须逐字同源，规则与理由见该函数。
          *
-         * 为什么不能一律回 `display_name`：`GET /api/org/members` 是
-         * `{access:'admin'}` + 组织管理员闸门 —— 普通成员**本来无权枚举组织成员**。
-         * 而在版本列表里回真名等于开了一条旁路：作者 id 是可枚举的整数，逐个翻页就
-         * 能拼出成员名单。这与仓库既有的"置灰即泄露"立场冲突。
-         *
-         * 规则（三档）：
-         *   1. 就是你自己 ⇒ 回你自己的名字（本来就知道）；
-         *   2. 你是 owner/admin ⇒ 回真名（你本来就有成员目录的读取权）；
-         *   3. 其余 ⇒ `displayName: null`，界面显示「另一位成员」。
-         * `id` 一律照回：它是"同一人的多次改动"能聚在一起的最小信息，
-         * 而单看一个不透明的整数并不能得到姓名。
+         * 此前这条规则只落在本端点，页详情无条件回真名 —— 版本下拉读的正是那份数据，
+         * 于是普通成员与匿名访客经由下拉拿到了真名，而本端点给的是 `displayName: null`。
          */
-        const viewerIsAdmin = viewer.orgRole === 'owner' || viewer.orgRole === 'admin'
         h.json(200, {
           ok: true,
           slug,
@@ -1711,14 +1758,11 @@ export const WikiPlugin = {
               title: v.title ?? null,
               // 0021：'content'（正文/标题被改）| 'acl'（只动了权限）| null（升级前的行）
               origin: v.origin ?? null,
-              author:
-                v.author_id === null || v.author_id === undefined
-                  ? null
-                  : {
-                      id: Number(v.author_id),
-                      displayName:
-                        viewerIsAdmin || Number(v.author_id) === viewer.userId ? (v.author_name ?? null) : null,
-                    },
+              /*
+               * ★ 作者走 `authorFor`（本插件内的**唯一真源**），与页详情 `versions[]`
+               * 逐字同源。规则本身与理由见该函数的文档注释。
+               */
+              author: authorFor(viewer, v.author_id, v.author_name),
               /*
                * 这一版**相对下一版**（更晚的那条快照）改了什么 —— 也就是说：把这条快照
                * 覆盖掉的那次编辑做了什么。最早的一版没有对照对象 ⇒ `null`（**不是**

@@ -72,11 +72,24 @@ export function versionOptions(page: Pick<PageDetail, 'version' | 'versions'>): 
  * ⚠️ 只依赖页面详情已有字段：`versions[]` 是异步按需补拉的（拉不到时不显示摘要行），
  * 而这行必须在**没有任何额外请求**时也能说真话。
  */
-export function versionCountText(page: Pick<PageDetail, 'version' | 'versions'>): string {
+export function versionCountText(
+  page: Pick<PageDetail, 'version' | 'versions'>,
+  /**
+   * 下拉里**实际列出**的条数。省略时按页内 `versions.length` 算。
+   *
+   * 为什么必须能传：下拉的行以分页端点的 `rows` 为准（到货后条数通常**多于**页内那份被
+   * `recentVersions` 截断的数组）。真机验收里就撞到过这一处 —— 下拉已经列出全部 12 条，
+   * 摘要却还写着"下拉里仅列最近 10 次"，**同一屏自己跟自己矛盾**（只是这次是少报）。
+   */
+  listedCount?: number,
+): string {
   const history = page.version - 1
   if (history <= 0) return '暂无历史版本'
+  const listed = listedCount === undefined ? page.versions.length : listedCount
   const base = `当前 v${page.version} · 共 ${history} 次改动`
-  return isTruncated(page) ? `${base}（下拉里仅列最近 ${page.versions.length} 次，更早的见「浏览全部历史…」）` : base
+  return listed < history
+    ? `${base}（下拉里仅列最近 ${listed} 次，更早的见「浏览全部历史…」）`
+    : base
 }
 
 /* ------------------------------------------------------------------ *
@@ -179,22 +192,48 @@ export function versionMetaText(
  * 改动摘要：把后端 `change` 结构压成一句话。
  *
  * 真实键名以 `packages/plugin-wiki/src/index.ts` 的 `/versions` 响应为准：
- * `{ contentChanged, blocksDelta, grantsDelta }`。三个字段的语义：
- * - `contentChanged === false && blocksDelta === 0 && grantsDelta === 0` ⇒ **没改动**
- *   （只有标题变了这种情况也走这里 —— 后端明确"比正文不比块快照"）
- * - `contentChanged === false` 但块/授权有变化 ⇒ **仅权限变更**
- * - 其余按块数增减给 `+N / −M 段`
+ * `{ contentChanged, blocksDelta, grantsDelta }`。
  *
- * ⚠️ 契约未就绪（`change === null`）或字段缺失时返回 `null`，界面**不显示摘要** ——
+ * ## `origin` 为什么必须参与（真机验收抓到的缺陷）
+ *
+ * 此前只看 `change`，而 `origin === 'acl'`（只动了权限：改档位/发布/发撤授权）
+ * 的那一条**恰好也是 `change === null`**（正文与块都没动，服务端不给 `change` 对象）。
+ * 于是界面上那一版**一个字的摘要都没有** —— 用户会把它读成"这一版没什么变化"，
+ * 而它其实是"有人改了这条的可见性/发布状态"。
+ *
+ * 更麻烦的是 `change === null` 本身**有歧义**：它既可能是"只改了权限"，
+ * 也可能是"最早的那一版，没有对照对象"。两者靠 `change` 分不开，**只有 `origin` 能分开**
+ * （0021 记的就是"这次动作是什么性质"）。所以权限变更这一档用 `origin` 判定，
+ * **不**从 `change` 去猜。
+ *
+ * ## `change` 的方向（别读反了）
+ *
+ * `change` 说的是「**比这一版更晚的那一版**相对它改了多少」，服务端算的是
+ * `countBlocks(本版) − countBlocks(更晚那版)`。所以正数意味着**更晚那版更少**
+ * （即那一版删了段落）。界面上的摘要因此挂在"被覆盖掉的那一版"上 ——
+ * 要看清某次改动，应点进对比弹窗（那里给行级 `+N −M` 与具体增删行）。
+ *
+ * ⚠️ 契约未就绪或字段缺失时返回 `null`，界面**不显示摘要** ——
  * 编一个"0 段改动"比不显示更糟（那是在声称一件没根据的事）。
  */
 export function versionChangeSummary(
   change: { contentChanged?: boolean; blocksDelta?: number; grantsDelta?: number } | null | undefined,
+  origin?: string | null,
 ): string | null {
+  /*
+   * 只动了权限：`origin` 是权威判据。即使 `change` 意外带了授权计数，也一并说清
+   * —— 那同样是权限侧的变化。
+   */
+  if (origin === 'acl') {
+    const g = typeof change?.grantsDelta === 'number' ? change.grantsDelta : 0
+    if (g > 0) return `+${g} 条授权`
+    if (g < 0) return `−${Math.abs(g)} 条授权`
+    return '仅权限变更（档位/发布）'
+  }
   if (!change || typeof change.contentChanged !== 'boolean') return null
   const blocks = typeof change.blocksDelta === 'number' ? change.blocksDelta : 0
   const grants = typeof change.grantsDelta === 'number' ? change.grantsDelta : 0
-  if (!change.contentChanged && blocks === 0 && grants === 0) return '仅标题或权限变更'
+  if (!change.contentChanged && blocks === 0 && grants === 0) return '仅标题变更'
   const parts: string[] = []
   if (blocks > 0) parts.push(`+${blocks} 段`)
   else if (blocks < 0) parts.push(`−${Math.abs(blocks)} 段`)
@@ -251,4 +290,58 @@ export function restoreErrorText(err: { details?: unknown } | null | undefined):
   const ordinals = details?.blockedOrdinals
   if (!Array.isArray(ordinals) || ordinals.length === 0) return null
   return `该版本含 ${ordinals.length} 个当前你无权查看的段落，无法恢复`
+}
+
+/* ------------------------------------------------------------------ *
+ * 列表末尾的"还有没有更早的"这一句
+ * ------------------------------------------------------------------ */
+
+/** 列表末尾那一行该说什么。三种取值各对应一个**不同的事实主张**，不可互换。 */
+export type OlderVersionsNote = 'load-more' | 'earliest' | 'not-listed' | 'none'
+
+/**
+ * 决定"已加载 N 条"之后，列表末尾该给「加载更早」还是「已到最早」。
+ *
+ * ## 为什么这个判断值得单独一个函数
+ *
+ * 它此前是用接口的 `hasMore` 直接判的，而那说的是"**这一页之外**还有没有"，
+ * 不是"**页内那份被 LIMIT 截断的数组**之外还有没有"。两者在"一次就装下全部历史"
+ * 时**恰好相反** —— 实测 `welcome`：历史共 12 条，接口一次全回且 `hasMore=false`，
+ * 而页内 `versions[]` 受 `recentVersions` 限制只给最近 10 条。旧判据于是在 10 条之后
+ * 打印「已到最早版本（v1）」，同一屏底部的条数摘要却写着「更早的见「浏览全部历史…」」
+ * —— 自相矛盾，而且用户被告知"到最早了"而 v2/v1 根本没列出来。
+ *
+ * ## 判据
+ * - `loadedCount >= historyTotal` ⇒ 真的到底了 ⇒ `'earliest'`；
+ * - 否则接口说还有（`hasMore`）⇒ `'load-more'`；
+ * - 否则（没到底、接口也说没有更早的 —— 即被单屏上限截断）⇒ `'not-listed'`：**如实说，
+ *   但不谎称到最早**；
+ * - 一条都没加载 ⇒ `'none'`（别在空列表下面写"已到最早"）。
+ *
+ * @param historyTotal 历史总数 = `page.version - 1`（权威来源是 `COUNT(page_versions)`）
+ * @param loadedCount  当前已列出的条数
+ * @param hasMore      接口是否报告还有下一页
+ */
+export function olderVersionsNote(
+  historyTotal: number,
+  loadedCount: number,
+  hasMore: boolean,
+): OlderVersionsNote {
+  if (loadedCount <= 0) return 'none'
+  if (loadedCount >= historyTotal) return 'earliest'
+  return hasMore ? 'load-more' : 'not-listed'
+}
+
+/** 列表末尾那一行的文案。空态组件不渲染任何东西。 */
+export function olderVersionsText(note: OlderVersionsNote): string | null {
+  switch (note) {
+    case 'load-more':
+      return '加载更早的版本…'
+    case 'earliest':
+      return '已到最早版本（v1）'
+    case 'not-listed':
+      return '更早的版本未在此列出（这一屏最多取 100 条）—— 用「浏览全部历史…」看全部。'
+    default:
+      return null
+  }
 }

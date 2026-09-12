@@ -123,11 +123,48 @@ test('游标分页用 before 而非 OFFSET（并发保存不跳条）', () => {
 })
 
 test('作者显示名对普通成员置空（不开口子枚举组织成员）', () => {
-  const body = endpointBlock("router.register('GET', '/api/pages/:slug/versions',")
-  assert.ok(body.includes('viewerIsAdmin'), '应有"查看者是否管理员"的判据')
+  /*
+   * ★ 这条守卫本轮改过判据，原因值得记下来。
+   *
+   * 原判据是"**分页端点体内**必须出现 `viewerIsAdmin`" —— 把规则钉在**某一个端点里**。
+   * 而本轮修掉的洞恰恰是这个形态造成的：规则只落在分页端点上，页详情端点的 `versions[]`
+   * 无条件回真名，于是版本下拉（读页详情那份数据）把同事真名漏给了普通成员与匿名访客。
+   * 旧判据对此**完全无感** —— 分页端点里那两行一直都在。
+   *
+   * 现在钉的是**唯一真源 + 两个调用点**：
+   *   1. 规则本体在 `authorFor` 里（本人 / owner·admin ⇒ 真名；其余 ⇒ `null`）；
+   *   2. 页详情与分页端点**都**调它。
+   * 任何"在某个端点里另写一遍判据"的改动都会让 ② 失败；把规则改弱会让 ① 失败。
+   */
+  const at = SRC.indexOf('const authorFor = (')
+  assert.ok(at !== -1, '反空洞：没定位到 authorFor 的定义')
+  const ruleBody = SRC.slice(at, at + 1400)
   assert.ok(
-    body.includes('viewerIsAdmin || Number(v.author_id) === viewer.userId'),
+    ruleBody.includes("viewer.orgRole === 'owner' || viewer.orgRole === 'admin'"),
+    'authorFor 里应有"查看者是否管理员"的判据',
+  )
+  assert.ok(
+    ruleBody.includes('viewerIsAdmin || isSelf ? displayName : null'),
     'displayName 仅对本人与 owner/admin 下发，其余置 null',
+  )
+  // 两个调用点都必须走同一个函数 —— 规则写成两份正是本轮的缺陷形态
+  const definitionCount = (SRC.match(/const authorFor = \(/g) ?? []).length
+  // 注意：`const authorFor = (` 里函数名与 `(` 之间**有空格**，所以下面这个正则只数调用点
+  const callCount = (SRC.match(/authorFor\((?!\s*=)/g) ?? []).length
+  assert.equal(definitionCount, 1, `authorFor 只应有一处定义，实际 ${definitionCount} 处`)
+  assert.ok(
+    callCount >= 2,
+    `反空洞：authorFor 应被页详情与分页端点各调一次，实际调用 ${callCount} 次`,
+  )
+  const detailAt = SRC.indexOf('const getPage = async (')
+  assert.ok(detailAt !== -1, '反空洞：没定位到 getPage')
+  assert.ok(
+    SRC.slice(detailAt, detailAt + 12000).includes('authorFor(principal'),
+    '页详情端点的 versions[] 必须调 authorFor（不得自己判 displayName）',
+  )
+  assert.ok(
+    endpointBlock("router.register('GET', '/api/pages/:slug/versions',").includes('authorFor(viewer'),
+    '分页端点必须调 authorFor（不得自己判 displayName）',
   )
 })
 

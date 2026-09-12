@@ -1286,6 +1286,22 @@ function WikiDetail(props: {
     if (page === null) return
     if (previewParam.kind !== 'ok') {
       setPreview(null)
+      /*
+       * ★ 参数**根本不成形**（`?v=abc` / `?v=-3` / `?v=0` / `?v=`）时也要清 URL 并说明。
+       *
+       * 此前这里只是 `setPreview(null); return` —— 于是坏链接**既不清 URL、也没有任何提示**，
+       * 用户从聊天记录里粘一个残缺的 `?v=abc` 进来，看到的是一篇正常的最新版页面，
+       * 完全不知道自己的链接没生效（而 `parsePreviewParam` 的注释明写"静默回到最新 +
+       * 从 URL 清掉 `?v=`" —— 注释与实现不一致）。
+       *
+       * 两种非法要分开处理（`kind` 已经分好了）：
+       *   - `invalid`：格式就不对（不是正整数）⇒ 提示 + 清 URL；
+       *   - `absent`：压根没带 `?v=` ⇒ 正常阅读，什么都不做。
+       */
+      if (previewParam.kind === 'invalid') {
+        onNavigate(homeMode ? '' : slug)
+        setPreviewNotice(PREVIEW_INVALID_TEXT)
+      }
       return
     }
     const wantId = previewParam.id
