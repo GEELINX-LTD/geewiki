@@ -438,6 +438,28 @@ else
 fi
 
 echo
+echo "=== 阶段 V：页面列表的版本数语义（version = 历史快照数 + 1）==="
+# 为什么必须有这一段：列表里的 `version` 是 `Number(COUNT(page_versions)) + 1`。
+# `pg` 把 COUNT(*)（bigint）作为**字符串**返回以避免精度丢失，所以那层 `Number()` 强转
+# 是**语义的一部分**，不是顺手写的：少了它，PG 下 `"0" + 1` 会变成字符串 `"01"`，
+# 而 SQLite 下一切正常 —— 只跑 SQLite 的用例**完全看不到**这个回归。
+# 本阶段同时钉住"列表的计数从相关子查询改成聚合 JOIN 之后仍然正确"（本批 T9 的改动）。
+VSLUG='p3a-vercount'
+check "V1 新建页面（version 应为 1）→ 200" "200" "$(put_page "$VSLUG" '版本计数 v1')"
+check "V2 第 2 次保存（产生第 1 条历史）→ 200" "200" "$(put_page "$VSLUG" '版本计数 v2')"
+check "V3 第 3 次保存（产生第 2 条历史）→ 200" "200" "$(put_page "$VSLUG" '版本计数 v3')"
+check "V4 第 4 次保存（产生第 3 条历史）→ 200" "200" "$(put_page "$VSLUG" '版本计数 v4')"
+sess GET /api/pages >/dev/null
+# 反空洞：先确认这一页真的出现在列表里 —— 否则 `find(...)` 返回 undefined，
+# 下一条会以"计数错了"的形式变红，而真实原因是"压根没找到这一页"。
+check "V5 前置：该页确实在列表里" "$VSLUG" "$(field "pages.find(p=>p.slug==='$VSLUG').slug")"
+check "V6 列表里 version === 4（3 条历史 + 1）" "4" "$(field "pages.find(p=>p.slug==='$VSLUG').version")"
+# 详情端点是同一口径的另一处实现（单页 COUNT），两处必须一致，否则界面上的
+# "当前为 v4 / 共 3 个快照"与列表里的"版本"列会互相矛盾。
+sess GET "/api/pages/$VSLUG" >/dev/null
+check "V7 详情端点同口径（version === 4）" "4" "$(field version)"
+
+echo
 echo "=== 阶段 J：收尾 —— 服务仍健康、日志无异常 ==="
 check "J1 /api/health → 200" "200" "$(anon /api/health)"
 if grep -qE "no such table|Unhandled|unhandledRejection" "$LOG"; then

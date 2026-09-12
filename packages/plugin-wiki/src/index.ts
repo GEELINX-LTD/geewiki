@@ -15,6 +15,8 @@
  * 方法集与上述四个端点一一对应，两者**共用同一份内部实现**（listPages/getPage/
  * savePage/deletePage），故同一入参下结果逐字段一致。
  */
+import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
@@ -23,6 +25,8 @@ import {
   asAsync,
   auditIpHash,
   closeAfterResponse,
+  DEFAULT_DATA_DIR,
+  resolveProjectPath,
   writeAuditLog,
   type AnyDatabaseAdapter,
   type DatabaseExecutor,
@@ -33,10 +37,21 @@ import {
 } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
 import {
+  ATTACHMENT_EXT_WHITELIST,
+  DEFAULT_MAX_BYTES,
+  attachmentUrl,
+  dispositionKindOf,
+  effectiveMime,
+  formatDisposition,
+  normalizeExt,
+  resolveAttachmentPath,
+} from './attachments.js'
+import { AttachmentStoreError, ensureAttachmentDirs, isUniqueViolation, storeStream } from './attachment-store.js'
+import {
   BlockParseError,
   BlockSyncError,
   parseBlocks,
-  projectBlocks,
+  projectPageContentFor,
   readExistingBlocks,
   sha256Hex,
   syncBlocksForPage,
@@ -47,7 +62,6 @@ import {
   type BlockVisibility,
   type ParsedBlock,
   type PageLevel,
-  type ReaderTier,
 } from './blocks.js'
 
 /**
@@ -114,6 +128,14 @@ export const WIKI_MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)),
 export interface WikiConfig {
   /** 页面详情中返回的最近版本历史条数上限 */
   recentVersions?: number
+  /** 单个附件的字节上限（默认 25MB） */
+  attachmentMaxBytes?: number
+  /** 单页附件总字节配额（默认 200MB） */
+  attachmentPageQuotaBytes?: number
+  /** 允许的附件扩展名（**只能收窄内置白名单**，不能放宽） */
+  attachmentAllowedExt?: string[]
+  /** 是否允许 SVG 内联展示（默认 false；同源内联 SVG 可执行脚本） */
+  attachmentInlineSvg?: boolean
 }
 
 /**
@@ -126,6 +148,33 @@ export const WikiConfigSchema = Schema.object({
     .min(1)
     .max(100)
     .description('页面详情返回的最近版本历史条数上限'),
+  /*
+   * 附件四项（本批 M2）。**上界 200MB 是硬编码的**：单文件上限越大，"一个并发上传打满
+   * 内存/磁盘"的代价越高，而这一层没有独立的限流设施 —— 所以把可用上限写死在
+   * 插件里，而不是让配置随手调到几个 GB。
+   */
+  attachmentMaxBytes: Schema.number()
+    .default(DEFAULT_MAX_BYTES)
+    .min(1)
+    .max(200 * 1024 * 1024)
+    .description('单个附件的字节上限（默认 25MB，最大 200MB）'),
+  attachmentPageQuotaBytes: Schema.number()
+    .default(200 * 1024 * 1024)
+    .min(1)
+    .description('单个页面的附件总字节配额（默认 200MB）'),
+  /*
+   * ⚠️ 这个配置**只能收窄**内置白名单（apply 里取交集），不能放宽：
+   * 放宽会让 `.html` 这类同源可执行内容进得来，而落盘路径的 `attachmentRelPath`
+   * 断言仍然按内置白名单校验 ⇒ 要么静默失败、要么（更糟）被绕过。收窄方向永远安全。
+   * **收窄只影响新的上传**：已收录附件的下载不查这个集合（否则一改配置，
+   * 历史附件会集体变成 404 —— 那是把一次配置调整变成数据不可读）。
+   */
+  attachmentAllowedExt: Schema.array(Schema.string())
+    .default([...ATTACHMENT_EXT_WHITELIST])
+    .description('允许上传的附件扩展名（含前导点；只能收窄内置白名单，不能放宽）'),
+  attachmentInlineSvg: Schema.boolean()
+    .default(false)
+    .description('是否允许 SVG 内联展示（默认关闭：同源内联 SVG 可执行脚本 = 存储型 XSS，除非另配 CSP）'),
 })
 
 /* ======================= wiki-service 服务契约 ======================= */
@@ -312,56 +361,10 @@ export const manifest: GeeWikiManifest = {
 /**
  * ★ P3a：把某页正文投影成**该主体可见的样子**（受限块替换为显式占位）。
  *
- * 三条要点，每条都对应一个具体的失败模式：
- *
- * 1. **优先读 `blocks` 表**（P3a 起由 `syncBlocksForPage` 在写入事务里维护）。
- * 2. **`blocks` 为空时现场解析 `pages.content`** —— P3a 之前保存的历史页面没有块行，
- *    若此时直接返回 `page.content`，那些页面里可能存在的受限区段就会被**原样吐出**。
- *    **读路径不能依赖"写入路径已经跑过"**：那是可被绕过的假设（旧数据、直接改库、
- *    迁移未回填都能让它不成立），而它一旦不成立就是泄漏。
- * 3. **读者等级只看组织角色**：匿名 = `0`，有组织角色 = `1`。`granted` 档由
- *    `projectBlocks` 判为永不命中（授权分支 `block_grants` 属 P3b）—— 失败关闭。
- *
- * 与检索的分工：`blocks.tier` 管"搜不搜得到"，这里管"读不读得到"；两者共用
- * `blockLevelOf` 的判据，写反方向会让"搜不到但读得到"成为泄漏。
+ * 实现已**上移**到 `./blocks.js` 的 `projectPageContentFor`（本批 M3）：
+ * 附件下载端点必须复用**同一条判据**判断"这份附件是否出现在该主体看得见的正文里"，
+ * 而两份实现必然漂移 —— 漂移的表现是"正文里看不到、附件却能下载"，且不会报错。
  */
-async function projectPageContent(
-  db: { query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> },
-  args: { pageId: number; content: string; principal: Principal; grantedBlockIds?: readonly number[] },
-): Promise<{ text: string; gatedCount: number }> {
-  /*
-   * ★ P3b：**必须把 `id` 一起取出来**。授权分支是拿块 id 去查的
-   * （`block_grants.block_id`），少了这一列，被授予的 `granted` 块会**对授权者也
-   * 不可见** —— 症状是"授权明明写进去了却看不到"，而且不报任何错。
-   */
-  const rows = await db.query<{ id: number; ordinal: number; text: string; visibility: string }>(
-    'SELECT id, ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
-    [args.pageId],
-  )
-  const blocks =
-    rows.length > 0
-      ? rows.map((r) => ({
-          // 块 id 必须原样带过去 —— 它是授权分支唯一的键
-          id: Number(r.id),
-          ordinal: r.ordinal,
-          text: r.text,
-          visibility: r.visibility as BlockVisibility,
-        }))
-      : /*
-         * 现场解析的降级路径：**没有块 id** ⇒ 授权分支必然落空
-         * （见 `ProjectableBlock.id` 的说明 —— 拿会漂移的 ordinal 去查权限表是错的）。
-         * 也就是说，**P3a 之前保存、且尚未被回填的历史页面里，`granted` 块对被授权者
-         * 也不可见**，直到该页被重新保存为止。方向是失败关闭。
-         */
-        parseBlocks(args.content)
-  const anonymous = args.principal.kind === 'anonymous'
-  const tier: ReaderTier = anonymous ? 0 : 1
-  return projectBlocks(blocks, {
-    tier,
-    anonymous,
-    grantedBlockIds: args.grantedBlockIds ?? [],
-  })
-}
 
 interface PageRow {
   id: number
@@ -379,6 +382,28 @@ interface PageRow {
   visibility?: string
   inherit?: number | boolean
   published_at?: string | null
+}
+
+/**
+ * 附件元数据行（`attachments` 表，本批 M2）。
+ *
+ * **磁盘上只有字节，这张表才是真源**：`sha256` + `ext` 一起决定落盘路径
+ * （`resolveAttachmentPath`），`byte_size`/`mime`/`original_name` 只用于响应头与展示。
+ * 下载路径因此**先查这张表、再拼路径**，而不是"拿 URL 里的东西去拼文件路径"。
+ */
+interface AttachmentRow {
+  id: number
+  page_id: number
+  sha256: string
+  ext: string
+  byte_size: number
+  mime: string
+  original_name: string
+  uploader_id: number | null
+  /** 联查 `pages` 得到的**当前** slug（判定用现值；`attachments.page_slug` 只是审计冗余列） */
+  live_slug: string
+  /** 联查 `pages` 得到的正文 —— 块级投影的输入 */
+  page_content: string
 }
 
 /**
@@ -570,6 +595,58 @@ export const WikiPlugin = {
      * 服务方法只负责入参校验后转发——两条路径因此不可能行为漂移。
      * ------------------------------------------------------------------- */
 
+    /* ------------------------- 附件存储（本批 M1/M2） ------------------------- */
+
+    /**
+     * 附件的数据目录与临时目录。
+     *
+     * 环境变量优先（`GEEWIKI_DATA_DIR`，与 docker-compose 的卷挂载约定一致），默认 `./data`
+     * —— 与 `@geewiki/db-sqlite` 取数据库路径时**逐字同款**的写法。相对路径经
+     * `resolveProjectPath` 以**仓库根**为基准解析：否则从不同 cwd 启动（`pnpm dev` /
+     * 子目录内 `node`）会落到不同的附件目录，表现为"刚上传的图刷新就 404"。
+     */
+    const attachmentsRoot = resolveProjectPath(
+      process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR,
+      import.meta.url,
+    )
+    /**
+     * 临时目录**刻意放在 `attachments/` 之外**（`<data>/tmp`）：
+     *
+     * 1. 内容寻址目录里因此**只可能出现完整的最终文件** —— 没有半截文件的中间态，
+     *    运维核对"磁盘上有哪些附件"时看到的集合就是数据库里的集合；
+     * 2. 临时文件与最终路径仍在同一文件系统（同一个数据根）⇒ `rename` 是原子的，
+     *    不会退化成跨设备拷贝。
+     */
+    const attachmentsTmpDir = join(attachmentsRoot, 'tmp')
+    /** 单文件字节上限与单页配额（`Schema.number()` 已保证是正整数） */
+    const attachmentMaxBytes = config.attachmentMaxBytes ?? DEFAULT_MAX_BYTES
+    const attachmentPageQuotaBytes = config.attachmentPageQuotaBytes ?? 200 * 1024 * 1024
+    /**
+     * 生效的扩展名白名单 = **内置白名单 ∩ 配置**（只收窄、不放宽，理由见配置项注释）。
+     * 空集是合法的（等于关掉上传），故不在这里兜底成内置白名单。
+     */
+    const attachmentAllowedExt: ReadonlySet<string> = new Set(
+      (config.attachmentAllowedExt ?? ATTACHMENT_EXT_WHITELIST)
+        .map((e) => e.toLowerCase())
+        .filter((e) => ATTACHMENT_EXT_WHITELIST.includes(e)),
+    )
+    const attachmentInlineSvg = config.attachmentInlineSvg === true
+
+    /**
+     * 激活期探针：**建一次目录**，把"附件目录不可写"这件事在启动时就暴露出来。
+     *
+     * 但**失败只告警、不阻止激活**：只读挂载 / 权限没配好的场景下，若在这里抛错，
+     * 整个 wiki 插件（含页面读写）会一起起不来 —— 那是把"附件用不了"升级成"整站用不了"。
+     * 正文与版本历史与附件目录毫无关系，它们没有理由陪葬。
+     */
+    void ensureAttachmentDirs(attachmentsRoot, attachmentsTmpDir).catch((err: unknown) => {
+      console.warn(
+        `[@geewiki/wiki] 附件目录不可用（${attachmentsRoot}）：上传将返回 503 storage_unavailable。` +
+          '页面与版本历史不受影响。原因:',
+        err,
+      )
+    })
+
     /**
      * 页面摘要列表（按 updated_at 倒序；version = 历史快照数 + 1）。
      *
@@ -668,10 +745,21 @@ export const WikiPlugin = {
       // 且复用策略层的唯一出口（不自己写第二套可见性规则）
       const visible = new Set(await policy().visibleSlugs(principal))
       return (
-        await adb.query<PageRow>(
-          `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at,
-                  (SELECT COUNT(*) FROM page_versions v WHERE v.page_id = p.id) AS version_count
-             FROM pages p ORDER BY p.updated_at DESC, p.id DESC`,
+        await adb.query<PageRow & { version_count: number | string | null }>(
+          /*
+            版本数一次算完，不再逐行跑相关子查询。
+            原先是 `(SELECT COUNT(*) FROM page_versions v WHERE v.page_id = p.id)`：
+            页数一多就是 N 次针对 page_versions 的独立扫描（PG 下每次还是一个独立子计划），
+            而"可见性过滤"只能发生在 JS 侧（见上方注释，DB 层拿不到"可见的第 N 页"），
+            所以这里**不做服务端分页**，只把 N 次扫描降到 1 次。
+            `LEFT JOIN`（不是 INNER）保证"一次都没存过版本的页面"仍然出现在结果里 ——
+            此时计数是 NULL，下面按 0 处理，语义与旧的子查询一致（COUNT 恒为 0 而不会是 NULL）。
+          */
+          `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at, v.n AS version_count
+             FROM pages p
+             LEFT JOIN (SELECT page_id, COUNT(*) AS n FROM page_versions GROUP BY page_id) v
+                    ON v.page_id = p.id
+            ORDER BY p.updated_at DESC, p.id DESC`,
         )
       )
         .filter((r) => visible.has(r.slug))
@@ -679,7 +767,14 @@ export const WikiPlugin = {
           slug: r.slug,
           title: r.title,
           updated_at: r.updated_at,
-          version: Number((r as unknown as { version_count: number }).version_count) + 1,
+          /*
+            **必须 Number() 强转**（与 getPage 的详情端点同一条理由，见那里的注释）：
+            `COUNT(*)` 是 bigint，`pg` 为免精度丢失把它作为**字符串**返回，而 better-sqlite3
+            返回数字。少了这层强转，PG 下 `+ 1` 会变成字符串拼接（"0" + 1 → "01"），
+            version 悄悄从数字变字符串 —— 只在 PG 这一种驱动下发生，只跑 SQLite 的测试看不到。
+            `?? 0` 兜住 LEFT JOIN 未命中时的 NULL。
+          */
+          version: Number(r.version_count ?? 0) + 1,
         }))
     }
 
@@ -703,7 +798,7 @@ export const WikiPlugin = {
        * "想办法删掉"正是最容易漏的形式 —— 那时原文已经进了对象，任何一条提前 return
        * 都会把它带出去。
        */
-      const projectedContent = await projectPageContent(adb, {
+      const projectedContent = await projectPageContentFor(adb, {
         pageId: page.id,
         content: page.content,
         principal,
@@ -2908,6 +3003,710 @@ export const WikiPlugin = {
         }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
 
         h.json(200, { ok: true, slug, blockId, removed: grantId, acl_revision: outcome.rev })
+      }, { access: 'user' }),
+    )
+
+    /* ---------- 附件（本批 M1/M2/M3）：上传 / 下载 / 列表 / 删除 ---------- */
+    /*
+     * ## 为什么不能把 `attachments/` 挂成静态目录（这条否掉了最省事的方案）
+     *
+     * `packages/server/src/index.ts:969 serveStatic` 与 `:850 servePluginUiAsset` 都在
+     * **路由层之外**执行：它们在 `dispatch()` 判定"无匹配路由"或走插件 UI 分支时直接写响应，
+     * 完全不经过 `:251 judgeAccess`，也不触发任何 `RequestHook`。而附件的路径就是**内容哈希**
+     * —— 它会出现在正文、搜索结果、访问日志与浏览器历史里，**任何拿到 URL 的人都能拼出来**。
+     * 把 `attachments/` 挂成静态根 = 整体旁路页面 ACL 与块级投影，而且**不会有任何报错**。
+     * 所以下载必须走一个 `public` 路由 + 处理器内的逐对象判定。
+     *
+     * ## 为什么 `GET` 端点必须是 `public`
+     *
+     * 图片是**内联子请求**（`<img src>`），匿名访客读公开页时也走它。设成 `user` 会让
+     * 公开页里的图对匿名用户全部破图 —— 而"页面能读、图读不到"并不是更安全，
+     * 只是坏掉。真正的判定在处理器里（见该端点的时序注释），`access` 只是粗粒度闸门。
+     *
+     * ## 统一响应头（T2）：四个端点**一律**发 `x-content-type-options: nosniff`
+     *
+     * `h.json` 只写 `content-type`、**不带** nosniff（实现见
+     * `packages/server/src/index.ts:565`），而这些端点的响应体里会回显**用户可控的字符串**
+     * （原始文件名、slug、id）。一旦某个中间层丢掉或改写了 `content-type`，浏览器就可能把
+     * JSON 文本**猜**成 HTML 去执行 —— 而"上传的字节完全由用户控制"正是这个能力的既定前提。
+     *
+     * 下载端点原本只在 200/304 上带它（见下面的 `VALIDATORS`），400/404/413 这些**错误响应
+     * 漏了**；故改为在**每个处理器入口处**各设置一次：node 的 `writeHead(status, headers)`
+     * 会与先前 `setHeader` 的值**合并**（同名时 `writeHead` 优先），于是该端点上的全部出口
+     * ——`h.json` 的每个错误分支、`sendHead` 的 200 与 304——都自动带上，不会漏。
+     *
+     * ## 统一响应头（T6）：错误响应的 `cache-control` 必须是 `no-store`
+     *
+     * `h.json` 也**不带** `cache-control`，而 404 这类错误响应浏览器是**可以启发式缓存**的：
+     * 没有显式指令时，它会按 `Last-Modified`/`Date` 猜一个新鲜期。于是"先越权拿到 404、
+     * 之后获得授权仍复用那份旧 404"会表现为**授权了还是破图**，而且用户按 F5 也未必解决
+     * （启发式缓存命中时连请求都不发）。错误响应的语义是"**此刻**的状态不允许"，它天然
+     * **不可复用**；故与 nosniff 同一处、同一理由：在**每个处理器入口**把默认值设成
+     * `no-store`，让 400/401/404/409/413/415/503 一个都不漏。
+     *
+     * ⚠️ **成功分支必须显式覆盖**这层默认值（`res.setHeader` 同名后写者胜），否则成功响应
+     * 也会变成 `no-store`，那会把"可复用但要回源校验"的优化一起关掉。两者的分工：
+     *   · 错误（含 404 / 413 / 403 之外的全部失败）→ `no-store`：别留下任何可复用的副本；
+     *   · 成功 → `private, no-cache`（下载再带 `no-transform`，因为它在传字节流）：
+     *     **可以留**，但每次复用前必须回源校验（见 `VALIDATORS` 上方的长注释：要禁止的
+     *     从来不是"存"，而是"不校验就复用"）。
+     */
+
+    /**
+     * 幂等写入附件元数据（同页同内容只一行）。
+     *
+     * **为什么不是 `INSERT OR IGNORE`**：那是 SQLite 方言，PG 要写 `ON CONFLICT DO NOTHING`；
+     * 而且两种写法在"被忽略"时都**不告诉我们命中的是哪一行**，仍然要再查一次。直接
+     * "查 → 插"少一层方言分支，`UNIQUE (page_id, sha256)` 依旧兜住并发（下面的唯一冲突分支）。
+     */
+    const writeAttachmentRow = async (i: {
+      pageId: number
+      pageSlug: string
+      sha256: string
+      ext: string
+      byteSize: number
+      mime: string
+      originalName: string
+      uploaderId: number | null
+      now: string
+    }): Promise<{ kind: 'created' | 'dedup' | 'conflict' | 'quota'; id: number }> => {
+      type RowOutcome = { kind: 'created' | 'dedup' | 'conflict' | 'quota'; id: number }
+      const lookup = async (q: DatabaseExecutor): Promise<RowOutcome | null> => {
+        const existing = (
+          await q.query<{ id: number; ext: string }>(
+            'SELECT id, ext FROM attachments WHERE page_id = ? AND sha256 = ?',
+            [i.pageId, i.sha256],
+          )
+        )[0]
+        if (!existing) return null
+        /*
+         * ★ 同页同内容但扩展名不一致 ⇒ 409（不是覆盖、也不是静默去重）。
+         * 扩展名决定响应头（`Content-Type` 与 `Content-Disposition`），而同一份字节不可能
+         * 同时是 `.png` 和 `.zip`。若静默保留第一次的扩展名，第二次上传者拿到的响应会与
+         * 他上传的东西不符 —— 那是最容易演变成"用户以为传了 PDF、实际伺服成图片"的形态。
+         */
+        return { kind: existing.ext === i.ext ? 'dedup' : 'conflict', id: Number(existing.id) }
+      }
+      try {
+        return await adb.transaction(async (tx): Promise<RowOutcome> => {
+          const hit = await lookup(tx)
+          if (hit) return hit
+          /*
+           * 配额在同一事务里**再判一次**（端点在读流之前已用 Content-Length 判过一次）：
+           * 前置那次是为了"不浪费一次上传"，这次才是权威判据 —— 两个并发上传都通过前置检查
+           * 时，只有事务内的累计值能拦住超额。
+           */
+          const total = Number(
+            (
+              await tx.query<{ n: number | string }>(
+                'SELECT COALESCE(SUM(byte_size), 0) AS n FROM attachments WHERE page_id = ?',
+                [i.pageId],
+              )
+            )[0]?.n ?? 0,
+          )
+          if (total + i.byteSize > attachmentPageQuotaBytes) return { kind: 'quota', id: 0 }
+          const ins = await tx.run(
+            `INSERT INTO attachments (page_id, page_slug, sha256, ext, byte_size, mime, original_name, uploader_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+            [i.pageId, i.pageSlug, i.sha256, i.ext, i.byteSize, i.mime, i.originalName, i.uploaderId, i.now],
+          )
+          const id = Number(ins.lastInsertRowid)
+          if (!Number.isFinite(id) || id <= 0) {
+            throw new Error('attachments_writer_no_rowid: 插入附件后拿不到 id（缺少 RETURNING id？）')
+          }
+          return { kind: 'created', id }
+        })
+      } catch (err) {
+        if (!isUniqueViolation(err)) throw err
+        /*
+         * 并发下的幂等重放：另一个同内容请求刚插进去。
+         * **必须在事务之外重查** —— PG 的事务一旦有语句报错就进入 aborted 状态，
+         * 后续语句一律失败，"捕获后继续"在那条路上不成立（与 blocks.ts 的说明同源）。
+         */
+        const again = (
+          await adb.query<{ id: number; ext: string }>(
+            'SELECT id, ext FROM attachments WHERE page_id = ? AND sha256 = ?',
+            [i.pageId, i.sha256],
+          )
+        )[0]
+        if (!again) throw err
+        return { kind: again.ext === i.ext ? 'dedup' : 'conflict', id: Number(again.id) }
+      }
+    }
+
+    /** 请求头里的单个值（`content-length` 在 Node 里可能是数组，统一取第一个）。 */
+    const headerValue = (h: RouteHandlerContext, name: string): string | null => {
+      const raw = h.req.headers[name]
+      if (typeof raw === 'string') return raw
+      if (Array.isArray(raw)) return raw[0] ?? null
+      return null
+    }
+
+    /* ---------- PUT /api/attachments/:slug?name=<urlencoded>：上传（裸 body） ---------- */
+    /*
+     * 请求体**就是文件字节**，`Content-Type` 是调用方声明的 MIME（不信任，见 `effectiveMime`）。
+     * 不用 multipart 的理由写在 `attachments.ts` 的文件头（undici 的 `formData()` 会整份缓冲
+     * 且没有 per-file 上限）。原始文件名经查询串的 `name` 传，**只进展示列**。
+     */
+    cleanups.push(
+      router.register('PUT', '/api/attachments/:slug', async (h) => {
+        /*
+         * 本能力统一响应头（T2 + T6）：错误响应也要带 nosniff；`cache-control` 的**默认值**
+         * 是 `no-store`（错误响应不可复用），成功分支会显式覆盖成 `private, no-cache`。
+         * 两条的理由见本节标题下的「统一响应头（T2）」「统一响应头（T6）」。
+         */
+        h.res.setHeader('x-content-type-options', 'nosniff')
+        h.res.setHeader('cache-control', 'no-store')
+        const slug = h.params.slug ?? ''
+        if (!isValidSlug(slug)) {
+          h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+          return
+        }
+        const p = requirePrincipal(h)
+        /*
+         * ★ 扩展名**第一步就判**：非法类型不该消耗一次上传（更不该先把字节写进临时目录）。
+         * `attachmentAllowedExt` 是"内置白名单 ∩ 配置"，只可能比内置白名单更窄。
+         */
+        const originalName = h.url.searchParams.get('name') ?? ''
+        const ext = normalizeExt(originalName)
+        if (ext === null || !attachmentAllowedExt.has(ext)) {
+          h.json(400, {
+            ok: false,
+            error: 'unsupported_ext',
+            message: `不支持的附件类型：只接受 ${[...attachmentAllowedExt].join(' ')}（按文件名的最后一个扩展名判定）`,
+          })
+          return
+        }
+        /*
+         * ★ 页面级判定先做，且**看不到与不能编辑都回 404**：
+         * 403/404 的差别本身就是一个存在性探测接口（设计文档 §2.3 要求不泄露存在性）。
+         * `canEdit` 与 `level` 都取自策略层的唯一出口（不在这里自己查 visibility）。
+         */
+        const access = await policy().resolvePage(p, slug)
+        if (access.level === 'none' || !access.canEdit) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const page = (await adb.query<{ id: number; slug: string }>('SELECT id, slug FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+
+        /*
+         * ★ **先看 `Content-Length`，缺失或超限就 413 且一个字节都不读。**
+         *
+         * 为什么"缺失"也要拒：没有长度就意味着只能边收边判 —— 那时已经被迫读了一大段
+         * 才可能发现超限（虽然 `storeStream` 仍会封顶，但前置拒绝是**零成本**的那一层）。
+         * 为什么必须在读流之前：`h.req` 是同一个 socket 上的可读流，一旦开始读，要么把
+         * 它收完（可能几个 GB），要么中断连接 —— 而中断连接前我们已经无法回一个干净的
+         * 413 响应体。`closeAfterResponse` 负责"请求体没读完也要让连接正确收尾"。
+         */
+        const lengthRaw = headerValue(h, 'content-length')
+        const declared = lengthRaw !== null && /^[0-9]+$/.test(lengthRaw) ? Number(lengthRaw) : null
+        if (declared === null) {
+          closeAfterResponse(h)
+          h.json(413, {
+            ok: false,
+            error: 'length_required',
+            message: '上传必须带 Content-Length（本端点不接受长度未知的裸 body：上限无法前置判定）',
+          })
+          return
+        }
+        if (declared > attachmentMaxBytes) {
+          closeAfterResponse(h)
+          h.json(413, {
+            ok: false,
+            error: 'payload_too_large',
+            message: `附件超过上限（${attachmentMaxBytes} 字节）`,
+          })
+          return
+        }
+        /*
+         * 单页配额前置检查（用声明长度当上界；权威判定在 `writeAttachmentRow` 的事务里）。
+         * 前置这一层的作用是"不为一必然失败的请求写盘"。
+         */
+        const usedBytes = Number(
+          (
+            await adb.query<{ n: number | string }>(
+              'SELECT COALESCE(SUM(byte_size), 0) AS n FROM attachments WHERE page_id = ?',
+              [page.id],
+            )
+          )[0]?.n ?? 0,
+        )
+        if (usedBytes + declared > attachmentPageQuotaBytes) {
+          closeAfterResponse(h)
+          h.json(413, {
+            ok: false,
+            error: 'page_quota_exceeded',
+            message: `该页附件总量将超过配额（已用 ${usedBytes} / ${attachmentPageQuotaBytes} 字节）`,
+          })
+          return
+        }
+
+        /* 流式哈希 + 落盘（内容寻址；超限在 storeStream 内再次封顶并中断） */
+        let stored: { sha256: string; byteSize: number; dedup: boolean }
+        try {
+          stored = await storeStream(h.req, {
+            dataDir: attachmentsRoot,
+            tmpDir: attachmentsTmpDir,
+            maxBytes: attachmentMaxBytes,
+            ext,
+          })
+        } catch (err) {
+          if (err instanceof AttachmentStoreError && err.code === 'payload_too_large') {
+            closeAfterResponse(h)
+            h.json(413, { ok: false, error: 'payload_too_large', message: err.message })
+            return
+          }
+          /*
+           * ★ 存储不可用 ⇒ **503 而不是 500**：磁盘只读/写满/无权限是**运维状态**，
+           * 不是本服务故障。500 会把它计入 `stats().consecutiveFailures`，连续失败
+           * 可能触发看门狗熔断 —— 于是"磁盘满了"被升级成"整站被熔断"。
+           */
+          if (err instanceof AttachmentStoreError && err.code === 'storage_unavailable') {
+            console.warn('[@geewiki/wiki] 附件落盘失败（存储不可用）:', err.message)
+            h.json(503, { ok: false, error: 'storage_unavailable', message: err.message })
+            return
+          }
+          throw err
+        }
+
+        const mime = effectiveMime(ext, headerValue(h, 'content-type') ?? '')
+        /*
+         * ⚠️ 这里有一个**可接受的**中间态：字节已经落盘、而元数据行可能还没写成功
+         * （配额被事务内的权威判定拦下、或并发冲突）。此时磁盘上会留下一个
+         * **没有元数据指向**的文件。它不会造成越权（没有行就没有 URL），
+         * 也不会被下载到（下载先查表），最终由 GC 回收（判据正是"没有任何
+         * `attachments` 行指向它"，见 `0018` 的索引 `idx_attachments_sha`）。
+         * 反过来（先写行、后落盘）才是不可接受的：那会留下"有 URL 但打不开"的死链。
+         */
+        const outcome = await writeAttachmentRow({
+          pageId: Number(page.id),
+          pageSlug: page.slug,
+          sha256: stored.sha256,
+          ext,
+          byteSize: stored.byteSize,
+          mime,
+          originalName,
+          uploaderId: p.userId ?? null,
+          now: new Date().toISOString(),
+        })
+        if (outcome.kind === 'conflict') {
+          h.json(409, {
+            ok: false,
+            error: 'attachment_conflict',
+            message: `同一份内容在本页已按 ${ext} 收录；同一内容的扩展名不能中途改变（请先删除原附件再上传）`,
+          })
+          return
+        }
+        if (outcome.kind === 'quota') {
+          h.json(413, {
+            ok: false,
+            error: 'page_quota_exceeded',
+            message: `该页附件总量超过配额（${attachmentPageQuotaBytes} 字节）`,
+          })
+          return
+        }
+        /*
+         * 审计：**只在真的新增了元数据行时写**。幂等重放（`dedup`）不重复留痕 ——
+         * 与"下载不写审计"同一条理由：高频重复事件会把审计表冲垮，真正有用的信号被淹没。
+         *
+         * 字段名必须是 `sha256` 而**不是** `hash`：`packages/core/src/audit.ts:61` 的
+         * `FORBIDDEN_AUDIT_KEYS` 含 `hash`，写进去会被 `redactForAudit` **静默删掉**。
+         * 同样刻意不记 `original_name` 之外的任何内容，也不记正文。
+         */
+        if (outcome.kind === 'created') {
+          void writeAuditLog(adb, {
+            action: 'attachment.upload',
+            targetKind: 'attachment',
+            targetId: String(outcome.id),
+            actorId: p.userId ?? null,
+            actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+            after: { page: page.slug, sha256: stored.sha256, ext, byte_size: stored.byteSize, mime },
+          }).catch((err: unknown) => console.error('[@geewiki/wiki] 附件上传审计写入失败:', err))
+        }
+        /*
+         * 状态码统一 201：本端点是**幂等 PUT**，重放同一个请求得到同形状的响应，
+         * "这次是否真的新建了行"由 `dedup` 表达（与 `PUT /api/pages/:slug` 用
+         * `outcome` 表达 created/updated/unchanged 是同一种做法）。
+         */
+        // T6：成功响应**覆盖**入口那层 `no-store` —— 可以留，但每次复用前要回源校验
+        h.res.setHeader('cache-control', 'private, no-cache')
+        h.json(201, {
+          ok: true,
+          id: outcome.id,
+          url: attachmentUrl(outcome.id),
+          mime,
+          size: stored.byteSize,
+          sha256: stored.sha256,
+          dedup: outcome.kind === 'dedup',
+        })
+      }, { access: 'user' }),
+    )
+
+    /**
+     * 下载端点对外**唯一**的"附件不存在"响应（T1）。
+     *
+     * 越权（页面不可见 / 所在段落不可见 / 引用已从正文移除）与"这个 id 根本没有行"必须回
+     * **同一个字节序列**，否则可枚举的连续整数 id 立刻变成一个"附件存在性预言机"：
+     * 从 403 与 404 的差别里就能读出"这里有一个存在、但被某个受限段落挡住的附件"。
+     * 这与 `getPage`（`index.ts:705-712` 的注释：不存在与无权同值）是同一条哲学。
+     *
+     * ⚠️ **审计不受此影响**：越权仍然照写 `access.denied`（见下面两个调用点）。
+     * "对外无差别"是为了不把信息交给**请求方**；审计是内部的，它必须记下**真实原因**，
+     * 否则"谁在探测、探到了什么"就查不出来了。别把"响应统一"误读成"不用记"。
+     *
+     * 调用方一律传**数值 id**：消息里的数字必须来自同一处，才能保证
+     * "存在但越权"与"不存在"两条路径的响应体逐字节相同（e2e 有 `cmp` 级别的断言）。
+     */
+    const attachmentNotFound = (h: RouteHandlerContext, id: number): void => {
+      h.json(404, { ok: false, error: 'not_found', message: `附件不存在: ${id}` })
+    }
+
+    /* ---------- GET /api/attachments/:id：下载（★ 判定时序是本能力最关键的安全点） ---------- */
+    /*
+     * ## 判定时序：页面级 → 401/404 → 块级投影 → 404 → **最后才开文件**
+     *
+     * 顺序不能换。反过来（先 `open` 再判权限）就是"先读盘再判权限"：任何一条提前
+     * `return` 都可能已经把字节交给了响应流，而**响应头一旦发出就改不了状态码** ——
+     * 于是越权者拿到的是 200 + 文件内容。`index.ts` 里 `getPage` 的注释记的正是这条教训
+     * （投影必须发生在构造详情对象之前）。
+     *
+     * ## 判据为什么是"投影后的正文里是否含这个 URL"
+     *
+     * 而不是"自己重算一遍块可见性"：`granted` / `org` / 页面档位 / `expires_at` 全部由
+     * `projectBlocks`（`blocks.ts:785-787` 的两条分支）唯一决定。第二套规则必然漂移，
+     * 而漂移方向一旦是"放宽"，就是"正文里看不到的段落，附件却能下载"——**不会报错的泄漏**。
+     * 复用投影还有一条额外好处：附件被从正文里删掉引用后，判定立即变成 404（无需任何缓存失效）。
+     *
+     * ## 为什么不做投影缓存
+     *
+     * `pages.acl_revision` 只在 ACL 变更时自增（`bumpAclRevision`，8 个调用点），而块级可见性
+     * 还会随**正文编辑**（`blocks.visibility` 由标记决定）与**块级授权**（`block_grants` 的
+     * `expires_at` 到点即失效）变化 —— 这些都不改 `acl_revision`。要正确缓存就得再引入一套
+     * 失效键，而"撤销后仍可见的窗口"正是本仓明令禁止给判定加 TTL 缓存的原因（见 `0012` 的说明）。
+     * 因此这里**每次现查**：一次块查询，代价可控，且没有陈旧窗口。
+     */
+    cleanups.push(
+      router.register('GET', '/api/attachments/:id', async (h) => {
+        /*
+         * 本能力统一响应头（T2 + T6）：错误响应也要带 nosniff；`cache-control` 的**默认值**
+         * 是 `no-store`（错误响应不可复用），成功分支会显式覆盖成 `private, no-cache`。
+         * 两条的理由见本节标题下的「统一响应头（T2）」「统一响应头（T6）」。
+         */
+        h.res.setHeader('x-content-type-options', 'nosniff')
+        h.res.setHeader('cache-control', 'no-store')
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(404, { ok: false, error: 'not_found', message: `附件不存在: ${h.params.id}` })
+          return
+        }
+        const p = requirePrincipal(h)
+        /*
+         * 联查 `pages` 取**当前** slug 与正文。判定一律用现值：
+         * `attachments.page_slug` 只是"审计/排障时可读"的冗余列。已核实本仓**不存在改名路径**
+         * （`savePage` 按 slug upsert、全仓无 `UPDATE pages SET slug`），故两者当前恒等；
+         * 取现值是为了将来真出现改名时判定不会跟着陈旧。
+         */
+        const row = (
+          await adb.query<AttachmentRow>(
+            `SELECT a.id, a.page_id, a.sha256, a.ext, a.byte_size, a.mime, a.original_name, a.uploader_id,
+                    p.slug AS live_slug, p.content AS page_content
+               FROM attachments a JOIN pages p ON p.id = a.page_id
+              WHERE a.id = ?`,
+            [id],
+          )
+        )[0]
+        if (!row) {
+          attachmentNotFound(h, id)
+          return
+        }
+        /* ① 页面级判定 */
+        const access = await policy().resolvePage(p, row.live_slug)
+        if (access.level === 'none') {
+          // 页存在但无权看：对外 404（不泄露存在性），内部记一次越权尝试
+          recordAccessDenied(h, row.live_slug, 'no_read_access', p)
+          attachmentNotFound(h, id)
+          return
+        }
+        /*
+         * ② 可用性补丁：**上传者本人 + 有编辑权**时，可以读自己刚上传、但正文还来不及引用的附件。
+         *
+         * 没有它就会出现"传完刷新就破图"——上传与"把引用写进正文并保存"之间有真实的窗口
+         * （上传接口不回写正文，前端保存正文是另一次请求）。
+         *
+         * 边界必须收紧：`uploader_id` 与主体 **user id 相等**、且该主体对**这一页**有
+         * `canEdit`。于是"另一个同样能编辑该页的用户"读同一份未引用附件仍然是 404
+         * （e2e 有这条负向断言）—— 补丁放宽的只是"自己上传的字节"，不是"这一页的附件"。
+         */
+        const ownUpload =
+          access.canEdit && p.userId !== null && row.uploader_id !== null && Number(row.uploader_id) === p.userId
+        /* ③ 块级判定（复用自己的正文投影判据） */
+        if (!ownUpload) {
+          const proj = await projectPageContentFor(adb, {
+            pageId: Number(row.page_id),
+            content: row.page_content,
+            principal: p,
+            /*
+             * 授权集合与投影必须来自**同一次**策略调用（与 `getPage` 同款要求）：
+             * 分别取两次会出现"判定用了一份授权、渲染用了另一份"的窗口。
+             */
+            grantedBlockIds: await grantedBlockIdsOf(p),
+          })
+          if (!proj.text.includes(attachmentUrl(Number(row.id)))) {
+            /*
+             * ★ T1：**与"不存在"回同一个 404**（此前是 403 `attachment_gated`）。
+             *
+             * 403 与 404 的差别本身就是信息：id 是连续整数、可枚举，于是"403"等于告诉任何
+             * 路过的人"这个 id 存在，而且它处在一个被收紧的段落里"。这条信息对有权者毫无
+             * 用处（他本来就能看），对无权者却是一次成功的侦察。要给出的唯一答案是
+             * "这个 url 没有可给你的东西"，而不是"为什么没有"。
+             *
+             * 审计**照写**（`attachment_gated` 保留为真实原因）：对外响应无差别与内部留痕
+             * 是两件事 —— 少了这条审计，"有人在逐个 id 探测受限段落"就查不出来了。
+             */
+            recordAccessDenied(h, row.live_slug, 'attachment_gated', p)
+            attachmentNotFound(h, Number(row.id))
+            return
+          }
+        }
+        /* ④ 到这里才碰文件：先 stat（"元数据在、文件不在"是可诊断的状态，不是 500） */
+        const absPath = resolveAttachmentPath(attachmentsRoot, row.sha256, row.ext)
+        let size: number
+        try {
+          size = (await stat(absPath)).size
+        } catch {
+          console.error(`[@geewiki/wiki] 附件元数据存在但文件缺失: id=${row.id} ${absPath}`)
+          h.json(404, { ok: false, error: 'blob_missing', message: '附件文件缺失（元数据存在）' })
+          return
+        }
+        if (size !== Number(row.byte_size)) {
+          // 不拦（仍按实际字节伺服），但必须留痕：路径即哈希，尺寸不符意味着内容被替换过
+          console.warn(
+            `[@geewiki/wiki] 附件尺寸与元数据不符: id=${row.id} db=${row.byte_size} disk=${size}`,
+          )
+        }
+
+        const etag = `"${row.sha256}"`
+        /*
+         * ★ 缓存必须是 `private`：**同一个 URL 的可见性会随 ACL 变化**，
+         * 而中间缓存（CDN/共享代理）只认 URL。若给 `public`/`immutable`，
+         * 一份曾被有权者取走的受限附件会被喂给下一个人 —— 浏览器之外没人再判一次权限。
+         * `no-transform` 阻止代理压缩/改写字节（那会破坏 ETag 的语义）。
+         *
+         * ★ T2：`max-age=300` → **`no-cache`**。
+         *
+         * `max-age=300` 说的是"5 分钟内别再问服务端"。而本能力的判定是**逐请求现查**的
+         * （块级授权可撤销、正文引用可删除、`expires_at` 到点即失效 —— 见本端点上方
+         * "为什么不做投影缓存"）：本地缓存会把"撤销后立刻生效"重新变成一个 ≤5 分钟的窗口，
+         * 而且更糟 —— 撤权之后浏览器**根本不再发请求**，服务端连拒绝的机会都没有。
+         *
+         * `no-cache` 的语义是"**每次复用前必须回源校验**"，正是这里需要的那一条：
+         * 校验请求带着 `If-None-Match`，会把上面那整套判定**重跑一遍**，于是
+         *   · 仍然有权 ⇒ 304（一个空响应，不重传字节：性能与 `max-age` 几乎无差）；
+         *   · 已撤权 ⇒ 落到上面的 404 分支，本地那份副本随即作废。
+         * 校验路径本身与本头无关（`If-None-Match` 命中就 304），此处只是把"何时允许复用"
+         * 从"5 分钟内随便用"收紧成"每次都得先问一句"。
+         *
+         * **为什么不是 `no-store`**：`no-store` 连"留一份可复用的字节"都不允许，会让每次
+         * `<img>` 加载都完整重传文件 —— 图片是页面上最高频的子请求，代价最大；而这里
+         * **不需要**禁止存储：本端点是内容寻址的，`ETag` 就是 `sha256`，
+         * "同一 ETag ⇒ 同一字节"恒真，304 复用不可能复用错内容。要禁止的从来不是"存"，
+         * 而是"**不校验就复用**" —— 那正是 `no-cache`。一句话：`no-store` 关掉的是性能，
+         * `no-cache` 关掉的才是那个窗口。
+         */
+        const VALIDATORS: Record<string, string | number> = {
+          'cache-control': 'private, no-cache, no-transform',
+          etag,
+          /*
+           * ★ 恒发 nosniff：没有它，浏览器可能把 `application/octet-stream` 的响应
+           * **猜**成 HTML 并执行（内容嗅探），而上传的字节完全由用户控制。
+           */
+          'x-content-type-options': 'nosniff',
+        }
+        const sendHead = (status: number, headers: Record<string, string | number>): void => {
+          for (const [k, v] of Object.entries(headers)) h.res.setHeader(k, v)
+          // 走统一的记账出口（`h.json` 会 end，故这里只记状态码），否则该请求不计入 stats()
+          h.noteStatus?.(status)
+          h.res.writeHead(status)
+        }
+        const inm = headerValue(h, 'if-none-match')
+        if (inm !== null && inm.split(',').some((t) => t.trim() === etag)) {
+          /*
+           * 304 **只回校验器**：表示（representation）的那几个头（`content-type` /
+           * `content-disposition`）与 `content-length` 都不该出现在 304 上 ——
+           * 后者是规范禁止的，前者会让"实体头"与"无实体"自相矛盾。
+           */
+          sendHead(304, VALIDATORS)
+          h.res.end()
+          return
+        }
+        sendHead(200, {
+          ...VALIDATORS,
+          'content-type': effectiveMime(row.ext, row.mime),
+          'content-disposition': formatDisposition(
+            dispositionKindOf(row.ext, { inlineSvg: attachmentInlineSvg }),
+            row.original_name,
+          ),
+          'content-length': size,
+        })
+        await new Promise<void>((resolve) => {
+          const stream = createReadStream(absPath)
+          stream.on('error', (err) => {
+            // 响应头已发出：改不了状态码，只能断开连接（让客户端看到截断，而不是一个 200 空体）
+            console.error(`[@geewiki/wiki] 附件读取失败: id=${row.id}`, err)
+            h.res.destroy()
+            resolve()
+          })
+          h.res.on('close', () => {
+            // 客户端提前断开（例如只加载了图片头部）：及时释放文件句柄
+            stream.destroy()
+            resolve()
+          })
+          stream.pipe(h.res)
+          stream.on('end', () => resolve())
+        })
+      }),
+    )
+
+    /* ---------- GET /api/pages/:slug/attachments：该页附件清单（管理面） ---------- */
+    /*
+     * `access: 'public'` + **处理器内要求 `canEdit`**：清单包含"有哪些附件、谁传的、
+     * 什么时候传的"，属于结构信息，普通读者不需要它（与"版本历史只对可编辑者开放"同款判据）。
+     * 可见但不可编辑 ⇒ 403；连页都看不到 ⇒ 404（不泄露存在性）。
+     */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/attachments', async (h) => {
+        /*
+         * 本能力统一响应头（T2 + T6）：错误响应也要带 nosniff；`cache-control` 的**默认值**
+         * 是 `no-store`（错误响应不可复用），成功分支会显式覆盖成 `private, no-cache`。
+         * 两条的理由见本节标题下的「统一响应头（T2）」「统一响应头（T6）」。
+         */
+        h.res.setHeader('x-content-type-options', 'nosniff')
+        h.res.setHeader('cache-control', 'no-store')
+        const slug = h.params.slug ?? ''
+        if (!isValidSlug(slug)) {
+          h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+          return
+        }
+        const p = requirePrincipal(h)
+        const access = await policy().resolvePage(p, slug)
+        if (access.level === 'none') {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        if (!access.canEdit) {
+          h.json(403, { ok: false, error: 'forbidden', message: '没有编辑该条目的权限，附件清单不对外提供' })
+          return
+        }
+        const page = (await adb.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        if (!page) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const rows = await adb.query<{
+          id: number
+          sha256: string
+          ext: string
+          byte_size: number
+          mime: string
+          original_name: string
+          uploader_id: number | null
+          created_at: string
+        }>(
+          `SELECT id, sha256, ext, byte_size, mime, original_name, uploader_id, created_at
+             FROM attachments WHERE page_id = ? ORDER BY id DESC`,
+          [page.id],
+        )
+        // T6：成功响应覆盖入口的 `no-store`（同上；这里没有字节流，故不需要 no-transform）
+        h.res.setHeader('cache-control', 'private, no-cache')
+        h.json(200, {
+          ok: true,
+          slug,
+          attachments: rows.map((r) => ({
+            id: Number(r.id),
+            name: r.original_name,
+            url: attachmentUrl(Number(r.id)),
+            ext: r.ext,
+            mime: r.mime,
+            size: Number(r.byte_size),
+            sha256: r.sha256,
+            uploaderId: r.uploader_id === null ? null : Number(r.uploader_id),
+            createdAt: r.created_at,
+          })),
+        })
+      }),
+    )
+
+    /* ---------- DELETE /api/attachments/:id：删元数据（磁盘文件留给 GC） ---------- */
+    /*
+     * ★ **只删 `attachments` 行，不删磁盘文件**：落盘路径是**内容寻址**的，同一份字节
+     * 可能被他页（乃至同页的另一条记录）共享 —— 在删除时顺手 `unlink` 会让别处正在引用的
+     * 附件变成破图，而且这种损坏是**跨页**的、极难归因。回收由 GC 负责：扫描磁盘、
+     * 删掉"没有任何元数据行指向"的文件（本批不做，属后续工作）。
+     *
+     * 权限：`canEdit` **或** 上传者本人（本人删自己传错的附件不该需要额外权限）。
+     */
+    cleanups.push(
+      router.register('DELETE', '/api/attachments/:id', async (h) => {
+        /*
+         * 本能力统一响应头（T2 + T6）：错误响应也要带 nosniff；`cache-control` 的**默认值**
+         * 是 `no-store`（错误响应不可复用），成功分支会显式覆盖成 `private, no-cache`。
+         * 两条的理由见本节标题下的「统一响应头（T2）」「统一响应头（T6）」。
+         */
+        h.res.setHeader('x-content-type-options', 'nosniff')
+        h.res.setHeader('cache-control', 'no-store')
+        const id = Number(h.params.id)
+        if (!Number.isInteger(id) || id < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const p = requirePrincipal(h)
+        const row = (
+          await adb.query<{ id: number; uploader_id: number | null; live_slug: string }>(
+            `SELECT a.id, a.uploader_id, p.slug AS live_slug
+               FROM attachments a JOIN pages p ON p.id = a.page_id
+              WHERE a.id = ?`,
+            [id],
+          )
+        )[0]
+        if (!row) {
+          attachmentNotFound(h, id)
+          return
+        }
+        const access = await policy().resolvePage(p, row.live_slug)
+        if (access.level === 'none') {
+          // 页存在但无权看：对外 404（不泄露存在性），内部记一次越权尝试
+          recordAccessDenied(h, row.live_slug, 'no_read_access', p)
+          attachmentNotFound(h, id)
+          return
+        }
+        const isUploader = p.userId !== null && row.uploader_id !== null && Number(row.uploader_id) === p.userId
+        if (!access.canEdit && !isUploader) {
+          /*
+           * ★ T5：**与下载端点完全同口径** —— 越权删除一律回同一个 `attachmentNotFound` 信封
+           * （此前是 403 `forbidden`）。
+           *
+           * 为什么必须统一：附件 id 是**可枚举的连续整数**，而"可见但删不动"与"根本不存在"
+           * 若给出不同状态码，任何能看见该页的人都能把 id 从 1 逐个试上去，靠 403 与 404 的
+           * 差别列出"这一页有哪些附件、哪些是别人传的"。这条信息对有权者毫无用处，对探测者
+           * 却是一次完整的侦察；要给出的唯一答案是"这个 url 没有可给你的东西"。
+           * 响应体也必须逐字节相同 —— `attachmentNotFound` 只回数值 id，不带任何标识字段
+           * （e2e 有 `cmp` 级别的断言）。
+           *
+           * ⚠️ **审计照写**（`no_edit_access` 是真实原因）：对外无差别是为了不把信息交给
+           * **请求方**，审计是内部的，它必须记下真实原因，否则"谁在逐个 id 试探删除权限"
+           * 就查不出来了 —— 别把"响应统一"误读成"不用记"（同下载端点 `attachment_gated` 的精神）。
+           */
+          recordAccessDenied(h, row.live_slug, 'no_edit_access', p)
+          attachmentNotFound(h, id)
+          return
+        }
+        await adb.run('DELETE FROM attachments WHERE id = ?', [id])
+        // T6：成功响应覆盖入口的 `no-store`
+        h.res.setHeader('cache-control', 'private, no-cache')
+        h.json(200, { ok: true, deleted: id })
       }, { access: 'user' }),
     )
 
