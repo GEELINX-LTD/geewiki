@@ -22,6 +22,7 @@ import {
   visitedSlugFromSub,
   type PaletteEntry,
 } from '../src/lib/commandPlan'
+import { HOME_SLUG } from '../src/lib/wikiRoute'
 
 /* ------------------------------ 模糊匹配 ------------------------------ */
 
@@ -229,12 +230,17 @@ test('moveIndex：环绕、未选中时的惯例、空列表', () => {
 
 /* ------------------------------ 路由 → 访问记录 ------------------------------ */
 
-test('visitedSlugFromSub：只有详情页算"页面访问"', () => {
+test('visitedSlugFromSub：详情页与主页算"页面访问"，其余都不算', () => {
   assert.equal(visitedSlugFromSub('guide/intro'), 'guide/intro')
   assert.equal(visitedSlugFromSub('standalone'), 'standalone')
-  assert.equal(visitedSlugFromSub(''), null, '列表页不算')
-  assert.equal(visitedSlugFromSub('list'), null)
-  assert.equal(visitedSlugFromSub('new'), null)
+  /*
+   * 空子路径 = 主页（`parseWikiRoute` 的 `kind: 'home'`），它**是一篇文章**：
+   * 记成约定 slug `home`，"最近访问"里才会出现用户最常到的那个页面。
+   * （这条断言此前写的是「列表页不算」并期望 null —— 那是"空路由=列表"时代的语义。）
+   */
+  assert.equal(visitedSlugFromSub(''), HOME_SLUG, '主页算一次页面访问')
+  assert.equal(visitedSlugFromSub('list'), null, '列表页不算')
+  assert.equal(visitedSlugFromSub('new'), null, '新建页不算')
   assert.equal(visitedSlugFromSub('search/关键词'), null, '检索页不算')
   assert.equal(visitedSlugFromSub('ask/问题'), null)
   assert.equal(visitedSlugFromSub('guide/intro/edit'), null, '编辑页不算')

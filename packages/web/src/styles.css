@@ -203,15 +203,10 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 .md-body th, .md-body td { border: 1px solid var(--gw-line); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 3); }
 .md-body hr { border: 0; border-top: 1px solid var(--gw-line); margin: 1.4em 0; }
 /*
-  正文卡片的内边距要**随屏宽收缩**：固定 6.5 / 8 档（≈26 / 32px，两侧合计 64px）在 320px
-  视口下会把正文挤到 200px 出头（外壳还有 --spacing-gutter 的 22px×2），可读性崩掉。
-  故小屏先用 4 档，≥640px 再恢复原值 —— 桌面观感逐像素不变。
-*/
-/*
   阅读卡片：宽度由**栅格列**决定，不再自己限宽居中。
 
   背景（2026-09-12 实测）：正文 `.md-body` 有 `max-width: var(--spacing-measure)`，而卡片
-  此前撑满栅格列（约 972px，正文只占 630px）⇒ 卡片右侧空出近一半，观感就是"左右两边
+  此前撑满栅格列（约 974px，正文只占 630px）⇒ 卡片右侧空出近一半，观感就是"左右两边
   空得太多"。空洞在**卡片内部**，加宽外壳解决不了。
 
   曾试过"卡片限宽 + `margin-inline: auto` 居中"，它消掉了卡内空白，但引入了新问题：
@@ -219,16 +214,18 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   `article.gw-reader` 左缘在 x=443.5、版本历史卡片在 x=357.5，**左右各错开 86px**，
   形成视觉上的"阶梯"。居中是"单张卡片自扫门前雪"的做法，列里只要还有别的卡片就必然对不齐。
 
-  现在的做法：**列本身窄下来 + 整块栅格居中**（见 `WikiPage.tsx` 里 `xl:grid-cols` 的
-  `min(15rem, var(--spacing-measure))`）。于是列内所有卡片左缘一致、宽度一致，正文照旧受
-  `--spacing-measure` 约束 ⇒ 35~45 字/行的可读性硬指标没有被牺牲（这也是为什么不直接
-  放大 `--spacing-measure`）。
+  现在的做法：**栅格列上限就是行宽** + 整块栅格居中 ——
+  `WikiPage.tsx` 的 `xl:grid-cols-[minmax(0,var(--spacing-measure))_15rem]`：
+  左列最多 `--spacing-measure`（630px）、右列 15rem，整块由外层居中。
+  于是列内所有卡片左缘一致、宽度一致，正文照旧受 `--spacing-measure` 约束
+  ⇒ 40 字/行的可读性硬指标没有被牺牲（2026-09-12 实测：`.md-body` clientWidth 564px、
+  字号 14px ⇒ 40 字/行；这是为什么不直接放大 `--spacing-measure`）。
+  没有右栏时（`hasRightRail` 为假）回落单栏，列宽同样由 `--spacing-measure` 封顶。
 
   ⚠️ 因此这里**不要再给卡片加 width/margin-inline**：一旦加上，卡片又会与同列其它卡片错开。
-  ⚠️ 选择器是 `article.gw-reader`（写在 `WikiPage.tsx` 的阅读卡片上），**不是**
-  `.page-detail > .md-body`：后者是早期版本的类名，现在源码里已无使用点（只剩注释提到），
-  挂在它上面的规则是**死代码**——2026-09-12 实测过一次：写完规则后卡片宽度纹丝不动，
-  正是因为选择器不匹配。
+
+  卡片的内边距**不在这里**：由 `WikiPage.tsx` 卡片上的 Tailwind 类给出（`px-6 py-6 sm:px-8`，
+  即小屏 24px、≥640px 32px），随屏宽收缩的意图靠 `sm:` 断点实现 —— 故无需再来一条媒体查询。
 */
 @media (min-width: 640px) {
   article.gw-reader {
@@ -239,10 +236,12 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 /*
   扫描态外壳的宽度由 `App.tsx` 以内联样式给出（`data-shell="wide"` 是稳定挂钩）。
   这里不做重复声明：两处写同一个数值会漂移，而内联样式能盖住 `max-w-[1280px]` 工具类。
+
+  ⚠️ 此前这里还有一条 `.page-detail > .md-body` 的内边距规则 —— **本轮已删除**：
+  `.page-detail` 是早期版本的类名，源码里早已没有任何使用点（只剩注释提到），
+  挂在它上面的规则是死代码（2026-09-12 实测：写过规则后卡片宽度纹丝不动，正是选择器不匹配）；
+  卡片内边距早已改由上面说的 Tailwind 类承担。留着它只会让下一位读者以为阅读页的内边距由 CSS 决定。
 */
-@media (min-width: 640px) {
-  .page-detail > .md-body { padding: calc(var(--spacing) * 6.5) calc(var(--spacing) * 8); }
-}
 .version-preview .md-body { padding: calc(var(--spacing) * 3.5) calc(var(--spacing) * 4.5); max-height: 360px; overflow: auto; }
 .field { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1.5); }
 .field > span { font-size: var(--text-xs); color: var(--gw-ink-muted); font-weight: 600; }

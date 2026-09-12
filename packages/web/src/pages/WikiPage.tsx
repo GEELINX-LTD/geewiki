@@ -9,8 +9,10 @@ import { PageAccessPanel } from '../components/access/PageAccessPanel'
 import { refreshCapabilitiesIfVisible, useAuth } from '../lib/authStore'
 import {
   NewPageAction,
+  createParam,
   loginForEditPage,
   loginForNewPage,
+  loginForWikiPath,
   newPageEntry,
   type NewPageEntry,
 } from '../lib/newPageGate'
@@ -130,8 +132,17 @@ const DRAFT_DEBOUNCE_MS = 900
  * `<slug>[/edit]`（详情/编辑）。**检索与问答是宿主原生 UI**（见 lib/slots.tsx 的冻结裁决：
  * 插件组件不接收 props），因此不走 Slot，而是这里自己的路由。
  */
-export function WikiPage(props: { sub: string; onNavigate: (path: string) => void }): ReactNode {
-  const { sub, onNavigate } = props
+export function WikiPage(props: {
+  sub: string
+  /**
+   * 本次 hash 的查询串（`?…`，无则空串），由 `App.tsx` 的 `useRouteQuery` 提供。
+   * **必须是 props 而不是渲染期读 `window.location.hash`**：路径不变、只有查询串变时
+   * 外层不会重渲染，直读会拿到陈旧值（`createHome` 就是靠它判定的，见下）。
+   */
+  query: string
+  onNavigate: (path: string) => void
+}): ReactNode {
+  const { sub, query, onNavigate } = props
   // 路由解析抽到 lib/wikiRoute.ts（纯函数 + 单测）：它修掉了"分层 slug 打不开"
   // 这个只在真实浏览器里才暴露的缺陷（未编码路径被当成未知深层跳回列表、
   // 编码路径被双重编码成 404）。
@@ -164,13 +175,6 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
    * 出现两种形态，而且选中态、返回行为都会分叉。用 `replace: true`（改写历史而不是压栈）
    * 是为了不让"后退"把用户卡在 `/wiki/home` ↔ `/wiki` 之间来回弹。
    */
-  /*
-   * 「创建主页」走 `#/wiki/home/new` —— 一个**已存在的路由形状**（`new` 是保留段，
-   * 所以它解析成 `detail slug='home/new'` 而不是别的含义），因此不需要动解析器，
-   * 也不会与"编辑已存在的主页"（`#/wiki/home/edit`）混淆。两者在下面的 edit 分支里分流。
-   */
-  const shouldCreateHome = route.kind === 'detail' && route.slug === `${HOME_SLUG}/new`
-  /** `#/wiki/home` → `#/wiki`（同一篇的两种写法归一到一个 URL） */
   const normalizeHome = route.kind === 'detail' && route.slug === HOME_SLUG
   useEffect(() => {
     if (!normalizeHome) return
@@ -179,57 +183,26 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
   if (normalizeHome) return null
 
   /*
-   * 创建主页也要过**同一道门**：它是一条真实可达的 URL（主页缺失时页面上的按钮就指向它，
-   * 别人也可以直接贴过来）。没有这道门，匿名用户会拿到一个完整可用的编辑器，填完点保存才被 401 弹走。
-   * 判据与 `#/wiki/new` / `#/wiki/<slug>/edit` 完全一致（`newPageEntry` 的 `ready`）。
+   * ★「创建主页」= **`#/wiki/new?create=home`**（本轮修正）。
+   *
+   * 此前用的是 `#/wiki/home/new`，它有一个会伤到真实用户的缺陷：`home/new` 是**合法 slug**
+   * （`SLUG_SEGMENT_RE` 允许，首段 `home` 不在保留段里），却同时被这里当成"创建主页"入口
+   * ⇒ 前端路由先匹配就赢，把一个真实可建的页面从用户手里抢走：**建得出来、打不开**
+   * （`#/wiki/home%2Fnew` 也救不回来 —— 解析器先整体解码再切分，两种写法归一成同一个 slug）。
+   * 这正是 `lib/wikiRoute.ts:8-13` 与 `lib/slugRules.ts:32` 头注里记录过的同一类缺陷。
+   *
+   * 查询参数不在 slug 形状里，因此不占用任何标识，也无需改动前后端镜像的保留段集合
+   * （动那个要同步 `packages/plugin-wiki/src/index.ts` 的校验，两处都有守卫测试钉住）。
+   *
+   * ⚠️ 查询串来自 **props**（`App.tsx` 的 `useRouteQuery`，随 `hashchange` 更新），
+   * 不是渲染期读 `window.location.hash`：`#/wiki/new?create=home` → `#/wiki/new` 这种
+   * "路径不变、只有查询串变"的导航不会让外层重渲染，直读会拿到陈旧值
+   * （实测症状：离开创建主页入口后，普通新建页仍显示"创建主页"、slug 仍预填 `home`）。
+   * 因此 `createHome` 还必须同时要求 `route.kind === 'new'`：查询串属于哪条路由由**路径**决定。
    */
-  if (shouldCreateHome && newEntry.kind !== 'ready') {
-    const needLogin = newEntry.kind === 'login'
-    return (
-      <WikiShell activeSlug={HOME_SLUG} pages={pages} onNavigate={onNavigate}>
-        <div className="page">
-          <div className="page-head">
-            <h1>创建主页</h1>
-          </div>
-          <EmptyState
-            icon={needLogin ? <LogIn className="size-8" /> : <ShieldCheck className="size-8" />}
-            title={needLogin ? '创建主页需要先登录' : '你暂时不能创建主页'}
-            hint={
-              needLogin
-                ? '匿名访客可以浏览知识库，但创建主页需要一个账号。去登录，登录成功后会自动回到这里。'
-                : newEntry.reason
-            }
-            action={
-              <div className="flex flex-wrap items-center gap-2">
-                {needLogin && (
-                  <Button variant="primary" icon={<LogIn className="size-3.5" />} onClick={loginForNewPage}>
-                    去登录
-                  </Button>
-                )}
-                <Button variant="secondary" onClick={() => onNavigate('list')}>
-                  全部页面
-                </Button>
-              </div>
-            }
-          />
-        </div>
-      </WikiShell>
-    )
-  }
-  // 有编辑权时：直接进"创建"语义的编辑器（预填 slug `home`）
-  if (shouldCreateHome) {
-    return (
-      <WikiShell activeSlug={HOME_SLUG} pages={pages} onNavigate={onNavigate}>
-        <WikiEdit
-          key={`${HOME_SLUG}/new`}
-          slug=""
-          prefillSlug={HOME_SLUG}
-          onDone={(next) => onNavigate(next)}
-          onCancel={() => onNavigate('home')}
-        />
-      </WikiShell>
-    )
-  }
+  const create = createParam(query)
+  /** 是否走「创建主页」语义：只在 `new` 路由上成立，其余路由下这个参数无意义（忽略） */
+  const createHome = route.kind === 'new' && create === HOME_SLUG
 
   if (route.kind === 'home') {
     /*
@@ -302,28 +275,42 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
     if (newEntry.kind !== 'ready') {
       const needLogin = newEntry.kind === 'login'
       return (
-        <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+        <WikiShell activeSlug={createHome ? HOME_SLUG : null} pages={pages} onNavigate={onNavigate}>
           <div className="page">
             <div className="page-head">
-              <h1>新建页面</h1>
+              <h1>{createHome ? '创建主页' : '新建页面'}</h1>
             </div>
             <EmptyState
               icon={needLogin ? <LogIn className="size-8" /> : <ShieldCheck className="size-8" />}
-              title={needLogin ? '新建页面需要先登录' : '你暂时不能新建页面'}
+              title={
+                needLogin
+                  ? createHome
+                    ? '创建主页需要先登录'
+                    : '新建页面需要先登录'
+                  : createHome
+                    ? '你暂时不能创建主页'
+                    : '你暂时不能新建页面'
+              }
               hint={
                 needLogin
-                  ? '匿名访客可以浏览知识库，但保存新页面需要一个账号。去登录，登录成功后会自动回到这个新建页 —— 现在写的内容还不会丢在编辑器里。'
+                  ? createHome
+                    ? '匿名访客可以浏览知识库，但创建主页需要一个账号。去登录，登录成功后会自动回到创建主页的入口。'
+                    : '匿名访客可以浏览知识库，但保存新页面需要一个账号。去登录，登录成功后会自动回到这个新建页 —— 现在写的内容还不会丢在编辑器里。'
                   : newEntry.reason
               }
               action={
                 <div className="flex flex-wrap items-center gap-2">
                   {needLogin && (
-                    <Button variant="primary" icon={<LogIn className="size-3.5" />} onClick={loginForNewPage}>
+                    <Button
+                      variant="primary"
+                      icon={<LogIn className="size-3.5" />}
+                      onClick={() => loginForNewPage(createHome)}
+                    >
                       去登录
                     </Button>
                   )}
-                  <Button variant="secondary" onClick={() => onNavigate('list')}>
-                    返回列表
+                  <Button variant="secondary" onClick={() => onNavigate(createHome ? 'home' : 'list')}>
+                    {createHome ? '回到主页' : '返回列表'}
                   </Button>
                 </div>
               }
@@ -333,8 +320,19 @@ export function WikiPage(props: { sub: string; onNavigate: (path: string) => voi
       )
     }
     return (
-      <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
-        <WikiEdit slug="" onDone={(slug) => onNavigate(slug)} onCancel={() => onNavigate('list')} />
+      <WikiShell activeSlug={createHome ? HOME_SLUG : null} pages={pages} onNavigate={onNavigate}>
+        <WikiEdit
+          key={createHome ? `${HOME_SLUG}/new` : 'new'}
+          slug=""
+          /*
+           * 「创建主页」= 同一个新建编辑器 + 预填约定 slug。`prefillSlug` 是这条路径的
+           * **唯一标识**：`WikiEdit` 里 `newMode = slug === '' || prefillSlug !== undefined`，
+           * 因此它既决定"新建"语义，也决定 slug 框预填 `home`。
+           */
+          prefillSlug={createHome ? HOME_SLUG : undefined}
+          onDone={(slug) => onNavigate(slug)}
+          onCancel={() => onNavigate(createHome ? 'home' : 'list')}
+        />
       </WikiShell>
     )
   }
@@ -1375,16 +1373,29 @@ function WikiDetail(props: {
             newEntry.kind === 'ready' ? (
               <EmptyState
                 icon={<FileText className="size-8" />}
-                title="这个站点还没有主页"
+                title="这里还没有可读的主页"
                 hint="主页就是一篇普通文章（slug 为 home）：它可以编辑、有版本历史，也受页面权限管辖。建议先在编辑器里写好草稿，再决定它对谁可见、要不要发布。"
                 action={
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button variant="primary" onClick={() => onNavigate(`${HOME_SLUG}/new`)}>
-                      创建主页
-                    </Button>
-                    <Button variant="secondary" onClick={() => onNavigate('list')}>
-                      先去全部页面
-                    </Button>
+                  <div className="flex flex-col gap-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      {/* `new?create=home`：复用新建编辑器并预填约定 slug（理由见本文件顶部的路由注释） */}
+                      <Button variant="primary" onClick={() => onNavigate('new?create=home')}>
+                        创建主页
+                      </Button>
+                      <Button variant="secondary" onClick={() => onNavigate('list')}>
+                        先去全部页面
+                      </Button>
+                    </div>
+                    {/*
+                      「创建主页」走的是 `PUT /api/pages/home`，而它是 **upsert**：页面已存在时
+                      会用你写的内容覆盖它，并把被覆盖的那一版留成历史快照。
+                      读路径对「不存在」与「无权访问」一律 404（防存在性探测），所以这里**无法排除**
+                      "主页其实存在、只是没对当前的你开放"——那种情况下这一按就是覆盖别人的正文。
+                      因此这句话必须留下（与保存时的冲突提示同一口气：说清后果，让用户自己决定）。
+                    */}
+                    <p className="text-note text-muted" role="status">
+                      若主页其实已存在、只是没对当前的你开放，保存会覆盖它的正文；被覆盖的那一版会作为历史快照保留在版本历史里。
+                    </p>
                   </div>
                 }
               />
@@ -1396,7 +1407,7 @@ function WikiDetail(props: {
                 action={
                   <div className="flex flex-wrap items-center gap-2">
                     {newEntry.kind === 'login' && (
-                      <Button variant="primary" onClick={loginForNewPage}>
+                      <Button variant="primary" onClick={() => loginForNewPage(true)}>
                         去登录
                       </Button>
                     )}
@@ -1904,6 +1915,14 @@ function WikiEdit(props: {
   /** 新建语义 = 空 slug（`#/wiki/new`）或"预填 slug 的创建"（主页引导） */
   const newMode = slug === '' || prefillSlug !== undefined
   const isNew = slug === ''
+  /*
+    「创建主页」与「新建页面」走的是**同一个**新建编辑器，但它们是两件事：
+    前者有约定 slug（`prefillSlug === HOME_SLUG`），标题与面包屑必须说"创建主页"——
+    否则用户在主页缺省面板点「创建主页」，进来看到的却是"新建页面"，会以为自己点错了。
+    ⚠️ 必须声明在 `save()` 之前：`save()` 要用它决定"建完主页之后留不留在本页"，
+    而它只依赖 `prefillSlug`（无需等任何 state/effect），所以这里就能定下来。
+  */
+  const createHomeMode = prefillSlug === HOME_SLUG
   /** 本编辑页自身的 hash（未保存离开后要退回它） */
   const selfHash = isNew ? '#/wiki/new' : `#/wiki/${slug}/edit`
   const route = isNew ? 'wiki/new' : `wiki/${slug}/edit`
@@ -1949,6 +1968,25 @@ function WikiEdit(props: {
    * 静默是绝对不允许的 —— 拖进来一个文件然后什么都没发生，用户只会以为功能坏了。
    */
   const [uploadNotice, setUploadNotice] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
+
+  /**
+   * 「主页刚创建」的**常驻**提示（仅创建主页这一条路径、且仅 `outcome === 'created'`）。
+   *
+   * 为什么必须常驻而不能像别处那样"提示完就跳走"：新页面的默认档位是 **`org` 且未发布**
+   * （见 `packages/plugin-wiki/src/index.ts:1141-1142` 的 `VALUES (…'org', 1, 0, ?)` 与
+   * `:2133-2135` 的"`public` 档必须同时发布才对匿名可见"）。主页是**默认落点**——
+   * 建完却不对匿名开放，访客打开站点只会看到"主页当前不可访问"的中性面板，而**没人会告诉他
+   * 这是档位问题**。所以这一条要给的是"下一步动作"：去页面上的「权限…」把档位设为公开并
+   * 打开「已发布」。
+   *
+   * 为什么 `outcome === 'updated'` 时**不显示**：那种情况是**覆盖了已存在的页面**，
+   * 提示的口径完全不同（"主页已存在，你覆盖了它的正文"），且保存前的引导里已经讲过后果。
+   * 两条挤在一起会互相盖掉，也会把"新建"说成"覆盖"——那是本仓库最忌讳的说错话。
+   *
+   * 与 `uploadNotice` 分开一格的理由同上：一次保存会 `setErr('')`，且上传反馈与创建反馈
+   * 可能同屏发生，共用一个槽位必然互相抹掉。
+   */
+  const [homeCreatedNotice, setHomeCreatedNotice] = useState<string | null>(null)
 
   /*
     AI 辅助写作（编辑器内）：选区由编辑器上报，采纳写回走编辑器的插入句柄。
@@ -2227,13 +2265,27 @@ function WikiEdit(props: {
         // 列表/侧边栏立刻反映新页面（新建）或新标题（改名）——否则要手动刷新才看得到
         void invalidatePages()
         void refreshCapabilitiesIfVisible() // 新建的页可能带来新的编辑权（见 remove() 的说明）
+        /*
+          ══════ 主页首次创建：留下常驻提示，**不跳走** ══════
+          判据用服务端返回的 `outcome`（`api.ts:414` 的 `'created' | 'updated' | 'unchanged'`），
+          而不是前端自己猜"这是不是第一次" —— 服务端的 upsert 结果是唯一权威。
+          `outcome === 'updated'` 走原来的跳转：那是"覆盖了已存在的页"，另有口径。
+        */
+        if (createHomeMode && r.outcome === 'created') {
+          setHomeCreatedNotice(
+            '主页已创建。它当前只对组织内可见 —— 匿名访客打开站点会看不到主页。要对外公开，请用页面上的「权限…」入口把档位设为公开并打开「已发布」。',
+          )
+          // 保持 `saving`（按钮 loading）：此时编辑器源文与已入库的正文一致、没什么可再存的；
+          // 让用户用下面那条提示里的动作离场，避免"再点一次保存"。
+          return
+        }
         onDone(newMode ? r.slug : slug)
       } catch (e) {
         setErr(errorLine(e))
         setSaving(false)
       }
     },
-    [content, isNew, newMode, slug, slugInput, title, onDone, prefillSlug],
+    [content, createHomeMode, isNew, newMode, slug, slugInput, title, onDone, prefillSlug],
   )
 
   /** ⌘/Ctrl+S 全局保存：焦点可能在标题输入框，不能只靠编辑器的 keymap */
@@ -2316,14 +2368,22 @@ function WikiEdit(props: {
   const previewEmpty = projected.markdown.trim() === ''
 
   const editSlug = newMode ? '' : origSlug !== '' ? origSlug : slug
+  /*
+   * 「创建主页」与「新建页面」走的是**同一个**新建编辑器，但它们是两件事：
+   * 前者有约定 slug（`prefillSlug === HOME_SLUG`），标题与面包屑必须说"创建主页"——
+   * 否则用户在主页缺省面板点「创建主页」，进来看到的却是"新建页面"，会以为自己点错了。
+   *
+   * ⚠️ `createHomeMode` 本身声明在组件顶部（`save()` 也要用它，见那里的说明）。
+   */
+  const newTitle = createHomeMode ? '创建主页' : '新建页面'
 
   return (
     <div className="flex flex-col gap-4">
-      <Breadcrumb slug={editSlug} title={newMode ? '新建页面' : editSlug} pages={editPages} />
+      <Breadcrumb slug={editSlug} title={newMode ? newTitle : editSlug} pages={editPages} />
 
       {/* 操作条 */}
       <div className="flex flex-wrap items-center gap-2">
-        <h1 className="m-0 text-xl font-semibold">{newMode ? '新建页面' : '编辑页面'}</h1>
+        <h1 className="m-0 text-xl font-semibold">{newMode ? newTitle : '编辑页面'}</h1>
         {dirty && (
           /*
            * 三态，优先级：失败 > 已保存 > 有改动。
@@ -2361,6 +2421,8 @@ function WikiEdit(props: {
           <Button
             variant="primary"
             loading={saving}
+            /* 主页已创建 ⇒ 不提供第二次保存：目标页已存在，再存一次会覆盖刚写的那一版 */
+            disabled={homeCreatedNotice !== null}
             icon={<Save className="size-3.5" />}
             onClick={() => void save()}
           >
@@ -2533,6 +2595,25 @@ function WikiEdit(props: {
             >
               {uploadNotice.text}
             </p>
+          )}
+          {/*
+            「主页已创建」的常驻提示（独立代码块，可整段摘除）。
+            与上面那条的区别：这不是"某个动作的即时反馈"，而是一条**待办**（去把档位改成公开），
+            所以用 `warn` 配色而不是成功绿 —— 绿色读起来像"一切都好了"，而匿名访客此刻打不开主页。
+            离场动作给「前往主页」：主页**已经建好了**，留在这张"新建页面"表单上没有意义。
+          */}
+          {homeCreatedNotice !== null && (
+            <div
+              role="status"
+              className="m-0 flex flex-col gap-2 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-note text-warn-ink"
+            >
+              <span>{homeCreatedNotice}</span>
+              <div>
+                <Button size="sm" variant="secondary" onClick={() => onDone(HOME_SLUG)}>
+                  前往主页
+                </Button>
+              </div>
+            </div>
           )}
         </section>
 

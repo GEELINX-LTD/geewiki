@@ -76,6 +76,33 @@ export function newPageEntry(
 }
 
 /**
+ * `#/wiki/new?create=home` 里的「预填哪个 slug」。
+ *
+ * 为什么主页创建要**复用 `new` 这个形状**，而不是自造 `#/wiki/home/new`：
+ * `home/new` 同时满足「合法 slug」（`SLUG_SEGMENT_RE` 允许，首段 `home` 不在保留段里）
+ * 与「主页创建入口」两个含义。前端路由**先匹配就赢**，于是这个 URL 会把一个真实可建的
+ * 页面（slug 恰好叫 `home/new`）从用户手里抢走 —— 页面建得出来、却打不开，
+ * 正是 `lib/wikiRoute.ts` 与 `lib/slugRules.ts` 头注里记录过的同一类缺陷
+ * （保留段被前端路由吃掉）。查询参数不在 slug 形状里，因此不占用任何标识。
+ *
+ * 用**手写解析**而不是 `URLSearchParams`：后者会做一次百分号解码，而本仓库的锚点
+ * 参数处理（`lib/hashAnchor.ts`）刻意避开它（解码两次会把 `%2F` 变成段内斜杠）。
+ * 这里只读一个无编码的短值，手写解析最短且行为可预测。
+ *
+ * 返回值恒为字符串（没有该参数时是空串），调用方自行与 {@link HOME_SLUG} 比对；
+ * 非浏览器环境（SSR 测试、node 单测）返回空串而不是抛错。
+ */
+export function createParam(hash: string): string {
+  const q = hash.indexOf('?')
+  if (q === -1) return ''
+  for (const part of hash.slice(q + 1).split('&')) {
+    const eq = part.indexOf('=')
+    if (eq > 0 && part.slice(0, eq) === 'create') return part.slice(eq + 1)
+  }
+  return ''
+}
+
+/**
  * 去登录页，并把**回到目标页**的地址带上（登录成功后 `LoginPage` 会直接跳回这里）。
  *
  * `redirect` 的值必须是站内 hash 路由（如 `/wiki/new`、`/wiki/guide%2Fintro/edit`），
@@ -86,9 +113,16 @@ export function loginForWikiPath(hashPath: string): void {
   window.location.hash = `/login?redirect=${encodeURIComponent(hashPath)}`
 }
 
-/** 去登录页，登录后回到 `#/wiki/new` */
-export function loginForNewPage(): void {
-  loginForWikiPath('/wiki/new')
+/**
+ * 去登录页，登录后回到 `#/wiki/new`。
+ *
+ * `createHome` 为真时回到 **`#/wiki/new?create=home`**（创建主页的入口）——
+ * 同一道登录门、同一个 `new` 形状，只是把"想干什么"原样带回去。
+ * 不回带的话，从主页缺省面板点「去登录」的人会被丢进普通新建页，
+ * 得自己再找一次创建主页的入口（或更糟：随手建了另一篇，主页仍然空着）。
+ */
+export function loginForNewPage(createHome = false): void {
+  loginForWikiPath(createHome ? '/wiki/new?create=home' : '/wiki/new')
 }
 
 /**
@@ -130,7 +164,12 @@ export function NewPageAction({
         variant="primary"
         size={size}
         icon={<LogIn className="size-3.5" />}
-        onClick={loginForNewPage}
+        /*
+         * ⚠️ 必须包一层箭头函数：`onClick={loginForNewPage}` 会把 **MouseEvent** 当成
+         * 第一个参数（`createHome`）传进去 —— 事件对象是 truthy，于是所有入口都被当成
+         * "创建主页"，跳到 `?create=home`。签名一旦有可选参数，直接当处理器用就是陷阱。
+         */
+        onClick={() => loginForNewPage()}
         title="新建页面需要账号：登录后会直接回到新建页"
       >
         登录后新建页面

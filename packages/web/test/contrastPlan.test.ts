@@ -105,3 +105,30 @@ test('已知失败清单的处置建议是可核算的：gray-600 确实全部�
   const ink = resolveHex(tokens, '--gw-ink')
   assert.ok(ink && contrastRatio(gray600, '#ffffff') < contrastRatio(ink, '#ffffff'), '替代值不应比正文色更强')
 })
+
+/*
+  ───────────────────── 外壳宽度 token 与 App 内联值的一致性 ─────────────────────
+
+  `App.tsx` 的扫描态外壳用**内联 style.maxWidth**（不用 Tailwind 工具类：`@theme` 里的自定义
+  尺寸变量只在被工具类引用时才进产物，内联 `var()` 可能落空，静默失效比写死更危险），
+  因此那里写的是一个字面量 `1552px`，而 `tokens.css` 里另有 `--spacing-wide: 1552px` ——
+  两处同值、各自独立，改一处忘另一处就会静默漂移（界面宽度对不上，没有任何报错）。
+
+  本断言把两边钉在一起：数据直接读源文本，不手抄一份值（照本文件的既有做法）。
+*/
+test('外壳宽度：App 的 WIDE_MAX_WIDTH 与 tokens.css 的 --spacing-wide 同值', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
+  const m = app.match(/const WIDE_MAX_WIDTH = '([^']+)'/)
+  const wide = m?.[1]
+  assert.ok(wide !== undefined, "App.tsx 里应有 `const WIDE_MAX_WIDTH = '…'`（扫描态外壳宽度）")
+  const token = css.match(/--spacing-wide:\s*([^;]+);/)
+  const tokenValue = token?.[1]
+  assert.ok(tokenValue !== undefined, 'tokens.css 里应有 `--spacing-wide`（扫描态外壳上限的唯一真源）')
+  assert.equal(
+    wide.trim(),
+    tokenValue.trim(),
+    'App.tsx 的 WIDE_MAX_WIDTH 与 tokens.css 的 --spacing-wide 必须同值（改一处要同时改另一处）',
+  )
+  // 反空洞：值必须真的是一个 px 尺寸，避免"两边都是空串"也算通过
+  assert.match(wide, /^\d+px$/, `WIDE_MAX_WIDTH 应是 px 字面量，实际 ${wide}`)
+})

@@ -28,6 +28,7 @@ import { ThemeToggle } from './components/ThemeToggle'
 import { SystemStatusDialog } from './components/SystemStatusDialog'
 import { MAIN_CONTENT_ID } from './lib/domIds'
 import { stripHashQuery } from './lib/hashAnchor'
+import { parseWikiRoute } from './lib/wikiRoute'
 import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
 import { titleForRoute } from './lib/pageMeta'
 import { visibleDests, type NavDest } from './lib/navPlan'
@@ -103,6 +104,35 @@ function useRoute(): string {
     return () => window.removeEventListener('hashchange', onChange)
   }, [])
   return route
+}
+
+/**
+ * 本次 hash 的**查询串**（`?` 之后的部分，无则空串），随 `hashchange` 更新。
+ *
+ * 为什么需要它：`useRoute` 返回的路径是**已剥掉查询串**的，于是"路径不变、只有查询串变"
+ * 的那种导航（`#/wiki/new?create=home` → `#/wiki/new`）不会引发任何重渲染 ——
+ * 组件在渲染期读 `window.location.hash` 拿到的值就永远停在第一次渲染时的那一刻。
+ * 实测症状：从创建主页入口离开到普通新建页，标题与预填 slug 仍是"创建主页"。
+ *
+ * 与 `useRoute` 并列成两个 `useState`（而不是合成一个对象或 `useSyncExternalStore`）：
+ * 钩子名与调用顺序都不变，`useEffect` 依赖数组也保持 `[]` ——
+ * 本仓库的 `authCacheInvalidation.test.ts` 会**按源码断言"不得出现 setInterval"**
+ * 之类的接线特征，合成快照最容易踩到那类守卫；两个独立 state 是最小改动。
+ */
+function useRouteQuery(): string {
+  const [query, setQuery] = useState(() => hashQueryOf(window.location.hash))
+  useEffect(() => {
+    const onChange = (): void => setQuery(hashQueryOf(window.location.hash))
+    window.addEventListener('hashchange', onChange)
+    return () => window.removeEventListener('hashchange', onChange)
+  }, [])
+  return query
+}
+
+/** 取 hash 里 `?` 之后的部分（含 `?`，便于直接交给解析器）；无查询串返回空串 */
+function hashQueryOf(hash: string): string {
+  const q = hash.indexOf('?')
+  return q === -1 ? '' : hash.slice(q)
 }
 
 /**
@@ -230,6 +260,12 @@ function isAuthRoute(id: string): boolean {
 
 export function App(): ReactNode {
   const route = useRoute()
+  /*
+   * 查询串单独成为**响应式**值（见 `useRouteQuery`）：`#/wiki/new?create=home` 这类
+   * "路径不变、只有查询串变"的导航不会改变 `route`，若组件在渲染期直接读 `window.location.hash`，
+   * 拿到的就永远是第一次渲染时的值（实测症状：从创建主页入口走到普通新建页，标题与预填 slug 不变）。
+   */
+  const routeQuery = useRouteQuery()
   const root = route.split('/')[0] ?? 'wiki'
   const known =
     [WIKI_ITEM, ...ADMIN_NAV, ...GOVERN_NAV].some((t) => t.id === root) || isAuthRoute(root)
@@ -364,17 +400,23 @@ export function App(): ReactNode {
    */
   const wikiSubForShell = route.slice('wiki'.length).replace(/^\/+/, '')
   /*
+   * 分档的判据是**解析出来的路由种类**，不是路径前缀的 `startsWith`：
+   * `searchfoo`、`ask-me` 都是**合法 slug**（首段只要不是保留段就当页面），
+   * 用前缀匹配会把它们误分档成扫描态（正文被拉到 1552px 外壳里）。
+   * `parseWikiRoute` 是同一份纯函数，路由怎么解析、外壳就怎么分档，不存在第二种口径。
+   *
    * ⚠️ 空子路径（`#/`、`#/wiki`）是**主页面**，它渲染的是一篇长文 ⇒ **阅读态**，
-   * 与详情页、版本预览同档。此前把它也算进 wide，导致主页在 1920 视口下拿到 1552px
-   * 外壳，而正文卡片只有 800px ⇒ 左右各空 ~376px，正是"两边空得太多"最刺眼的一处，
-   * 且与上面那段注释（明写"主页"属阅读态）自相矛盾 —— 注释与行为不一致本身就是缺陷。
-   * 扫描态只留真正列扫描型内容的三个去处：列表（`list`）、检索（`search`）、问答（`ask`）。
+   * 与详情页、版本预览同档（`kind === 'home'` 不在下面的扫描态集合里）。
+   * 此前把它也算进 wide，导致主页在 1920 视口下拿到 1552px 外壳，而正文卡片只有 630px
+   * ⇒ 左右各空出近一半，正是"两边空得太多"最刺眼的一处。
+   * 扫描态只留真正列扫描型内容的三个去处：列表、检索、问答。
    */
+  const shellRoute = parseWikiRoute(wikiSubForShell)
   const wideShell =
     active !== 'wiki' ||
-    wikiSubForShell === 'list' ||
-    wikiSubForShell.startsWith('search') ||
-    wikiSubForShell.startsWith('ask')
+    shellRoute.kind === 'list' ||
+    shellRoute.kind === 'search' ||
+    shellRoute.kind === 'ask'
   /** 与 tokens.css 的 `--spacing-wide` 同值。写具体值而不是 var()：`@theme` 里的自定义
    *  尺寸变量只在被工具类引用时才输出到 `:root`，内联 var() 引用可能落空（静默失效）。 */
   const WIDE_MAX_WIDTH = '1552px'
@@ -384,6 +426,8 @@ export function App(): ReactNode {
     body = (
       <WikiPage
         sub={route.slice('wiki'.length).replace(/^\/+/, '')}
+        /* 查询串**原样**交给 WikiPage：它自己决定哪个参数对它有意义（如 `?create=home`） */
+        query={routeQuery}
         onNavigate={(path) => nav(`wiki/${path}`)}
       />
     )

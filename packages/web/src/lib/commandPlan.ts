@@ -10,7 +10,7 @@
  * 组件（`components/CommandPalette.tsx`）只负责：把数据接进来、把 `run` 挂上去、
  * 渲染与键盘/ARIA 接线。
  */
-import { parseWikiRoute } from './wikiRoute'
+import { HOME_SLUG, parseWikiRoute } from './wikiRoute'
 
 /** 分组 id（顺序即展示顺序的语义，具体顺序由 {@link buildPaletteGroups} 决定） */
 export type PaletteGroupId = 'recent' | 'page' | 'action'
@@ -222,9 +222,13 @@ export function moveIndex(current: number, delta: number, total: number): number
  * 用 `parseWikiRoute` 而不是自己写一遍判断：保留段（`search`/`ask`/`new`/`list`）
  * 与 `/edit` 后缀的语义只该有一处定义，否则迟早与路由解析漂移
  * （`lib/wikiRoute.ts` 的注释记录了这类漂移已经造成过一次真缺陷）。
+ *
+ * **主页也算一次页面访问**（`kind === 'home'` ⇒ 约定 slug `home`）：它就是一篇文章，
+ * 而且是默认落点 —— 不记的话，"最近访问"里永远不会出现用户最常到的那个页面。
  */
 export function visitedSlugFromSub(sub: string): string | null {
   const route = parseWikiRoute(sub)
+  if (route.kind === 'home') return HOME_SLUG
   return route.kind === 'detail' ? route.slug : null
 }
 
