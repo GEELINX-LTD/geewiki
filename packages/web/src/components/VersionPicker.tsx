@@ -20,9 +20,9 @@
  * 大文档上这是开菜单就卡一下的来源。所以：时间线只给"何时 / 谁"（本地已有数据），
  * **行数统计在打开对比弹窗时才算**（那时只需要相邻两版）。
  */
-import { useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { History, RotateCcw } from 'lucide-react'
-import { api, type PageDetail, type VersionMeta } from '../api'
+import { api, type PageDetail, type VersionMeta, type VersionPageItem } from '../api'
 import { Badge } from '../ui/Badge'
 import { Button } from '../ui/Button'
 import {
@@ -34,7 +34,9 @@ import {
   DropdownMenuTrigger,
 } from '../ui/DropdownMenu'
 import { Dialog, DialogContent } from '../ui/Dialog'
+import { Spinner } from '../ui/Spinner'
 import { absoluteTime, relativeTime } from '../lib/timePlan'
+import { pickerTriggerText, versionChangeSummary, versionMetaText, versionNumberOf } from '../lib/versionPlan'
 import { authorText } from './VersionDiffDialog'
 import { cn } from '../ui/cn'
 import { focusRing } from '../ui/a11y'
@@ -46,9 +48,15 @@ import { focusRing } from '../ui/a11y'
  */
 export const COMPACT_VERSIONS = 3
 
-/** 标签：`page.version` 是**当前**版本号，历史条目按倒序数下来是 `version - index - 1`。 */
+/**
+ * 标签：历史条目按倒序数下来是 `v{总数 - i}`。
+ *
+ * ⚠️ 实现已挪到 `lib/versionPlan.ts` 的 `versionNumberOf`（**从总数往下数**）：
+ * 旧写法 `version - i - 1` 在快照被 `recentVersions` 截断时会整体偏移，
+ * 把"最近的一条历史"标成更低的号。这里保留同名导出只为兼容既有调用，语义以 versionPlan 为准。
+ */
 export function versionLabel(page: { version: number }, index: number): number {
-  return page.version - index - 1
+  return versionNumberOf(page, index)
 }
 
 /**
@@ -120,57 +128,139 @@ export function VersionList({
 }
 
 export function VersionPicker({
+  slug,
   page,
+  previewNumber,
+  onPreview,
   onCompare,
 }: {
+  /** 用于拉分页版本列表（改动摘要与更早的版本只有那个端点有） */
+  slug: string
   /** 只要版本号与版本列表 —— 避免与 `PageDetail` 的其它字段耦合 */
   page: Pick<PageDetail, 'version' | 'versions'>
+  /** 正在预览的历史版本号；`null` = 看的是最新版 */
+  previewNumber: number | null
+  /** 选中某一版 ⇒ **进预览态**（写进 URL，可分享）。参数是快照 id 与它的版本号 */
+  onPreview: (id: number, label: number) => void
+  /** 打开对比弹窗（在同一版上"看差异"）。与预览是两件事：预览改 URL，对比不改 */
   onCompare: (version: VersionMeta, label: number) => void
 }): ReactNode {
   const [timelineOpen, setTimelineOpen] = useState(false)
   const versions = page.versions
+  /*
+   * 改动摘要与"更早的版本"都只有 `GET …/versions`（分页端点）有：
+   * 页内 `versions[]` 只给最近的 N 条、且不含 `change`。
+   *
+   * **按需拉取**（菜单打开时）而不是随页面一起拉：摘要要服务端为每条算一次差值，
+   * 而多数访问根本不点开这个菜单。拉不到就**不显示摘要** —— 见 `versionChangeSummary`。
+   */
+  const [rows, setRows] = useState<VersionPageItem[]>([])
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+
+  const loadPage = useCallback(
+    async (before?: number): Promise<void> => {
+      setLoadingMore(true)
+      try {
+        const r = await api.versions(slug, before === undefined ? undefined : { before })
+        setRows((prev) => (before === undefined ? r.versions : [...prev, ...r.versions]))
+        setHasMore(r.hasMore)
+      } catch {
+        /* 降级：保留已有的行，摘要不显示。这里刻意不弹错误 —— 看版本不该被摘要拖累 */
+      } finally {
+        setLoadingMore(false)
+      }
+    },
+    [slug],
+  )
+
+  /*
+   * 摘要/额外行按 id 索引。**以 `rows` 为准**（它带服务端算好的版本号与 `change`），
+   * 页内 `versions[]` 只在 `rows` 还没到货时兜底 —— 两条来源同时用会让"版本号"出现两套说法。
+   */
+  const rowById = useMemo(() => new Map(rows.map((r) => [r.id, r])), [rows])
+  const missing = rows.length === 0
+  const lastLoadedNumber = rows.length === 0 ? null : rows[rows.length - 1]!.number
 
   return (
     <>
-      <DropdownMenu>
+      <DropdownMenu onOpenChange={(open) => { if (open && rows.length === 0) void loadPage() }}>
         <DropdownMenuTrigger asChild>
           <button
             type="button"
-            aria-label={`版本选择，当前 v${page.version}`}
+            aria-label={`版本选择，${previewNumber === null ? `当前 v${page.version}` : `正在预览 v${previewNumber}`}`}
             className={cn(
               focusRing,
               'inline-flex min-h-6 min-w-6 cursor-pointer items-center rounded-md border border-line bg-surface px-2 py-0.5 text-2xs font-medium text-ink hover:bg-hover',
+              previewNumber !== null && 'border-warn-line bg-warn-bg text-warn-ink',
             )}
           >
-            版本 v{page.version}
+            {pickerTriggerText(page.version, previewNumber)}
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="max-h-[60vh] overflow-y-auto">
+        {/*
+          长列表可滚：`recentVersions` 最多 100 条，不设上限会把菜单撑出视口。
+          `24rem` 是"能看清十来条"与"不遮住页面"的折中。
+        */}
+        <DropdownMenuContent align="start" className="max-h-[min(24rem,60vh)] overflow-y-auto">
           <DropdownMenuLabel>版本</DropdownMenuLabel>
-          <DropdownMenuItem active>
-            当前（v{page.version}）
-            <span className="ml-auto text-2xs text-muted">{relativeTime(new Date().toISOString())}</span>
+          {/* 「最新」固定在顶部：它是"退出预览"的出口，不该被历史列表挤走 */}
+          <DropdownMenuItem active={previewNumber === null} onSelect={() => onPreview(0, -1)}>
+            v{page.version}
+            <span className="ml-auto pl-3 text-2xs text-muted">最新{previewNumber === null ? ' · 正在查看' : ''}</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {versions.length === 0 ? (
             <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">暂无历史版本</p>
           ) : (
             versions.map((v, i) => {
-              const label = versionLabel(page, i)
+              const label = versionNumberOf(page, i)
+              const active = previewNumber === label
+              const summary = versionChangeSummary(rowById.get(v.id)?.change)
               return (
-                <DropdownMenuItem key={v.id} onSelect={() => onCompare(v, label)}>
+                <DropdownMenuItem key={v.id} active={active} onSelect={() => onPreview(v.id, label)}>
                   v{label}
-                  <span className="ml-auto pl-3 text-2xs text-muted" title={absoluteTime(v.saved_at)}>
-                    {relativeTime(v.saved_at)} · {authorText(v.author)}
+                  {active && <span className="ml-1 text-2xs text-accent">正在预览</span>}
+                  <span className="ml-auto flex items-center gap-2 pl-3">
+                    {/* 摘要拉不到就不显示 —— 编一句"0 段改动"比不显示更糟 */}
+                    {summary !== null && <span className="text-2xs text-muted">{summary}</span>}
+                    <span className="text-2xs text-muted" title={absoluteTime(v.saved_at)}>
+                      {versionMetaText(v.saved_at, v.author)}
+                    </span>
                   </span>
                 </DropdownMenuItem>
               )
             })
           )}
           <DropdownMenuSeparator />
+          {/*
+            「加载更早的版本」用**游标**（`before` = 已加载的最后一条 id）而不是 offset：
+            并发保存时 offset 会跳条/重复。
+          */}
+          {hasMore ? (
+            <DropdownMenuItem
+              disabled={loadingMore}
+              /*
+               * 就地加载下一页：Radix 默认"选中即关菜单"，而这里希望用户留在列表里
+               * —— 所以不用 `onSelect`（它会关），改用 `onClick` 直接触发。
+               */
+              onClick={() => {
+                if (loadingMore || lastLoadedNumber === null) return
+                void loadPage(rows[rows.length - 1]!.id)
+              }}
+            >
+              {loadingMore && <Spinner label="正在加载更早的版本" />}
+              {loadingMore ? '正在加载…' : '加载更早的版本…'}
+            </DropdownMenuItem>
+          ) : (
+            rows.length > 0 &&
+            missing === false && (
+              <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">已到最早版本（v1）</p>
+            )
+          )}
           <DropdownMenuItem onSelect={() => setTimelineOpen(true)}>
             <History className="size-3.5" />
-            查看全部改动…
+            浏览全部历史…
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -195,11 +285,14 @@ export function VersionPicker({
  * 也**不算行数**（见文件头注释）。要看内容就点进去，对比弹窗里同时给差异与恢复。
  */
 export function TimelineDialog({
+  slug,
   open,
   onOpenChange,
   page,
   onPick,
 }: {
+  /** 拉全量历史（分页端点）；给了才能在弹窗里看到**更早的**改动，而不只是最近 N 条 */
+  slug?: string
   open: boolean
   onOpenChange: (open: boolean) => void
   page: Pick<PageDetail, 'version' | 'versions'>
@@ -208,6 +301,35 @@ export function TimelineDialog({
   const versions = page.versions
   const total = page.version - 1
   const truncated = total > versions.length
+  /*
+   * 弹窗是"我主动翻历史"的场景 ⇒ 这里**值得**拉全量（含更早的条目）。拉不到就退回页内
+   * 那 N 条，并在下方如实说明"更早的未列出"——现状文案已经这么写了，不额外编造。
+   */
+  const [rows, setRows] = useState<VersionPageItem[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!open || slug === undefined || rows.length > 0) return
+    let cancelled = false
+    setLoading(true)
+    api
+      .versions(slug, { limit: 100 })
+      .then((r) => {
+        if (!cancelled) setRows(r.versions)
+      })
+      .catch(() => {
+        /* 降级：用页内那份，不弹错 */
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, slug, rows.length])
+
+  const listed = rows.length > 0 ? rows.length : versions.length
+  const stillTruncated = total > listed
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -217,7 +339,7 @@ export function TimelineDialog({
           /* 诚实性要求不变，但比旧卡片那句短得多：把"总数"与"已列出"分开说 */
           total === 0
             ? '暂无历史版本 —— 每次保存正文变化都会在此留档。'
-            : `共 ${total} 次改动，列出最近 ${versions.length} 次${truncated ? '（更早的未列出）' : ''}。`
+            : `共 ${total} 次改动，列出 ${listed} 次${stillTruncated ? '（更早的未列出）' : ''}。`
         }
         className="w-[min(44rem,calc(100vw-2rem))]"
         footer={
@@ -228,14 +350,30 @@ export function TimelineDialog({
       >
         {versions.length === 0 ? (
           <p className="m-0 text-note text-muted">还没有可对比的历史版本。</p>
+        ) : rows.length > 0 ? (
+          /*
+           * 有服务端行就用它：**版本号来自 `ROW_NUMBER()`**（翻页/截断都对），
+           * 且带 `change` 摘要。最后一条（最早那版）没有对照对象 ⇒ 它的 `change` 为 null，
+           * 摘要自然不显示 —— 不是"什么都没改"。
+           */
+          <ServerVersionList
+            rows={rows}
+            canCompare
+            onPick={(r) => onPick({ id: r.id, saved_at: r.saved_at, title: r.title, author: r.author }, r.number)}
+          />
         ) : (
-          /* 与紧凑区共用同一行组件（`VersionList`）：两处观感与信息必须逐字一致 */
+          /* 降级：分页端点还没到货（或失败）时，退回页内那 N 条 */
           <VersionList page={page} onPick={onPick} />
         )}
-        {truncated && (
+        {loading && (
+          <p className="m-0 mt-3 flex items-center gap-2 text-2xs text-muted">
+            <Spinner label="正在加载更早的改动" />
+            正在加载更早的改动…
+          </p>
+        )}
+        {stillTruncated && (
           <p className="m-0 mt-3 text-2xs text-muted">
-            更早的改动未列出（一次只取最近 {versions.length} 条）——
-            这不代表它们不存在，只是这一屏没取。
+            更早的改动未列出（这一屏最多取 100 条）—— 这不代表它们不存在，只是这一屏没取。
           </p>
         )}
       </DialogContent>
@@ -246,4 +384,110 @@ export function TimelineDialog({
 /** 只读徽标：无编辑权时的版本显示（**不是**禁用态按钮）。 */
 export function VersionBadge({ version }: { version: number }): ReactNode {
   return <Badge tone="neutral">版本 v{version}</Badge>
+}
+
+/**
+ * 改动时间线的行列表 —— 数据来自**分页端点**（`VersionPageItem`），不是页内那 N 条。
+ *
+ * 为什么不复用 `VersionList`：后者按 `page.version - i` 从**下标**推版本号，只能画页内
+ * `versions[]`（最多 `recentVersions` 条）。要列"更早的"，版本号必须用服务端算好的
+ * `number`（`ROW_NUMBER()`）—— 翻页之后下标与版本号不再对应，这正是 `versionPlan.ts`
+ * 反复强调的那条。
+ */
+function ServerVersionList({
+  rows,
+  onPick,
+  canCompare,
+}: {
+  rows: readonly VersionPageItem[]
+  onPick: (row: VersionPageItem) => void
+  /** 只读视角下不给"看差异"入口：快照端点要求 `canEdit`，给了也必然 404 */
+  canCompare: boolean
+}): ReactNode {
+  return (
+    <ul className="m-0 flex list-none flex-col gap-1 p-0">
+      {rows.map((r) => {
+        /* 摘要拉不到就整段不显示 —— 编一句"0 段改动"比不显示更糟 */
+        const summary = versionChangeSummary(r.change)
+        const meta = versionMetaText(r.saved_at, r.author)
+        const inner = (
+          <>
+            <span className="font-medium text-ink">v{r.number}</span>
+            {summary !== null && <span className="text-2xs text-muted">{summary}</span>}
+            <span className="ml-auto text-2xs text-muted" title={absoluteTime(r.saved_at)}>
+              {meta}
+            </span>
+          </>
+        )
+        return (
+          <li key={r.id} className="m-0">
+            {canCompare ? (
+              <button
+                type="button"
+                onClick={() => onPick(r)}
+                className={cn(
+                  focusRing,
+                  'flex w-full cursor-pointer items-center gap-2 rounded-md border border-line px-2.5 py-1.5 text-left text-sm hover:bg-hover',
+                )}
+              >
+                {inner}
+              </button>
+            ) : (
+              /* 只读：**纯文本行**而不是禁用按钮 —— 禁用按钮仍在暗示"这里有个能力" */
+              <span className="flex w-full items-center gap-2 rounded-md border border-line px-2.5 py-1.5 text-sm">
+                {inner}
+              </span>
+            )}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+/**
+ * 只读用户的版本信息入口。
+ *
+ * 给到**存在性**为止：复用改动记录弹窗列出「版本 / 时间 / 谁」，但**没有**快照正文入口
+ * （服务端在快照端点上对非 `canEdit` 一律 404，给出入口就是给出必然失败的按钮），
+ * 也**没有**恢复入口（那要 `canManageVisibility`）。
+ *
+ * 为什么仍然要给：只读视角下头部此前只有一枚 `版本 vN` 徽标 —— 读者看得见"这是第几版"，
+ * 却完全不知道"这一页改过几次、最近什么时候动的"。那属于**不敏感的存在性信息**，
+ * 不给反而让人以为页面从未被改动过。
+ *
+ * 为什么复用 `TimelineDialog` 而不另写：那个弹窗已经在列「版本 / 时间 / 谁」，
+ * 再写一份必然漂移（两份"改动记录"迟早对不上）。传 `onPick` 为空操作 ⇒ 只读用户
+ * 点行不会打开任何对比弹窗。
+ */
+export function ReadonlyHistoryButton({
+  slug,
+  page,
+}: {
+  slug: string
+  page: Pick<PageDetail, 'version' | 'versions'>
+}): ReactNode {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className={cn(
+          focusRing,
+          'inline-flex min-h-6 min-w-6 cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-2xs font-medium text-muted hover:bg-hover hover:text-ink',
+        )}
+      >
+        <History className="size-3" aria-hidden="true" />
+        历史
+      </button>
+      <TimelineDialog
+        slug={slug}
+        open={open}
+        onOpenChange={setOpen}
+        page={page}
+        onPick={() => setOpen(false)}
+      />
+    </>
+  )
 }

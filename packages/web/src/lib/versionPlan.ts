@@ -8,6 +8,7 @@
  * ⚠️ 本文件的函数必须保持纯：可单测、可在 SSR 下跑（仓库有 SSR 渲染测试的既有做法）。
  */
 import type { PageDetail, VersionMeta } from '../api'
+import { authorText } from './authorText'
 import { absoluteTime, relativeTime } from './timePlan'
 
 /** 版本列表里一项的展示模型（把"算出来的标签"与"接口给的事实"分开）。 */
@@ -140,9 +141,12 @@ export const PREVIEW_ATTACHMENT_NOTE =
 
 /** 菜单项右侧的"何时 / 谁"（与时间线共用格式，避免两处漂移）。 */
 export function versionMetaText(savedAt: string, author: { displayName: string | null } | null): string {
-  const name = author?.displayName
-  const who = typeof name === 'string' && name.trim() !== '' ? name : '未记录'
-  return `${relativeTime(savedAt)} · ${who}`
+  /*
+   * 作者文案经 `VersionDiffDialog.authorText` —— **「未记录」这个措辞全站只有一处定义**。
+   * 在这里重写一遍判断（`displayName ?? '未记录'`）会让"空字符串算不算未记录"这类
+   * 边界在两处慢慢分叉，而这类分叉的表现是"同一个人在两个地方显示不同"。
+   */
+  return `${relativeTime(savedAt)} · ${authorText(author)}`
 }
 
 /**

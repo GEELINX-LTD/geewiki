@@ -12,6 +12,9 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   PREVIEW_ATTACHMENT_NOTE,
   PREVIEW_INVALID_TEXT,
@@ -224,4 +227,72 @@ test('restoreErrorText：从 blockedOrdinals 生成可读提示，无该字段�
 test('PREVIEW_INVALID_TEXT 同时说出两种可能（与"404 不区分成因"的纪律一致）', () => {
   assert.match(PREVIEW_INVALID_TEXT, /不存在/)
   assert.match(PREVIEW_INVALID_TEXT, /无权/)
+})
+
+/* ------------------------------ 源码守卫 ------------------------------ */
+
+/**
+ * 这几条是**防回归**的源码级断言：本轮的改动各自都能被一个"看起来对"的写法悄悄改回去，
+ * 而那些改法都不会让上面任何一条纯逻辑用例变红。
+ */
+const here = dirname(fileURLToPath(import.meta.url))
+const read = (rel: string): string => readFileSync(join(here, rel), 'utf8')
+
+/**
+ * 剥掉注释再断言 —— 本轮的注释里**故意**引用了被禁的旧写法（"旧写法 `version - i - 1`
+ * 在截断时会偏移"），不剥的话守卫会因为注释而红，那就成了"注释不能提旧代码"的荒谬约束。
+ * 与仓库既有的 `codeOnly` 同款实现。
+ */
+const codeOnly = (src: string): string =>
+  src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+test('★ 守卫：恢复必须调四位一体的 restoreVersion，不得退回 savePage', () => {
+  const src = read('../src/pages/WikiPage.tsx')
+  assert.ok(src.length > 20000, 'WikiPage 读不到内容？反空洞')
+  assert.match(src, /api\s*\.\s*restoreVersion\(/, '恢复必须调 api.restoreVersion')
+  /*
+   * `savePage` 仍然存在（保存正文要用），所以不能断言"文件里没有 savePage"。
+   * 要钉的是**恢复路径**不经过它：恢复分支里若又出现 `savePage`，说明有人把
+   * "只回正文"的旧实现拿回来了 —— 那会让恢复变成静默的半截动作（权限不回滚）。
+   */
+  const restoreBlock = src.slice(src.indexOf('const restore = ('))
+  const restoreBody = restoreBlock.slice(0, restoreBlock.indexOf('\n  }'))
+  assert.ok(restoreBody.length > 200, '恢复分支切片过短？反空洞')
+  assert.doesNotMatch(restoreBody, /api\s*\.\s*savePage\(/, '恢复分支不得再走 savePage（只回正文）')
+})
+
+test('守卫：?v= 预览态存在，且非法值会清掉 URL', () => {
+  const src = read('../src/pages/WikiPage.tsx')
+  assert.match(src, /parsePreviewParam\(query\)/, '必须从 query prop 解析 ?v=')
+  assert.match(src, /previewRoute\(slug, id\)/, '选择历史版本必须写进 URL（可分享）')
+  assert.match(src, /PREVIEW_INVALID_TEXT/, '非法/无权时必须有提示')
+  assert.match(src, /onNavigate\(slug\)/, '非法 ?v= 必须把 URL 清回不带参数')
+  // 预览态禁用写操作入口
+  assert.match(src, /disabled=\{previewing\}/, '预览态下编辑/权限/删除必须禁用')
+})
+
+test('守卫：只读视角不给可编辑的版本下拉', () => {
+  const picker = read('../src/components/VersionPicker.tsx')
+  assert.ok(picker.length > 3000, 'VersionPicker 读不到内容？反空洞')
+  assert.match(picker, /export function ReadonlyHistoryButton/, '只读视角需要「历史」入口')
+  const page = read('../src/pages/WikiPage.tsx')
+  // 静态徽标 + 只读历史入口，都在 canEdit 为假的分支里
+  assert.match(page, /<VersionBadge version=\{page\.version\} \/>/, '只读时保留静态徽标')
+  assert.match(page, /<ReadonlyHistoryButton/, '只读时给「历史」入口')
+})
+
+test('守卫：版本号算法全站只有一处实现（不许再出现 version - index - 1）', () => {
+  for (const rel of [
+    '../src/components/VersionPicker.tsx',
+    '../src/components/VersionDiffDialog.tsx',
+    '../src/pages/WikiPage.tsx',
+  ]) {
+    const src = codeOnly(read(rel))
+    assert.ok(src.length > 1000, `${rel} 读不到内容？反空洞`)
+    assert.doesNotMatch(
+      src,
+      /version\s*-\s*(?:index|i)\s*-\s*1/,
+      `${rel} 不得再自己推版本号（截断时会整体偏移）—— 用 versionNumberOf`,
+    )
+  }
 })

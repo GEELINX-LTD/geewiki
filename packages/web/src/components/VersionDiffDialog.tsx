@@ -21,20 +21,28 @@ import { Button } from '../ui/Button'
 import { Dialog, DialogContent } from '../ui/Dialog'
 import { changedSections, diffLines, statsLabel, type DiffOp } from '../lib/textDiff'
 import { absoluteTime, relativeTime } from '../lib/timePlan'
+import { versionNumberOf } from '../lib/versionPlan'
 import { errorLine } from '../lib/errorText'
 import { cn } from '../ui/cn'
 
-/** 作者缺失时的**唯一**表述。不要改成"匿名"。 */
-export const UNKNOWN_AUTHOR = '未记录'
+import { authorText, UNKNOWN_AUTHOR } from '../lib/authorText'
 
-export function authorText(author: { displayName?: string | null } | null | undefined): string {
-  const name = author?.displayName
-  return typeof name === 'string' && name.trim() !== '' ? name : UNKNOWN_AUTHOR
-}
+/*
+ * 作者缺失时的**唯一**表述。不要改成"匿名"。定义已下沉到 `lib/authorText.ts`
+ * （避免与 `lib/versionPlan.ts` 构成循环 import），这里转出以保持既有引用点不变。
+ */
+export { UNKNOWN_AUTHOR, authorText }
 
-/** 版本行的展示标签。注意：**当前版本没有快照行**，`page.version` 本身是当前版本号。 */
+/**
+ * 版本行的展示标签 —— 转调 `lib/versionPlan.ts` 的 `versionNumberOf`。
+ *
+ * ⚠️ **不要**在这里重新实现 `page.version - index - 1`：那个写法假定 `versions[]` 覆盖了
+ * 全部历史，而 `recentVersions` 会截断（默认 10 条）⇒ 截断时整体偏移、"最近的一条历史"
+ * 被标成更低的号。版本号算法全站只留 `versionNumberOf` 一处（见 `versionPlan.test.ts`
+ * 的截断场景用例）。
+ */
 export function versionLabelOf(page: { version: number }, index: number): number {
-  return page.version - index - 1
+  return versionNumberOf(page, index)
 }
 
 interface DiffTarget {
@@ -62,7 +70,12 @@ export function VersionDiffDialog({
   /** null = 关闭 */
   target: DiffTarget | null
   onClose: () => void
-  onRestore: (t: DiffTarget, content: string) => void
+  /**
+   * 恢复回调。**不传快照正文** —— 恢复走服务端的四位一体端点（正文 + 块级权限 + 档位 +
+   * 发布态），由端点自己去读那一版；本组件拉到的 `oldContent` 只用于算差异展示，
+   * 拿它去 `savePage` 会把恢复做成半截动作（只回正文、不回权限）。
+   */
+  onRestore: (t: DiffTarget) => void
   restoring: boolean
   /**
    * 能否恢复。传 `canManageVisibility`（**不是** `canEdit`）：恢复会改写页面状态，
@@ -139,7 +152,11 @@ export function VersionDiffDialog({
                 icon={<RotateCcw className="size-3.5" />}
                 disabled={restoring || oldContent === null}
                 onClick={() => {
-                  if (target !== null && oldContent !== null) onRestore(target, oldContent)
+                  /*
+                   * 仍然要求 `oldContent !== null`：恢复是在**看过差异之后**做的决定，
+                   * 快照还没拉到就允许点，等于让用户盲恢复。
+                   */
+                  if (target !== null && oldContent !== null) onRestore(target)
                 }}
               >
                 恢复此版本

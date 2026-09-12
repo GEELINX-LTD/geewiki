@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HOME_SLUG, parseWikiRoute, wikiRouteHash } from '../lib/wikiRoute'
+import { hashQueryOf, stripHashQuery } from '../lib/hashAnchor'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
 import { ChevronLeft, ChevronRight, FileText, History, List as ListIcon, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
@@ -17,12 +18,27 @@ import {
   type NewPageEntry,
 } from '../lib/newPageGate'
 import { AskPanel } from '../components/AskPanel'
+import {
+  PREVIEW_ATTACHMENT_NOTE,
+  PREVIEW_INVALID_TEXT,
+  canRestoreVersion,
+  parsePreviewParam,
+  pickerTriggerText,
+  previewBarText,
+  previewRoute,
+  restoreConfirmBody,
+  restoreDoneText,
+  restoreErrorText,
+  versionNumberOf,
+} from '../lib/versionPlan'
+import { Tooltip } from '../ui/Tooltip'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { EditorSlotOutlet, useEditorSlot } from '../lib/slots'
 import { AssistToolbar } from '../components/ai/AssistToolbar'
 import {
   COMPACT_VERSIONS,
+  ReadonlyHistoryButton,
   TimelineDialog,
   VersionBadge,
   VersionList,
@@ -190,11 +206,36 @@ export function WikiPage(props: {
    * 为什么重定向而不是两个 URL 渲染同一篇：两套 URL 会让"复制链接/浏览器历史/面包屑"
    * 出现两种形态，而且选中态、返回行为都会分叉。用 `replace: true`（改写历史而不是压栈）
    * 是为了不让"后退"把用户卡在 `/wiki/home` ↔ `/wiki` 之间来回弹。
+   *
+   * ⚠️ **必须带上查询串**（形如 `?v=68`，**含 `?`**）：漏掉它会把 `#/wiki/home?v=68`（历史快照预览）
+   * 变成 `#/wiki` —— 页面照常显示最新版，用户却以为自己给的链接坏了。
+   * 主页是默认落点，所以这个丢参数的机会比别的 slug 高得多（实测踩到过）。
+   *
+   * ⚠️⚠️ 光"带上查询串"还不够：这个查询串**必须从当前 URL 现读**，不能取 `props.query`
+   * （它由另一个 `hashchange` 订阅者维护，可能比 `route` 落后一拍）。详见下面 effect 里的长注释 ——
+   * 点击版本下拉时丢 `?v=` 的根因就在这里。
    */
   const normalizeHome = route.kind === 'detail' && route.slug === HOME_SLUG
   useEffect(() => {
     if (!normalizeHome) return
-    window.location.replace('#/wiki')
+    /*
+     * ⚠️ 查询串**从当前 URL 现读**，不用 `props.query`。这不是风格偏好，是本页最容易复发的缺陷：
+     *
+     * `route` 与 `query` 是 `App.tsx` 里**两个各自订阅 `hashchange` 的 state**。而 React 可能
+     * 在**第一个订阅者**（`useRoute`）把 `route` 换掉之后就提交一次渲染、并在提交后跑本 effect
+     * ——此时 `query` 还是上一个 URL 的值（实测：`#/wiki/home?v=68` 下 `props.query === ''`，
+     * 于是 `replace('#/wiki' + '')` 把 `?v=68` 抹掉 ⇒ 预览态永远进不去，且不再重试）。
+     *
+     * 本 effect 是**URL 级规范化**，输入就该是 URL 本身：读当前 hash ⇒ 与触发本次渲染的地址同源，
+     * 于是与"两个 state 谁先落地"彻底无关（顺序再变，改写结果都一样）。这也保证了深链
+     * `#/wiki/home?v=68`、点击路径、以及"只有查询串变"的同文档导航三条入口行为一致。
+     *
+     * 再用 `stripHashQuery` 复核一次：被动 effect 可能在**又发生了一次导航之后**才被冲刷，
+     * 那时当前 URL 已经不是别名了 —— 这种过期 effect 必须什么都不做，绝不能把新地址劫持回主页。
+     */
+    const hash = window.location.hash
+    if (stripHashQuery(hash) !== `wiki/${HOME_SLUG}`) return
+    window.location.replace(`#/wiki${hashQueryOf(hash)}`)
   }, [normalizeHome])
   if (normalizeHome) return null
 
@@ -231,6 +272,7 @@ export function WikiPage(props: {
         <WikiDetail
           key={HOME_SLUG}
           slug={HOME_SLUG}
+          query={query}
           homeMode
           onEdit={() => onNavigate(`${HOME_SLUG}/edit`)}
           onDeleted={() => onNavigate('list')}
@@ -358,6 +400,7 @@ export function WikiPage(props: {
         <WikiDetail
           key={route.slug}
           slug={route.slug}
+          query={query}
           onEdit={() => onNavigate(`${route.slug}/edit`)}
           onDeleted={() => onNavigate('list')}
           onNavigate={onNavigate}
@@ -1087,6 +1130,13 @@ function Breadcrumb({
 
 function WikiDetail(props: {
   slug: string
+  /**
+   * 本次 hash 的裸查询串（`?` 之后的部分，无则空串）。由 `App.tsx` 的 `useRouteQuery` 提供。
+   *
+   * 用于 `?v=<版本 id>` 的历史快照预览：放进 URL 而不是组件 state，因为"你看这一版"
+   * 是一个**要发给别人的状态**（可分享、可刷新、可前进后退）。
+   */
+  query: string
   onEdit: () => void
   onDeleted: () => void
   onNavigate: (path: string) => void
@@ -1102,7 +1152,7 @@ function WikiDetail(props: {
    */
   homeMode?: boolean
 }): ReactNode {
-  const { slug, onEdit, onDeleted, onNavigate, homeMode = false } = props
+  const { slug, query, onEdit, onDeleted, onNavigate, homeMode = false } = props
   // 当前页路由（锚点 href 要用它拼 `#/wiki/<slug>?a=<id>`，见 lib/hashAnchor.ts）
   const route = `wiki/${slug}`
 
@@ -1216,6 +1266,81 @@ function WikiDetail(props: {
     () => (page === null ? '' : stripDuplicateLeadingTitle(page.content, page.title)),
     [page],
   )
+
+  /*
+   * ══════ 历史快照预览（`?v=<版本 id>`，可分享的 URL）══════
+   *
+   * 为什么把"预览哪一版"放进 URL 而不是组件 state：这是**可分享的状态**
+   * ——"你看这一版"得把链接发给别人。放进 state 就只能靠嘴描述版本号。
+   * `query` 由 `App.tsx` 的 `useRouteQuery` 随 hashchange 更新（同 `create=home` 的做法）。
+   */
+  const previewParam = useMemo(() => parsePreviewParam(query), [query])
+  /** 预览中的快照；`null` = 正在看最新版 */
+  const [preview, setPreview] = useState<{ id: number; number: number; savedAt: string; content: string } | null>(
+    null,
+  )
+  const [previewLoading, setPreviewLoading] = useState(false)
+  /*
+   * 非法/无权 `?v=` 的提示。**单独一个 state**，不借用列表视图的 `queryNotice`：
+   * 那个提示位只在列表分支渲染，而这里要提示的是**详情页**上的失败 —— 塞进看不见的地方
+   * 等于没有反馈（实测踩到过：URL 清干净了，用户却完全不知道刚发生了什么）。
+   */
+  const [previewNotice, setPreviewNotice] = useState('')
+
+  useEffect(() => {
+    if (page === null) return
+    if (previewParam.kind !== 'ok') {
+      setPreview(null)
+      return
+    }
+    const wantId = previewParam.id
+    let cancelled = false
+    setPreviewLoading(true)
+    api
+      .version(slug, wantId)
+      .then((r) => {
+        if (cancelled) return
+        /*
+         * 版本号优先按 `versions[]` 里的名次算（`versionNumberOf` 从**总数**往下数，
+         * 截断时也对，见 `lib/versionPlan.ts`）；目标不在最近 N 条里时退回
+         * `page.version - total`（`total` 是快照总数，差值就是它的号）。
+         */
+        const idx = page.versions.findIndex((v) => v.id === wantId)
+        const number = idx >= 0 ? versionNumberOf(page, idx) : Math.max(1, page.version - page.versions.length)
+        setPreview({ id: wantId, number, savedAt: r.saved_at, content: r.content })
+        setPreviewNotice('')
+      })
+      .catch(() => {
+        if (cancelled) return
+        /*
+         * 非法 / 无权 / 已删除的快照都落这里。服务端对"不存在"与"无权"刻意回同一个 404，
+         * 故文案**必须同时说出两种可能**（与仓库"404 不区分成因"的既有一致），
+         * 并**从 URL 清掉 `?v=`** —— 否则用户每次刷新都要再吃一遍同样的回落。
+         */
+        setPreview(null)
+        /*
+         * 清掉 `?v=`，但**必须留在当前这一页**：
+         *
+         * - 主页（`homeMode`）：`onNavigate('')` 得到规范地址 `#/wiki`（而不是 `#/wiki/home`
+         *   —— 那会被主页规范化再改写一次，且 `WikiDetail` 会卸载重挂、连上面那条提示一起丢）。
+         * - 其它 slug：用**它自己的 slug**（`#/wiki/<slug>`）。此前这里一律用 `''`，于是
+         *   `#/wiki/getting-started?v=999999` 会把读者**甩到主页**；又因为 slug 变了、
+         *   `key={slug}` 变了，`WikiDetail` 重挂，`previewNotice`（组件 state）一并消失 ——
+         *   用户既丢了正在读的那一页，也拿不到任何解释（实测：hash=`#/wiki`、h1=`主页`、
+         *   `[role=status]` 为空）。同 slug 导航不重挂，提示因此留得住。
+         */
+        onNavigate(homeMode ? '' : slug)
+        setPreviewNotice(PREVIEW_INVALID_TEXT)
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [previewParam, page, slug, onNavigate, homeMode])
+
+  const previewing = preview !== null
   /*
    * slug → 标题。给正文链接改写用：判定站内链接目标是否存在（不存在则弱化标注），
    * 并把 `[[wikilink]]` 的自动显示文本换成页面真实标题。
@@ -1237,6 +1362,21 @@ function WikiDetail(props: {
     // 附件破图占位里的「申请访问」按**页面**提交（附件没有独立申请端点）
     attachmentSlug: slug,
   })
+  /*
+   * 预览态的正文**走同一条渲染管线**（同一个 `useRenderedMarkdown`）：它顺带给出 TOC 与
+   * 站内链接改写。另起一条渲染路径，两边的 id 生成一旦有差异就会"目录点不动"。
+   */
+  const snapshotMarkdown = useMemo(
+    () => (page === null || preview === null ? '' : stripDuplicateLeadingTitle(preview.content, page.title)),
+    [page, preview],
+  )
+  const renderedSnapshot = useRenderedMarkdown(snapshotMarkdown, {
+    route,
+    pages: pageTitles,
+    attachmentSlug: slug,
+  })
+  /** 正文卡片实际渲染哪一份：预览态用快照，否则用当前正文 */
+  const shown = previewing ? renderedSnapshot : rendered
   const tocIds = useMemo(() => rendered.toc.map((t) => t.id), [rendered.toc])
   const activeId = useActiveHeading(tocIds)
 
@@ -1305,36 +1445,48 @@ function WikiDetail(props: {
     setCompareTarget({ id: v.id, label, savedAt: v.saved_at, author: v.author ?? null })
   }
 
-  const restore = (target: CompareTarget, content: string): void => {
+  /**
+   * 恢复某一版 —— **四位一体**（正文 + 块级权限 + 页面档位 + 发布状态）。
+   *
+   * ⚠️ 这里必须调服务端的恢复端点 `api.restoreVersion`，**不能**用 `api.savePage` 拿旧正文覆盖：
+   * 后者只动正文，会把"恢复"做成半截动作 —— 用户以为回到了那一版，而那一版的**权限与发布态
+   * 并没有回来**，于是本不该可见的内容继续可见（或反之）。这是**静默的权限不一致**，
+   * 比报错严重得多。
+   *
+   * 代价：端点要求 `canManageVisibility`（比 `canEdit` 严，因为它在改权限），
+   * 故入口门控必须与之对齐（见 `VersionDiffDialog` 的 `canRestore` 与
+   * `lib/versionPlan.ts` 的 `canRestoreVersion`）；门控不齐会给用户一个点了必然 403 的按钮。
+   *
+   * 恢复**不原地覆盖**，而是追加一个新版本 ⇒ 老编号不会回来。确认框里如实写明。
+   */
+  const restore = (target: CompareTarget): void => {
     if (page === null) return
     /*
-     * 恢复是"用旧内容覆盖当前内容"，而确认框会盖住页面 —— 用户看不见自己选的是哪一版。
-     * 故标题/正文都带上版本号与快照时间。
-     *
-     * ⚠️ 这里走的是 `api.savePage`（只覆盖正文）。服务端另有四位一体的 restore 端点
-     *    （正文 + 块级权限 + 页面档位 + 发布态），但**它要求 `canManageVisibility`**，
-     *    而本入口的门控是 `canEdit`——两者不是同一个能力。要改成调那个端点，
-     *    得先把入口门控与产品语义一起定下来（属行为变更，需上层拍板）。
+     * 确认框会盖住页面 —— 用户看不见自己选的是哪一版。
+     * 故正文逐条说清三件事：覆盖谁、会新生成版本、老快照只能恢复正文。
      */
     confirm({
       title: `恢复到 v${target.label}？`,
-      body:
-        `当前内容（v${page.version}）会被 v${target.label}（保存于 ` +
-        `${fmtTime(target.savedAt)}）覆盖，并生成一个新版本。`,
+      body: restoreConfirmBody(target.label, page.version, target.savedAt),
       confirmLabel: '恢复此版本',
       danger: false,
       onConfirm: () => {
         setRestoring(true)
         return api
-          .savePage(slug, { title: page.title, content })
+          .restoreVersion(slug, target.id)
           .then((r) => {
-            setNotice(`已恢复 v${target.label} 内容（当前 v${r.version}）`)
+            setNotice(restoreDoneText(r.warnings))
             setCompareTarget(null)
+            setPreview(null)
             load()
             void invalidatePages() // 版本变了 ⇒ 列表里的"版本"列与排序都要更新
             void refreshCapabilitiesIfVisible() // 写操作后能力可能已变（见 remove() 的说明）
           })
-          .catch((e: unknown) => setErr(errorLine(e)))
+          .catch((e: unknown) => {
+            // 块级可见性不足时服务端会回 403 + details.blockedOrdinals：翻成人话再显示
+            const blocked = restoreErrorText(e as { details?: unknown })
+            setErr(blocked ?? errorLine(e))
+          })
           .finally(() => setRestoring(false))
       },
     })
@@ -1524,11 +1676,34 @@ function WikiDetail(props: {
             而版本内容对只读者本来就不该开放（快照端点非 canEdit 一律 404）。
           */}
           {page.capabilities.canEdit ? (
-            <VersionPicker page={page} onCompare={startCompare} />
+            <VersionPicker
+              slug={slug}
+              page={page}
+              previewNumber={preview?.number ?? null}
+              onPreview={(id, label) => {
+                /*
+                 * `id === 0` 是下拉顶部那条「最新」的约定值 —— 它代表**退出预览**
+                 * （回到不带 `?v=` 的地址），而不是"预览第 0 版"。
+                 */
+                void label
+                onNavigate(id === 0 ? slug : previewRoute(slug, id))
+              }}
+              onCompare={startCompare}
+            />
           ) : (
-            <VersionBadge version={page.version} />
+            <>
+              {/*
+                只读视角：静态徽标 + 一个「历史」入口。给的是**存在性信息**（改过几次、
+                什么时候动的），不给快照正文与恢复 —— 那两个能力服务端都不放行，
+                给出入口就是给出必然失败的按钮（理由见 `ReadonlyHistoryButton` 的文件头）。
+              */}
+              <VersionBadge version={page.version} />
+              <ReadonlyHistoryButton slug={slug} page={page} />
+            </>
           )}
           <span>更新于 {fmtTime(page.updated_at)}</span>
+          {/* 快照在途：给一句可见反馈，免得"点了没反应"被当成坏了 */}
+          {previewLoading && <span className="text-2xs text-muted" role="status">正在加载该版本…</span>}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {notice !== '' && (
@@ -1539,6 +1714,11 @@ function WikiDetail(props: {
           {err !== '' && (
             <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-note text-danger-ink">
               {err}
+            </span>
+          )}
+          {previewNotice !== '' && (
+            <span role="status" className="rounded-md border border-warn-line bg-warn-bg px-3 py-1 text-note text-warn-ink">
+              {previewNotice}
             </span>
           )}
           {/*
@@ -1558,6 +1738,8 @@ function WikiDetail(props: {
               size="sm"
               icon={<ShieldCheck className="size-3.5" />}
               onClick={() => setAccessOpen(true)}
+              disabled={previewing}
+              title={previewing ? '先返回最新版本' : undefined}
             >
               权限…
             </Button>
@@ -1569,18 +1751,65 @@ function WikiDetail(props: {
               size="sm"
               icon={<Trash2 className="size-3.5" />}
               onClick={remove}
-              disabled={restoring}
+              disabled={restoring || previewing}
+              title={previewing ? '先返回最新版本' : undefined}
             >
               删除
             </Button>
           )}
           {page.capabilities.canEdit && (
-            <Button variant="primary" size="sm" icon={<Pencil className="size-3.5" />} onClick={onEdit}>
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<Pencil className="size-3.5" />}
+              onClick={onEdit}
+              disabled={previewing}
+              title={previewing ? '先返回最新版本' : undefined}
+            >
               编辑
             </Button>
           )}
         </div>
       </div>
+
+      {/*
+        预览态状态条：说清"你在看的是哪一版、它是只读的、以及附件的判定口径与正文不同"。
+        附件那句不是免责声明而是**真会发生的差异**：快照正文按保存时显示，而附件下载
+        按**当前**正文的引用判定（见后端下载端点），所以历史里的图片可能打不开。
+      */}
+      {preview !== null && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-note text-warn-ink"
+        >
+          <span>{previewBarText(preview.number, preview.savedAt)}</span>
+          <span className="text-2xs opacity-80">{PREVIEW_ATTACHMENT_NOTE}</span>
+          {/*
+            预览态下「编辑 / 权限… / 删除」被禁用（不是隐藏）。这里用**可见文字**说明原因而不是
+            只挂 Tooltip：Tooltip 在禁用按钮上根本触发不了（禁用元素不派发指针事件、也不可聚焦），
+            触屏与读屏用户更拿不到 —— 那等于把唯一的解释挂在了够不着的地方。
+          */}
+          <span className="text-2xs">历史快照是只读的：要编辑请先返回最新版本。</span>
+          <span className="ml-auto flex items-center gap-2">
+            <Button variant="secondary" size="sm" onClick={() => onNavigate(slug)}>
+              返回最新
+            </Button>
+            {canRestoreVersion(page) && (
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<RotateCcw className="size-3.5" />}
+                disabled={restoring}
+                onClick={() =>
+                  restore({ id: preview.id, label: preview.number, savedAt: preview.savedAt, author: null })
+                }
+              >
+                恢复此版本
+              </Button>
+            )}
+          </span>
+        </div>
+      )}
 
       {/*
         两栏：正文（含历史）在左，目录/最近更新在右。
@@ -1618,10 +1847,10 @@ function WikiDetail(props: {
           */}
           <article className="gw-reader rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
             <h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>
-            {page.content.trim() === '' ? (
+            {shown.html === '' ? (
               <p className="text-sm text-muted">（空白页面 —— 点击「编辑」写入内容）</p>
             ) : (
-              <MarkdownBody html={rendered.html} className="md-body" />
+              <MarkdownBody html={shown.html} className="md-body" />
             )}
           </article>
 

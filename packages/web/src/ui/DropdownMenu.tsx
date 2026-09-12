@@ -56,23 +56,42 @@ export function DropdownMenuContent({
 export function DropdownMenuItem({
   children,
   onSelect,
+  onClick,
   active = false,
+  disabled = false,
   className,
 }: {
   children: ReactNode
   onSelect?: () => void
   /** 当前路由所在项：加高亮（视觉），同时用 aria-current 传达给辅助技术 */
   active?: boolean
+  /**
+   * 禁用该项（不派发 `onSelect`、不可键盘提交）。
+   *
+   * 用途是**就地加载**这类"占位项"（例如版本列表底部的「加载更早的版本…」正在请求时）：
+   * 它需要在菜单**保持打开**的同时不可再次触发。
+   */
+  disabled?: boolean
+  /**
+   * 点击时触发（**不改菜单开合**）。用于"就地加载下一页"这类不需要关闭菜单的动作 ——
+   * Radix 的 `Item` 在指针按下时就会关菜单，若走 `onSelect` 就来不及看到加载结果。
+   * 需要"选中即关"的普通项仍用 `onSelect`。
+   */
+  onClick?: () => void
   className?: string
 }): ReactNode {
   return (
     <Menu.Item
+      disabled={disabled}
+      onClick={onClick}
       onSelect={onSelect === undefined ? undefined : () => onSelect()}
       aria-current={active ? 'page' : undefined}
       className={cn(
         'flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-1.5 text-sm',
         'text-ink select-none',
         'data-[highlighted]:bg-hover',
+        // 禁用项不该有 pointer 光标：否则读起来像"能点，只是点不动"
+        disabled && 'cursor-default text-muted data-[disabled]:pointer-events-none data-[disabled]:opacity-60',
         active && 'bg-accent-soft font-semibold text-accent-soft-ink data-[highlighted]:bg-accent-soft',
         focusRing,
         touchTarget,

@@ -181,8 +181,23 @@ test('守卫：对比弹窗必须容忍缺失的作者字段（显示「未记�
   const pickerSrc = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
   // 「未记录」的**唯一**定义点（`authorText`）；VersionPicker 通过 import 复用它。
   assert.ok(diffSrc.length > 1500, 'VersionDiffDialog 读不到内容？反空洞')
-  assert.match(diffSrc, /export const UNKNOWN_AUTHOR = '未记录'/, '缺失作者必须显示为「未记录」')
-  assert.match(diffSrc, /export function authorText/, 'authorText 必须导出（供版本下拉复用同一口径）')
+  /*
+   * 定义已下沉到 `lib/authorText.ts`（原地在 VersionDiffDialog 里，但那会与
+   * `lib/versionPlan.ts` 构成循环 import —— 前者要用版本号算法、后者要用作者文案）。
+   * 所以这里钉的是"**全仓只有一处字面量定义**"，而不是"必须定义在某个具体文件里"：
+   * 后者是形态，前者才是要防的漂移。
+   */
+  const authorSrc = readFileSync(join(here, '../src/lib/authorText.ts'), 'utf8')
+  assert.ok(authorSrc.length > 200, 'authorText 读不到内容？反空洞')
+  assert.match(authorSrc, /export const UNKNOWN_AUTHOR = '未记录'/, '缺失作者必须显示为「未记录」')
+  assert.match(authorSrc, /export function authorText/, 'authorText 必须导出（供版本下拉复用同一口径）')
+  assert.match(diffSrc, /authorText/, 'VersionDiffDialog 必须经同一个 authorText')
+  // 反空洞 + 单一来源：字面量只在 authorText.ts 出现一次
+  assert.equal(
+    (authorSrc.match(/'未记录'/g) ?? []).length,
+    1,
+    '「未记录」的字面量在 authorText.ts 里只应出现一次',
+  )
 
   for (const [name, src] of [
     ['VersionDiffDialog', diffSrc],
@@ -195,12 +210,23 @@ test('守卫：对比弹窗必须容忍缺失的作者字段（显示「未记�
       `${name} 不得把"没有作者信息"写成"匿名"（那是另一种事实主张，注释里说明原因不算）`,
     )
   }
-  // 下拉与时间线都必须走同一个 authorText（否则两处口径会漂移）
-  assert.equal(
-    (pickerSrc.match(/authorText\(/g) ?? []).length >= 2,
-    true,
-    'VersionPicker 的菜单项与时间线都要经 authorText',
+  /*
+   * 下拉与时间线都必须走**同一份**作者文案（否则两处口径会漂移）。
+   *
+   * 判据说的是"同一份"，不是"必须直接调 authorText"：本轮把菜单项的文案抽到了
+   * `lib/versionPlan.ts` 的 `versionMetaText`（它内部转调 `authorText`），此时把
+   * `authorText` 再留一份在 VersionPicker 里反而会变成**第二份口径** —— 那正是本条要防的事。
+   * 所以这里钉"单一来源"，实现形态允许经一层转发。
+   */
+  const planSrc = readFileSync(join(here, '../src/lib/versionPlan.ts'), 'utf8')
+  assert.ok(planSrc.length > 1500, 'versionPlan 读不到内容？反空洞')
+  assert.match(planSrc, /authorText\(/, 'versionPlan 的 versionMetaText 必须转调 authorText')
+  assert.doesNotMatch(
+    pickerSrc,
+    /displayName\s*\?\?/,
+    'VersionPicker 不得自己拼作者名（那会绕开 authorText，形成第二份口径）',
   )
+  assert.match(diffSrc, /authorText\(/, 'VersionDiffDialog 自身也要经 authorText')
 })
 
 test('守卫：旧版本历史卡片不得回来（特征文案已删除）', () => {

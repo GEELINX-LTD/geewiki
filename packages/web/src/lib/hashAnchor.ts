@@ -33,6 +33,22 @@ export function stripHashQuery(hash: string): string {
   return q === -1 ? withoutPrefix : withoutPrefix.slice(0, q)
 }
 
+/**
+ * 取整串 hash 的**查询串**（`?` 之后的部分，含 `?`，便于直接交给解析器）；无则空串。
+ *
+ * 与 `stripHashQuery` 是同一把刀的两面：一个取 `?` 之前（路由），一个取 `?` 之后（参数）。
+ * **两者必须共用同一个 `?` 分界** —— 各写一份迟早会漂移（例如一个支持 `#wiki/...` 无斜杠写法、
+ * 另一个不支持），那时"路由"与"查询串"就会来自同一个 URL 的两个不同切法。
+ *
+ * ⚠️ 调用时机比实现更重要：本函数读的是 **URL 那一刻的真值**。在**渲染期**读它会在
+ * "路径不变、只有查询串变"的导航下拿到陈旧值（`App.tsx` 的 `useRouteQuery` 头注记录了实测症状）；
+ * 在**副作用里**（如 `WikiPage` 的主页规范化）读它才是对的 —— 那里要的正是"当前 URL"。
+ */
+export function hashQueryOf(hash: string): string {
+  const q = hash.indexOf('?')
+  return q === -1 ? '' : hash.slice(q)
+}
+
 /** 从整串 hash 里读出锚点 id（无则 null） */
 export function readHashAnchor(hash: string): string | null {
   const q = hash.indexOf('?')

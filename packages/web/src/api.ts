@@ -378,6 +378,60 @@ export interface VersionMeta {
   author: { id: number; displayName: string | null } | null
 }
 
+/**
+ * `GET /api/pages/:slug/versions?...` 的一项。
+ *
+ * 与页内 `versions[]`（`VersionMeta`）的差别：这里多了服务端算好的**版本号 `number`**
+ * 与**改动摘要 `change`**。两者都刻意由服务端算 —— 前端算版本号会在翻页后错位，
+ * 前端算改动要拉两份全文。
+ */
+export interface VersionPageItem {
+  id: number
+  /** 版本号（v1、v2 …）。由服务端 `ROW_NUMBER()` 算出，**不要用下标推** */
+  number: number
+  saved_at: string
+  title: string | null
+  /** `'content'`（正文/标题被改）| `'acl'`（只动了权限）| `null`（升级前的旧行） */
+  origin: string | null
+  author: { id: number; displayName: string | null } | null
+  /**
+   * 这一版相对**下一版**（更晚那条）改了什么；最早一版没有对照对象 ⇒ `null`
+   * （语义是"无对照"，**不是**"什么都没改"）。
+   *
+   * `blocksDelta`/`grantsDelta` 是**结构计数差**，不是字节差。
+   */
+  change: { contentChanged: boolean; blocksDelta: number; grantsDelta: number } | null
+}
+
+export interface VersionPageResponse {
+  ok: true
+  total: number
+  limit: number
+  hasMore: boolean
+  versions: VersionPageItem[]
+}
+
+/** 块级结构差异。**响应里刻意没有块文本**（`t`/`text`/`content` 都不该出现）。 */
+export interface VersionDiffResponse {
+  ok: true
+  from: number
+  to: number
+  added: { ordinal: number; kind: string; visibility: string }[]
+  removed: { ordinal: number; kind: string; visibility: string }[]
+  modified: { ordinal: number; kind: string; visibility: string; changed: string[] }[]
+  unchangedCount: number
+}
+
+export interface RestoreResult {
+  ok: true
+  slug: string
+  /** 被恢复的那一版的 id（**不是**新生成的版本号） */
+  restored: number
+  acl_revision: number
+  /** "这次没能做到的部分"；空数组表示四位一体全部回滚成功 */
+  warnings: string[]
+}
+
 export interface PageDetail extends PageSummary {
   content: string
   created_at: string
@@ -929,6 +983,46 @@ export const api = {
       'GET',
       `/api/pages/${encodeURIComponent(slug)}/versions/${id}`,
     ),
+  /*
+    分页列版本（游标）。`before` 传**上一页最后一项的 id**，不是 offset ——
+    并发保存时 offset 会跳条/重复（同时间线里新增一条，第二页就错位）。
+
+    ⚠️ `number`（版本号）由服务端的 `ROW_NUMBER()` 算出，**不要**在前端用下标推：
+    翻页之后下标与版本号不再对应（见 `lib/versionPlan.ts` 的 `versionNumberOf`）。
+  */
+  versions: (slug: string, opts?: { limit?: number; before?: number }) => {
+    const q = new URLSearchParams()
+    if (opts?.limit !== undefined) q.set('limit', String(opts.limit))
+    if (opts?.before !== undefined) q.set('before', String(opts.before))
+    const qs = q.toString()
+    return request<VersionPageResponse>(
+      'GET',
+      `/api/pages/${encodeURIComponent(slug)}/versions${qs === '' ? '' : `?${qs}`}`,
+    )
+  },
+  /*
+    块级结构差异（与更旧的那一版比）。**只回结构元数据、绝不回块文本** ——
+    若某块是 `granted` 档而调用者未被授予，回文本就等于让"能编辑本页的人"读到
+    他自己在正文里看不到的那段。
+
+    错误码：`no_previous`（该版本已是最早一版，无对照对象）、
+    `snapshot_incomplete`（两侧任一 `blocks_json` 为 NULL，老快照算不出结构差）。
+  */
+  versionDiff: (slug: string, id: number) =>
+    request<VersionDiffResponse>(
+      'GET',
+      `/api/pages/${encodeURIComponent(slug)}/versions/${id}/diff`,
+    ),
+  /*
+    ★ 四位一体恢复：正文 + 块级权限 + 页面档位 + 发布状态。
+    服务端要求 `canManageVisibility`（比 `canEdit` 严），**不原地覆盖而是追加一个新版本**
+    （所以老编号不会回来）。
+
+    `warnings` 是"这次没能做到的部分"（例如老快照没有块级权限数据 ⇒
+    `block_acls_not_restored`），调用方**必须**翻成中文提示给用户。
+  */
+  restoreVersion: (slug: string, id: number) =>
+    request<RestoreResult>('POST', `/api/pages/${encodeURIComponent(slug)}/versions/${id}/restore`),
   /*
     反向链接与出链：**按 slug 的两个小端点**。
 

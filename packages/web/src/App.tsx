@@ -27,7 +27,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { ThemeToggle } from './components/ThemeToggle'
 import { SystemStatusDialog } from './components/SystemStatusDialog'
 import { MAIN_CONTENT_ID } from './lib/domIds'
-import { stripHashQuery } from './lib/hashAnchor'
+import { hashQueryOf, stripHashQuery } from './lib/hashAnchor'
 import { parseWikiRoute } from './lib/wikiRoute'
 import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
 import { titleForRoute } from './lib/pageMeta'
@@ -127,12 +127,6 @@ function useRouteQuery(): string {
     return () => window.removeEventListener('hashchange', onChange)
   }, [])
   return query
-}
-
-/** 取 hash 里 `?` 之后的部分（含 `?`，便于直接交给解析器）；无查询串返回空串 */
-function hashQueryOf(hash: string): string {
-  const q = hash.indexOf('?')
-  return q === -1 ? '' : hash.slice(q)
 }
 
 /**
