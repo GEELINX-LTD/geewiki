@@ -189,6 +189,13 @@ function toggleBold(view: EditorView): boolean {
   return true
 }
 
+export interface MarkdownEditorHandle {
+  /** 在光标处插入（有选区时**替换**选区 —— 与 CodeMirror 的 `replaceSelection` 同语义） */
+  insertAtCursor(text: string): void
+  /** 只替换当前选区；无选区时不动作并返回 `false`（调用方据此提示而不是静默） */
+  replaceSelection(text: string): boolean
+}
+
 export interface MarkdownEditorProps {
   value: string
   onChange: (next: string) => void
@@ -205,6 +212,23 @@ export interface MarkdownEditorProps {
    * 默认动作（导航走 / 塞 data URI），只在状态行里说明，绝不让用户以为"什么都没发生"。
    */
   onUploadFiles?: (files: File[]) => Promise<string[]>
+  /**
+   * 选区变化回调（供**宿主**的 AI 辅助写作判断"此刻能做什么"）。
+   *
+   * 为什么由宿主驱动而不是编辑器内建：AI 辅助的入口在编辑面板（宿主 UI），
+   * 且第三方编辑器插件占用 `editor` 插槽时宿主仍要可用 —— 选区上报做成**可选**能力，
+   * 不提供时宿主的动作按"无选区"降级，不会因为缺少这一路而失效。
+   *
+   * 回调参数：`null` = 无选区（光标态）；否则给出 `from`/`to` 与选中文本。
+   */
+  onSelectionChange?: (sel: { from: number; to: number; text: string } | null) => void
+  /**
+   * 宿主可调用的插入句柄（AI 辅助"采纳"用）。
+   *
+   * 三种落点：`replace` = 替换当前选区；`insert` = 在光标处插入；`clear` = 清空文档后写入。
+   * 全部走 `userEvent: 'input'` 事务 ⇒ **⌘Z 一次即可撤销**（AI 产物绝不进"不可撤销"的路径）。
+   */
+  handleRef?: React.RefObject<MarkdownEditorHandle | null>
 }
 
 /* ------------------------- 附件上传：可复用的纯函数 ------------------------- */
@@ -270,6 +294,15 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
    * 那次保存"之后 —— 保存成功随即导航离开，这段刚插入的内容就**静默丢失**了。
    */
   const disabledRef = useRef(props.disabled)
+  /** 选区回调也用 ref：updateListener 只在创建时挂一次，直接闭包捕获会永远是第一版 */
+  const onSelectionRef = useRef(props.onSelectionChange)
+  /**
+   * 上一次上报给宿主的选区键（`from:to`）。
+   *
+   * 为什么需要它：CodeMirror 的 update 会在**每次按键**触发，而选区绝大多数时候没变。
+   * 不比对就上报会让宿主每敲一个字就重渲染一次工具条（还会打断输入法组合）。
+   */
+  const lastSelectionRef = useRef<string>('')
   const editable = new Compartment()
   /** 占位序号：同一次会话内单调递增，保证多文件同时上传时占位互不冲突 */
   const seqRef = useRef(0)
@@ -285,6 +318,46 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
   onSaveRef.current = props.onSave
   onUploadRef.current = props.onUploadFiles
   disabledRef.current = props.disabled
+  onSelectionRef.current = props.onSelectionChange
+
+  /**
+   * 上报选区（带去重）。`instance` 由调用方给出：初始挂载时 `view.current` 还没赋值，
+   * 而 updateListener 的第一次回调就发生在构造过程中。
+   */
+  const reportSelection = useCallback((instance: EditorView): void => {
+    const cb = onSelectionRef.current
+    if (!cb) return
+    const range = instance.state.selection.main
+    const key = `${range.from}:${range.to}`
+    if (key === lastSelectionRef.current) return
+    lastSelectionRef.current = key
+    if (range.empty) cb(null)
+    else cb({ from: range.from, to: range.to, text: instance.state.sliceDoc(range.from, range.to) })
+  }, [])
+
+  // 把插入句柄交给宿主（AI 辅助"采纳"用）。依赖数组里带上句柄对象本身：
+  // 宿主传 `undefined` 时也要把上一次挂上的清掉，避免"页面切走了句柄还指着旧编辑器"。
+  useEffect(() => {
+    const target = props.handleRef
+    if (!target) return
+    target.current = {
+      insertAtCursor: (text: string) => {
+        const instance = view.current
+        if (instance === null) return
+        insertIntoView(instance, text, null)
+      },
+      replaceSelection: (text: string) => {
+        const instance = view.current
+        if (instance === null) return false
+        if (instance.state.selection.main.empty) return false
+        insertIntoView(instance, text, null)
+        return true
+      },
+    }
+    return () => {
+      target.current = null
+    }
+  }, [props.handleRef])
 
   /**
    * 跑一批上传：`slots` 里的 `placeholder` 是**替换锚点**——首次上传时是"上传中…"占位，
@@ -444,6 +517,8 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       ]),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) onChangeRef.current(u.state.doc.toString())
+        // 选区变化也要上报：宿主据此决定"改写选中"能不能点
+        if (u.selectionSet || u.docChanged || u.focusChanged) reportSelection(u.view)
       }),
       /*
         附件：粘贴 / 拖入文件。两个 handler 都**自己 preventDefault**（理由见文件头）：
@@ -478,6 +553,8 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       parent,
     })
     view.current = instance
+    // 首次上报：宿主可能在挂载前就渲染了工具条，不报一次会让"有选区/无选区"停在初始态
+    reportSelection(instance)
     return () => {
       instance.destroy()
       view.current = null

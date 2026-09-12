@@ -18,6 +18,9 @@ import { AskPanel } from '../components/AskPanel'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { EditorSlotOutlet, useEditorSlot } from '../lib/slots'
+import { AssistToolbar } from '../components/ai/AssistToolbar'
+import type { MarkdownEditorHandle } from '../components/MarkdownEditor'
+import { unavailableText, type AssistSelection } from '../lib/assistPlan'
 import { ensureSlotLoaded } from '../lib/pluginUi'
 import { SearchView } from '../components/SearchView'
 import { TableOfContents } from '../components/TableOfContents'
@@ -1947,6 +1950,57 @@ function WikiEdit(props: {
    */
   const [uploadNotice, setUploadNotice] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
 
+  /*
+    AI 辅助写作（编辑器内）：选区由编辑器上报，采纳写回走编辑器的插入句柄。
+    三态探测与列表页同一模式（先问 /api/plugins 拿权威的"插件是否激活"，避免撞 404 红控制台）：
+    `aiPlugin` null=探测中 / true=已激活 / false=未启用；`aiModelAvailable` null=探测中。
+  */
+  const [editorSelection, setEditorSelection] = useState<AssistSelection | null>(null)
+  const editorHandleRef = useRef<MarkdownEditorHandle | null>(null)
+  const [aiPlugin, setAiPlugin] = useState<boolean | null>(null)
+  const [aiModelAvailable, setAiModelAvailable] = useState<boolean | null>(null)
+  const [aiProviders, setAiProviders] = useState<number>(0)
+
+  useEffect(() => {
+    let alive = true
+    api
+      .plugins()
+      .then((r) => {
+        if (!alive) return
+        const active = r.plugins.find((p) => p.name === '@geewiki/ai')?.state === 'active'
+        setAiPlugin(active)
+        if (!active) return
+        return api.aiCapabilities().then((c) => {
+          if (!alive) return
+          setAiModelAvailable(c.available)
+          setAiProviders(c.providers.length)
+        })
+      })
+      .catch((e: unknown) => {
+        // 探测失败按"不可用"处理并保留日志；工具条会用可见文案说明原因，不静默
+        console.debug('[geewiki-wiki] AI 辅助能力探测失败：', e instanceof Error ? e.message : e)
+        if (alive) setAiPlugin(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  /**
+   * 不可用时给用户看的**可见**原因（空串 = 可用）。
+   *
+   * 路由：插件未激活 → 提示去插件管理启用；激活但无可用 provider → 区分"没有路由"与
+   * "有路由但缺凭据"（后者才是"未配置模型密钥"）。
+   */
+  const aiHint =
+    aiPlugin === null || aiModelAvailable === null
+      ? ''
+      : unavailableText({
+          pluginActive: aiPlugin,
+          modelAvailable: aiModelAvailable,
+          degraded: null,
+        }) || (aiModelAvailable ? '' : aiProviders === 0 ? '没有可用的模型路由：AI 辅助写作需要模型，检索与问答仍可用。' : '未配置模型密钥：AI 辅助写作需要模型，检索与问答仍可用。')
+
   /** 加载时的基线（脏值比较用 state 而非 ref：比较结果要参与渲染） */
   const [original, setOriginal] = useState<PageDraft>({ title: '', content: '', slugInput: slug })
   /** 本页加载时服务端的 updated_at；保存前用它检测"别人改过了" */
@@ -2440,9 +2494,28 @@ function WikiEdit(props: {
                 不含上传，这是本批明确的边界（见 slots.tsx 的 EditorSlotProps）。
               */
               onUploadFiles={uploadFiles}
+              onSelectionChange={setEditorSelection}
+              handleRef={editorHandleRef}
               placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
             />
           )}
+          {/*
+            AI 辅助写作工具条（见 `components/ai/AssistToolbar.tsx` 的三条硬规则）。
+            挂在**宿主**的编辑面板里而不是编辑器内部：`EditorSlotProps` 没有选区/插入通道，
+            且 `editor` 是单占用插槽 —— 放进插件会让第三方编辑器一占插槽就带走宿主的 AI 能力。
+            故这里在插件编辑器路径下也照常渲染（选区缺失即按"无选区"降级为续写/摘要）。
+          */}
+          <AssistToolbar
+            docText={content}
+            title={title}
+            slug={newMode ? '' : slug}
+            selection={editorSelection}
+            handleRef={editorHandleRef}
+            pluginActive={aiPlugin === true}
+            modelAvailable={aiModelAvailable}
+            modelHint={aiHint}
+            onApplied={(text) => setUploadNotice({ tone: 'ok', text })}
+          />
           {/*
             附件上传的可见提示（M4）。放在编辑区**下方**而不是页头：动作发生在这里，
             反馈就该在这里（页头那条 `err` 是保存错误的固定位置，两者互不覆盖）。

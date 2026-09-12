@@ -520,6 +520,38 @@ export interface AiCapabilitiesResponse {
   message: string
 }
 
+/* --------------------------- AI 辅助写作 --------------------------- */
+
+/** 四个动作（与后端 `ASSIST_ACTIONS` 一一对应；新增动作必须同时改两侧与文案映射） */
+export type AiAssistAction = 'continue' | 'rewrite' | 'polish' | 'summarize'
+
+export interface AiAssistRequest {
+  action: AiAssistAction
+  /** 选区文本（改写/润色必填；摘要可省） */
+  selection?: string
+  /** 光标前的文本（续写必填；摘要可省） */
+  before?: string
+  title?: string
+  /** 带 slug 时服务端会额外收紧到"该页可编辑"；不传则只要求全局编辑能力 */
+  slug?: string
+  maxTokens?: number
+}
+
+/**
+ * `POST /api/ai/assist` 的响应体。
+ *
+ * **不变式**：`mode === 'unavailable'` ⇒ `text === null` 且 `degraded` 非空。
+ * 前端不得为"不可用"编造任何替代文本（例如拿摘要冒充续写）。
+ */
+export interface AiAssistResponse {
+  ok: boolean
+  mode: 'generated' | 'unavailable'
+  action: AiAssistAction
+  text: string | null
+  degraded: Degraded | null
+  elapsedMs: number
+}
+
 /* --------------------------- 流式问答 --------------------------- */
 
 export interface AiStreamOptions {
@@ -902,6 +934,14 @@ export const api = {
       ...(opts?.extractive === undefined ? {} : { extractive: opts.extractive }),
     }),
   aiCapabilities: () => request<AiCapabilitiesResponse>('GET', '/api/ai/capabilities'),
+  /**
+   * AI 辅助写作（编辑器内的续写/改写/润色/摘要）。
+   *
+   * ⚠️ **降级不是错误**：模型不可用时服务端回 **502** 且 `body.mode === 'unavailable'`，
+   * 此时 `request()` 会抛 `ApiError`（`status=502`）——调用方**必须**按"不可用"呈现，
+   * 而不是当成网络故障报错。`text` 在没有模型时恒为 `null`，**不存在**任何兜底文本。
+   */
+  aiAssist: (body: AiAssistRequest) => request<AiAssistResponse>('POST', '/api/ai/assist', body),
   /** 流式问答（见 `aiAskStream` 的文档：取消与三类错误面） */
   aiAskStream: (q: string, opts: AiStreamOptions) => aiAskStream(q, opts),
 
