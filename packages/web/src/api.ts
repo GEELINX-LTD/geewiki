@@ -173,7 +173,7 @@ async function uploadRaw<T>(
     const res = await fetch(path, {
       method: 'PUT',
       headers: {
-        // 后端按扩展名与 MIME 双重判定（415 档），故这里必须**如实**给出文件的类型
+        // 后端按扩展名判定（不受支持 ⇒ **415 `unsupported_media_type`**），故这里必须**如实**给出文件的类型
         'content-type': file.type || 'application/octet-stream',
         'x-gw-csrf': '1',
       },
@@ -208,9 +208,15 @@ async function uploadRaw<T>(
  * 上传一个文件到某页面（`PUT /api/attachments/:slug?name=<urlencoded>`）。
  *
  * 需登录；错误码与界面处置：401 未登录 / 404 页面不可编辑或不存在 /
+ * **400 `length_mismatch`**（实收字节数与 `Content-Length` 不符 ⇒ 上传被截断，服务端不落盘）/
  * 409 同页同内容但类型不一致 / 413 `payload_too_large` 与 `page_quota_exceeded` /
- * 415 扩展名不允许 / 503 `storage_unavailable`。这些**一律经 `ApiError` 抛出**，
- * 由调用方（编辑器）转成正文里的一行失败说明 + 界面提示，不在这里吞掉。
+ * **415 `unsupported_media_type`**（扩展名不在白名单）/ 503 `storage_unavailable`。
+ * 这些**一律经 `ApiError` 抛出**，由调用方（编辑器）转成正文里的一行失败说明 + 界面提示，
+ * 不在这里吞掉。
+ *
+ * ⚠️ 本文件**不维护"错误码 → 中文文案"的映射表**：界面上展示的是服务端返回的 `message`
+ * （`errorText.ts` 也没有为这些码建表）。故后端改错误码/文案时，前端只需跟着改**注释口径**
+ * ——这正是 X2 那次"注释写 415、后端回 400"能被长期忽略的原因，别再让注释成为第三个真源。
  */
 export function uploadAttachment(
   slug: string,

@@ -201,6 +201,54 @@ test('storeStream：超限即中断并抛 payload_too_large，tmp 目录不留�
   }
 })
 
+test('storeStream：实收字节数与声明不符 ⇒ length_mismatch，且**最终路径从未被创建**（X6）', async () => {
+  const root = await tmpRoot()
+  try {
+    const dataDir = join(root, 'data')
+    const tmpDir = join(root, 'tmp')
+    const bytes = Buffer.from('声明 9999 字节，实发这么多', 'utf8')
+    await assert.rejects(
+      // 声明 9999、实收 bytes.length ⇒ 必须拒绝：一个被截断的文件在内容寻址下是一份
+      // **全新的哈希**（路径自洽、byte_size 自洽、去重也挡不住），会静默破坏
+      // "同一哈希 ⇒ 同一字节"这条不变式
+      () => storeStream(bodyOf([bytes]), { dataDir, tmpDir, maxBytes: 1024 * 1024, ext: '.txt', expectedBytes: 9999 }),
+      (err: unknown) => {
+        assert.ok(err instanceof AttachmentStoreError)
+        assert.equal(err.code, 'length_mismatch')
+        assert.match(err.message, new RegExp(String(bytes.length)))
+        assert.match(err.message, /9999/)
+        return true
+      },
+    )
+    // 关键断言：失败发生在 rename **之前** ⇒ 内容寻址目录里一个字节都不该出现，tmp 也无残留
+    assert.deepEqual(await readdir(join(dataDir, 'attachments')), [])
+    assert.deepEqual(await readdir(tmpDir), [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('storeStream：声明值一致时照常放行（对照面，防止"一律拒绝"式的假绿）', async () => {
+  const root = await tmpRoot()
+  try {
+    const dataDir = join(root, 'data')
+    const tmpDir = join(root, 'tmp')
+    const bytes = Buffer.from('长度对得上', 'utf8')
+    const res = await storeStream(bodyOf([bytes]), {
+      dataDir,
+      tmpDir,
+      maxBytes: 1024,
+      ext: '.txt',
+      expectedBytes: bytes.length,
+    })
+    assert.equal(res.byteSize, bytes.length)
+    assert.equal(res.dedup, false)
+    assert.deepEqual(await readFile(resolveAttachmentPath(dataDir, res.sha256, '.txt')), bytes)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('storeStream：同内容二次上传 dedup=true，磁盘上只有一份文件', async () => {
   const root = await tmpRoot()
   try {

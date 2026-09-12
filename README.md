@@ -72,7 +72,7 @@ pnpm dev       # 一条命令同时启动后端（:3000）与前端开发服务�
 
 - 零外部依赖默认配置：数据落在 `data/geewiki.db`（WAL + 自动迁移建表）。
 - 界面（hash 路由，共 6 态，见 `packages/web/src/lib/wikiRoute.ts`）：`#/wiki` 知识库（列表/**内置搜索框**/编辑/Markdown/版本历史）· `#/wiki/new` 新建 · `#/wiki/<slug>` 详情（**支持分层 slug**，编码为 `%2F`）· `#/wiki/<slug>/edit` 编辑 · `#/wiki/search/<q>` 检索结果 · `#/wiki/ask/<q>` 检索增强问答（**支持 SSE 逐字渲染**）· `#/plugins` 插件管理（会话层热启停、schema 自动生成的配置表单——无 schema 插件退回 JSON 编辑、应用并持久化、被跳过的 UI 入口分级展示）· `#/graph` 依赖图（React Flow DAG）。另有 `⌘K` / `/` 唤起的**命令面板**（最近访问 + 操作，`components/CommandPalette.tsx`）与**侧边栏页树**（`components/Sidebar.tsx`）。
-- 插件热操作示例：在「插件管理」启用 `@geewiki/echo` 即时挂载 `GET /api/echo`，停用即摘除；启用 `@geewiki/ai` 即时挂载 `POST/GET /api/ai/ask`、**`POST /api/ai/stream`（SSE）** 与 `GET /api/ai/capabilities`；启用 `@geewiki/editor-plain` 后用纯文本编辑器**替换知识库的默认 CodeMirror 编辑区**（`editor` 插槽的第一个真实消费者），停用即回落到内置编辑器；「应用并持久化」把会话变更合并进 `config/plugins.base.json`（**含各自的 `config` 字段**）。⚠️ **基础层插件（`db-sqlite` / `http` / `wiki` / `search`）与声明 `supportsHotReload: false` 的插件（两个数据库插件）不支持热操作**——停用基础层插件返回 409 `base_layer`，启用 `@geewiki/postgres` 返回 409 `hot_reload_not_supported`。
+- 插件热操作示例：在「插件管理」启用 `@geewiki/echo` 即时挂载 `GET /api/echo`，停用即摘除；启用 `@geewiki/ai` 即时挂载 `POST/GET /api/ai/ask`、**`POST /api/ai/stream`（SSE）** 与 `GET /api/ai/capabilities`；启用 `@geewiki/editor-plain` 后用纯文本编辑器**替换知识库的默认 CodeMirror 编辑区**（`editor` 插槽的第一个真实消费者），停用即回落到内置编辑器；⚠️ **启用它之后附件上传就没了**——`editor` 是单占用插槽，插件占住后内置编辑器（**唯一**支持拖拽/粘贴上传的编辑器）根本不渲染，而 `EditorSlotProps` 契约里没有上传通道；真机实测的现场是「拖入文件 0 个请求、无提示，浏览器还把窗口导航到了那个文件」。故本批已把它从**默认启用清单**里移除（出厂配置不占用 `editor` 插槽），并在 `EditorSlotOutlet` 加了兜底（阻止默认拖放 + `role="status"` 可见提示）；**第三方编辑器在补上上传能力前不得默认占用 `editor` 插槽**（理由写在 `packages/server/src/index.ts` 的注册条目注释里）；「应用并持久化」把会话变更合并进 `config/plugins.base.json`（**含各自的 `config` 字段**）。⚠️ **基础层插件（`db-sqlite` / `http` / `wiki` / `search`）与声明 `supportsHotReload: false` 的插件（两个数据库插件）不支持热操作**——停用基础层插件返回 409 `base_layer`，启用 `@geewiki/postgres` 返回 409 `hot_reload_not_supported`。
 - REST 面：`/api/health`（健康/库表/迁移/**长连接计数**）· `/api/plugins*`（含 `/api/plugins/graph`、**`/api/plugins/slots`**、`/api/plugins/ui`、`/api/plugins/:name/{enable,disable,replace,config}`）· `/api/session` + `/api/session/persist` · `/api/pages*`（含 `:slug/{backlinks,links}`）· **`/api/search`（全文检索，默认启用；`mode=phrase|terms`）** · **`/api/ai/ask` + `/api/ai/stream` + `/api/ai/capabilities`（检索增强问答，需启用 `@geewiki/ai`）**。
 - **Docker 部署**：仓库自带多阶段 `Dockerfile` 与 `docker-compose.yml`，容器内以非 root（`node`）运行、数据落在宿主机 `./data`（SQLite）：
   ```bash
@@ -221,7 +221,7 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
         │
         │  服务抽象层 (DI)
         ▼
-插件生态（按冲突组划分）：[数据库组: @geewiki/db-sqlite ↔ @geewiki/postgres（已实现，默认不启用，冷切换）] [编辑器组: `editor` 插槽 —— 内置 @geewiki/editor-plain 已接入，Milkdown / TipTap 等第三方编辑器仍未做]
+插件生态（按冲突组划分）：[数据库组: @geewiki/db-sqlite ↔ @geewiki/postgres（已实现，默认不启用，冷切换）] [编辑器组: `editor` 插槽 —— 内置 @geewiki/editor-plain 已接入（**默认不启用**：它会顶掉唯一支持附件上传的内置编辑器，见上）， Milkdown / TipTap 等第三方编辑器仍未做]
         +
 AI 层（**不进任何冲突组**，可自由组合）：@geewiki/search（FTS5 + trigram 检索，默认启用）
         → @geewiki/ai（检索增强问答，无 key 时降级为 retrieval-only）→ @geewiki/llm（契约层：route→provider 注册表）
@@ -244,7 +244,7 @@ geewiki/
 │   ├── plugin-llm/   # LLM 契约插件 @geewiki/llm：route→provider 注册表 + 终止保证 + 无 key 降级 + 密钥脱敏（**不含厂商 adapter**）
 │   ├── plugin-openai/# OpenAI 兼容 adapter @geewiki/openai：向 llm-service 注册一条真实路由（默认不启用，需外部凭据）
 │   ├── plugin-ai/    # AI 问答插件 @geewiki/ai：检索增强问答（RAG），无 key 时降级为 retrieval-only 抽取式摘要；`/api/ai/stream` SSE
-│   ├── plugin-editor-plain/ # 纯文本编辑器插件 @geewiki/editor-plain：`editor` 插槽的第一个真实消费者（`slots: ['editor']`）
+│   ├── plugin-editor-plain/ # 纯文本编辑器插件 @geewiki/editor-plain：`editor` 插槽的第一个真实消费者（`slots: ['editor']`）；**默认不启用**（插槽契约无上传通道，启用即失去附件拖拽/粘贴上传）
 │   └── plugin-echo/  # 示例插件 @geewiki/echo：热插拔演示（GET /api/echo）
 ├── config/           # 插件清单：plugins.base.json（默认启用 db-sqlite / http / wiki / search）/ plugins.session.json（运行时改写、不入库）
 ├── data/             # SQLite 数据库与运行时数据（已在 .gitignore 中排除）

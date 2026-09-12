@@ -720,13 +720,22 @@ class HttpRouter implements HttpRouterService {
       const denial = verdictDenial(raw)
       if (denial) {
         /*
-         * ★ 拒绝响应一律 `no-store`（T6）。**为什么在这里设**：附件能力的 401/403 是在
-         * `gateThenInvoke` 里发出的 —— 那时**插件的处理器还没跑**，插件在自己的处理器入口
-         * 设的 `cache-control` 根本轮不到。错误响应的语义是"此刻的状态不允许"，它不可复用；
-         * 缺了它，浏览器可以启发式缓存 401/403（拿到授权后仍复用旧拒绝，表现为"登录了还是被挡"）。
+         * ★ 拒绝响应一律 `no-store` **+ `nosniff`**（T6 / X3）。**为什么在这里设**：
+         * 附件能力的 401/403 是在 `gateThenInvoke` 里发出的 —— 那时**插件的处理器还没跑**，
+         * 插件在自己的处理器入口设的响应头根本轮不到。错误响应的语义是"此刻的状态不允许"，
+         * 它不可复用；缺了 `no-store`，浏览器可以启发式缓存 401/403（拿到授权后仍复用旧拒绝，
+         * 表现为"登录了还是被挡"）。
+         *
+         * `nosniff` 同理必须补：**拒绝响应同样是响应**，不能少这一层。网关拒绝的信封里
+         * 含**调用方可控**的字符串（`denial.message` 与 `details.access` 取自路由/主体），
+         * 一旦某个中间层丢掉或改写了 `content-type`，浏览器就可能把这段 JSON 文本
+         * **猜**成 HTML 去执行。`h.json` 只写 `content-type`、**不带** nosniff
+         * （实现见本文件 `json()` 的响应体路径），所以每个绕过插件处理器的出口
+         * 都要自己补上——这里正是其中一个。
          * 成功响应不受影响：这条路径只走拒绝分支。
          */
         h.res.setHeader('cache-control', 'no-store')
+        h.res.setHeader('x-content-type-options', 'nosniff')
         // 错误信封与 gateThenInvoke 的拒绝**保持同一形状**（含 details.access）：
         // 同为"拒绝"，两处形状不一致会让前端文案与告警匹配规则产生漂移。
         h.json(denial.status, {
@@ -759,8 +768,16 @@ class HttpRouter implements HttpRouterService {
     const credentialSource = envAdminToken() !== null || this.identity.credentialSourceProbe?.() === true
     const denial = judgeAccess(route.access, h.principal ?? anonymousPrincipal(), credentialSource)
     if (denial) {
-      /* ★ 同上（T6）：网关层的拒绝（401 `unauthorized` / 403 `forbidden`）也必须是 `no-store` */
+      /*
+       * ★ 同上（T6 / X3）：网关层的拒绝（401 `unauthorized` / 403 `forbidden`）也必须是
+       * `no-store` **+ `nosniff`** —— 这里发响应时**插件的处理器一行都没跑**，
+       * 插件在自己入口设的那两个头轮不到，所以本层必须自己补全（理由详见 runHooks 里
+       * 同一段注释）。四个附件端点虽然都在处理器入口设了 `nosniff`，但匿名 PUT / 缺 CSRF
+       * 的拒绝发生在**进入处理器之前**：实测正是这两个响应此前缺 `nosniff`
+       * （`x-content-type-options: null`），本条注释就是那次实测的落点。
+       */
       h.res.setHeader('cache-control', 'no-store')
+      h.res.setHeader('x-content-type-options', 'nosniff')
       h.json(denial.status, {
         ok: false,
         error: denial.code,
@@ -1379,6 +1396,19 @@ export function defaultRegistry(
     // 纯文本编辑器：`editor` 插槽的第一个真实消费者（证明"插件可替换编辑器"这条扩展点可用）。
     // **只登记、不写进基础清单**——它替换的是默认编辑器，是否替换应由使用者显式决定；
     // 未启用时编辑页走内置 CodeMirror（回落路径已端到端覆盖）。
+    //
+    // ★★ **出厂配置下不得默认启用它**（X1，真机实测的教训）：
+    // **内置编辑器是唯一支持附件拖拽/粘贴上传的编辑器**——上传通道走宿主的
+    // `MarkdownEditor` 的 `onUploadFiles`（`packages/web/src/pages/WikiPage.tsx`），
+    // 而 `editor` 插槽的契约 `EditorSlotProps`（`packages/core/src/index.ts` 的权威副本 +
+    // `packages/web/src/lib/slots.tsx` 的镜像）**不含任何上传字段**。
+    // 由于 `editor` 是**单占用**插槽（`SINGLE_OCCUPANCY_SLOTS`），插件一旦占住它，
+    // 内置编辑器就**根本不渲染** ⇒ 用户拖入文件时 0 个请求、无占位、无提示，
+    // 而且浏览器默认动作会把窗口导航到被拖入的文件（未保存的正文一起丢）。
+    // ⇒ **第三方/插件编辑器插槽在补上上传能力（契约加字段 + 两端镜像 + 守卫测试）之前，
+    // 不得默认占用 `editor` 插槽**。本条目只登记、默认不启用，这条纪律靠本注释与
+    // `EditorSlotOutlet` 里的兜底（阻止默认拖放 + `role="status"` 可见提示）双向兜住。
+    //
     // 它的前端产物在 <webDist>/plugins-ui/@geewiki/editor-plain/（内置插件无自带产物根，
     // 见 resolvePluginUiRoots 的第二候选根），由 `pnpm --filter @geewiki/web build:fixtures` 生成。
     {

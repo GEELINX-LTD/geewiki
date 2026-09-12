@@ -716,6 +716,18 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'acl.change',
         'acl.resync_failed',
         'page.publish',
+        /*
+         * 附件的内容变更（X5）。**为什么归 acl 视图而不是 security 视图**：
+         * 这两个动作都是"**已获授权的主体做成了某事**"，没有发生权限判定失败 ——
+         * 它们要回答的是"这份附件是谁传的 / 谁删的"（合规追溯），
+         * 而不是"谁在被拒绝"（要告警）。安全视图（`SECURITY_ACTIONS`）里的动作
+         * 全部以"被拒/被限流/走了应急通道"为共同特征，把正常的上传塞进去会**稀释告警**，
+         * 让"有人在探测权限边界"淹没在正常流量里 —— 这正是白名单存在的理由。
+         * 两者的另一半（越权上传/越权删除）不受影响：它们由 `access.denied` 记录，
+         * 本来就落在安全视图里。
+         */
+        'attachment.upload',
+        'attachment.delete',
         'identity.link',
         'identity.unlink',
         'user.create',

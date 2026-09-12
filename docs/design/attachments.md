@@ -469,7 +469,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON attachments(sha256);
 | 状态 | `error` | 触发条件（实现里的实际分支） |
 |---|---|---|
 | 400 | `invalid_slug` | `:3126-3129`：`isValidSlug(slug)` 不通过（`packages/plugin-wiki/src/index.ts:242-298`） |
-| 400 | **`unsupported_ext`** | `:3170-3180`：`normalizeExt(name)` 返回 `null`，或该扩展名不在 `attachmentAllowedExt`（= 内置白名单 ∩ 配置）里。★ **本文初稿写的是 415 `unsupported_media_type` —— 实现选了 400**。两者都不算错（415 的语义更贴切），但**以实现的 400 为准**；若要改成 415，需同时改前端 `errorText` 映射与 e2e（记在 §12.2.4 的"小分歧"表里） |
+| **415** | **`unsupported_media_type`** | ★ **X2 已改（v1.1 时曾是 400 `unsupported_ext`）**：`normalizeExt(name)` 返回 `null`，或该扩展名不在 `attachmentAllowedExt`（= 内置白名单 ∩ 配置）里 —— 即"扩展名第一步就判"的那个分支（`packages/plugin-wiki/src/index.ts` 的 `PUT /api/attachments/:slug`；搜 `unsupported_media_type` 即可定位）。**为什么改成 415**：RFC 9110 §15.5.16 的 415 就是"源服务器拒绝服务该请求，因为**载荷的格式不受支持**"，正是本分支的语义；而前端 `packages/web/src/api.ts` 的 `uploadAttachment` 注释与 e2e 断言**早已按 415 写**（前端没有 `errorText` 映射，界面直接展示服务端的 `message`）⇒ 三处不一致比"选哪个码"更糟，故以 415 为准（分歧记录见 §12.2.4） |
 | 404 | `not_found` | `:3195`（页面不存在）与 `:3200` 一类的页面级不可见分支（**不区分"不存在"与"无权"**，与详情读路径同款） |
 | 409 | **`attachment_conflict`** | `:3245-3253`：**同一页 + 同一 `sha256` 但扩展名不同**（"同一内容的扩展名不能中途改变"）。⇒ 这是 409 在本能力里的**实际用法**；初稿设想的"删除时仍被引用 ⇒ 409"**未采用**（见 §4.5） |
 | 413 | **`length_required`** | `:3205-3213`：**请求没带可解析的 `Content-Length`（例如 chunked）⇒ 直接拒绝**（并 `closeAfterResponse(h)`）。★ 与本文初稿不同：初稿说"缺 `Content-Length` ⇒ 允许，仍受计数器上限约束"；实现选择**要求显式长度** —— 这更保守（也更好算配额），**以实现为准** |
@@ -482,9 +482,10 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON attachments(sha256);
 | 503 | `bootstrap_required` | 闸门第 3 步（无任何凭据来源），由 `judgeAccess` 给出 |
 | **201** | （成功） | **成功也回 201**（含幂等命中的 `dedup: true`）—— 见 §4.2 的响应小节与 §12.2.4 的"小分歧" |
 
-**不再存在的错误码（初稿有、实现没有）**：`invalid_name`（展示名的清洗**不产生错误**：`name` 只用来取扩展名与展示）、`invalid_block`（**没有 `block` 查询参数**，因为不物化块关系 —— U22）、`incomplete_body`（**没有这条分支**：截断的请求在存储层表现为字节数少于一行的 `byte_size`，而"声明与实际不符"目前**不单独报错** ⇒ 详见下方"★ 一处「已核实」的防护缺口"）、`repo_quota_exceeded`（**全库配额未实现**）、`unsupported_media_type`（改成 400 `unsupported_ext`）。
+**不再存在的错误码（初稿有、实现没有）**：`invalid_name`（展示名的清洗**不产生错误**：`name` 只用来取扩展名与展示）、`invalid_block`（**没有 `block` 查询参数**，因为不物化块关系 —— U22）、`incomplete_body`（初稿设想的这个名字**没有被采用**：同一个语义改叫 **`length_mismatch`** 并已实现，见下一段 —— 名字取"与声明长度不符"这个**判据**，而不是"体不完整"这个**猜测**）、`repo_quota_exceeded`（**全库配额未实现**）。★ **`unsupported_media_type` 已从本列表移出**：X2 之后它就是扩展名分支的真实错误码（415，见上表）。
 
-**★ 一处「已核实」的防护缺口（建议补，成本极小）**：**"声明的 `Content-Length` 与实际收到的字节数不符"没有校验** —— 我 grep 了整个上传端点：`declared` 只用在三处（`:3206` 解析、`:3207-3213` 要求它存在、`:3216` 上限预检、`:3237` 页配额预检），**没有任何地方把它与 `stored.byteSize` 比较**。⇒ 推论（**标为推论，未实测**）：**若客户端"干净地"提前结束请求体**（半关闭、少发字节），`for await (const chunk of src)` 会正常结束 ⇒ 落盘的是**实收字节**、哈希与 `byte_size` 都与之一致 ⇒ **一份被截断的文件会安静地落成"自洽"的记录**（内容寻址下最难发现的一类静默错误：路径就是它自己的哈希，看起来永远完整）。**建议**：EOF 后补一条 `if (stored.byteSize !== declared) ⇒ 400`（并删 tmp + 不写元数据行）。**对照**：若客户端是**粗暴断开**，Node 会让请求流以错误结束 ⇒ 走存储层的 `catch`（删 tmp、抛错），但那个错误会被映射成 **503 `storage_unavailable`** —— 语义上不准（这不是存储故障），**建议另开一个 400 分支**。两条都请实现者按实际行为核对后再定。
+**★ X6（原「已核实」的防护缺口）—— 已修，且实测结论与当初的推论不同**：**"声明的 `Content-Length` 与实际收到的字节数不符"现在会被拒绝**。实现落在**存储层、`rename` 之前**：`packages/plugin-wiki/src/attachment-store.ts` 的 `storeStream()` 新增可选入参 `expectedBytes`（HTTP 场景由 PUT 处理器传 `declared`），读完请求体后若 `byteSize !== expectedBytes` ⇒ 抛 `AttachmentStoreError('length_mismatch')` ⇒ 端点回 **400 `length_mismatch`**。**为什么必须校验**：落盘路径是内容寻址的，被截断的文件在内容寻址下是一份**全新的哈希** —— 它路径自洽、`byte_size` 自洽、下载也吐得回来，"同一哈希 ⇒ 同一字节"这条不变式会被**静默**破坏，而发现时机是"用户某天打开这张图，下半截是灰的"；去重挡不住它（去重比的正是哈希）。**为什么放在 `rename` 之前**：失败时只有临时文件存在、走既有的 `discardTmp()`，**最终路径从未被创建** —— "不留残留"靠的是"不发生"，而不是事后删文件（事后删会**误删 `dedup` 场景下别页正在引用的那份内容**）。
+**实测（本次真机/裸 socket 核对，修正了原推论）**：用裸 socket 发 `Content-Length: 102400` 但只发 51200 字节再半关闭 ⇒ **Node 的 HTTP 解析器在进入任何路由之前就回了 `400 Bad Request`**（处理器一行都没跑，因此也谈不上"安静落盘"）。也就是说，**在 Content-Length 分帧下，"少发字节"这件事根本到不了处理器** —— Node 已经把这条不变式守住了。⇒ 本条校验的定位是**纵深防御**（反代重新分帧、将来换 HTTP/2/其它 `h.req` 来源、代码挪动后基准错位），而不是"补一个真实可达的漏洞"；它的单元测试用内存 `Readable` 直接覆盖（`packages/plugin-wiki/test/attachments.test.ts`），端到端那一侧断言的是**可观察的事实**：截断请求 ⇒ 400 且 `attachments/` 与 `tmp/` **零残留**（`packages/plugin-wiki/test/e2e-attachments.sh` 的 X6 段）。
 
 ### 4.3 `GET /api/attachments/:publicId` —— 下载（**权限判定必须按本节算法**）
 
@@ -679,7 +680,7 @@ M1 把"**哪些扩展名允许**"（`ATTACHMENT_EXT_WHITELIST`，`packages/plugi
 ### T6 `Content-Length` 伪造（[P0]）
 
 - **攻击者能做什么**：① 声明 `Content-Length: 10` 实发 2 GiB（chunked 或直接多写）；② 声明 2 GiB 实发 10 字节（占住我们对"上限预检"的信任，然后断开）；③ 不发 `Content-Length`（chunked）。
-- **对策（★ v1.1：**以实现为准**）**：① **上限预检用声明值**（`:3216`：声明就超限 ⇒ 立即 413，省流量），**实际大小以计数器为准**（存储层的 `for await` 累加计数：超限 ⇒ `payload_too_large` ⇒ 413）；② ★ **缺 `Content-Length`（如 chunked）⇒ 直接拒绝 413 `length_required`**（`:3205-3213`，并 `closeAfterResponse`）—— 与初稿"允许 chunked、只靠计数器"相反，实现选了**要求显式长度**（更保守，也让配额预检有意义）；③ ⚠️ **"声明与实际不符"目前不校验**（初稿设想的 400 `incomplete_body` **不存在**）⇒ 见 §4.2 末尾那条「已核实」的防护缺口。⇒ 本节的**残余风险**相应更新为：**少了第 ③ 条**，所以"少发字节"的请求会安静落盘（推论，未实测）；**多发的字节**仍被计数器挡住。
+- **对策（★ v1.1：**以实现为准**；★ X6 已补第 ③ 条）**：① **上限预检用声明值**（声明就超限 ⇒ 立即 413，省流量），**实际大小以计数器为准**（存储层的 `for await` 累加计数：超限 ⇒ `payload_too_large` ⇒ 413）；② ★ **缺 `Content-Length`（如 chunked）⇒ 直接拒绝 413 `length_required`**（并 `closeAfterResponse`）—— 与初稿"允许 chunked、只靠计数器"相反，实现选了**要求显式长度**（更保守，也让配额预检有意义）；③ ★ **"声明与实际不符"现在会拒绝**：`storeStream()` 读完体后比对 `byteSize` 与 `expectedBytes`，不符 ⇒ `400 length_mismatch`，且**失败发生在 `rename` 之前**（最终路径从未创建 ⇒ 零残留）。⇒ 本节的**残余风险**相应更新为：**"少发字节"不再能安静落盘**（纵深防御；实测中 Content-Length 分帧下的截断请求由 Node 解析器直接 400，见 §4.2 末尾）；**多发/谎报偏小的字节**由计数器与分帧共同挡住。
 - **残余风险**：声明 1 字节实发 10 MiB 的请求会被读到**计数器上限**才拒（有上限兜底，代价是那 10 MiB 的带宽）—— 这是**无法避免的**（HTTP 无"边读边验证声明"的机制）。
 
 ### T7 受限段落附件泄露（[P0] —— **本设计的核心威胁**）
@@ -1375,7 +1376,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 
 | 项 | 本文 | M2 | 说明 |
 |---|---|---|---|
-| 扩展名不支持的状态码 | **415** `unsupported_media_type`（任务书也点名要求 415） | **400** `unsupported_ext`（`:3170-3180`） | HTTP 语义上 415 更准（"媒体类型不受支持"），且任务书把 415 列为必须给出的错误码 ⇒ **建议改 415**（若改，前端 `errorText` 的映射与 e2e 一起改）。⚠️ **v1.1 仍为 400**（未改） |
+| 扩展名不支持的状态码 | **415** `unsupported_media_type`（任务书也点名要求 415） | ★ **已按本文改为 415**（X2；原实现是 400 `unsupported_ext`） | 已收敛：后端状态码与错误码改成 415 `unsupported_media_type`，e2e 的 B4b/T1a/T1b 与 §4.2 的错误码表同批更新。前端**没有** `errorText` 的码→文案映射（界面直接展示服务端 `message`），故前端只需同步 `packages/web/src/api.ts` 的注释口径 |
 | 幂等重放的响应码 | 200 | **201**（与 created 同形状，用 `dedup` 区分，`:3288-3300`） | 可接受（M2 的理由是"幂等 PUT ⇒ 同形状响应"，与 `PUT /api/pages/:slug` 的 `outcome` 表达法一致）。⇒ **本文 §4.2 的"200"改为以 M2 为准** |
 | 同页同 sha 但**扩展名不同** | 未定义 | **409 `attachment_conflict`**（`:3246-3253`） | ★ 这是一个**合理的 409 用法**（避免"同一份字节因扩展名不同落两个路径"）。本文 §4.5 的 409 语义（删除时仍被引用）**依然保留**，两者不冲突 |
 | 审计 `access.denied` 的 `targetKind` | 建议 `attachment` | 复用 `recordAccessDenied` ⇒ **`page`**（`:905-906`），用 `after.reason` 区分 | 可接受（复用既有函数 = 不造第二个真源；`GET /api/admin/audit` 的 `security` 视图仍能看到）。⇒ 本文 §8.3 的 `target_kind='attachment'` **降级为可选** |

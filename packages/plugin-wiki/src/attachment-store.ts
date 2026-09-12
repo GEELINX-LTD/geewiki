@@ -31,6 +31,7 @@ import { attachmentRelPath, assertExtAllowed } from './attachments.js'
  * 附件存储层的错误。`code` 即端点要回的错误码（沿用仓库"消息前缀即错误码"的约定）：
  *
  * - `payload_too_large` ⇒ 413（调用方的输入问题）
+ * - `length_mismatch` ⇒ **400**（实收字节数与声明的 `Content-Length` 不符：上传被截断/半途而废）
  * - `storage_unavailable` ⇒ **503**（不是 500）。这一点是刻意的：磁盘只读/写满/无权限是
  *   **运维状态**，不是本服务故障。报 500 会让每个失败请求都计入 `stats().consecutiveFailures`，
  *   连续失败达到阈值就可能触发看门狗熔断 —— 于是"磁盘满了"被升级成"整站被熔断"。
@@ -38,7 +39,7 @@ import { attachmentRelPath, assertExtAllowed } from './attachments.js'
  */
 export class AttachmentStoreError extends Error {
   constructor(
-    readonly code: 'payload_too_large' | 'storage_unavailable',
+    readonly code: 'payload_too_large' | 'length_mismatch' | 'storage_unavailable',
     message: string,
   ) {
     super(`${code}: ${message}`)
@@ -123,10 +124,12 @@ export interface StoreStreamResult {
  * @param o.tmpDir 临时目录（**必须与最终路径同一文件系统**，否则 `rename` 会退化成跨设备拷贝）。
  * @param o.maxBytes 字节上限：累计超出即中断并抛 `payload_too_large`。
  * @param o.ext 已过白名单的扩展名（落盘路径需要它；非法值由 `attachmentRelPath` 断言拒绝）。
+ * @param o.expectedBytes **声明**的字节数（HTTP 场景即 `Content-Length`）。给了就必须
+ *   与实收一致，否则抛 `length_mismatch`；不传则不做这项校验（纯函数层的既有用例不受影响）。
  */
 export async function storeStream(
   src: Readable,
-  o: { dataDir: string; tmpDir: string; maxBytes: number; ext: string },
+  o: { dataDir: string; tmpDir: string; maxBytes: number; ext: string; expectedBytes?: number },
 ): Promise<StoreStreamResult> {
   // 先断言扩展名与目录：这些是"迟早要失败"的条件，不要等到收完几个 GB 的字节才失败
   assertExtAllowed(o.ext)
@@ -197,6 +200,44 @@ export async function storeStream(
       ws.end((err?: Error | null) => (err ? reject(err) : resolve()))
     })
     if (writeError !== null) throw writeError
+    /*
+     * ★ **实收字节数 vs 声明值**（X6）：不一致 ⇒ 抛 `length_mismatch`（端点回 400）。
+     *
+     * ## 为什么这条校验必须有
+     *
+     * 落盘路径是**内容寻址**的，而"被截断的文件"对内容寻址而言是一份**全新的哈希** ——
+     * 它长得完全合法：路径自洽、`byte_size` 自洽、下载也能原样吐回来。于是"同一哈希 ⇒
+     * 同一字节"这条整个附件能力赖以成立的不变式会被**静默**破坏（去重挡不住它，因为
+     * 去重比的正是哈希），而发现它的时机是"用户某天打开这张图，下半截是灰的"。
+     * 声明长度与实际字节数是**唯一**能在写入那一刻对照的两个独立来源，故必须比。
+     *
+     * ## 为什么放在 `rename` **之前**（而不是上传完成后回删最终文件）
+     *
+     * 放在这里 ⇒ 失败时只有临时文件存在，走的是既有的 `discardTmp()` 路径，
+     * **最终路径上的文件从未被创建过**，不存在"删最终文件"这一步：
+     *   · 不会误删**别人**引用的那份内容（`dedup: true` 时最终文件是先前就存在的，
+     *     按"上传失败就删"处理会删掉他页正在用的字节）；
+     *   · 也没有"删到一半"的中间态需要兜底。
+     * 换句话说，"不留残留"不是靠事后清理，而是靠**不发生**。
+     *
+     * ## 误报风险评估（结论：本端点无误报，取舍明确）
+     *
+     * · `Transfer-Encoding: chunked`：本端点**没有** `Content-Length` 就直接 413
+     *   `length_required`（见 `index.ts` 的 PUT 处理器），故 `expectedBytes` 在分块场景下
+     *   根本不会被传入 —— 分块请求不会误报。
+     * · `Content-Encoding: gzip`：Node 的 HTTP 服务端**不**自动解压请求体，`h.req` 给出的
+     *   是**线上字节**，而 `Content-Length` 正是线上字节的长度 ⇒ 两者同基准，不会误报。
+     *   （若将来加了"自动解压请求体"的中间层，这条基准就会错位：那时必须在中间层把
+     *   解压后的长度重新声明，或干脆不传 `expectedBytes`。）
+     * · 反向代理：代理在转发时会自己发一份 `Content-Length`，与我们实际收到的字节同基准。
+     * · 反例（真会不一致的情形只有一种）：**请求体被中途掐断**。那正是我们要拒的东西。
+     */
+    if (o.expectedBytes !== undefined && byteSize !== o.expectedBytes) {
+      throw new AttachmentStoreError(
+        'length_mismatch',
+        `实收 ${byteSize} 字节，与声明的长度 ${o.expectedBytes} 不符：上传被截断，落盘会产生一份"自洽但残缺"的新内容`,
+      )
+    }
   } catch (err) {
     src.destroy()
     ws.destroy()

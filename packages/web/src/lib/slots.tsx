@@ -1,4 +1,12 @@
-import { Component, useSyncExternalStore, type ComponentType, type ReactNode } from 'react'
+import {
+  Component,
+  useState,
+  useSyncExternalStore,
+  type ClipboardEvent,
+  type ComponentType,
+  type DragEvent,
+  type ReactNode,
+} from 'react'
 /*
   ⚠️ 这里与 `pluginUi.ts` 是**双向 import**（那边要 `registerSlotByName`），刻意接受：
   两边的引用都只发生在**函数体内**（本文件只在渲染时读失败清单，那边只在加载完成时注册插槽），
@@ -276,20 +284,102 @@ export function useEditorSlot(): SlotEntry | undefined {
 }
 
 /**
+ * 插件编辑器路径上的**附件兜底文案**（X1）。
+ *
+ * 导出是为了让界面与源码级守卫测试共用同一份来源 —— 这类"用户唯一的解释"一旦两处措辞
+ * 漂移，测试钉住的就不再是用户真正看到的那句话。文案刻意给出**可执行的下一步**
+ * （去插件管理换回内置编辑器），而不是只说"不支持"。
+ */
+export const EDITOR_SLOT_NO_UPLOAD_HINT =
+  '当前编辑器由插件提供，它没有插入附件的能力：拖入或粘贴的文件不会上传。请在插件管理中改用内置编辑器（内置编辑器支持拖拽与粘贴上传）。'
+
+/**
  * `editor` 插槽出口：把宿主持有的编辑态作为 props 交给**生效的那一个**编辑器插件。
  *
  * 与 {@link SlotOutlet} 的差别：这是**单占用 + 带数据**的出口，故只渲染第一条，
  * 且必须由调用方提供完整的 {@link EditorSlotProps}（宿主是这些值的唯一持有者）。
+ *
+ * ---------------------------------------------------------------------------
+ * ## 附件兜底（X1）—— **这是兜底，不是替代方案**
+ *
+ * {@link EditorSlotProps} 里**没有**上传通道：`value` / `mode` / `slug` / `readOnly` /
+ * `onChange` / `onSave` / `onCancel` 七个字段，一个都表达不了"把文件交给宿主上传"。
+ * 于是**任何**插件编辑器接管 `editor` 插槽后，用户拖入文件都会直接落到浏览器的默认行为上：
+ * 浏览器**导航到那个文件**，编辑器里未保存的正文一起丢掉，而且全程零提示。
+ * （真机实测：拖入 PNG 时 0 个请求、无占位、无提示，窗口 target 数 6→7 —— 页面真的被顶掉了。）
+ *
+ * 这里只做两件事：
+ *   ① `preventDefault()` 拦住默认拖放 —— 这一条是**硬要求**，不拦就是丢数据；
+ *   ② 给一句 `role="status"` 的**可见**提示，指出可执行的下一步。
+ *
+ * ⚠️ 它**不**解决"插件编辑器能不能上传附件"这个能力问题 —— 那需要把上传通道加进
+ * {@link EditorSlotProps}（core 侧的权威副本 + 本文件镜像 + `editorSlotProps.test.ts`
+ * 的镜像守卫要一起改），属于契约演进，不在本次修复范围。在那一刻到来之前，
+ * **不要让任何插件默认占用 `editor` 插槽**（`config/plugins.base.json` 的默认清单里
+ * 没有 `@geewiki/editor-plain`，理由就是这个）。
+ *
+ * 两条实现取舍：
+ * - **`event.defaultPrevented` 为真时保持沉默**：React 的合成事件按 DOM 深度冒泡，
+ *   插件组件在内层、先跑；插件自己接住了拖放就说明它有话事权，宿主不该再弹提示。
+ *   将来的编辑器插件真接上上传后，这里自动让路，不必再改一次。
+ * - **提示用 state 渲染，而不是直接改 DOM**：`role="status"` 要被播报，实时区域就必须
+ *   先于内容存在（见下面那个恒常存在的 `<p>`），临时塞进去的节点多半不会被读出来。
  */
 export function EditorSlotOutlet(props: EditorSlotProps): ReactNode {
   const entry = useEditorSlot()
+  /** 用户刚刚试图拖入/粘贴文件（而当前编辑器接不住）——只用于驱动那句可见提示 */
+  const [uploadBlocked, setUploadBlocked] = useState(false)
+
+  /** `dataTransfer` / `clipboardData` 里是否带着**文件**（纯文本拖放/粘贴不归这里管） */
+  const carriesFiles = (dt: DataTransfer | null): boolean =>
+    dt !== null && Array.from(dt.types).includes('Files')
+
+  const onDragOver = (event: DragEvent<HTMLDivElement>): void => {
+    if (!carriesFiles(event.dataTransfer) || event.defaultPrevented) return
+    // 必须拦：不拦的话浏览器会把窗口导航到被拖入的文件，正在编辑的正文一起丢
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'none'
+    setUploadBlocked(true)
+  }
+
+  const onDrop = (event: DragEvent<HTMLDivElement>): void => {
+    if (!carriesFiles(event.dataTransfer) || event.defaultPrevented) return
+    // 双保险：即使某些浏览器在 dragover 之后仍然派发了 drop，也不能让它落到默认行为上
+    event.preventDefault()
+    setUploadBlocked(true)
+  }
+
+  const onPaste = (event: ClipboardEvent<HTMLDivElement>): void => {
+    if (!carriesFiles(event.clipboardData) || event.defaultPrevented) return
+    // 粘贴文件没有"浏览器默认动作"要拦（textarea 本来也贴不进去），但同样必须给可见反馈，
+    // 否则用户看到的就是"贴了一下，什么都没发生"
+    event.preventDefault()
+    setUploadBlocked(true)
+  }
+
   if (!entry) return null
   const Editor = entry.component as EditorSlotComponent
   return (
-    <div className="slot-outlet" data-slot="editor" data-count={1} data-editor-source={entry.source}>
+    <div
+      className="slot-outlet"
+      data-slot="editor"
+      data-count={1}
+      data-editor-source={entry.source}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+      onPaste={onPaste}
+    >
       <SlotErrorBoundary source={entry.source}>
         <Editor {...props} />
       </SlotErrorBoundary>
+      {/*
+        这个 `<p>` **恒常存在**（空闲时内容为空串、CSS 里由 `:empty` 收掉内边距）：
+        实时区域要先于内容出现，屏幕阅读器才会播报随后写进去的那句话。
+        `data-editor-upload-hint` 暴露状态供真机验收与测试观察。
+      */}
+      <p className="slot-hint" role="status" data-editor-upload-hint={uploadBlocked ? 'shown' : 'idle'}>
+        {uploadBlocked ? EDITOR_SLOT_NO_UPLOAD_HINT : ''}
+      </p>
     </div>
   )
 }

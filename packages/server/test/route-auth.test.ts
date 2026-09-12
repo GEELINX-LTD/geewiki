@@ -192,12 +192,21 @@ test('已配置令牌：带正确令牌放行，不带或带错一律 401 unauth
     const missing = await fetch(base(h, '/api/t/admin'), { method: 'POST' })
     assert.equal(missing.status, 401)
     assert.equal(((await missing.json()) as { error: string }).error, 'unauthorized')
+    /*
+     * ★ X3：网关层的拒绝（这里是 `gateThenInvoke` 的 401）**也是响应**，两个安全头一个都不能少。
+     * 附件能力的 401/403 正是在这里发出的 —— 那时插件的处理器还没跑，插件在自己入口设的
+     * `nosniff` / `no-store` 根本轮不到（真机实测修复前 `x-content-type-options` 为 null）。
+     * 这里直接断言响应头，而不是只断言状态码：状态码对而头缺失是**静默**的。
+     */
+    assert.equal(missing.headers.get('x-content-type-options'), 'nosniff', '网关拒绝也必须带 nosniff')
+    assert.equal(missing.headers.get('cache-control'), 'no-store', '网关拒绝也不可被启发式缓存')
 
     const wrong = await fetch(base(h, '/api/t/admin'), {
       method: 'POST',
       headers: { 'x-gw-admin-token': 'not-the-token' },
     })
     assert.equal(wrong.status, 401, '错误令牌是"未认证"，不是"无权限"')
+    assert.equal(wrong.headers.get('x-content-type-options'), 'nosniff')
   })
   assert.equal(handlerCalls, 1, '三次请求里只有"带正确令牌"的那次应进入处理器，两次拒绝不得触达处理器')
 })
@@ -255,6 +264,12 @@ test('use()：钩子拒绝即短路（处理器不执行），注销后恢复', 
     // 文案与告警匹配规则漂移。这条断言覆盖的是 **runHooks 的拒绝路径** ——
     // 与下面那个走 gateThenInvoke 的 403 用例是**两条不同的代码路径**，不能互相替代。
     assert.equal(body.details?.access, 'public', '钩子拒绝的信封应与闸门拒绝同形（含 details.access）')
+    /*
+     * ★ X3：这条走的是 **runHooks 的拒绝路径**（缺 CSRF 的 403 就是从这里出去的），
+     * 与上面 401 用例走的是另一条代码路径 —— 两条都得带 nosniff，缺哪条都会漏。
+     */
+    assert.equal(denied.headers.get('x-content-type-options'), 'nosniff', '钩子拒绝也必须带 nosniff')
+    assert.equal(denied.headers.get('cache-control'), 'no-store')
   } finally {
     off()
     off() // 幂等：重复注销不抛错

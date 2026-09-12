@@ -598,26 +598,38 @@ export const WikiPlugin = {
     /* ------------------------- 附件存储（本批 M1/M2） ------------------------- */
 
     /**
-     * 附件的数据目录与临时目录。
+     * 附件的**数据根**与临时目录。
+     *
+     * ⚠️ 名字先把话说死（此处曾被误读，进而以为临时目录落在 `data/attachments/tmp`）：
+     * `attachmentDataRoot` 是**数据根 `<data>` 本身**，**不是** `attachments/`。附件的最终
+     * 路径要在它之下再加一层 `attachments/`（见 `resolveAttachmentPath`），即
+     * `<data>/attachments/<sha 前 2>/<sha 3-4>/<sha><ext>`。
      *
      * 环境变量优先（`GEEWIKI_DATA_DIR`，与 docker-compose 的卷挂载约定一致），默认 `./data`
      * —— 与 `@geewiki/db-sqlite` 取数据库路径时**逐字同款**的写法。相对路径经
      * `resolveProjectPath` 以**仓库根**为基准解析：否则从不同 cwd 启动（`pnpm dev` /
      * 子目录内 `node`）会落到不同的附件目录，表现为"刚上传的图刷新就 404"。
      */
-    const attachmentsRoot = resolveProjectPath(
+    const attachmentDataRoot = resolveProjectPath(
       process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR,
       import.meta.url,
     )
     /**
-     * 临时目录**刻意放在 `attachments/` 之外**（`<data>/tmp`）：
+     * 临时目录**刻意放在 `attachments/` 之外**：`join(<data>, 'tmp')` ⇒ **`<data>/tmp`**
+     * （默认部署即 `<仓库根>/data/tmp`）—— 注意**不是** `<data>/attachments/tmp`：
      *
      * 1. 内容寻址目录里因此**只可能出现完整的最终文件** —— 没有半截文件的中间态，
      *    运维核对"磁盘上有哪些附件"时看到的集合就是数据库里的集合；
      * 2. 临时文件与最终路径仍在同一文件系统（同一个数据根）⇒ `rename` 是原子的，
      *    不会退化成跨设备拷贝。
+     *
+     * 已核对（决策依据）：全仓**没有**别的东西在用 `<data>/tmp` ——
+     * 在 `packages/` 各包的 `src/` 下搜 `'tmp'` 只命中本处，故这里不是"与他人共用的目录"，
+     * 也就不存在"挪走会撞车"的问题；而它本来就已经在 `attachments/` 之外，
+     * 无须再挪一次。e2e 的 `tmp_count()`（`packages/plugin-wiki/test/e2e-attachments.sh:161`）
+     * 断言的正是 `$TMP/data/tmp`，是这条口径的实测证据。
      */
-    const attachmentsTmpDir = join(attachmentsRoot, 'tmp')
+    const attachmentTmpDir = join(attachmentDataRoot, 'tmp')
     /** 单文件字节上限与单页配额（`Schema.number()` 已保证是正整数） */
     const attachmentMaxBytes = config.attachmentMaxBytes ?? DEFAULT_MAX_BYTES
     const attachmentPageQuotaBytes = config.attachmentPageQuotaBytes ?? 200 * 1024 * 1024
@@ -639,9 +651,9 @@ export const WikiPlugin = {
      * 整个 wiki 插件（含页面读写）会一起起不来 —— 那是把"附件用不了"升级成"整站用不了"。
      * 正文与版本历史与附件目录毫无关系，它们没有理由陪葬。
      */
-    void ensureAttachmentDirs(attachmentsRoot, attachmentsTmpDir).catch((err: unknown) => {
+    void ensureAttachmentDirs(attachmentDataRoot, attachmentTmpDir).catch((err: unknown) => {
       console.warn(
-        `[@geewiki/wiki] 附件目录不可用（${attachmentsRoot}）：上传将返回 503 storage_unavailable。` +
+        `[@geewiki/wiki] 附件目录不可用（${attachmentDataRoot}）：上传将返回 503 storage_unavailable。` +
           '页面与版本历史不受影响。原因:',
         err,
       )
@@ -3035,6 +3047,17 @@ export const WikiPlugin = {
      * 会与先前 `setHeader` 的值**合并**（同名时 `writeHead` 优先），于是该端点上的全部出口
      * ——`h.json` 的每个错误分支、`sendHead` 的 200 与 304——都自动带上，不会漏。
      *
+     * ⚠️ **但这只覆盖"进得来处理器"的响应**（X3 的订正，此前这段注释把话说满了）：
+     * 401（`@geewiki/http` 的 `gateThenInvoke` 里 `judgeAccess` 拒绝）与 403 `csrf_rejected`
+     * （`@geewiki/auth` 的前置钩子拒绝）都发生在**处理器之前**，插件入口的 `setHeader`
+     * 根本轮不到执行 —— 真机实测：这两个响应的 `x-content-type-options` 曾是 **null**。
+     * 所以 nosniff 与 `no-store` 各由**两层**共同负责，缺一层就漏一档：
+     *   · **网关层**（`packages/server/src/index.ts` 的 `runHooks` 拒绝分支与
+     *     `gateThenInvoke` 拒绝分支）→ 覆盖**未进入处理器**的拒绝（401 / 403 / 钩子拒绝）；
+     *   · **插件处理器入口**（本节这四个端点）→ 覆盖进入处理器之后的**全部**出口
+     *     （200 / 201 / 304 / 400 / 404 / 409 / 413 / 415 / 503）。
+     * 别把这段读成"插件设了就万事大吉"：网关层的两个分支必须自己设（server 侧有注释与测试钉住）。
+     *
      * ## 统一响应头（T6）：错误响应的 `cache-control` 必须是 `no-store`
      *
      * `h.json` 也**不带** `cache-control`，而 404 这类错误响应浏览器是**可以启发式缓存**的：
@@ -3043,6 +3066,8 @@ export const WikiPlugin = {
      * （启发式缓存命中时连请求都不发）。错误响应的语义是"**此刻**的状态不允许"，它天然
      * **不可复用**；故与 nosniff 同一处、同一理由：在**每个处理器入口**把默认值设成
      * `no-store`，让 400/401/404/409/413/415/503 一个都不漏。
+     * ⚠️ 同样的分工也适用于 `no-store`：上面那条"处理器入口"只覆盖进得来处理器的响应，
+     * 网关层的 401/403 由 `packages/server/src/index.ts` 的两个拒绝分支自己设（同为 X3）。
      *
      * ⚠️ **成功分支必须显式覆盖**这层默认值（`res.setHeader` 同名后写者胜），否则成功响应
      * 也会变成 `no-store`，那会把"可复用但要回源校验"的优化一起关掉。两者的分工：
@@ -3170,9 +3195,22 @@ export const WikiPlugin = {
         const originalName = h.url.searchParams.get('name') ?? ''
         const ext = normalizeExt(originalName)
         if (ext === null || !attachmentAllowedExt.has(ext)) {
-          h.json(400, {
+          /*
+           * ★ 状态码是 **415 `unsupported_media_type`**（不是 400 `unsupported_ext`）。
+           *
+           * RFC 9110 §15.5.16 的 415 就是"**源服务器拒绝服务该请求，因为载荷的格式不被
+           * 支持**"——这正是本分支的语义（扩展名不在白名单 ⇒ 我们不接受这种媒体类型），
+           * 比笼统的 400 精确。而且这条口径**前端与设计文档早已按 415 写**
+           * （`packages/web/src/api.ts` 的 `uploadAttachment` 注释、`docs/design/attachments.md`
+           * §4.2 的错误码表与 §12.2.4 的分歧表），只有后端实现落在了 400 上——
+           * 三处不一致比"选哪个码"更糟，故以 415 为准。
+           *
+           * 错误码同步从 `unsupported_ext` 改成 `unsupported_media_type`：调用方匹配的是
+           * 这个字符串（`error` 字段），改名必须与状态码同批做，否则会出现"码和名各自对一半"。
+           */
+          h.json(415, {
             ok: false,
-            error: 'unsupported_ext',
+            error: 'unsupported_media_type',
             message: `不支持的附件类型：只接受 ${[...attachmentAllowedExt].join(' ')}（按文件名的最后一个扩展名判定）`,
           })
           return
@@ -3248,15 +3286,34 @@ export const WikiPlugin = {
         let stored: { sha256: string; byteSize: number; dedup: boolean }
         try {
           stored = await storeStream(h.req, {
-            dataDir: attachmentsRoot,
-            tmpDir: attachmentsTmpDir,
+            dataDir: attachmentDataRoot,
+            tmpDir: attachmentTmpDir,
             maxBytes: attachmentMaxBytes,
             ext,
+            /*
+             * ★ 把**声明**的长度交给存储层做"实收 vs 声明"对照（X6）——理由与
+             * "为什么放在 rename 之前"写在 `attachment-store.ts` 的那段长注释里。
+             * 这里只强调一点：`declared` 在进入本分支前已被校验为**纯数字且 ≤ 上限**，
+             * 所以它可以直接当基准，不需要在这里再兜一层。
+             */
+            expectedBytes: declared,
           })
         } catch (err) {
           if (err instanceof AttachmentStoreError && err.code === 'payload_too_large') {
             closeAfterResponse(h)
             h.json(413, { ok: false, error: 'payload_too_large', message: err.message })
+            return
+          }
+          /*
+           * ★ 实收字节数与声明不符 ⇒ **400 `length_mismatch`**（调用方的请求有问题，
+           * 不是服务或存储的问题）。临时文件已由存储层删除，**最终路径从未被创建** ——
+           * 故这里不需要（也不应该）去删任何已落盘的文件：删最终文件会误伤
+           * `dedup` 场景下别页正在引用的那份内容。
+           * 不 `closeAfterResponse`：走到这里说明请求体已经读完（或已断），
+           * 连接状态是干净的，没必要额外关掉它。
+           */
+          if (err instanceof AttachmentStoreError && err.code === 'length_mismatch') {
+            h.json(400, { ok: false, error: 'length_mismatch', message: err.message })
             return
           }
           /*
@@ -3472,7 +3529,7 @@ export const WikiPlugin = {
           }
         }
         /* ④ 到这里才碰文件：先 stat（"元数据在、文件不在"是可诊断的状态，不是 500） */
-        const absPath = resolveAttachmentPath(attachmentsRoot, row.sha256, row.ext)
+        const absPath = resolveAttachmentPath(attachmentDataRoot, row.sha256, row.ext)
         let size: number
         try {
           size = (await stat(absPath)).size
@@ -3663,9 +3720,22 @@ export const WikiPlugin = {
           return
         }
         const p = requirePrincipal(h)
+        /*
+         * 选列里带上 `sha256` / `ext` / `byte_size`：**审计要用**（删掉之后这两列在库里
+         * 就没有了 —— 审计是这条记录唯一的去处）。刻意不选 `original_name`：
+         * 展示名由上传者完全控制，而审计条目会被导出、被别的系统消费，
+         * 让"用户可控的任意字符串"进入审计正文没有收益（`target_id` 已经能唯一定位）。
+         */
         const row = (
-          await adb.query<{ id: number; uploader_id: number | null; live_slug: string }>(
-            `SELECT a.id, a.uploader_id, p.slug AS live_slug
+          await adb.query<{
+            id: number
+            uploader_id: number | null
+            live_slug: string
+            sha256: string
+            ext: string
+            byte_size: number
+          }>(
+            `SELECT a.id, a.uploader_id, a.sha256, a.ext, a.byte_size, p.slug AS live_slug
                FROM attachments a JOIN pages p ON p.id = a.page_id
               WHERE a.id = ?`,
             [id],
@@ -3704,6 +3774,37 @@ export const WikiPlugin = {
           return
         }
         await adb.run('DELETE FROM attachments WHERE id = ?', [id])
+        /*
+         * ★ 审计：**成功的删除必须留痕**（X5）。
+         *
+         * 此前只有上传写审计、删除什么都不写 —— 而删除是**破坏性**动作：
+         * 它是"这份附件为什么不见了"的唯一答案，也是"谁在批量清空某一页的附件"的唯一线索。
+         * 只记成功不记拒绝是**刻意**的：拒绝路径已经在文件里 `recordAccessDenied(...)`
+         * 写了 `access.denied`（那是安全事件），这里补的是"合规记录"这一半。
+         *
+         * 与上传同款的两条纪律：
+         *   ① 字段名是 `sha256`、**不是** `hash` —— `packages/core/src/audit.ts` 的
+         *      `FORBIDDEN_AUDIT_KEYS` 含 `hash`，写了会被 `redactForAudit` **静默删掉**；
+         *   ② 不记正文、不记磁盘绝对路径（路径由 sha 推出，记了只是把服务器布局抄进审计）。
+         * `id` 同时出现在 `targetId`（审计表的一等列）与 `after` 里：前者可被索引与按 id 过滤，
+         * 后者让这条 JSON **自解释**（导出/迁库后单看 `after` 就知道删的是哪一个）。
+         * 写入失败**不让删除失败**：行已经删掉了，回滚审计等于把"已发生的事实"藏起来；
+         * 故与上传同款 `void … .catch(console.error)`。
+         */
+        void writeAuditLog(adb, {
+          action: 'attachment.delete',
+          targetKind: 'attachment',
+          targetId: String(id),
+          actorId: p.userId ?? null,
+          actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
+          after: {
+            id,
+            page_slug: row.live_slug,
+            sha256: row.sha256,
+            ext: row.ext,
+            size: Number(row.byte_size),
+          },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 附件删除审计写入失败:', err))
         // T6：成功响应覆盖入口的 `no-store`
         h.res.setHeader('cache-control', 'private, no-cache')
         h.json(200, { ok: true, deleted: id })

@@ -6,9 +6,10 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { buildRegistry, defaultRegistry } from '../src/index.js'
 
 function makeRoot(): { root: string; cleanup: () => void } {
@@ -79,3 +80,49 @@ test('buildRegistry：外部插件目录不可用（不是目录）→ issues �
     cleanup()
   }
 })
+
+test('出厂配置：默认基础层清单**不得**启用会顶掉内置编辑器的插件（X1）', () => {
+  /*
+   * 这条钉的是真机实测过一次的数据丢失：
+   * `editor` 是**单占用**插槽（`packages/web/src/lib/slots.tsx` 的 `SINGLE_OCCUPANCY_SLOTS`），
+   * 而插槽契约 `EditorSlotProps`（core 侧权威副本）里**没有上传通道** ⇒ 插件一旦占了它，
+   * 内置 CodeMirror —— **唯一**支持附件拖拽/粘贴上传的编辑器 —— 根本不渲染：
+   * 用户拖入文件时 0 个请求、无占位、无提示，浏览器还会把窗口导航到那个文件
+   * （未保存的正文一起丢）。
+   *
+   * 所以"出厂配置不得启用编辑器类插件"不是偏好，而是**在插槽契约补上上传能力之前**的硬约束。
+   * 将来真要默认启用某个编辑器插件，请先让 `EditorSlotProps` 带上上传通道
+   * （core 副本 + web 镜像 + `packages/web/test/editorSlotProps.test.ts` 的镜像守卫一起改），
+   * 再把它的名字从下面的清单里删掉。
+   */
+  const editorPlugins = ['@geewiki/editor-plain']
+  const configPath = join(repoRoot(), 'config', 'plugins.base.json')
+  const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as { enabled: { name: string }[] }
+  const names = cfg.enabled.map((e) => e.name)
+
+  // 反空洞：先证明真的读到了清单（路径写错时 names 会是空数组，"0 个违规"就成了假绿）
+  assert.ok(names.includes('@geewiki/wiki'), `未能从 ${configPath} 读到默认清单（names=${names.join(',')}）`)
+
+  assert.deepEqual(
+    names.filter((n) => editorPlugins.includes(n)),
+    [],
+    `默认基础层清单启用了编辑器插件（${configPath}）：它会顶掉内置编辑器，用户将无法拖拽/粘贴上传附件。` +
+      '先把上传能力补进 EditorSlotProps，再考虑默认启用。',
+  )
+})
+
+/** 从本测试文件向上找到含 pnpm-workspace.yaml 的仓库根 */
+function repoRoot(): string {
+  let cur = dirname(fileURLToPath(import.meta.url))
+  for (let i = 0; i < 12; i++) {
+    try {
+      readFileSync(join(cur, 'pnpm-workspace.yaml'))
+      return cur
+    } catch {
+      const parent = dirname(cur)
+      if (parent === cur) break
+      cur = parent
+    }
+  }
+  throw new Error('未能向上找到仓库根（pnpm-workspace.yaml）')
+}

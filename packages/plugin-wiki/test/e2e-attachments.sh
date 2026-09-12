@@ -10,8 +10,18 @@
 #   - **上传者可用性补丁的边界**：本人 + 可编辑 ⇒ 能读自己刚传、正文还没引用的附件；
 #     **另一个同样可编辑的用户读同一附件必须 404**
 #   - 上传：匿名 401、private 页 404（不泄露存在性）、超限 413、单页配额 413、
-#     不支持的类型 400、错误扩展名不落盘、同内容二次上传 dedup=true 且磁盘只有一份
-#   - 响应头：`nosniff`（**含错误响应**：四个附件端点在处理器入口就设，覆盖 400/404/413 与 304）、
+#     不支持的类型 **415 `unsupported_media_type`**（X2：此前实现回 400 `unsupported_ext`，
+#     与前端注释/设计文档不一致 ⇒ 统一到语义更准的 415）、错误扩展名不落盘、
+#     同内容二次上传 dedup=true 且磁盘只有一份
+#   - **截断上传**（X6）：声明 100KB、实发 50KB ⇒ 400 且 `attachments/` 与 `tmp/` 零残留、
+#     不落成"自洽但残缺"的元数据行（内容寻址下最难发现的一类静默错误）
+#   - **网关层拒绝也是完整响应**（X3）：匿名 401 与缺 CSRF 403 都发生在**处理器之前**，
+#     故 `nosniff` 与 `cache-control: no-store` 必须由网关层自己补，不能指望插件入口
+#   - **审计**（X5）：`attachment.upload` 与 `attachment.delete` 都在 `view=acl` 里可见
+#     （此前 upload 不在 `ACL_ACTIONS` 白名单里、删除成功则完全不写审计）
+#   - 响应头：`nosniff` 由**两层**共同负责 —— 插件处理器入口覆盖进入处理器后的全部出口
+#     （200/201/304/400/404/409/413/415/503，见 B4e/D7c/D8c），网关层覆盖**未进入处理器**的
+#     拒绝（匿名 401 / 缺 CSRF 403，见 B1b–B1e；X3）、
 #     `cache-control` **不含 public** 且**不含 max-age**
 #     （同 URL 的可见性随 ACL 变化 ⇒ `private, no-cache`：每次复用前回源校验，撤销即时生效）、
 #     `content-type` 用白名单推出的值（不信任声明）、svg 强制 `attachment`
@@ -160,6 +170,49 @@ set_vis() { # set_vis <slug> <json>
 attachments_count() { find "$TMP/data/attachments" -type f 2>/dev/null | wc -l | tr -d ' '; }
 tmp_count() { find "$TMP/data/tmp" -type f 2>/dev/null | wc -l | tr -d ' '; }
 
+# X6：合成"声明的 Content-Length 与实发字节数不符"的请求。
+# curl 不会主动制造这种请求（长度由它自己算），故直接用裸 socket：
+# 声明 <declared> 字节、只发 <actual> 字节，然后**半关闭**（shutdown write）——
+# 这是最"礼貌"的截断方式（不是粗暴断开），也是最容易骗过"读完整就落盘"的写法。
+# 打印完整原始响应（含状态行）到 stdout，调用方自己取状态码。
+truncated_upload() { # truncated_upload <slug> <原始名> <声明字节> <实发字节> [cookie jar]
+  node -e '
+const fs = require("node:fs")
+const net = require("node:net")
+const [port, slug, name, declared, actual, jar] = process.argv.slice(1)
+let cookie = ""
+try {
+  const row = fs
+    .readFileSync(jar, "utf8")
+    .split("\n")
+    // ⚠️ curl 的 Netscape 格式里，HttpOnly 的 cookie 会被写成 `#HttpOnly_<域>` 前缀行 ——
+    // 它**不是注释**，直接按 # 过滤会把会话 cookie 丢掉，于是这条断言会退化成一个 401
+    // （本脚本第一版就踩了这个坑）。故只过滤真正的注释行。
+    .filter((l) => l !== "" && (!l.startsWith("#") || l.startsWith("#HttpOnly_")))
+    .map((l) => l.replace(/^#HttpOnly_/, "").split("\t"))
+    .find((c) => c[5] === "gw_sid")
+  if (row) cookie = `Cookie: gw_sid=${row[6]}\r\n`
+} catch {
+  /* 没有 jar ⇒ 匿名请求 */
+}
+const sock = net.connect(Number(port), "127.0.0.1", () => {
+  sock.write(
+    `PUT /api/attachments/${encodeURIComponent(slug)}?name=${encodeURIComponent(name)} HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${port}\r\nContent-Type: image/png\r\n${cookie}` +
+      `x-gw-csrf: 1\r\nContent-Length: ${declared}\r\nConnection: close\r\n\r\n`,
+  )
+  sock.write(Buffer.alloc(Number(actual), 0x41), () => sock.end())
+})
+const chunks = []
+sock.on("data", (d) => chunks.push(d))
+sock.on("close", () => process.stdout.write(Buffer.concat(chunks).toString("latin1")))
+sock.on("error", (e) => {
+  process.stderr.write(String(e.code))
+  process.exit(1)
+})
+' "$PORT" "$1" "$2" "$3" "$4" "${5:-$JAR}"
+}
+
 # 自带的配置目录：把单文件上限压到 1MB、单页配额压到 2MB，**不改仓库里的 config/**
 # （否则"配额/超限"两条断言只能靠上传几十 MB 的真文件来触发）。
 # 阶段 T 会用 `WIKI_CFG` 换一份配置重启，故这里是参数化的。
@@ -245,6 +298,20 @@ echo
 echo "=== 阶段 B：上传（裸 body PUT）—— 鉴权、类型、幂等、超限 ==="
 check "B0 建页 att-pub → 200" "200" "$(put_page att-pub '初始正文 ATT0000')"
 check "B1 **匿名上传 → 401**（access:'user' 闸门先于处理器）" "401" "$(upload - att-pub "$TMP/tiny.png" 'x.png')"
+# ★ X3：**网关层的拒绝同样是响应，不能少安全头那一层**。
+# 这两条断言的对象都是"处理器一行都没跑"的响应：401 出自 `gateThenInvoke` 的
+# `judgeAccess`，403 出自 `@geewiki/auth` 的 CSRF 钩子（`runHooks` 的 verdict 分支）。
+# 四个附件端点在**处理器入口**设的 `nosniff` / `no-store` 在这里**根本轮不到** ——
+# 修复前实测：这两个响应的 `x-content-type-options` 是 **null**。
+curl -s -D "$TMP/anon401.head" -o /dev/null -X PUT "http://127.0.0.1:$PORT/api/attachments/$(urlenc att-pub)?name=x.png" \
+  -H 'content-type: image/png' --data-binary @"$TMP/tiny.png" >/dev/null
+check_present "B1b **匿名 401 也带 nosniff**（网关层自己补，不靠插件入口）" "$TMP/anon401.head" "x-content-type-options: nosniff"
+check_present "B1c 匿名 401 也带 cache-control: no-store" "$TMP/anon401.head" "cache-control: no-store"
+# 缺 CSRF（带会话 cookie、但那一个自定义头故意不发）⇒ `authHook` 拒绝
+curl -s -D "$TMP/nocsrf.head" -o /dev/null -X PUT "http://127.0.0.1:$PORT/api/attachments/$(urlenc att-pub)?name=x.png" \
+  -b "$JAR" -c "$JAR" -H 'content-type: image/png' --data-binary @"$TMP/tiny.png" >/dev/null
+check_present "B1d **缺 CSRF 的 403 也带 nosniff**（钩子拒绝，处理器没跑）" "$TMP/nocsrf.head" "x-content-type-options: nosniff"
+check_present "B1e 缺 CSRF 的 403 也带 cache-control: no-store" "$TMP/nocsrf.head" "cache-control: no-store"
 # 上传时**故意声明 text/html**：响应头必须仍由扩展名推出 image/png（存储型 XSS 的常见入口）
 check "B2 owner 上传 png → 201" "201" "$(upload "$JAR" att-pub "$TMP/tiny.png" '图片 一.png' 'text/html')"
 PNG_ID=$(field id); PNG_URL=$(field url); PNG_SHA=$(field sha256); PNG_SIZE=$(field size)
@@ -259,13 +326,13 @@ check "B3c 磁盘上该内容只有一份（按 sha 前 4 位两级目录）" "1
 check "B3d 落盘路径就是内容寻址（<2>/<2>/<sha>.png）" "1" \
   "$(find "$TMP/data/attachments/${PNG_SHA:0:2}/${PNG_SHA:2:2}" -maxdepth 1 -type f -name "$PNG_SHA.png" | wc -l | tr -d ' ')"
 check "B3e 临时目录无残留" "0" "$(tmp_count)"
-check "B4 不支持的类型（x.php）→ 400" "400" "$(upload "$JAR" att-pub "$TMP/tiny.png" 'x.php')"
-check "B4b 错误码 unsupported_ext" "unsupported_ext" "$(field error)"
+check "B4 不支持的类型（x.php）→ 415" "415" "$(upload "$JAR" att-pub "$TMP/tiny.png" 'x.php')"
+check "B4b 错误码 unsupported_media_type" "unsupported_media_type" "$(field error)"
 # ★ T2：`nosniff` 必须覆盖**错误响应**（`h.json` 只写 content-type，不带 nosniff）；
-# 附件端点改为在处理器入口设置一次，因此 400/404/413 这些分支也不会漏
+# 附件端点改为在处理器入口设置一次，因此 415/404/413 这些分支也不会漏
 curl -s -D "$TMP/err.head" -o /dev/null -X PUT "http://127.0.0.1:$PORT/api/attachments/$(urlenc att-pub)?name=x.php" \
   -b "$JAR" -c "$JAR" -H 'x-gw-csrf: 1' -H 'content-type: image/png' --data-binary @"$TMP/tiny.png" >/dev/null
-check_present "B4e **400 错误响应也带 nosniff**（错误分支没漏）" "$TMP/err.head" "x-content-type-options: nosniff"
+check_present "B4e **415 错误响应也带 nosniff**（错误分支没漏）" "$TMP/err.head" "x-content-type-options: nosniff"
 # 同页同内容但扩展名不一致 ⇒ 409（扩展名决定响应头，不能静默保留第一次的）
 check "B4c 同内容换扩展名 → 409 attachment_conflict" "409" "$(upload "$JAR" att-pub "$TMP/tiny.png" 'same.txt')"
 check "B4d 错误码 attachment_conflict" "attachment_conflict" "$(field error)"
@@ -291,6 +358,28 @@ check "B6 无 Content-Length 的裸 body → 413 length_required" "413" \
   "$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT "http://127.0.0.1:$PORT/api/attachments/att-pub?name=b.png" \
      -b "$JAR" -c "$JAR" -H 'x-gw-csrf: 1' -H 'content-type: image/png' -H 'transfer-encoding: chunked' --data-binary @"$TMP/tiny.png")"
 check "B6b 错误码 length_required" "length_required" "$(field error)"
+# ★ X6：截断上传（声明 100KB、实发 50KB）⇒ 400，且**磁盘与数据库都不留痕**。
+#
+# 为什么必须断言"不留痕"：落盘路径是**内容寻址**的，被截断的字节是一份**全新的哈希** ——
+# 它路径自洽、`byte_size` 自洽、下载也吐得回来，而去重**挡不住**它（去重比的正是哈希），
+# 于是"同一哈希 ⇒ 同一字节"这条不变式会被**静默**破坏，发现时机是"用户某天打开这张图，
+# 下半截是灰的"。服务端的对策是 `storeStream()` 的 `expectedBytes` 对照（**放在 rename 之前**，
+# 失败时最终路径从未被创建 ⇒ 零残留，也不会误删 dedup 场景下别页引用的那份内容）。
+#
+# ⚠️ 实测口径（重要，别把这条断言读成"覆盖了那条分支"）：在这套 HTTP 栈上，
+# **Content-Length 分帧下的截断请求由 Node 的 HTTP 解析器直接回 400**（路由与处理器
+# 一行都没跑）。所以本段断言的是"**400 + 零残留**"这个可观察事实；`length_mismatch`
+# 那条应用层分支由 `packages/plugin-wiki/test/attachments.test.ts` 的内存流用例直接覆盖。
+X6_BEFORE_FILES=$(attachments_count)
+X6_CODE=$(truncated_upload att-pub trunc.png 102400 51200 | head -1 | awk '{print $2}')
+check "B6c 声明 100KB 实发 50KB 的截断上传 → 400" "400" "$X6_CODE"
+X6_SHA=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(Buffer.alloc(51200,0x41)).digest("hex"))')
+check "B6d **截断的那 50KB 没有落盘**（按它的 sha 查磁盘：0 个文件）" "0" \
+  "$(find "$TMP/data/attachments" -type f -name "$X6_SHA*" | wc -l | tr -d ' ')"
+check "B6e 截断上传后 attachments 目录无新增" "$X6_BEFORE_FILES" "$(attachments_count)"
+check "B6f 截断上传后 tmp 目录无残留" "0" "$(tmp_count)"
+check "B6g **没有落成一条「自洽」的元数据行**（按 sha 查库：0 行）" "0" \
+  "$(node_db 'const D=require("better-sqlite3");const db=new D(process.argv[1]);process.stdout.write(String(db.prepare("SELECT COUNT(*) n FROM attachments WHERE sha256=?").get(process.argv[2]).n))' "$X6_SHA")"
 # private 页：member（visibility=none ⇒ canEdit=false）上传必须 404 —— **不是 403**，403 会确认它存在
 check "B7 建 private 页 → 200" "200" "$(put_page att-private '私密页')"
 check "B7b 设为 private → 200" "200" "$(set_vis att-private '{"visibility":"private"}')"
@@ -517,6 +606,30 @@ check "G2b 审计 after 的字段集固定（不含正文，且 sha256 具名）
 sess GET '/api/admin/audit?limit=200' >/dev/null
 check "G3 下载成功**不写审计**（图片是高频内联请求，逐次留痕会冲垮审计表）" "0" \
   "$(field 'entries.filter(e=>String(e.action).includes("attachment.download")||String(e.action).includes("attachment.read")).length')"
+# ★ X5：**删除成功必须留痕**（此前只有上传写审计，删除什么都不写 ——
+# 而删除是破坏性动作，"这份附件为什么不见了"只有审计能回答）。
+sess GET '/api/admin/audit?action=attachment.delete&limit=50' >/dev/null
+check_ge "G3b 至少有一条删除审计（action=attachment.delete）" "$(field total)" 1
+check "G3c 删除审计 after 的字段集固定（id/page_slug/sha256/ext/size；**不含 hash**）" "ext,id,page_slug,sha256,size" \
+  "$(body_expr 'Object.keys(o.entries[0].after).sort().join(",")')"
+check "G3d 删除审计带操作者（actorId 非空）" "true" \
+  "$(body_expr 'String(o.entries[0].actorId !== null && o.entries[0].actorId !== undefined)')"
+check "G3e 删除审计的 targetKind=attachment 且 targetId 是数值 id" "ok" \
+  "$(body_expr 'o.entries[0].targetKind === "attachment" && /^[0-9]+$/.test(String(o.entries[0].targetId)) ? "ok" : "bad"')"
+# ★ X5：两个动作都要能在审计界面的「权限变更」（acl）视图里看到 ——
+# 此前 `attachment.upload` 不在 `ACL_ACTIONS` 白名单里，于是它**只在 all 视图可见**，
+# 而白名单的设计意图是"未分类的动作只出现在 all 里"（漏分类是可见的）。
+sess GET '/api/admin/audit?view=acl&action=attachment.upload&limit=10' >/dev/null
+check_ge "G3f **上传审计出现在 acl 视图**（已收入 ACL_ACTIONS）" "$(field total)" 1
+sess GET '/api/admin/audit?view=acl&action=attachment.delete&limit=10' >/dev/null
+check_ge "G3g **删除审计也出现在 acl 视图**" "$(field total)" 1
+# 对照面（防空洞）：两者都**不该**出现在 security 视图 —— 那一档是"要告警的越权事件"，
+# 把正常的上传/删除塞进去会把"有人在探测权限边界"稀释掉。这两条同时证明 G3f/G3g 的红绿
+# 是白名单决定的，而不是"view 参数根本没生效"（若没生效，这里会跟着一起 ≥1）。
+sess GET '/api/admin/audit?view=security&action=attachment.upload&limit=10' >/dev/null
+check "G3h 对照：上传**不在** security 视图（越权才进那一档）" "0" "$(field total)"
+sess GET '/api/admin/audit?view=security&action=attachment.delete&limit=10' >/dev/null
+check "G3i 对照：删除**不在** security 视图" "0" "$(field total)"
 check "G4 服务仍健康 → 200" "200" "$(anon GET /api/health)"
 if grep -qE "\[http\] 路由 .* 异常|no such table: attachments|Unhandled|unhandledRejection" "$LOG"; then
   echo "  日志中的可疑行："; grep -nE "\[http\] 路由 .* 异常|no such table: attachments|Unhandled|unhandledRejection" "$LOG" | head -5
@@ -567,8 +680,8 @@ else
   start_server
   check "T0 新配置下服务就绪 → 200" "200" "$(anon GET /api/health)"
   check "T1 建页 → 200" "200" "$(put_page att-config '配置生效测试')"
-  check "T1a 被收窄掉的 .png → 400 unsupported_ext" "400" "$(upload "$JAR" att-config "$TMP/tiny.png" 'narrowed.png')"
-  check "T1b 错误码 unsupported_ext" "unsupported_ext" "$(field error)"
+  check "T1a 被收窄掉的 .png → 415 unsupported_media_type" "415" "$(upload "$JAR" att-config "$TMP/tiny.png" 'narrowed.png')"
+  check "T1b 错误码 unsupported_media_type" "unsupported_media_type" "$(field error)"
   check "T2 仍在白名单内的 .txt → 201" "201" "$(upload "$JAR" att-config "$TMP/tiny.txt" 'kept.txt')"
   CFG_TXT_ID=$(field id)
   check "T2b 上传者本人可读（未引用；可用性补丁）→ 200" "200" "$(dl "$JAR" "$CFG_TXT_ID")"

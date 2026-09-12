@@ -242,6 +242,22 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   overflow-wrap: anywhere;
 }
 
+/*
+  插件编辑器路径上的附件兜底提示（`lib/slots.tsx` 的 `EditorSlotOutlet`，X1）。
+  用中性色而不是 warn：这不是"哪里坏了"，而是"当前这个编辑器没有这个能力"——
+  换回内置编辑器即可，是可选的下一步，不是需要排查的故障。
+  那个 `<p role="status">` **恒常存在**（空闲时内容为空串）：实时区域必须先于内容出现，
+  屏幕阅读器才会播报随后写进去的那句话。故这里用 `:empty` 把空态的内边距/边框收掉，
+  使它既不占位置、又留在无障碍树里（`display: none` 会把它从无障碍树里摘掉，那就白留了）。
+*/
+.slot-hint {
+  display: block; margin: 0; font-size: var(--text-note); line-height: 1.6;
+  background: var(--gw-surface-sunken); color: var(--gw-ink-soft); border: 1px solid var(--gw-line);
+  border-radius: var(--radius-md); padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2.5);
+  overflow-wrap: anywhere;
+}
+.slot-hint:empty { padding: 0; border: 0; background: none; }
+
 .schema-form { display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); }
 .schema-field { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1); }
 .schema-label { font-size: var(--text-xs); color: var(--gw-ink-soft); display: flex; gap: calc(var(--spacing) * 1.5); align-items: baseline; flex-wrap: wrap; }

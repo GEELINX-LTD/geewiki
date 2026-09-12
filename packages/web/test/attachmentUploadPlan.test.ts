@@ -316,3 +316,43 @@ test('守卫：编辑页接上了上传，且"新建页面"给出可执行提示
   // 失败提示必须可见：状态是 state 且渲染进 JSX
   assert.ok(page.includes('setUploadNotice(') && page.includes('{uploadNotice !== null &&'), '上传结果必须有可见提示')
 })
+
+test('守卫：插件编辑器路径必须拦住默认拖放，并给出可见提示（X1 兜底）', () => {
+  /*
+   * 这条守的是**真机上抓到的那次数据丢失**：插件占了 `editor` 插槽时内置编辑器根本不渲染，
+   * 而 `EditorSlotProps` 契约里没有上传通道 ⇒ 用户拖入文件时 0 个请求、无提示，
+   * 浏览器还会把窗口**导航到那个文件**，正在编辑的正文一起丢（target 数 6→7）。
+   * 兜底只能靠源码级守卫钉住：`preventDefault()` 与 `role="status"` 都"删掉也能跑"，
+   * 而删掉之后的表现恰好是"没有任何表现"——这正是最难靠人工发现的一类回归。
+   */
+  const slots = readCode('lib/slots.tsx')
+  const from = slots.indexOf('export function EditorSlotOutlet(')
+  assert.ok(from > 0, '应能找到 EditorSlotOutlet（结构变了即红）')
+  const region = slots.slice(from)
+  assert.ok(region.length > 400, `EditorSlotOutlet 区域过短（解析写坏？实际 ${region.length} 字符）`)
+
+  // ① 拖放的默认行为必须被拦下（三条路径：dragover / drop / paste）
+  assert.ok(region.includes('onDragOver={onDragOver}'), '拖入过程就要接住（dragover 不拦 ⇒ drop 根本不会来）')
+  assert.ok(region.includes('onDrop={onDrop}'), '落点处必须接住 drop')
+  assert.ok(region.includes('onPaste={onPaste}'), '粘贴截图是同一类输入，必须一并接住')
+  assert.equal(
+    (region.match(/preventDefault\(\)/g) ?? []).length,
+    3,
+    'dragover / drop / paste 三条路径**各自**都要 preventDefault（漏一条就是"浏览器导航走"）',
+  )
+  assert.ok(region.includes('dataTransfer') && region.includes('clipboardData'), '要从两个 dataTransfer 来源取文件')
+
+  // ② 提示必须可见且可被播报：role="status" + 真的渲染进 DOM（不是 console）
+  assert.ok(region.includes('role="status"'), '提示必须是实时区域（role="status"），不能只 console')
+  assert.ok(region.includes('data-editor-upload-hint'), '提示要暴露状态供真机验收观察')
+  assert.ok(!region.includes('title='), '不得只靠 title（鼠标悬停才可见，读屏与触屏都拿不到）')
+  assert.ok(region.includes('setUploadBlocked(true)'), '提示必须由 state 驱动渲染')
+
+  // ③ 文案要给出**可执行的下一步**，且不承诺做不到的事
+  const hint = slots.match(/export const EDITOR_SLOT_NO_UPLOAD_HINT =\s*\n?\s*'([^']+)'/)
+  assert.ok(hint !== null, '应存在导出的兜底文案常量（界面与测试共用同一份来源）')
+  const text = hint[1] as string
+  assert.ok(text.includes('插件管理'), '文案要指出下一步去哪（插件管理）')
+  assert.ok(text.includes('内置编辑器'), '文案要点名该换成哪个编辑器')
+  assert.ok(!text.includes('已上传') && !text.includes('已插入'), '兜底提示不得暗示上传成功')
+})
