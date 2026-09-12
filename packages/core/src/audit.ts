@@ -51,6 +51,18 @@ const FORBIDDEN_AUDIT_KEYS = new Set([
   'token',
   'tokenhash',
   'hash',
+  /*
+   * `content_hash`：**正文的派生物**，与 `hash` 同类。
+   *
+   * 为什么必须逐个列出而不是靠 `hash` 兜住：匹配是 `key.toLowerCase()` 的**精确相等**，
+   * 不含子串 —— 于是 `content_hash` / `block_hash` 这类"带前缀的哈希"会**漏过去**。
+   * 实测踩过：`page.delete` 的审计 `after` 里落进了整串 sha256（注释却声称"不记 hash"）。
+   *
+   * 记内容指纹看着无害，实际有两个问题：① 审计表长期留存，指纹可用于比对"某份内容
+   * 是否曾在库里出现过"，属内容侧信息；② 与"审计记**动作**、不记**内容派生物**"的
+   * 既有纪律相悖（连 `hash` 都禁）。需要按指纹比对时应由备份/取证侧自行计算。
+   */
+  'content_hash',
   'salt',
   'secret',
   'apikey',

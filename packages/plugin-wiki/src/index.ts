@@ -272,6 +272,27 @@ export interface WikiSaveResult {
   indexTiersResync?: ResyncReport
 }
 
+/**
+ * `GET /api/pages/:slug/versions` 的查询行（内部类型，不下发）。
+ *
+ * 单独命名而不是内联在查询里：这条 SQL 要在**两个方言**上跑，行形状被三处消费
+ * （分页、`change` 的对照行、响应映射），内联书写时改一处漏一处最容易漂移。
+ */
+interface VersionListRow {
+  id: number
+  /** `ROW_NUMBER() OVER (ORDER BY id DESC)`：1 = 最新快照。版本号由它反推 */
+  rn: number
+  saved_at: string
+  title: string | null
+  /** 0021：'content' | 'acl' | null（null = 0021 之前的行） */
+  origin: string | null
+  author_id: number | null
+  author_name: string | null
+  content: string
+  blocks_json: string | null
+  acl_json: string | null
+}
+
 /** 反向链接项：**引用**了某页的页面（对应 GET /api/pages/:slug/backlinks 的单项） */
 export interface WikiBacklink {
   slug: string
@@ -479,6 +500,19 @@ export const SLUG_MAX_LENGTH = 80
 
 /** 层级深度上限：超过即拒绝（避免无意义的极深嵌套） */
 export const SLUG_MAX_DEPTH = 8
+
+/**
+ * 版本快照的**来源**（`page_versions.origin`，0021）。
+ *
+ * 存在的意义只有一个：让用户能分清"**正文**被改了"与"**只动了权限**"。
+ * 两者都会产生快照，但读者关心的事情完全不同 —— 所以它必须是**受控枚举**：
+ * 让调用方随手写字符串，就等于把这个区分交给每个调用点的自觉。
+ *
+ * - `content`：这次动作**改了正文**（保存、恢复历史版本）
+ * - `acl`：正文没动，只动了档位/发布/授权（以及随正文保存而变的块级可见性）
+ */
+export const VERSION_ORIGINS = ['content', 'acl'] as const
+export type VersionOrigin = (typeof VERSION_ORIGINS)[number]
 
 /**
  * 会被**前端路由吃掉**的保留首段：这些路径永远进不了详情页。
@@ -1572,35 +1606,34 @@ export const WikiPlugin = {
          * （0019 之前的历史行、跨插件代调用、账号已删）⇒ 表现为"历史少了几条"。
          */
         const viewer = requirePrincipal(h)
-        const rows = await adb.query<{
-          id: number
-          rn: number
-          saved_at: string
-          title: string | null
-          origin: string | null
-          author_id: number | null
-          author_name: string | null
-          content: string
-          blocks_json: string | null
-          acl_json: string | null
-        }>(
-          /*
-           * `ROW_NUMBER()` 算出**权威的版本号**：窗口函数在 SQLite 3.25+ 与 PostgreSQL
-           * 8.0+ 都可用，两侧同形。不能靠 `total - i` 在应用层推 —— 那只在"从最新一页
-           * 开始、且期间没有新写入"时成立；一旦用游标翻到中间，偏移量就无从得知了。
-           */
-          `SELECT * FROM (
-             SELECT v.id, v.saved_at, v.title, v.origin, v.saved_by AS author_id,
-                    u.display_name AS author_name, v.content, v.blocks_json, v.acl_json,
-                    ROW_NUMBER() OVER (ORDER BY v.id DESC) AS rn
-               FROM page_versions v
-               LEFT JOIN users u ON u.id = v.saved_by
-              WHERE v.page_id = ?
-           ) ranked
-            WHERE (? IS NULL OR id < ?)
-            ORDER BY id DESC LIMIT ?`,
-          [page.id, before, before, limit],
-        )
+        const baseSelect = `SELECT v.id, v.saved_at, v.title, v.origin, v.saved_by AS author_id,
+                     u.display_name AS author_name, v.content, v.blocks_json, v.acl_json,
+                     ROW_NUMBER() OVER (ORDER BY v.id DESC) AS rn
+                FROM page_versions v
+                LEFT JOIN users u ON u.id = v.saved_by
+               WHERE v.page_id = ?`
+        /*
+         * `ROW_NUMBER()` 算出**权威的版本号**：窗口函数在 SQLite 3.25+ 与 PostgreSQL
+         * 8.0+ 都可用，两侧同形。不能靠 `total - i` 在应用层推 —— 那只在"从最新一页
+         * 开始、且期间没有新写入"时成立；一旦用游标翻到中间，偏移量就无从得知了。
+         *
+         * ★ **游标条件按有无分两条 SQL，不要写成 `(? IS NULL OR id < ?)`**：
+         *   PostgreSQL 在 `$2 IS NULL` 这种写法下**无法推断参数类型**，报
+         *   `could not determine data type of parameter $2`（本仓库实测；SQLite 不报）。
+         *   这是"同一份 SQL 跑两个方言"的典型陷阱：SQLite 全绿、PG 上整个端点 500。
+         *   分开写还有个附带好处 —— 有游标时 PG 能用上 `page_id` 索引的顺序，
+         *   而 `OR` 会让它退化成顺序扫描。
+         */
+        const rows =
+          before === null
+            ? await adb.query<VersionListRow>(`SELECT * FROM (${baseSelect}) ranked ORDER BY id DESC LIMIT ?`, [
+                page.id,
+                limit,
+              ])
+            : await adb.query<VersionListRow>(
+                `SELECT * FROM (${baseSelect}) ranked WHERE id < ? ORDER BY id DESC LIMIT ?`,
+                [page.id, before, limit],
+              )
         /*
          * `change` 需要每条的**上一条**（更新时间更晚、id 更大那条）作对照 ——
          * 而它不一定落在同一页里：游标翻到第 3 页时，第一条的"上一条"在第 2 页。
@@ -2053,7 +2086,10 @@ export const WikiPlugin = {
          */
         if (row.blocks_json === null || row.acl_json === null) {
           const revision = await adb.transaction(async (tx) => {
-            await snapshotAclVersion(tx, slug, guard.principal.userId) // 恢复前记一条 ⇒ 本次恢复可逆
+            // 恢复前记一条 ⇒ 本次恢复可逆。
+            // `origin='content'`：这次动作**改的就是正文**（下面那句 UPDATE 即可为证），
+            // 标成 `'acl'` 会让界面告诉用户"只动了权限"。
+            await snapshotAclVersion(tx, slug, guard.principal.userId, 'content')
             await tx.run('UPDATE pages SET content = ?, content_hash = ?, updated_at = ? WHERE id = ?', [
               row.content,
               sha256Hex(row.content),
@@ -2136,8 +2172,9 @@ export const WikiPlugin = {
         }
 
         const revision = await adb.transaction(async (tx) => {
-          // ① 恢复前先记一条版本 ⇒ 恢复可逆
-          await snapshotAclVersion(tx, slug, guard.principal.userId)
+          // ① 恢复前先记一条版本 ⇒ 恢复可逆。
+          //    `origin='content'`：这一步改的是正文（②里有 `UPDATE pages SET content = …`）。
+          await snapshotAclVersion(tx, slug, guard.principal.userId, 'content')
           // ② 页面级 ACL + 正文
           await tx.run(
             `UPDATE pages SET content = ?, content_hash = ?, updated_at = ?, visibility = ?, inherit = ?, published_at = ?
@@ -2384,9 +2421,14 @@ export const WikiPlugin = {
      *   此前这条路径**一行审计都不写**（只有 ACL 类动作写），于是"谁把页面删了"在
      *   审计里查不到，只能靠 `access.denied` 之类的旁证去猜。
      *
-     *   记的是**被删条目的摘要**（标题/历史条数/字节数/content_hash），不是正文 ——
+     *   记的是**被删条目的摘要**（标题/历史条数/字节数），不是正文 ——
      *   审计表要长期留存，把正文抄进去等于复制一份永不可删的内容。
-     *   `content_hash` 足以在事后与外部备份比对"被删的是哪一版"。
+     *
+     *   ★ **连内容哈希也不记**（`content_hash` 曾在此写入，已移除）：它是正文的**派生物**，
+     *   落进审计等于把"内容指纹"长期留存 —— 与"审计不记内容派生物"的既有纪律相悖
+     *   （`packages/core/src/audit.ts` 的 `FORBIDDEN_AUDIT_KEYS` 连 `hash` 都禁）。
+     *   若确实需要与外部备份比对"被删的是哪一版"，那属于独立的取证需求，
+     *   应由备份侧算、而不是让审计表承担。
      *
      *   放在删除**之后**写：删失败（404）不该留一条"删除了"的假记录；
      *   而 `void … .catch` 让审计写入失败**不回滚**已经完成的删除（数据已经没了，
@@ -2410,7 +2452,6 @@ export const WikiPlugin = {
             versions: removed.versions,
             bytes: removed.bytes,
             created_at: removed.createdAt,
-            content_hash: removed.contentHash,
           },
         }).catch((err: unknown) => console.error('[@geewiki/wiki] 删除审计写入失败:', err))
         h.json(200, { ok: true, deleted: slug })
@@ -2539,13 +2580,24 @@ export const WikiPlugin = {
     }
 
     /**
-     * 记一条**权限版本**：`content` 保持当前正文，只有 `blocks_json` / `acl_json` 变化。
+     * 记一条**中间版本**：`content` 取"当前"（即变更前）的正文，`blocks_json` / `acl_json`
+     * 一并定格，供恢复时回到那一刻。
      *
-     * 由**每一条改权限的路径**调用（改档位、页面授予、块级授予；随正文保存而变的块级
-     * 可见性由 `savePage` 那条版本覆盖），理由见 `0017_version_blocks.sql`。
+     * 由**两类路径**调用：
+     *   - 改权限的路径（改档位、页面授予、块级授予、申请批准）—— 正文不动 ⇒ `origin='acl'`
+     *     （默认值；随正文保存而变的块级可见性由 `savePage` 那条版本负责，见 `0017_version_blocks.sql`）
+     *   - **恢复历史版本**（两条分支：老版本只回正文、新版本连 ACL 一起回）—— 这次动作
+     *     **改的就是正文** ⇒ 必须显式传 `origin='content'`
+     *
+     * ★ 为什么 `origin` 必须由调用方传、而不能像原来那样写死 `'acl'`：这个字段的全部意义
+     *   就是让用户分清"正文被改了"与"只动了权限"。恢复路径在写完本快照后**紧接着**
+     *   `UPDATE pages SET content = …`，若仍标 `'acl'`，界面会告诉用户"这次只动了权限"——
+     *   那是**说反了**，比不标还糟。
      *
      * 记的是**变更前**的状态 —— 与 `savePage` 的既有约定一致（"先快照旧的，再改"），
      * 于是"版本 N = 变更 N 之前的状态"，恢复版本 N 得到的就是那一刻。
+     * `title` 随之取**变更前**的标题：它与 `origin`/`saved_at` 一起描述"被替换掉的那一版"，
+     * 三者自洽；恢复目标版本的标题由 `GET /versions/:id` 那条记录自己带着。
      */
     const snapshotAclVersion = async (
       tx: DatabaseExecutor,
@@ -2555,6 +2607,11 @@ export const WikiPlugin = {
        * 那里一定拿得到主体；传 `null` 只用于"确实没有主体"的服务侧调用。
        */
       actorId?: number | null,
+      /**
+       * 本条的来源（受控枚举）。默认 `'acl'` = "只动了权限"；
+       * 恢复历史版本的两条分支必须显式传 `'content'`。
+       */
+      origin: VersionOrigin = 'acl',
     ): Promise<void> => {
       const page = (
         await tx.query<{ id: number; content: string; title: string }>(
@@ -2564,14 +2621,8 @@ export const WikiPlugin = {
       )[0]
       if (!page) return
       const snap = await versionSnapshotOf(tx, Number(page.id))
-      /*
-       * `origin`（0021）恒为 `'acl'`，同样不需要调用方传参：本函数的语义就是
-       * "为**权限类**变更留一条快照"，它的 8 个调用点全部是档位/发布/授权/申请批准
-       * —— 正文那一条由 `savePage` 自己的 INSERT 负责。让来源在此处成为常量，
-       * 调用方就没有写错的机会。
-       */
       await tx.run(
-        `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json, saved_by, title, origin) VALUES (?, ?, ?, ?, ?, ?, ?, 'acl')`,
+        `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json, saved_by, title, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           Number(page.id),
           page.content,
@@ -2580,6 +2631,7 @@ export const WikiPlugin = {
           snap.aclJson,
           actorId ?? null,
           page.title,
+          origin,
         ],
       )
     }

@@ -1,0 +1,16 @@
+-- 0021_version_origin.sql —— 版本快照承载「这次改动是什么性质」（PostgreSQL 对偶）
+--
+-- 与 sqlite 侧 `0021_version_origin.sql` 同义：给 `page_versions` 增 `origin TEXT`。
+--
+-- ★ 方言对照（sqlite → postgres）：
+--   `ALTER TABLE … ADD COLUMN origin TEXT;` 两侧同形。PG 上 `TEXT` 与 `VARCHAR` 无
+--   性能差异，仓内既有文本列（`pages.title`、`page_versions.content`）也用 `TEXT`。
+--
+-- ★ 与 sqlite 侧逐条一致的四条决定（理由详见 sqlite 侧注释）：
+--   1. 取值 `'content' | 'acl' | NULL` —— 区分"正文被编辑"与"只是权限变了"，
+--      否则用户看到版本号增长会以为自己的正文被改了那么多次；
+--   2. **不加 CHECK 约束** —— 将来新增来源类别时不必再开迁移改约束，
+--      且该列只用于展示，非法值不影响数据正确性；
+--   3. **可空、默认 NULL** —— 回滚策略是"回滚应用代码、保留列"；
+--      0021 之前的历史行该列为 NULL，语义是**升级前**而不是"未知"。
+ALTER TABLE page_versions ADD COLUMN origin TEXT;
