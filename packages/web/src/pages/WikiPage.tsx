@@ -37,11 +37,8 @@ import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { EditorSlotOutlet, useEditorSlot } from '../lib/slots'
 import { AssistToolbar } from '../components/ai/AssistToolbar'
 import {
-  COMPACT_VERSIONS,
   ReadonlyHistoryButton,
-  TimelineDialog,
   VersionBadge,
-  VersionList,
   VersionPicker,
 } from '../components/VersionPicker'
 import { VersionDiffDialog } from '../components/VersionDiffDialog'
@@ -1223,8 +1220,6 @@ function WikiDetail(props: {
    * 内容不再存于页面 —— `VersionDiffDialog` 自己拉、自己算差异，页面不参与。
    */
   const [compareTarget, setCompareTarget] = useState<CompareTarget | null>(null)
-  /** 改动记录时间线（紧凑入口打开的弹窗） */
-  const [timelineOpen, setTimelineOpen] = useState(false)
   const [restoring, setRestoring] = useState(false)
   const anchor = useHashAnchor()
   /*
@@ -1731,40 +1726,34 @@ function WikiDetail(props: {
             门控 `canManageVisibility`（**不是** canEdit）：能编辑不等于能改"谁能看"，
             两者是服务端下发的两个字段。无权限时**不渲染**（不是置灰 —— 置灰本身
             就在暗示"这里有个你够不着的能力"）。
+
+            ⚠️ 预览历史版本时**同样整块不渲染**：那是只读态，此时改档位/删除/编辑都要么
+            语义错乱（改的是"当前版"而用户看的是旧版正文）、要么必然失败。这里刻意不用
+            `disabled + title` —— 置灰按钮仍然在暗示"够得着"，而且 `title` 对触屏与读屏
+            都不可达（本仓库既有纪律）。**出口是预览条上的「返回最新」**，它自己会说明。
           */}
-          {page.capabilities.canManageVisibility && (
+          {page.capabilities.canManageVisibility && !previewing && (
             <Button
               variant="secondary"
               size="sm"
               icon={<ShieldCheck className="size-3.5" />}
               onClick={() => setAccessOpen(true)}
-              disabled={previewing}
-              title={previewing ? '先返回最新版本' : undefined}
             >
               权限…
             </Button>
           )}
           {/* ══════════════════════════════════════════════════════ */}
-          {page.capabilities.canDelete && (
-            <Button
-              variant="danger"
-              size="sm"
-              icon={<Trash2 className="size-3.5" />}
-              onClick={remove}
-              disabled={restoring || previewing}
-              title={previewing ? '先返回最新版本' : undefined}
-            >
+          {page.capabilities.canDelete && !previewing && (
+            <Button variant="danger" size="sm" icon={<Trash2 className="size-3.5" />} onClick={remove} disabled={restoring}>
               删除
             </Button>
           )}
-          {page.capabilities.canEdit && (
+          {page.capabilities.canEdit && !previewing && (
             <Button
               variant="primary"
               size="sm"
               icon={<Pencil className="size-3.5" />}
               onClick={onEdit}
-              disabled={previewing}
-              title={previewing ? '先返回最新版本' : undefined}
             >
               编辑
             </Button>
@@ -1872,39 +1861,16 @@ function WikiDetail(props: {
           <PageLinks slug={page.slug} />
 
           {/*
-            改动记录：**紧凑区块**，取代原先正文下方那张占一大块的「版本历史」卡片。
-            为什么还留在这里、而不是全部收进头部下拉：头部下拉是"选择要对比哪一版"（动作），
-            而这里是"这一页最近改了什么、谁改的"（状态）—— 后者是读者也可能关心的信息。
+            改动记录**不再常驻正文下方**（这里原来有一块紧凑列表，再往前是一整张「版本历史」卡片）。
+            为什么彻底移走：正文下方任何常驻的版本列表都是"与正文争版面"的东西 —— 用户的原话是
+            "放在下面占这么大块位置不合适"。现在改动的入口只有一个：**头部左上角的版本下拉**
+            （`<VersionPicker>`），它把"当前版本 + 最近改动 + 更早的版本 + 改动摘要"收在一个
+            按需展开的浮层里；需要铺开看时走它内部的「浏览全部历史…」弹窗 ——
+            **用户主动打开的弹窗占版面是合理的，常驻的列表不是**。
 
-            为什么只列 `COMPACT_VERSIONS` 条：版本多时（后端最多 100 条）"全列"就等于把版面
-            撑回原样，那正是要解决的问题。其余走「查看全部改动…」弹窗 —— **用户主动打开的
-            弹窗占版面是合理的，常驻的列表不是**。
-
-            为什么整块受 `canEdit` 门控：无编辑权者进不了对比弹窗（服务端在快照端点上
-            对非 `canEdit` 一律 404），列出"点不动的行"等于给了一条死路。此时只留头部那枚
-            静态版本徽标 —— 版本号本身是可见信息，改动明细不是。
+            信息没有丢：条数摘要（共 N 次改动 / 更早的未列出）在下拉的底部一行，见
+            `VersionPicker` 的 `versionCountText`；无编辑权者仍能在头部看到静态版本号徽标。
           */}
-          {page.version > 1 && page.capabilities.canEdit && (
-            <section className="flex flex-col gap-2" aria-label="最近改动">
-              <p className="m-0 flex flex-wrap items-center gap-x-2 gap-y-1 text-note text-muted">
-                <History className="size-3.5" aria-hidden="true" />
-                <span>
-                  当前 v{page.version} · 共 {page.version - 1} 次改动
-                  {page.version - 1 > page.versions.length
-                    ? `（列出最近 ${page.versions.length} 次，更早的未列出）`
-                    : ''}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setTimelineOpen(true)}
-                  className={cn(focusRing, 'cursor-pointer text-accent underline-offset-2 hover:underline')}
-                >
-                  查看全部改动…
-                </button>
-              </p>
-              <VersionList page={page} onPick={startCompare} limit={COMPACT_VERSIONS} />
-            </section>
-          )}
         </div>
 
         {/*
@@ -1932,17 +1898,6 @@ function WikiDetail(props: {
         onRestore={restore}
         restoring={restoring}
         canRestore={page.capabilities.canManageVisibility}
-      />
-
-      {/* 改动记录时间线（头部下拉里的「查看全部改动…」与正文下方那行紧凑入口共用同一个弹窗） */}
-      <TimelineDialog
-        open={timelineOpen}
-        onOpenChange={setTimelineOpen}
-        page={page}
-        onPick={(v, label) => {
-          setTimelineOpen(false)
-          startCompare(v, label)
-        }}
       />
 
       {/* 危险操作确认（删除页面 / 恢复历史版本）：确认之后才真的调 api */}

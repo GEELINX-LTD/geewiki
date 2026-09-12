@@ -36,7 +36,7 @@ import {
 import { Dialog, DialogContent } from '../ui/Dialog'
 import { Spinner } from '../ui/Spinner'
 import { absoluteTime, relativeTime } from '../lib/timePlan'
-import { pickerTriggerText, versionChangeSummary, versionMetaText, versionNumberOf } from '../lib/versionPlan'
+import { pickerTriggerText, versionChangeSummary, versionCountText, versionMetaText, versionNumberOf } from '../lib/versionPlan'
 import { authorText } from './VersionDiffDialog'
 import { cn } from '../ui/cn'
 import { focusRing } from '../ui/a11y'
@@ -258,6 +258,19 @@ export function VersionPicker({
               <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">已到最早版本（v1）</p>
             )
           )}
+          <DropdownMenuSeparator />
+          {/*
+            条数摘要：**从正文下方那块常驻列表搬过来的**（原处有一行"当前 vN · 共 N 次改动
+            （列出最近 M 次，更早的未列出）"）。搬进下拉而不是删掉，是因为"这一页一共改过几次、
+            这里列的是不是全部"属于**诚实的边界信息** —— 少了它，用户会把"下拉里就这几条"
+            误当成"这一页只改过这几次"。
+
+            措辞刻意与分页状态解耦：`rows` 是异步按需拉的（拉不到就不显示），
+            而这行只依赖页面详情里已经有的 `page.version` 与 `versions.length`。
+          */}
+          <p className="m-0 px-2.5 py-1.5 text-2xs text-muted">
+            {versionCountText(page)}
+          </p>
           <DropdownMenuItem onSelect={() => setTimelineOpen(true)}>
             <History className="size-3.5" />
             浏览全部历史…

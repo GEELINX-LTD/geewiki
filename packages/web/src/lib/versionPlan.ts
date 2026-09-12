@@ -62,6 +62,23 @@ export function versionOptions(page: Pick<PageDetail, 'version' | 'versions'>): 
   }))
 }
 
+/**
+ * 版本下拉底部的**条数摘要**：`当前 vN · 共 M 次改动`，被截断时追加"仅列最近 K 次"。
+ *
+ * 为什么要有一行摘要：它原本在正文下方那块常驻列表里，随该列表一起被移除。删掉之后
+ * "下拉里就这几条"会被误读成"这一页只改过这几次" —— 这是**诚实性**问题，不是装饰，
+ * 所以搬进下拉而不是删除。措辞与 `isTruncated` 同源，避免两套"是不是全部"的说法。
+ *
+ * ⚠️ 只依赖页面详情已有字段：`versions[]` 是异步按需补拉的（拉不到时不显示摘要行），
+ * 而这行必须在**没有任何额外请求**时也能说真话。
+ */
+export function versionCountText(page: Pick<PageDetail, 'version' | 'versions'>): string {
+  const history = page.version - 1
+  if (history <= 0) return '暂无历史版本'
+  const base = `当前 v${page.version} · 共 ${history} 次改动`
+  return isTruncated(page) ? `${base}（下拉里仅列最近 ${page.versions.length} 次，更早的见「浏览全部历史…」）` : base
+}
+
 /* ------------------------------------------------------------------ *
  * 判据
  * ------------------------------------------------------------------ */

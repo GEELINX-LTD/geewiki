@@ -285,33 +285,42 @@ test('守卫：版本选择器落在 canEdit 门控内，且无编辑权走静�
   assert.match(page, /<VersionBadge/, '无编辑权时要退化为静态徽标')
 })
 
-test('守卫：紧凑区只展示 COMPACT_VERSIONS 条，且整块受 canEdit 门控', () => {
+test('守卫：正文下方不得再有常驻的版本列表（入口只在头部下拉）', () => {
   const page = readFileSync(join(here, '../src/pages/WikiPage.tsx'), 'utf8')
-  const at = page.indexOf('<VersionList')
-  assert.notEqual(at, -1, '正文下方必须有紧凑版本列表')
-  assert.match(page.slice(at, at + 120), /limit=\{COMPACT_VERSIONS\}/, '紧凑列表必须限量，否则版本多了又变成一大块')
+  assert.ok(page.length > 20000, 'WikiPage 读不到内容？反空洞')
+  const code = codeOnly(page)
   /*
-   * 门控在**区块开头**（`{page.version > 1 && page.capabilities.canEdit && (`），
-   * 距 `<VersionList` 隔着整段说明注释与头部一行 —— 按固定字符窗口截会随注释长度失效。
-   * 故按"区块起点 → 列表"整段判定：起点取该区块自己的 `<section ... aria-label="最近改动">`。
+   * 本轮把正文下方那块紧凑列表也移除了（此前移除了更早的那张大卡片）。
+   * 判据不是"某段文案消失"，而是**组件级**的：正文里不得再渲染版本列表 / 时间线弹窗，
+   * 也不得再有"最近改动"区块 —— 否则版面会被重新撑起来。
    */
-  const sectionAt = page.lastIndexOf('<section', at)
-  assert.notEqual(sectionAt, -1, '紧凑列表应包在 aria-label="最近改动" 的 section 里')
-  const block = page.slice(sectionAt - 600, at)
-  assert.match(block, /page\.capabilities\.canEdit/, '整块必须在 canEdit 门控内（无编辑权者进不了对比弹窗）')
-  assert.match(block, /aria-label="最近改动"/, '区块要有可读的名称（读屏用户需要知道这是什么）')
-  // 反空洞：常量必须真的存在且是个小数
-  const picker = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
-  const m = /export const COMPACT_VERSIONS = (\d+)/.exec(picker)
-  assert.ok(m !== null, 'COMPACT_VERSIONS 必须导出为字面量')
-  assert.ok(Number(m[1]) >= 1 && Number(m[1]) <= 10, '默认展示条数应在 1–10 之间')
+  assert.doesNotMatch(code, /<VersionList/, '正文下方不得再渲染版本列表')
+  assert.doesNotMatch(code, /<TimelineDialog/, '时间线弹窗只由头部下拉自己持有，页面不得再挂一份')
+  assert.doesNotMatch(code, /aria-label="最近改动"/, '「最近改动」常驻区块不得回来')
+  assert.doesNotMatch(code, /setTimelineOpen/, '页面不该再有时间线弹窗的状态')
+  // 正面对照：入口必须仍在（头部下拉 + 对比弹窗），否则"删掉了"可能只是整块被误删
+  assert.match(page, /<VersionPicker/, '详情页必须渲染版本选择器')
+  assert.match(page, /<VersionDiffDialog/, '详情页必须渲染对比弹窗')
+  assert.match(page, /<ReadonlyHistoryButton|<VersionBadge/, '无编辑权仍要有版本号/只读历史入口')
 })
 
-test('守卫：紧凑区与「查看全部改动」弹窗共用同一行组件（避免两处漂移）', () => {
+test('守卫：条数摘要随列表一起搬进了下拉（信息不得随版面一起丢失）', () => {
+  const picker = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
+  const plan = readFileSync(join(here, '../src/lib/versionPlan.ts'), 'utf8')
+  assert.ok(picker.length > 5000 && plan.length > 5000, '文件读不到内容？反空洞')
+  assert.match(picker, /versionCountText\(page\)/, '下拉里必须渲染条数摘要')
+  assert.match(plan, /export function versionCountText/, '摘要必须是可单测的纯函数')
+  // 摘要必须说清"共几次"与"是否只列了一部分"，两者缺一都会让读者误判完整性
+  assert.match(plan, /共 \$\{history\} 次改动/, '摘要要给出改动总数')
+  assert.match(plan, /仅列最近 \$\{page\.versions\.length\} 次/, '被截断时必须说明只列了最近几次')
+  assert.match(plan, /isTruncated\(page\)/, '截断判据必须与 isTruncated 同源，不得另起一套')
+})
+
+test('守卫：紧凑列表仍与「浏览全部历史」弹窗共用同一行组件（避免两处漂移）', () => {
   const picker = readFileSync(join(here, '../src/components/VersionPicker.tsx'), 'utf8')
   // 行渲染只能有一处：抽出成 VersionRowButton，由 VersionList 使用
   assert.equal((picker.match(/export function VersionRowButton/g) ?? []).length, 1, '行组件应只有一个')
-  assert.match(picker, /export function VersionList/, '列表组件必须导出（页面与弹窗共用）')
+  assert.match(picker, /export function VersionList/, '列表组件必须导出（弹窗内部使用）')
   assert.equal(
     (picker.match(/<VersionRowButton/g) ?? []).length,
     1,

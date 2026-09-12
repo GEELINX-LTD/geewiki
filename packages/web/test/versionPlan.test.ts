@@ -269,8 +269,19 @@ test('守卫：?v= 预览态存在，且非法值会清掉 URL', () => {
   assert.match(src, /previewRoute\(slug, id\)/, '选择历史版本必须写进 URL（可分享）')
   assert.match(src, /PREVIEW_INVALID_TEXT/, '非法/无权时必须有提示')
   assert.match(src, /onNavigate\(slug\)/, '非法 ?v= 必须把 URL 清回不带参数')
-  // 预览态禁用写操作入口
-  assert.match(src, /disabled=\{previewing\}/, '预览态下编辑/权限/删除必须禁用')
+  /*
+   * 预览态必须让写操作入口**消失**。
+   *
+   * 这里原本断言 `disabled={previewing}`（置灰 + title），本轮改成整块不渲染：
+   * 置灰按钮仍在暗示"够得着"，而 `title` 对触屏与读屏都不可达 —— 那是本仓库早就立过的
+   * 纪律（不给必然失败的入口）。新判据比旧的更严：不仅不能可用，连控件都不该出现在
+   * 只读快照的 DOM 里。
+   */
+  const gated = src.match(/!previewing\s*&&/g) ?? []
+  assert.ok(gated.length >= 3, `编辑/权限/删除三处都要在 !previewing 门控内（实测 ${gated.length} 处）`)
+  assert.match(src, /page\.capabilities\.canEdit\s*&&\s*!previewing/, '编辑按钮必须在 !previewing 门控内')
+  assert.match(src, /page\.capabilities\.canDelete\s*&&\s*!previewing/, '删除按钮必须在 !previewing 门控内')
+  assert.match(src, /page\.capabilities\.canManageVisibility\s*&&\s*!previewing/, '权限入口必须在 !previewing 门控内')
 })
 
 test('守卫：只读视角不给可编辑的版本下拉', () => {
