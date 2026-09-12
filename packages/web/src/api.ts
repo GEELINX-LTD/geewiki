@@ -4,6 +4,7 @@
  * HTTP 状态码与 ManagerError.code 映射（404 not_found / 409 冲突类 / 400 / 500）。
  */
 import { createAiStreamDecoder, type AiStreamEvent } from './lib/aiStreamPlan'
+import { ATTACHMENT_URL_PREFIX } from './lib/attachmentPlan'
 import { authFailureAction, type AuthFailureAction } from './lib/authFailure'
 import type { SlotName } from './lib/slots'
 
@@ -95,6 +96,129 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     throw new ApiError(res.status, f.error ?? 'http_' + res.status, f.message ?? `请求失败 (${res.status})`, f.details)
   }
   return data as T
+}
+
+/* ------------------------- 附件（M4，裸 body PUT） ------------------------- */
+
+/**
+ * `PUT /api/attachments/:slug` 的成功响应。
+ *
+ * `url` 是**相对路径**（`/api/attachments/<id>`），写进正文的就是它：同源请求自动带
+ * HttpOnly 会话 cookie，因此前端**不拼绝对地址、不携带任何 token**（绝对地址会在换域名/
+ * 反代后指向错误主机；token 进正文等于把凭据写进人人都能读的内容里）。
+ */
+export interface AttachmentUploadResult {
+  ok: true
+  id: number
+  url: string
+  mime: string
+  size: number
+  sha256: string
+  /** `true` = 同页已有同内容同类型的附件，服务端复用了旧行（本次没有新写盘） */
+  dedup: boolean
+}
+
+/**
+ * 附件列表的一行（`GET /api/pages/:slug/attachments`，需 `canEdit`）。
+ *
+ * ⚠️ 与上传响应不同，列表行的**字段名以后端实现为准**：`name` / `createdAt` 目前按
+ * 常规命名声明，且都标成可空 —— 界面在它们缺席时退化为显示 id 与 MIME，而不是崩掉。
+ */
+export interface AttachmentSummary {
+  id: number
+  url: string
+  name?: string
+  mime?: string
+  size?: number
+  createdAt?: string
+  sha256?: string
+}
+
+export interface AttachmentListResult {
+  ok: true
+  slug: string
+  attachments: AttachmentSummary[]
+}
+
+/** `DELETE /api/attachments/:id`（`canEdit` 或上传者本人）。`removed` 由后端决定是否返回。 */
+export interface AttachmentDeleteResult {
+  ok: true
+  removed?: number
+}
+
+/**
+ * 裸 body 上传的实现体（**只有上传走这条路**）。
+ *
+ * 为什么不复用 `request<T>`：它固定 `JSON.stringify(body)` 并强制
+ * `content-type: application/json`，而上传要把 `File` 原样当 body —— 塞进
+ * `JSON.stringify` 只会得到 `{}`。因此 `request<T>` **一行未改**（既有签名与行为不变），
+ * 这里另开一条路径，但把错误处理的三件事照抄，保证两条路径对调用方完全一致：
+ * ① 非 2xx 解析 `{ok:false,error,message,details}` → `ApiError`；
+ * ② 401/403 走同一个全局出口 `notifyAuthFailure`（否则"会话过期"在上传上表现为静默失败）；
+ * ③ `credentials: 'same-origin'`。
+ *
+ * ⚠️ **`x-gw-csrf: 1` 绝不能漏**：服务端在带会话 cookie 时强制校验这个头（见
+ * `requestHeaders` 的说明），裸 PUT 同样会被拦 —— 少了它，用户看到的是没有任何解释的失败。
+ *
+ * 进度：`fetch` 对**请求体上传**没有标准进度事件（上传流 + `duplex: 'half'` 仅 Chromium
+ * 实验性支持），所以这里只报"开始/结束"两态，**不做百分比**（做不到的进度条比没有更糟）。
+ */
+async function uploadRaw<T>(
+  path: string,
+  file: File,
+  onProgressNote?: (state: 'uploading' | 'done') => void,
+): Promise<T> {
+  onProgressNote?.('uploading')
+  try {
+    const res = await fetch(path, {
+      method: 'PUT',
+      headers: {
+        // 后端按扩展名与 MIME 双重判定（415 档），故这里必须**如实**给出文件的类型
+        'content-type': file.type || 'application/octet-stream',
+        'x-gw-csrf': '1',
+      },
+      body: file,
+      credentials: 'same-origin',
+    })
+    let data: unknown = null
+    try {
+      data = await res.json()
+    } catch {
+      /* 非 JSON（如反向代理返回的 HTML 错误页） */
+    }
+    if (!res.ok) {
+      const f = (data ?? {}) as Partial<ApiFailure>
+      notifyAuthFailure(res.status, f.error, path)
+      throw new ApiError(res.status, f.error ?? 'http_' + res.status, f.message ?? `请求失败 (${res.status})`, f.details)
+    }
+    return data as T
+  } finally {
+    /*
+      `done` 的语义是**"本次尝试结束了"**（成功与否看 Promise 是 resolve 还是 reject），
+      而不是"上传成功了"。写在 `finally` 里是刻意的：失败时若不发这一条，用
+      `onProgressNote` 显示"上传中…"的父组件会**永远停在"上传中"**。
+      网络层失败（fetch 抛 TypeError）不额外包装，原样抛出 —— `errorText.isUnreachable`
+      按 `instanceof TypeError` 判"连不上"，包一层自定义错误会把"断网"误报成"服务出错"。
+    */
+    onProgressNote?.('done')
+  }
+}
+
+/**
+ * 上传一个文件到某页面（`PUT /api/attachments/:slug?name=<urlencoded>`）。
+ *
+ * 需登录；错误码与界面处置：401 未登录 / 404 页面不可编辑或不存在 /
+ * 409 同页同内容但类型不一致 / 413 `payload_too_large` 与 `page_quota_exceeded` /
+ * 415 扩展名不允许 / 503 `storage_unavailable`。这些**一律经 `ApiError` 抛出**，
+ * 由调用方（编辑器）转成正文里的一行失败说明 + 界面提示，不在这里吞掉。
+ */
+export function uploadAttachment(
+  slug: string,
+  file: File,
+  onProgressNote?: (state: 'uploading' | 'done') => void,
+): Promise<AttachmentUploadResult> {
+  const path = `${ATTACHMENT_URL_PREFIX}${encodeURIComponent(slug)}?name=${encodeURIComponent(file.name)}`
+  return uploadRaw<AttachmentUploadResult>(path, file, onProgressNote)
 }
 
 /* ------------------------- 插件管理器 ------------------------- */
@@ -559,6 +683,113 @@ export interface AuthMeResponse {
   capabilities: AuthCapabilities
 }
 
+/* ---------------- 组织与邀请管理（P5-B M4/M5） ---------------- */
+
+/**
+ * 组织角色。
+ *
+ * ⚠️ 这是后端 `packages/plugin-org/src/index.ts:58` 的
+ * `OrgRole = 'owner' | 'admin' | 'member' | 'viewer'` 的**手抄镜像**
+ * （web 不能 import 后端包，与 `PageVisibility` / `DegradedReason` 同款做法）。
+ * 改一侧必须改另一侧。
+ *
+ * 两个容易搞错的点：
+ * 1. **`null` 不是角色**：它是 "Guest 通道"（登录了但没有组织角色），
+ *    与 `viewer`（有角色、只是最窄）**不是同一件事**，不能互相回退；
+ * 2. 除 `GET /api/org` 之外，组织侧端点全部要求 `admin+`（owner / admin），
+ *    涉及 owner 的变更还要 owner（服务端 403）。
+ */
+export type OrgRole = 'owner' | 'admin' | 'member' | 'viewer'
+
+/** `GET /api/org` 的 `org` 字段：组织档案。 */
+export interface OrgInfo {
+  id: number
+  slug: string
+  name: string
+  /** 档位（服务端未在此端点约束取值，界面原样展示、不猜） */
+  visibility: string
+  createdAt: string
+}
+
+/**
+ * `GET /api/org` 的 `me` 字段：**我在组织里的身份**。
+ *
+ * 这个端点标的是 `access: 'user'`（登录即可读，**不需要管理员**），
+ * 所以它是"我是谁、我在哪个组织、我属于哪些组"的唯一非管理员来源。
+ */
+export interface OrgSelf {
+  /** 后端为 `p?.userId ?? null`；该端点要求登录，正常路径下非空 */
+  userId: number | null
+  /** null = 无组织角色（Guest 语义）——**不等于 viewer** */
+  role: OrgRole | null
+  /** 登录了但没有任何组织角色 */
+  isGuest: boolean
+  /** 我所在的用户组 id（判定页面/块授权时按它展开） */
+  groupIds: number[]
+}
+
+export interface OrgResponse {
+  ok: true
+  org: OrgInfo
+  me: OrgSelf
+  /** 组织成员数（服务端 `COUNT(*)` 已收敛成 Number） */
+  memberCount: number
+}
+
+/** `GET /api/org/members` 的一行（`access: 'admin'`）。 */
+export interface OrgMember {
+  userId: number
+  email: string
+  displayName: string
+  role: OrgRole
+  joinedAt: string
+}
+
+/** `GET /api/org/groups` 的一行。**没有改名端点**，组只有建/删与成员增删。 */
+export interface OrgGroup {
+  id: number
+  name: string
+  createdAt: string
+  /**
+   * 组内成员的**用户 id**（服务端只回 id 列表，不含邮箱/昵称）。
+   * 界面要显示人名时去 `orgMembers()` 的结果里查，**不要**再按组逐个拉取。
+   */
+  memberIds: number[]
+}
+
+/**
+ * `GET /api/org/invitations` 的一行。
+ *
+ * ⚠️ **没有 `token` 字段，也不可能有** —— 库里只存 `sha256`，原始令牌
+ * 只在 `POST /api/org/invitations` 的**那一次**响应里出现（见 `InvitationCreated`）。
+ */
+export interface OrgInvitationView {
+  /** **字符串**（后端 `randomBytes(16).toString('hex')`），不是数字 —— 别当 number 处理 */
+  id: string
+  email: string
+  /** null = **Guest 通道**（不给组织角色），与 `viewer` 不同 */
+  orgRole: OrgRole | null
+  /** 入伙时一并加入的用户组（null = 不入组） */
+  groupId: number | null
+  expiresAt: string
+  /** 非 null ⇒ 已被接受（这是一条**入伙记录**，删除它不会移除已入伙的成员） */
+  acceptedAt: string | null
+  createdAt: string
+}
+
+/**
+ * `POST /api/org/invitations` 的响应（201）。
+ *
+ * ★ `token` **只在这一次响应里出现**：库里只有 sha256，之后任何端点都取不回来。
+ * 因此界面必须"只在刚创建成功的分支里渲染它，关闭即清空"，且
+ * **不得**写入 URL / 本地存储 / 控制台 —— 那等于把一个一次性凭据变成长期凭据。
+ */
+export interface InvitationCreated {
+  ok: true
+  invitation: OrgInvitationView
+  token: string
+}
+
 export const api = {
   /* 身份与登录（P1） */
   /**
@@ -747,6 +978,361 @@ export const api = {
       'GET',
       `/api/admin/cache-plan${since === undefined || since === '' ? '' : `?since=${encodeURIComponent(since)}`}`,
     ),
+
+  /* ---------------- 可见性与授权（权限治理界面 M1-M3） ---------------- */
+  /**
+   * 改档位 / 发布 / 断继承。**部分更新**：只传**用户实际改动过**的字段。
+   *
+   * ⚠️ 不要"顺手带上"其它字段：服务端对未传字段保持原值（`body['inherit'] === undefined`
+   * 时用 `before.inherit`），而 `inherit: false` 表示"不再继承祖先档位"——
+   * 一次多余的传参就会把继承态悄悄改掉，且用户无从察觉。
+   *
+   * 响应里的 `index_tiers_resync_failed: true` 是**内容泄漏级**信号（读路径已收紧、
+   * 检索仍按旧档位），界面须按 `lib/accessPlan.ts` 的 `resyncNotice()` 渲染，不得显示"已同步成功"。
+   */
+  setVisibility: (
+    slug: string,
+    patch: { visibility?: PageVisibility; inherit?: boolean; published?: boolean },
+  ) =>
+    request<VisibilityResult>('PUT', `/api/pages/${encodeURIComponent(slug)}/visibility`, patch),
+  /** 例外授予列表（**snake_case** 字段，见 `PageGrantRow`）。需要该条目的可见性管理权，否则 403/404。 */
+  pageGrants: (slug: string) =>
+    request<GrantsResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/grants`),
+  /**
+   * 新增/更新一条例外授予（同一 `(页面, 主体)` 是幂等 upsert）。
+   *
+   * `subjectKind` **只有** user | group —— 角色不是授权对象（服务端 D13 会 400
+   * `invalid_subject_kind`）。`subjectId` 是**自由文本**（用户填用户 id、组填组 id）：
+   * 界面刻意不做成员选择器，因为成员列表端点需要 org admin（普通成员会 403）。
+   */
+  addPageGrant: (
+    slug: string,
+    body: { subjectKind: SubjectKind; subjectId: string; role: GrantRole; expiresAt?: string | null },
+  ) =>
+    request<GrantMutationResult & { subjectKind: SubjectKind; subjectId: string; expiresAt: string | null }>(
+      'POST',
+      `/api/pages/${encodeURIComponent(slug)}/grants`,
+      body,
+    ),
+  removePageGrant: (slug: string, id: number) =>
+    request<GrantRemovalResult>('DELETE', `/api/pages/${encodeURIComponent(slug)}/grants/${id}`),
+  /**
+   * 块级治理视图。**刻意不含正文**（后端不返回 `text`）——受限块的正文按定义不该出现在
+   * 治理列表里，要读正文请走详情页（那里有完整投影）。
+   */
+  blocks: (slug: string) =>
+    request<BlocksResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/blocks`),
+  /**
+   * 块级例外授予。响应额外回 `block_visibility`（该块**自身声明**的档位）：
+   * 规则 B1 是"块只能比页面更窄"，所以当块比页面宽时授权**不会**突破页面上限，
+   * 界面据此提示"实际可见性由页面决定"，而不是让用户以为授权没生效。
+   */
+  addBlockGrant: (
+    slug: string,
+    blockId: number,
+    body: { subjectKind: SubjectKind; subjectId: string; role: GrantRole; expiresAt?: string | null },
+  ) =>
+    request<BlockGrantResult & { subjectKind: SubjectKind; subjectId: string; expiresAt: string | null }>(
+      'POST',
+      `/api/pages/${encodeURIComponent(slug)}/blocks/${blockId}/grants`,
+      body,
+    ),
+  removeBlockGrant: (slug: string, blockId: number, grantId: number) =>
+    request<GrantRemovalResult>(
+      'DELETE',
+      `/api/pages/${encodeURIComponent(slug)}/blocks/${blockId}/grants/${grantId}`,
+    ),
+  /**
+   * **待审**访问申请（`status = 'pending'`，服务端最多 200 条、无总数）。
+   * 界面文案必须照此写（"待审申请"），**不得**写成"共 N 条申请"。
+   */
+  accessRequests: (slug: string) =>
+    request<AccessRequestsResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/access-requests`),
+  /**
+   * 提交一次访问申请。**未登录会 401**；已有权限 409 `already_has_access`；
+   * 已有待审申请 409 `already_requested`；页面不存在 404 `not_found`。
+   * 返回的 `id` 是申请人**撤回**自己的申请所需的句柄（服务端按 id 定位）。
+   */
+  requestAccess: (slug: string, body: { message?: string; role?: GrantRole }) =>
+    request<AccessRequestCreated>('POST', `/api/pages/${encodeURIComponent(slug)}/access-requests`, body),
+  /** 批准：默认 `viewer`；`expiresAt` 省略即不过期。非 pending ⇒ 409 `request_not_pending`。 */
+  approveAccessRequest: (
+    slug: string,
+    id: number,
+    body?: { role?: GrantRole; expiresAt?: string | null },
+  ) =>
+    request<{ ok: true; slug: string; approved: number; userId: number; role: GrantRole; acl_revision: number }>(
+      'POST',
+      `/api/pages/${encodeURIComponent(slug)}/access-requests/${id}/approve`,
+      body ?? {},
+    ),
+  /** 拒绝：不动 `acl_revision`（没有授权的增减）。非 pending ⇒ 409 `request_not_pending`。 */
+  denyAccessRequest: (slug: string, id: number) =>
+    request<{ ok: true; slug: string; denied: number }>(
+      'POST',
+      `/api/pages/${encodeURIComponent(slug)}/access-requests/${id}/deny`,
+    ),
+  /**
+   * 撤回**自己**的申请 —— 不需要可见性管理权（那会要求申请人先有管理权，自相矛盾）。
+   * 不是自己的申请 ⇒ 服务端按"不存在"处理（404），不泄露"这里有一条别人的申请"。
+   */
+  withdrawAccessRequest: (slug: string, id: number) =>
+    request<{ ok: true; slug: string; withdrawn: number }>(
+      'POST',
+      `/api/pages/${encodeURIComponent(slug)}/access-requests/${id}/withdraw`,
+    ),
+
+  /* ---------------- 组织与邀请管理（P5-B M4/M5） ---------------- */
+  /**
+   * 组织档案 + 我在组织里的身份。
+   * **`access: 'user'`**：登录即可读，不需要管理员 —— 这是它与本组其它端点唯一的区别，
+   * 也是"Guest 到底有没有组织角色"的唯一权威来源（`me.role === null` 即 Guest）。
+   */
+  org: () => request<OrgResponse>('GET', '/api/org'),
+  /** 成员列表（`access: 'admin'`：普通成员会 403，这是治理界面几乎全在本页的原因）。 */
+  orgMembers: () => request<{ ok: true; members: OrgMember[] }>('GET', '/api/org/members'),
+  /**
+   * 改某个成员的组织角色。
+   *
+   * 冲突面（服务端）：涉及 owner 的变更（目标是 owner / 要把谁变成 owner）**仅 owner 可做**
+   * ⇒ 403 `forbidden`；降级/移除最后一位 owner ⇒ 409 `last_owner`。
+   * 界面先用 `lib/orgPlan.ts` 的 `roleChangeOptions()` 收敛选项，让这两种错不可能发出去。
+   */
+  setOrgMemberRole: (userId: number, role: OrgRole) =>
+    request<{ ok: true; userId: number; role: OrgRole }>(
+      'PUT',
+      `/api/org/members/${encodeURIComponent(String(userId))}`,
+      { role },
+    ),
+  /**
+   * 移除成员。**级联已核实**（`packages/plugin-org/src/index.ts:479`）：事务内显式删
+   * `org_members` 并额外 `DELETE FROM group_members WHERE user_id = ?` ⇒ 该用户**立即**
+   * 失去组织内一切访问权限（含其所在的用户组带来的授权）；而 `page_grants` / `block_grants`
+   * 里 `subject_kind='user'` 的行**保留**（不删）。
+   * 冲突：移除自己 ⇒ 409 `cannot_remove_self`；移除最后一位 owner ⇒ 409 `last_owner`。
+   */
+  removeOrgMember: (userId: number) =>
+    request<{ ok: true; removed: number }>(
+      'DELETE',
+      `/api/org/members/${encodeURIComponent(String(userId))}`,
+    ),
+  orgGroups: () => request<{ ok: true; groups: OrgGroup[] }>('GET', '/api/org/groups'),
+  /** 建组：名称 1–80 字符；同名 ⇒ 409 `group_exists`（唯一约束在组织内）。**没有改名端点**。 */
+  createOrgGroup: (name: string) =>
+    request<{ ok: true; group: OrgGroup }>('POST', '/api/org/groups', { name }),
+  /**
+   * 删组。**级联已核实**（`packages/plugin-org/src/index.ts:641`）：只删 `groups` 行，
+   * `group_members` 靠 `ON DELETE CASCADE` 清掉；`page_grants` / `block_grants` 里
+   * `subject_kind='group'` 的行**保留在库里**，但判定时展开的 `groupIds` 不再包含它
+   * ⇒ 该组的授权**实际失效**。方向是**收紧**（相关页面可能变得不可读），
+   * 不是"删了也没关系"——界面的确认文案必须照此措辞。
+   */
+  deleteOrgGroup: (id: number) =>
+    request<{ ok: true; removed: number }>('DELETE', `/api/org/groups/${encodeURIComponent(String(id))}`),
+  /**
+   * 把成员加入用户组。
+   * **只能加已是组织成员的人**，否则 409 `not_org_member`（防止"组里有个人但不在组织里"
+   * 的幽灵成员：他能凭组授权访问，却不出现在成员列表里）。
+   */
+  addGroupMember: (groupId: number, userId: number) =>
+    request<{ ok: true; groupId: number; userId: number; added: boolean }>(
+      'PUT',
+      `/api/org/groups/${encodeURIComponent(String(groupId))}/members/${encodeURIComponent(String(userId))}`,
+    ),
+  removeGroupMember: (groupId: number, userId: number) =>
+    request<{ ok: true; groupId: number; userId: number; added: boolean }>(
+      'DELETE',
+      `/api/org/groups/${encodeURIComponent(String(groupId))}/members/${encodeURIComponent(String(userId))}`,
+    ),
+  /** 邀请列表（**没有 token 字段**；服务端最多回 200 条，无总数）。 */
+  orgInvitations: () =>
+    request<{ ok: true; invitations: OrgInvitationView[] }>('GET', '/api/org/invitations'),
+  /**
+   * 签发邀请。`orgRole` 缺省 / `null` ⇒ **Guest 通道**（入伙但不给组织角色）——
+   * 这不是"最低档位"，它就是"没有角色"；`viewer` 是另一件事。
+   * 签发 owner 邀请需要 owner（否则 403）。
+   * 响应里的 `token` **只此一次**（见 `InvitationCreated`）。
+   */
+  createInvitation: (body: { email: string; orgRole?: OrgRole | null; groupId?: number | null }) =>
+    request<InvitationCreated>('POST', '/api/org/invitations', body),
+  /**
+   * 撤销邀请：服务端**不区分是否已接受**，无条件删行；已接受者的成员身份不受影响
+   * （接受时已写入 `org_members`）—— 界面对"已接受"的行必须说清这一点，
+   * 否则管理员会以为"撤销 = 把人踢出去"。
+   */
+  revokeInvitation: (id: string) =>
+    request<{ ok: true; removed: string }>(
+      'DELETE',
+      `/api/org/invitations/${encodeURIComponent(id)}`,
+    ),
+
+  /* 附件（M4） */
+  /**
+   * 上传（**裸 body PUT**，见 {@link uploadAttachment}）。放在 `api` 上只是为了与其它
+   * 端点同一个调用面；真正的实现在模块顶层，编辑器可直接 `import { uploadAttachment }`。
+   */
+  uploadAttachment,
+  /** 某页面的附件列表（需 `canEdit`；无权限时服务端回 404/403，不在这里降级处理）。 */
+  pageAttachments: (slug: string) =>
+    request<AttachmentListResult>(
+      'GET',
+      `/api/pages/${encodeURIComponent(slug)}/attachments`,
+    ),
+  /** 删除附件（`canEdit` 或上传者本人）。按 **id** 定位，不按文件名。 */
+  deleteAttachment: (id: number) =>
+    request<AttachmentDeleteResult>('DELETE', `${ATTACHMENT_URL_PREFIX}${encodeURIComponent(String(id))}`),
+}
+
+/* ------------------- 可见性与授权（权限治理 M1-M3） ------------------- */
+
+/**
+ * 页面档位。与后端 `packages/plugin-wiki/src/index.ts:1724` 的
+ * `VISIBILITIES = ['private', 'org', 'public']` **同集合**（白名单，服务端不认识别的值）。
+ * 这里的刻度是**宽松度**：private（最窄）< org < public（最宽）。
+ */
+export type PageVisibility = 'private' | 'org' | 'public'
+
+/**
+ * 块档位。与后端 `packages/plugin-wiki/src/blocks.ts:28` 的
+ * `BlockVisibility = 'public' | 'org' | 'granted'` **同集合** —— 注意它**不是**
+ * 页面档位那一套：块**没有** `private`，多出 `granted`（默认谁都不能看，只能靠单独授权放行）。
+ *
+ * 块档位由作者在 Markdown 里用 `<!--gated:org-->` / `<!--gated:granted-->` 标记声明
+ * （打开/闭合 `<!--/gated-->`），保存正文时解析入库；**没有**改块档位的端点，
+ * 因此治理界面只读地展示它，不提供"改档位"的控件。
+ */
+export type BlockVisibility = 'public' | 'org' | 'granted'
+
+/** 授权对象类别。**只有** user | group —— 角色不是授权对象（服务端 D13 明确拒绝 `org_role`）。 */
+export type SubjectKind = 'user' | 'group'
+
+/** 授予角色。`editor` 比 `viewer` 宽（同一人既有直授又有组授时 editor 优先）。 */
+export type GrantRole = 'editor' | 'viewer'
+
+/** `PUT /api/pages/:slug/visibility` 的响应。 */
+export interface VisibilityResult {
+  ok: true
+  slug: string
+  visibility: PageVisibility
+  inherit: boolean
+  published_at: string | null
+  acl_revision: number
+  /** 被重算 `tier` 的**子孙块**条数（0 = 该页没有子孙块）。 */
+  index_tiers_resynced: number
+  /**
+   * ★ **与上面那个 0 必须分开对待**：`true` 表示扇出**抛错、一个都没算**
+   * （读路径已收紧而检索仍按旧档位 ⇒ **内容泄漏级**），`false` 才是"没有子孙块"。
+   * 界面文案见 `lib/accessPlan.ts` 的 `resyncNotice()`。
+   */
+  index_tiers_resync_failed: boolean
+  /** 仅失败时出现：服务端的原始错误串（给运维看，不要直接当界面文案）。 */
+  index_tiers_resync_error?: string
+}
+
+/**
+ * 页级例外授予的一行。
+ *
+ * ⚠️ **字段是 snake_case** —— 服务端 `GET /api/pages/:slug/grants` 直接回表列名
+ * （`subject_kind` / `subject_id` / `granted_at` / `expires_at`），
+ * 而**块级**授予在 `GET /api/pages/:slug/blocks` 里是 camelCase（见 `BlockGrantRow`）。
+ * 两种命名并存是既有事实，前端按实际形状读，不要"统一"。
+ */
+export interface PageGrantRow {
+  id: number
+  subject_kind: SubjectKind
+  subject_id: string
+  role: GrantRole
+  granted_at: string
+  /** null = 不过期。过期授予在**判定时**即失效，不依赖清理任务。 */
+  expires_at: string | null
+}
+
+/** 块级例外授予的一行（嵌在 `BlockRow.grants` 里，**camelCase**）。 */
+export interface BlockGrantRow {
+  id: number
+  subjectKind: SubjectKind
+  subjectId: string
+  role: GrantRole
+  grantedAt: string
+  expiresAt: string | null
+}
+
+/** `GET /api/pages/:slug/blocks` 的一块。**没有 `text`**（后端刻意不返回正文）。 */
+export interface BlockRow {
+  id: number
+  ordinal: number
+  kind: string
+  /** 该块**自身声明**的档位（不是与页面合成后的有效档位） */
+  visibility: BlockVisibility
+  inherit: boolean
+  /** 来源标记原文（`'org'` / `'granted'`），null = 未标记。仅用于展示，不参与判定。 */
+  marker: string | null
+  /**
+   * 检索等级：`0`/`1` 是该块所属的读者等级，**`null` = 不属于任何等级**
+   * （`granted` 档 ⇒ 只能靠单独授权命中）。界面据此区分"授权档"。
+   */
+  tier: number | null
+  grants: BlockGrantRow[]
+}
+
+/** 待审申请的一行（**camelCase**）。`message` 是唯一承载用户自由文本的字段，展示端负责转义。 */
+export interface AccessRequestRow {
+  id: number
+  userId: number
+  message: string | null
+  status: string
+  createdAt: string
+  decidedAt: string | null
+}
+
+export interface GrantsResponse {
+  ok: true
+  slug: string
+  grants: PageGrantRow[]
+}
+
+export interface BlocksResponse {
+  ok: true
+  slug: string
+  blocks: BlockRow[]
+}
+
+export interface AccessRequestsResponse {
+  ok: true
+  slug: string
+  /** **只有待审**（服务端已按 `status = 'pending'` 过滤并 LIMIT 200）；没有总数字段。 */
+  requests: AccessRequestRow[]
+}
+
+/** 新增/更新一条授予的结果（页级与块级共用的部分）。 */
+export interface GrantMutationResult {
+  ok: true
+  slug: string
+  role: GrantRole
+  acl_revision: number
+}
+
+export interface GrantRemovalResult {
+  ok: true
+  slug: string
+  removed: number
+  acl_revision: number
+}
+
+/** 块级授权的响应：额外带该块**自身声明**的档位。 */
+export interface BlockGrantResult extends GrantMutationResult {
+  blockId: number
+  /** 该块自身声明的档位 —— 当它比页面更宽时，授权不会突破页面上限（规则 B1） */
+  block_visibility: string
+}
+
+/** `POST /api/pages/:slug/access-requests` 的响应：`id` 是撤回自己的申请所需的句柄。 */
+export interface AccessRequestCreated {
+  ok: true
+  slug: string
+  id: number
+  status: string
+  requestedRole: GrantRole
 }
 
 export interface AuditEntry {

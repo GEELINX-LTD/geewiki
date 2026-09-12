@@ -140,18 +140,76 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
  */
 .md-body pre {
   background: var(--gw-header-bg); color: var(--gw-header-ink); padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3.5); border-radius: var(--radius-md);
-  overflow-x: auto; font-size: var(--text-note);
+  overflow-x: auto; max-width: 100%; font-size: var(--text-note);
 }
 .md-body code { font-family: var(--font-mono); }
 .md-body :not(pre) > code { background: var(--gw-surface-hover); padding: 1px calc(var(--spacing) * 1.5); border-radius: 5px; font-size: 0.92em; }
 .md-body blockquote { margin: 0.6em 0; padding: calc(var(--spacing) * 0.5) calc(var(--spacing) * 3.5); border-left: 4px solid var(--gw-line-strong); color: var(--gw-ink-soft); background: var(--gw-surface-sunken); border-radius: 0 8px 8px 0; }
 .md-body img { max-width: 100%; }
-.md-body table { border-collapse: collapse; margin: 0.6em 0; }
+/*
+ * ---------- 附件（M4）：破图兜底占位块 ----------
+ *
+ * 这些类名由 `lib/markdownRender.ts` 的 `buildBlockedAttachment()` 在**运行时**注入
+ * （同 `.gw-code` / `.gw-heading-anchor`），不参与构建期的类名收集，因此只能写成普通类，
+ * 不能写成 Tailwind 工具类。
+ *
+ * 为什么用**虚线边框 + 下沉底色**而不是红色告警块：`<img>` 的加载失败在浏览器里不带状态码，
+ * 403（无权）与 404（已删除）完全同形，我们说不出"这是错误"还是"这就是现状"。
+ * 视觉上"这里本该有张图，现在没有"比"出错了"更准确，也不会让读者以为页面坏了。
+ */
+.gw-attachment-blocked {
+  margin: 0.8em 0;
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3.5);
+  border: 1px dashed var(--gw-line-strong);
+  border-radius: var(--radius-md);
+  background: var(--gw-surface-sunken);
+  color: var(--gw-ink-soft);
+  font-size: var(--text-note);
+  line-height: 1.6;
+  max-width: 100%;
+}
+.gw-attachment-blocked-title { margin: 0; font-weight: 600; color: var(--gw-ink); }
+.gw-attachment-blocked-alt { font-family: var(--font-mono); color: var(--gw-ink-muted); }
+.gw-attachment-blocked-reason { margin: calc(var(--spacing) * 1) 0 0; color: var(--gw-ink-muted); }
+.gw-attachment-blocked-actions {
+  margin-top: calc(var(--spacing) * 2);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+}
+.gw-attachment-blocked-apply {
+  border: 1px solid var(--gw-accent-soft-line);
+  background: var(--gw-accent-soft);
+  color: var(--gw-accent-soft-ink);
+  border-radius: var(--radius-sm);
+  padding: calc(var(--spacing) * 1) calc(var(--spacing) * 2.5);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.gw-attachment-blocked-apply:hover { border-color: var(--gw-accent); }
+/* 焦点环用 outline：强制颜色模式下仍可见（与 focus.css 同一取舍） */
+.gw-attachment-blocked-apply:focus-visible { outline: 2px solid var(--gw-focus-ring); outline-offset: 2px; }
+.gw-attachment-blocked-pending { color: var(--gw-ok-ink); font-size: var(--text-xs); }
+/*
+  宽表**必须自身滚动**：表格若没有滚动容器，就会把整页撑宽（320px 视口下 → 整页横向滚动）。
+  `display: block` 是让 `overflow-x` 在表格上真正生效的前提（`display: table` 的盒子不产生
+  滚动容器），列的排布仍由内部的匿名表格盒按内容计算，故既有观感不变。
+*/
+.md-body table { border-collapse: collapse; margin: 0.6em 0; display: block; max-width: 100%; overflow-x: auto; }
 .md-body th, .md-body td { border: 1px solid var(--gw-line); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 3); }
 .md-body hr { border: 0; border-top: 1px solid var(--gw-line); margin: 1.4em 0; }
+/*
+  正文卡片的内边距要**随屏宽收缩**：固定 6.5 / 8 档（≈26 / 32px，两侧合计 64px）在 320px
+  视口下会把正文挤到 200px 出头（外壳还有 --spacing-gutter 的 22px×2），可读性崩掉。
+  故小屏先用 4 档，≥640px 再恢复原值 —— 桌面观感逐像素不变。
+*/
 .page-detail > .md-body {
   background: var(--gw-surface); border: 1px solid var(--gw-line); border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm); padding: calc(var(--spacing) * 6.5) calc(var(--spacing) * 8);
+  box-shadow: var(--shadow-sm); padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4);
+}
+@media (min-width: 640px) {
+  .page-detail > .md-body { padding: calc(var(--spacing) * 6.5) calc(var(--spacing) * 8); }
 }
 .version-preview .md-body { padding: calc(var(--spacing) * 3.5) calc(var(--spacing) * 4.5); max-height: 360px; overflow: auto; }
 .field { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1.5); }
@@ -169,6 +227,20 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   `:has()` 不被支持时退化为"空横条可见"，不影响功能。
 */
 .app-footer:has(> .slot-outlet[data-count='0']:only-child) { display: none; }
+
+/*
+  插件界面故障提示（两个来源，共用同一个类名）：
+  1. `lib/slots.tsx` 的错误边界 —— 插件组件**渲染期**抛错；
+  2. `lib/pluginUi.ts` 的 failedLoads —— 插件 bundle **加载期**失败（产物缺失/入口抛错）。
+  此前这两条路只打 console.warn，用户看到的是"功能凭空不见了"而没有任何解释。
+  配色用 warn 而不是 danger：这不是本页出错，而是某个插件的产物没到位（多可自愈）。
+*/
+.slot-error {
+  display: block; margin: 0; font-size: var(--text-note); line-height: 1.6;
+  background: var(--gw-warn-bg); color: var(--gw-warn-ink); border: 1px solid var(--gw-warn-line);
+  border-radius: var(--radius-md); padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2.5);
+  overflow-wrap: anywhere;
+}
 
 .schema-form { display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); }
 .schema-field { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1); }
@@ -212,8 +284,23 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 .search-hit-title, .ask-source-title {
   border: 0; background: transparent; padding: 0; cursor: pointer;
   font-size: var(--text-sm); font-weight: 600; color: var(--gw-accent); text-align: left;
+  /*
+    检索结果标题现在是**真链接**（`<a href="#/wiki/…">`，可中键新开 / 右键复制链接）。
+    链接默认带下划线，而这里要保持与原来按钮态**逐像素一致**的观感：下划线只在 hover 出现
+    （见下一条规则），故显式去掉默认的 `text-decoration`。
+  */
+  text-decoration: none;
 }
 .search-hit-title:hover, .ask-source-title:hover { text-decoration: underline; }
+/*
+  键盘可达性：`.gw-focus-ring` 只挂在部分元素上，而这里是从 `<button>` 换成 `<a>` 的入口，
+  必须补一条 `:focus-visible`（Tab 到时看得见焦点在哪；鼠标点击不显示，与 focus.css 同一取舍）。
+*/
+.search-hit-title:focus-visible, .ask-source-title:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
 .search-snippet, .ask-snippet { margin: 0; font-size: var(--text-note); color: var(--gw-ink-soft); line-height: 1.7; overflow-wrap: anywhere; }
 
 /* 服务端高亮：必须给 <mark> 可见样式，否则高亮"生效了却看不出来" */

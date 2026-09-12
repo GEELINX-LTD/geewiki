@@ -27,15 +27,28 @@
  * （`http://127.0.0.1` 属 "potentially trustworthy origin"，`navigator.clipboard` 可用；
  * 真正会走到 manual 的是 `http://<局域网 IP>` 这类场景。）
  */
-import { useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { copyText } from '../lib/clipboard'
-import { COPY_BUTTON_ATTR, codeTextFromButton, renderMarkdownBody } from '../lib/markdownRender'
+import {
+  ATTACHMENT_APPLY_ATTR,
+  ATTACHMENT_BLOCKED_ATTR,
+  ATTACHMENT_MEDIA_ATTR,
+  ATTACHMENT_SLUG_ATTR,
+} from '../lib/attachmentPlan'
+import { recallRequest } from '../lib/myAccessRequests'
+import {
+  COPY_BUTTON_ATTR,
+  buildBlockedAttachment,
+  codeTextFromButton,
+  renderMarkdownBody,
+} from '../lib/markdownRender'
+import { ApplyAccessDialog } from './access/ApplyAccessDialog'
 
 /** 反馈停留时长：成功 1s（与 Docusaurus 的 1000ms 一致），失败 3s（够用户读完并按键） */
 const OK_MS = 1000
 const MANUAL_MS = 3000
 
-/** 计算 Markdown 的渲染产物（消毒 + 锚点 + 复制按钮 + 目录 + 链接改写） */
+/** 计算 Markdown 的渲染产物（消毒 + 锚点 + 复制按钮 + 目录 + 链接改写 + 附件标记） */
 export function useRenderedMarkdown(
   markdown: string,
   opts: {
@@ -43,6 +56,8 @@ export function useRenderedMarkdown(
     route?: string
     /** 已知页面（slug → 标题）：判定站内链接是否存在、并给 `[[wikilink]]` 回填标题 */
     pages?: ReadonlyMap<string, string> | null
+    /** 正文所属页面（附件破图占位块的「申请访问」按它提交申请）；未知时不传 */
+    attachmentSlug?: string | null
   } = {},
 ): ReturnType<typeof renderMarkdownBody> {
   const withCopyButtons = opts.withCopyButtons ?? true
@@ -53,9 +68,10 @@ export function useRenderedMarkdown(
    * 也不标"不存在"）。
    */
   const pages = opts.pages ?? null
+  const attachmentSlug = opts.attachmentSlug ?? null
   return useMemo(
-    () => renderMarkdownBody(markdown, { withCopyButtons, route, pages }),
-    [markdown, withCopyButtons, route, pages],
+    () => renderMarkdownBody(markdown, { withCopyButtons, route, pages, attachmentSlug }),
+    [markdown, withCopyButtons, route, pages, attachmentSlug],
   )
 }
 
@@ -82,6 +98,8 @@ export function MarkdownBody({
   const timers = useRef(new Map<HTMLElement, number>())
   const hostRef = useRef<HTMLDivElement | null>(null)
   const injected = useRef<string | null>(null)
+  /** 需要打开「申请访问」对话框的页面 slug（占位块里的按钮点出来的） */
+  const [applySlug, setApplySlug] = useState<string | null>(null)
 
   /*
    * **命令式注入，而不是 `dangerouslySetInnerHTML`**（这是本批踩到的一个真坑）。
@@ -105,6 +123,39 @@ export function MarkdownBody({
     injected.current = html
   }, [html])
 
+  /*
+   * 附件破图兜底：**捕获阶段**监听 `error`。
+   *
+   * 为什么必须挂在 `window` 且 `capture: true`：资源加载失败的事件**不冒泡**
+   * （直接在目标上派发，`bubbles: false`），React 的合成事件（挂在容器上、冒泡阶段）
+   * 收不到它；只有捕获阶段能从上往下拿到。
+   *
+   * 为什么只认带 `data-gw-attachment` 的图：外链图挂掉是另一回事，把它替换成
+   * "无权访问或被删除"是彻头彻尾的谎话（`decorateAttachmentMedia` 只标附件图）。
+   *
+   * 替换是**一次性**的（`data-gw-attachment-blocked` 标记）：某些浏览器在图片被重新
+   * 挂载/重试时会重复派发 error，没有这个标记就会重复替换、占位块里再套占位块。
+   */
+  useEffect(() => {
+    const onError = (event: Event): void => {
+      const target = event.target
+      if (!(target instanceof HTMLImageElement)) return
+      if (target.getAttribute(ATTACHMENT_MEDIA_ATTR) === null) return
+      if (target.getAttribute(ATTACHMENT_BLOCKED_ATTR) !== null) return
+      target.setAttribute(ATTACHMENT_BLOCKED_ATTR, '')
+      const slug = target.getAttribute(ATTACHMENT_SLUG_ATTR)
+      /*
+       * `recallRequest` 读的是**本机**记下的待审申请（服务端没有"查我的申请"端点）。
+       * 有 ⇒ 显示状态而不是再给一个必然 409 的按钮。读不到（隐私模式/换设备）时
+       * 一律当"没申请过"：多给一个按钮比给一句不实的"已提交"要好。
+       */
+      const pending = slug !== null && recallRequest(slug) !== null
+      target.replaceWith(buildBlockedAttachment(document, slug, pending, target.alt))
+    }
+    window.addEventListener('error', onError, true)
+    return () => window.removeEventListener('error', onError, true)
+  }, [])
+
   // 卸载时清掉待还原的定时器，避免对已移除的节点写文本
   useEffect(() => {
     const map = timers.current
@@ -117,6 +168,18 @@ export function MarkdownBody({
   const onCopyClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target
     if (!(target instanceof Element)) return
+
+    /*
+     * 破图占位块里的「申请访问」也走同一个委托（按钮同样是命令式注入的 DOM，
+     * React 不管这棵子树）。命中它时**立即返回**，不要继续当成复制按钮处理。
+     */
+    const apply = target.closest(`[${ATTACHMENT_APPLY_ATTR}]`)
+    if (apply !== null) {
+      const slug = apply.getAttribute(ATTACHMENT_SLUG_ATTR)
+      if (slug !== null && slug !== '') setApplySlug(slug)
+      return
+    }
+
     const btn = target.closest(`[${COPY_BUTTON_ATTR}]`)
     if (!(btn instanceof HTMLElement)) return
     const text = codeTextFromButton(btn)
@@ -148,5 +211,25 @@ export function MarkdownBody({
     })
   }, [])
 
-  return <div ref={hostRef} className={className} onClick={onCopyClick} />
+  return (
+    <>
+      <div ref={hostRef} className={className} onClick={onCopyClick} />
+      {/*
+        「申请访问」对话框：**受控打开且不带自带触发器**（入口就是占位块里的按钮）。
+        复用既有的 `ApplyAccessDialog`（M3）而不是另写一份表单 —— 提交/冲突/撤回的
+        状态机在这个仓库里只应有一份。它渲染进 Portal，因此不会破坏 `.page-detail > .md-body`
+        这类"直接子元素"选择器（Fragment 本身不产生 DOM 节点）。
+      */}
+      {applySlug !== null && (
+        <ApplyAccessDialog
+          slug={applySlug}
+          open
+          withTrigger={false}
+          onOpenChange={(next) => {
+            if (!next) setApplySlug(null)
+          }}
+        />
+      )}
+    </>
+  )
 }

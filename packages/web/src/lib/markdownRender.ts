@@ -40,6 +40,18 @@ import {
   resolveBodyLink,
 } from './linkPlan'
 import { WIKILINK_ATTR, WIKILINK_AUTO_ATTR } from './wikilink'
+import {
+  ATTACHMENT_APPLY_ATTR,
+  ATTACHMENT_APPLY_PENDING_TEXT,
+  ATTACHMENT_APPLY_TEXT,
+  ATTACHMENT_BLOCKED_ATTR,
+  ATTACHMENT_BLOCKED_CLASS,
+  ATTACHMENT_BLOCKED_REASON,
+  ATTACHMENT_BLOCKED_TEXT,
+  ATTACHMENT_MEDIA_ATTR,
+  ATTACHMENT_SLUG_ATTR,
+  isAttachmentUrl,
+} from './attachmentPlan'
 
 /** 复制按钮的标记（事件委托靠它定位；见 `MarkdownBody`） */
 export const COPY_BUTTON_ATTR = 'data-gw-copy'
@@ -103,6 +115,94 @@ function rewriteBodyLinks(
 }
 
 /**
+ * 附件图片的后处理：加懒加载标记、以及"它属于哪个页面"（破图兜底要用）。
+ *
+ * 与 `rewriteBodyLinks` 并列、同样在**消毒之后**跑：这里只新增属性，不解析正文字符串。
+ *
+ * 三件事各自的理由：
+ * - `loading="lazy"`：正文里可能嵌了很多张图，一次性下载会把首屏和带宽都拖垮
+ *   （附件是**二进制**，与文本正文的量级完全不同）；
+ * - `data-gw-attachment`：破图兜底只认**附件**图，不能把用户贴的外链图也替换掉
+ *   （外链图挂了是另一回事，把它替换成"无权访问"是彻头彻尾的谎话）；
+ * - `data-gw-attachment-slug`：附件可能"页面可读但它自己被删/被挡"，此时唯一的下一步是
+ *   **申请该页面的访问权**，而申请端点按 slug 定位。slug 未知（历史预览等）就不写这个属性，
+ *   占位块里也就没有申请入口 —— 宁可不给，也不给一个点了没用的按钮。
+ */
+export function decorateAttachmentMedia(
+  holder: HTMLElement,
+  opts: { applySlug?: string | null } = {},
+): void {
+  const slug = opts.applySlug ?? ''
+  for (const img of [...holder.querySelectorAll('img')]) {
+    if (!isAttachmentUrl(img.getAttribute('src'))) continue
+    img.setAttribute('loading', 'lazy')
+    img.setAttribute(ATTACHMENT_MEDIA_ATTR, '')
+    if (slug !== '') img.setAttribute(ATTACHMENT_SLUG_ATTR, slug)
+  }
+}
+
+/**
+ * 破图占位块：附件图加载失败时**替换**掉那个 `<img>`（见 `MarkdownBody` 的捕获阶段监听）。
+ *
+ * 为什么文案必须含糊（「无权访问**或**被删除」）：浏览器对 `<img>` 的失败只给一个 `error`
+ * 事件，**不带状态码** —— 而服务端对越权与不存在都回同一个 404（防存在性探测），
+ * 前端因此完全同形。写成"你没有权限"是把猜测说成事实，而附件很可能只是被作者删了。
+ * 这与服务端"越权一律回同一个 404"（防存在性探测）是同一条哲学：界面不能比它掌握的证据说得更硬。
+ *
+ * `pending` 为真表示本机记着"我已经申请过这个页面的访问权"（`lib/myAccessRequests.ts`），
+ * 此时显示状态而不是再给一个必然 409 的按钮。
+ */
+export function buildBlockedAttachment(
+  doc: Document,
+  slug: string | null,
+  pending: boolean,
+  alt = '',
+): HTMLElement {
+  const box = doc.createElement('div')
+  box.className = ATTACHMENT_BLOCKED_CLASS
+  box.setAttribute(ATTACHMENT_BLOCKED_ATTR, '')
+
+  const title = doc.createElement('p')
+  title.className = 'gw-attachment-blocked-title'
+  title.textContent = ATTACHMENT_BLOCKED_TEXT
+  box.append(title)
+
+  // 原图的 alt（通常就是文件名）留着：多图页面里，用户要知道是**哪一张**没显示出来
+  if (alt !== '') {
+    const name = doc.createElement('span')
+    name.className = 'gw-attachment-blocked-alt'
+    name.textContent = `（${alt}）`
+    title.append(' ', name)
+  }
+
+  const reason = doc.createElement('p')
+  reason.className = 'gw-attachment-blocked-reason'
+  reason.textContent = ATTACHMENT_BLOCKED_REASON
+  box.append(reason)
+
+  if (slug !== null && slug !== '') {
+    const actions = doc.createElement('div')
+    actions.className = 'gw-attachment-blocked-actions'
+    if (pending) {
+      const state = doc.createElement('span')
+      state.className = 'gw-attachment-blocked-pending'
+      state.textContent = ATTACHMENT_APPLY_PENDING_TEXT
+      actions.append(state)
+    } else {
+      const btn = doc.createElement('button')
+      btn.type = 'button'
+      btn.className = 'gw-attachment-blocked-apply'
+      btn.setAttribute(ATTACHMENT_APPLY_ATTR, '')
+      btn.setAttribute(ATTACHMENT_SLUG_ATTR, slug)
+      btn.textContent = ATTACHMENT_APPLY_TEXT
+      actions.append(btn)
+    }
+    box.append(actions)
+  }
+  return box
+}
+
+/**
  * Markdown → 已消毒 HTML + 注入锚点与复制按钮 + 目录。
  *
  * @param markdown 原始 Markdown
@@ -116,6 +216,10 @@ function rewriteBodyLinks(
  *                       `null`/缺省表示"尚未取到列表"——此时**不判定缺失**，
  *                       只把显式路径改写成 hash 形态（否则列表加载完成前会把全站链接
  *                       都标成"不存在"）。
+ * @param opts.attachmentSlug 正文所属页面的 slug。只用于附件破图兜底：占位块里的
+ *                       「申请访问」要按页面 slug 提交申请（附件没有独立申请端点）。
+ *                       未知时（历史快照预览等）传 `null`/不传 ⇒ 占位块不给申请入口，
+ *                       但**仍然**如实说明"无权访问或被删除"。
  */
 export function renderMarkdownBody(
   markdown: string,
@@ -123,6 +227,7 @@ export function renderMarkdownBody(
     withCopyButtons?: boolean
     route?: string
     pages?: ReadonlyMap<string, string> | null
+    attachmentSlug?: string | null
   } = {},
 ): RenderedMarkdown {
   const withCopyButtons = opts.withCopyButtons ?? true
@@ -136,6 +241,13 @@ export function renderMarkdownBody(
    * 我们注入的 `.gw-heading-anchor` 还没出现，因而不存在"把自己刚写的锚点再改写一次"的问题。
    */
   rewriteBodyLinks(holder, route, pages)
+
+  /*
+   * 附件图片紧随其后（同样只加属性）。两处都必须在**消毒之后**：
+   * `decorateAttachmentMedia` 依赖 `img[src]` 的最终形态，若在消毒前跑，
+   * DOMPurify 可能把属性/节点整段摘掉，我们就白标了。
+   */
+  decorateAttachmentMedia(holder, { applySlug: opts.attachmentSlug ?? null })
 
   const headingEls = [...holder.querySelectorAll('h2, h3')].filter(
     (el) => el.closest(SKIP_SELECTOR) === null,

@@ -19,8 +19,22 @@
  * `EditorView.theme` 的 `dark` 标志在此**不是必需的**：它主要用于 CodeMirror 内建样式的
  * 明暗分支，而我们把相关样式全部用变量覆盖了；`color-scheme` 由 `theme.ts` 设在
  * `<html>` 上，编辑器从根继承（原生滚动条/选区随之正确）。
+ *
+ * ## 附件上传（M4）：粘贴与拖入文件
+ *
+ * 编辑器**不做任何网络请求**（与 `onSave` 同一约定）：它只负责"把文件交给父组件、
+ * 把结果写回正文"。父组件（`pages/WikiPage.tsx`）用 `uploadAttachment()` 真正上传。
+ *
+ * 三条硬约束（都有真机教训，别改回去）：
+ * 1. **drop 必须 `preventDefault()`**：浏览器对"把文件拖进页面"的默认动作是**导航到该文件**
+ *    —— 用户丢掉的是整页编辑内容。粘贴同理（默认会把图片以 data URI 形式塞进文档，
+ *    等于把二进制内容写进页面正文，保存后体积爆炸）。
+ * 2. **先插占位、后按文本替换**：上传是异步的，这期间用户会继续打字，任何"记住的偏移量"
+ *    都会失效。占位文本带单调序号，替换时**重新查找**（见 `lib/attachmentPlan.ts`）。
+ * 3. **失败必须留在正文里**：写成 `> ⚠️ 上传失败：…` 而不是只弹一条提示——用户可能同时
+ *    拖了 5 个文件，只有"失败的那一行"能说清是哪一个没上去。
  */
-import { useEffect, useRef, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { EditorState, EditorSelection, Compartment, type Extension } from '@codemirror/state'
 import {
   EditorView,
@@ -53,6 +67,15 @@ import { markdown, markdownLanguage, insertNewlineContinueMarkup, deleteMarkupBa
  * 而这正是我们想要的——依赖必须显式声明，不能靠"碰巧被装上了"。
  */
 import { tags as t } from '@lezer/highlight'
+import { Button } from '../ui/Button'
+import { errorLine } from '../lib/errorText'
+import { useSlowHint } from '../lib/useSlowHint'
+import {
+  findUploadPlaceholder,
+  uploadFailureMarkdown,
+  uploadPlaceholder,
+  uploadSummaryText,
+} from '../lib/attachmentPlan'
 
 const highlightStyle = HighlightStyle.define([
   { tag: t.heading1, fontSize: '1.5em', fontWeight: '700', color: 'var(--gw-ink)' },
@@ -176,6 +199,62 @@ export interface MarkdownEditorProps {
   /** 供 `<label>`/屏幕阅读器使用的可访问名称 */
   ariaLabel: string
   minHeight?: string
+  /**
+   * 粘贴/拖入文件时的上传入口：返回**与入参一一对应**的 Markdown 文本（父组件负责网络、
+   * 权限与"新页面还没保存"这类业务判断）。不传 = 本场景不支持上传：此时仍然拦掉浏览器
+   * 默认动作（导航走 / 塞 data URI），只在状态行里说明，绝不让用户以为"什么都没发生"。
+   */
+  onUploadFiles?: (files: File[]) => Promise<string[]>
+}
+
+/* ------------------------- 附件上传：可复用的纯函数 ------------------------- */
+
+/** 从 DataTransfer 取出文件（过滤掉目录：目录在 `files` 里 name 为空串） */
+function filesFromDataTransfer(dt: DataTransfer | null): File[] {
+  if (dt === null) return []
+  const out: File[] = []
+  for (const f of Array.from(dt.files ?? [])) {
+    if (f.name !== '') out.push(f)
+  }
+  return out
+}
+
+/**
+ * 在视图里插入一段文本。
+ * `pos === null`（粘贴）⇒ 走**当前选区**；给了坐标（拖放）⇒ 插到落点。
+ * 两种都带 `userEvent: 'input'`：上传占位与最终结果都必须能被 ⌘Z 撤销。
+ */
+function insertIntoView(instance: EditorView, text: string, pos: number | null): void {
+  if (pos === null) {
+    instance.dispatch(instance.state.replaceSelection(text), {
+      userEvent: 'input',
+      scrollIntoView: true,
+    })
+    return
+  }
+  instance.dispatch({
+    changes: { from: pos, insert: text },
+    selection: { anchor: pos + text.length },
+    userEvent: 'input',
+    scrollIntoView: true,
+  })
+}
+
+/**
+ * 把文档里的**占位文本**替换成最终结果；占位已不存在时返回 `false`（不往别处插）。
+ * 详见 `lib/attachmentPlan.ts` 里"为什么按文本查找"的说明。
+ */
+function replacePlaceholderInView(instance: EditorView, placeholder: string, insert: string): boolean {
+  const range = findUploadPlaceholder(instance.state.doc.toString(), placeholder)
+  if (range === null) return false
+  instance.dispatch({ changes: { from: range.from, to: range.to, insert }, userEvent: 'input' })
+  return true
+}
+
+/** 一次上传批次里，某个 File 与其在正文中的落点（首次是"上传中"占位，重试时是失败说明） */
+interface UploadSlot {
+  file: File
+  placeholder: string
 }
 
 export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
@@ -184,10 +263,129 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
   /** 用 ref 持有回调：keymap 在创建时闭包捕获，若直接捕获 props 就会永远用第一版回调 */
   const onChangeRef = useRef(props.onChange)
   const onSaveRef = useRef(props.onSave)
+  const onUploadRef = useRef(props.onUploadFiles)
+  /**
+   * `disabled` 也要用 ref 读：DOM handler 建在依赖为空的 effect 里，直接闭包捕获会永远是
+   * 第一版取值。保存进行中（`disabled`）时若还接受上传，插入的正文会落在"已经发出去的
+   * 那次保存"之后 —— 保存成功随即导航离开，这段刚插入的内容就**静默丢失**了。
+   */
+  const disabledRef = useRef(props.disabled)
   const editable = new Compartment()
+  /** 占位序号：同一次会话内单调递增，保证多文件同时上传时占位互不冲突 */
+  const seqRef = useRef(0)
+  /** 在飞的上传数量（驱动"仍在上传…"的慢提示） */
+  const [uploading, setUploading] = useState(0)
+  /** 状态行文案（成功/失败各一条，用 `role="status"` 礼貌播报） */
+  const [uploadNote, setUploadNote] = useState('')
+  /** 失败待重试的文件（连同它们在正文里的失败说明，重试成功后按文本替换掉） */
+  const [failures, setFailures] = useState<UploadSlot[]>([])
+  const slow = useSlowHint(uploading > 0)
 
   onChangeRef.current = props.onChange
   onSaveRef.current = props.onSave
+  onUploadRef.current = props.onUploadFiles
+  disabledRef.current = props.disabled
+
+  /**
+   * 跑一批上传：`slots` 里的 `placeholder` 是**替换锚点**——首次上传时是"上传中…"占位，
+   * 重试时是那条失败说明本身（两者都靠文本查找定位，见 `lib/attachmentPlan.ts`）。
+   *
+   * 每个文件**单独**调用 `upload`：一次拖 5 个文件时，一个 413 不该让另外 4 个也失败。
+   */
+  const startBatch = useCallback(
+    (
+      slots: UploadSlot[],
+      anchor: EditorView,
+      upload: (files: File[]) => Promise<string[]>,
+    ): void => {
+      let settled = 0
+      let inserted = 0
+      let missing = 0
+      const failed: UploadSlot[] = []
+      setUploading((n) => n + slots.length)
+      setUploadNote(slots.length === 1 ? '正在上传 1 个附件…' : `正在上传 ${slots.length} 个附件…`)
+
+      for (const slot of slots) {
+        void upload([slot.file])
+          .then((out) => {
+            const text = (out[0] ?? '').trim()
+            if (text === '') {
+              // 契约是"与入参一一对应"。返回空串 = 父组件没给出可插入的正文，**不能静默**
+              const marker = uploadFailureMarkdown('上传完成，但没有拿到可插入的正文内容')
+              replacePlaceholderInView(anchor, slot.placeholder, marker)
+              failed.push({ file: slot.file, placeholder: marker })
+              return
+            }
+            if (replacePlaceholderInView(anchor, slot.placeholder, text)) inserted++
+            // 占位已不在文档里（用户上传期间删了它）：尊重这个意图，不插入、也不提供重试
+            else missing++
+          })
+          .catch((e: unknown) => {
+            // 原因经 `errorLine` 清洗：界面（含正文）不得出现原始 message / API 路径
+            const marker = uploadFailureMarkdown(errorLine(e))
+            replacePlaceholderInView(anchor, slot.placeholder, marker)
+            failed.push({ file: slot.file, placeholder: marker })
+          })
+          .finally(() => {
+            settled++
+            if (settled < slots.length) return
+            setUploading((n) => Math.max(0, n - slots.length))
+            setFailures((prev) => [...prev, ...failed])
+            setUploadNote(uploadSummaryText(inserted, failed.length, missing))
+          })
+      }
+    },
+    [],
+  )
+
+  /** 粘贴/拖入文件的总入口（DOM handler 经 ref 调它，避免闭包捕获第一版 props） */
+  const runUploads = useCallback(
+    (files: File[], pos: number | null): void => {
+      const instance = view.current
+      if (instance === null || files.length === 0) return
+      if (disabledRef.current) {
+        // 只读/保存中：浏览器默认动作已由 DOM handler 拦下，这里**一个占位也不插**
+        setUploadNote('正在保存，附件上传已暂停；请等保存完成后再试')
+        return
+      }
+      const upload = onUploadRef.current
+      if (upload === undefined) {
+        // 没有上传能力时**不插占位**：正文里不能留下一个永远替换不掉的"上传中…"
+        setUploadNote('当前场景未启用附件上传（已拦下浏览器默认动作，正文未被改动）')
+        return
+      }
+      const slots: UploadSlot[] = files.map((file) => ({
+        file,
+        placeholder: uploadPlaceholder(++seqRef.current),
+      }))
+      /*
+        多个占位之间留一个空行：紧挨着的 `![](a)![](b)` 会被 Markdown 当成同一段落里
+        连续两张图片；其中一个失败时替换出来的引用块会与相邻图片粘在一行，读起来像胡话。
+      */
+      insertIntoView(instance, slots.map((s) => s.placeholder).join('\n\n'), pos)
+      startBatch(slots, instance, upload)
+    },
+    [startBatch],
+  )
+
+  /** DOM handler 创建于 effect（依赖为空），故用 ref 拿最新实现 */
+  const runUploadsRef = useRef(runUploads)
+  runUploadsRef.current = runUploads
+
+  /**
+   * 重试失败的上传。
+   * **重试的是同一个 `File` 对象**（保存在 `failures` 里）：裸 body PUT 只要 File 还在内存里
+   * 就能原样重发，不需要用户重新选一次文件——这正是"失败也要把 File 留着"的用处。
+   */
+  const retryUploads = useCallback((): void => {
+    const instance = view.current
+    const upload = onUploadRef.current
+    if (instance === null || upload === undefined || failures.length === 0) return
+    const pending = failures
+    // 先移出待重试项（失败时 `startBatch` 会把它们重新加回来），避免列表里出现两份
+    setFailures([])
+    startBatch(pending, instance, upload)
+  }, [failures, startBatch])
 
   useEffect(() => {
     const parent = host.current
@@ -247,6 +445,32 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       EditorView.updateListener.of((u) => {
         if (u.docChanged) onChangeRef.current(u.state.doc.toString())
       }),
+      /*
+        附件：粘贴 / 拖入文件。两个 handler 都**自己 preventDefault**（理由见文件头）：
+        浏览器的默认动作分别是"把 data URI 塞进文档"与"整页导航到该文件"，
+        两者都会造成不可逆的损失，因此即使本场景没接上传（onUploadFiles 缺省）也要拦。
+      */
+      EditorView.domEventHandlers({
+        paste: (event) => {
+          const files = filesFromDataTransfer(event.clipboardData)
+          if (files.length === 0) return false // 普通文本粘贴：交回 CodeMirror 的默认行为
+          event.preventDefault()
+          runUploadsRef.current(files, null)
+          return true
+        },
+        drop: (event, instance) => {
+          const files = filesFromDataTransfer(event.dataTransfer)
+          if (files.length === 0) return false
+          /*
+            落点必须在 `preventDefault()` 之前取：`posAtCoords` 读的是当前布局，拦下默认
+            行为之后浏览器不会再给第二次机会，而且**只能在这里**拿到拖放的坐标。
+          */
+          const pos = instance.posAtCoords({ x: event.clientX, y: event.clientY })
+          event.preventDefault()
+          runUploadsRef.current(files, pos)
+          return true
+        },
+      }),
     ]
 
     const instance = new EditorView({
@@ -283,16 +507,34 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
   }, [props.disabled, editable])
 
   return (
-    <div
-      ref={host}
-      className="overflow-hidden rounded-md"
-      style={{ minHeight: props.minHeight ?? '420px' }}
-      /*
-        这里**刻意不加** `role="group"` / `aria-label`：可访问名称已由上面的
-        `contentAttributes` 交给 `.cm-content`（真正的 role="textbox"）。
-        若外层再挂一个同名 label，读屏会先念一遍组名、再念一遍文本框名，**重复播报**。
-        一个没有语义的纯容器 div 不该带 ARIA——"no ARIA is better than bad ARIA"。
-      */
-    />
+    <div className="flex flex-col gap-1.5">
+      <div
+        ref={host}
+        className="overflow-hidden rounded-md"
+        style={{ minHeight: props.minHeight ?? '420px' }}
+        /*
+          这里**刻意不加** `role="group"` / `aria-label`：可访问名称已由上面的
+          `contentAttributes` 交给 `.cm-content`（真正的 role="textbox"）。
+          若外层再挂一个同名 label，读屏会先念一遍组名、再念一遍文本框名，**重复播报**。
+          一个没有语义的纯容器 div 不该带 ARIA——"no ARIA is better than bad ARIA"。
+        */
+      />
+      {/*
+        上传状态行：`role="status"`（礼貌播报）而不是 `alert` —— 上传结果不该打断用户
+        正在进行的输入；但它**必须**存在，否则键盘/读屏用户粘贴截图后完全不知道发生了什么
+        （占位在文档里，可它是"上传中…"这几个字，成功与否只有这条状态说得出）。
+        `failures.length > 0` 时给出重试入口：File 还在内存里，重发不需要用户再选一次。
+      */}
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+        <p role="status" className="m-0">
+          {uploading > 0 && slow ? '网络较慢，仍在进行…' : uploadNote}
+        </p>
+        {failures.length > 0 && (
+          <Button size="sm" variant="secondary" onClick={retryUploads}>
+            重试上传（{failures.length}）
+          </Button>
+        )}
+      </div>
+    </div>
   )
 }
