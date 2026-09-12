@@ -353,9 +353,29 @@ export interface PageSummary {
   version: number
 }
 
+/**
+ * 版本元数据（详情端点内嵌的 `versions[]`：最近 N 条，按 id 降序）。
+ *
+ * ★ 三个字段的语义（后端 0019 起全量下发）：
+ *   · `title`  —— **该快照当时的标题**（`null` = 0019 之前的历史行）
+ *   · `author` —— **做出这次改动的人**（`null` = 未记录；**不是**"匿名"）
+ *
+ * ⚠️ **作者 ≠ 快照内容的作者**：快照存的是**改动前**的状态（`savePage` 的既有约定
+ *    "先快照旧的，再改"），而 `author` 与 `saved_at` 记的是**同一次保存动作**。
+ *    所以第 i 条快照的作者 = **把它覆盖掉的那个人**。界面据此把
+ *    「什么时候 + 谁 + 这次改了哪几行」对齐成一条改动。
+ *
+ * `author: null` 的三种来源（显示「未记录」，**不编造**）：0019 之前的历史行、
+ * 经 `wiki-service.save()` 代调用且无主体的写入、以及账号已被删除（0019 刻意不加外键
+ * —— 历史资产必须留存，见迁移注释，故 id 可能指向查不到的账号）。
+ */
 export interface VersionMeta {
   id: number
   saved_at: string
+  /** 保存前的旧标题（`null` 时不显示标题差异，**不猜**） */
+  title: string | null
+  /** 该版本的作者；`null` ⇒ 界面显示「未记录」 */
+  author: { id: number; displayName: string | null } | null
 }
 
 export interface PageDetail extends PageSummary {

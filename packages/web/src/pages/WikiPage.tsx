@@ -3,7 +3,7 @@ import { HOME_SLUG, parseWikiRoute, wikiRouteHash } from '../lib/wikiRoute'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
 import { ChevronLeft, ChevronRight, FileText, History, List as ListIcon, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
-import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary } from '../api'
+import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary, type VersionMeta } from '../api'
 import { ApplyAccessDialog } from '../components/access/ApplyAccessDialog'
 import { PageAccessPanel } from '../components/access/PageAccessPanel'
 import { refreshCapabilitiesIfVisible, useAuth } from '../lib/authStore'
@@ -21,6 +21,14 @@ import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { EditorSlotOutlet, useEditorSlot } from '../lib/slots'
 import { AssistToolbar } from '../components/ai/AssistToolbar'
+import {
+  COMPACT_VERSIONS,
+  TimelineDialog,
+  VersionBadge,
+  VersionList,
+  VersionPicker,
+} from '../components/VersionPicker'
+import { VersionDiffDialog } from '../components/VersionDiffDialog'
 import type { MarkdownEditorHandle } from '../components/MarkdownEditor'
 import { unavailableText, type AssistSelection } from '../lib/assistPlan'
 import { ensureSlotLoaded } from '../lib/pluginUi'
@@ -95,6 +103,14 @@ import { cn } from '../ui/cn'
 function fmtTime(iso: string): string {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false })
+}
+
+/** 要对比的历史版本。`author` 缺失 ⇒ 弹窗显示「未记录」（**不猜**、不写"匿名"）。 */
+interface CompareTarget {
+  id: number
+  label: number
+  savedAt: string
+  author: { id: number; displayName: string | null } | null
 }
 
 /** 预览渲染的防抖时长（见 WikiEdit 的说明） */
@@ -1152,13 +1168,13 @@ function WikiDetail(props: {
   }, [siblings, slug])
   const prev = neighbors.prev
   const next = neighbors.next
-  // versionContent: id=快照主键（API 定位用）；label=per-page 版本号（展示/恢复提示用）
-  const [versionContent, setVersionContent] = useState<{
-    id: number
-    saved_at: string
-    content: string
-    label: number
-  } | null>(null)
+  /*
+   * 版本对比：只记"要对比哪一版"（`id` 用来拉快照，`label` 用来显示 vN）。
+   * 内容不再存于页面 —— `VersionDiffDialog` 自己拉、自己算差异，页面不参与。
+   */
+  const [compareTarget, setCompareTarget] = useState<CompareTarget | null>(null)
+  /** 改动记录时间线（紧凑入口打开的弹窗） */
+  const [timelineOpen, setTimelineOpen] = useState(false)
   const [restoring, setRestoring] = useState(false)
   const anchor = useHashAnchor()
   /*
@@ -1279,53 +1295,41 @@ function WikiDetail(props: {
     })
   }
 
-  const showVersion = (id: number, savedAt: string, label: number): void => {
-    setVersionContent(null)
-    setErr('')
-    api
-      .version(slug, id)
-      .then((v) => setVersionContent({ id, saved_at: v.saved_at, content: v.content, label }))
-      .catch((e: unknown) => {
-        /*
-         * 404 在这里有**两种**成因，而服务端**刻意不区分**它们
-         * （`packages/plugin-wiki/src/index.ts`：快照端点既在 `!access.canEdit` 时 404，
-         * 也在 `版本不存在: <id>` 时 404 —— 与读路径一样防"这条存不存在"的探测）。
-         *
-         * 所以文案**不能**断言其中一种：断言"没有权限"会把"版本真的没了/页面被删了"
-         * 说成权限问题（用户跑了半天要权限，其实该刷新或换一条快照）；断言"版本不存在"
-         * 则反过来把权限问题说成数据问题（用户会去怀疑数据损坏）。
-         * 两种可能都要说，并给出**可执行**的下一步：先刷新重试，仍失败再找管理员确认权限。
-         * 顺带一提，这个按钮只在 `page.capabilities.canEdit` 为真时渲染，因此"版本已不存在"
-         * 的可能性并不比"没有权限"低。
-         */
-        setErr(
-          e instanceof ApiError && e.status === 404
-            ? '无法查看该历史版本：可能你没有查看历史快照的权限，或该版本已不存在 —— 刷新后重试，仍失败请向管理员确认权限。'
-            : errorLine(e),
-        )
-      })
+  /**
+   * 打开某一版的**对比弹窗**（`VersionDiffDialog` 自己负责拉取快照内容与算差异）。
+   *
+   * 为什么不在页面里存快照内容了：旧实现把"拉取 → 内联渲染在正文下方"绑成一件事，
+   * 那正是卡片占一大块的来源。现在内容由弹窗持有，页面只记"要对比哪一版"。
+   */
+  const startCompare = (v: VersionMeta, label: number): void => {
+    setCompareTarget({ id: v.id, label, savedAt: v.saved_at, author: v.author ?? null })
   }
 
-  const restore = (): void => {
-    if (!versionContent || !page) return
+  const restore = (target: CompareTarget, content: string): void => {
+    if (page === null) return
     /*
      * 恢复是"用旧内容覆盖当前内容"，而确认框会盖住页面 —— 用户看不见自己选的是哪一版。
-     * 故标题/正文都带上版本号与快照时间（同批的删除页面那处已带标题，本批 R6 对齐）。
+     * 故标题/正文都带上版本号与快照时间。
+     *
+     * ⚠️ 这里走的是 `api.savePage`（只覆盖正文）。服务端另有四位一体的 restore 端点
+     *    （正文 + 块级权限 + 页面档位 + 发布态），但**它要求 `canManageVisibility`**，
+     *    而本入口的门控是 `canEdit`——两者不是同一个能力。要改成调那个端点，
+     *    得先把入口门控与产品语义一起定下来（属行为变更，需上层拍板）。
      */
     confirm({
-      title: `恢复到 v${versionContent.label}？`,
+      title: `恢复到 v${target.label}？`,
       body:
-        `当前内容（v${page.version}）会被 v${versionContent.label}（保存于 ` +
-        `${fmtTime(versionContent.saved_at)}）覆盖，并生成一个新版本。`,
+        `当前内容（v${page.version}）会被 v${target.label}（保存于 ` +
+        `${fmtTime(target.savedAt)}）覆盖，并生成一个新版本。`,
       confirmLabel: '恢复此版本',
       danger: false,
       onConfirm: () => {
         setRestoring(true)
         return api
-          .savePage(slug, { title: page.title, content: versionContent.content })
+          .savePage(slug, { title: page.title, content })
           .then((r) => {
-            setNotice(`已恢复 v${versionContent.label} 内容（当前 v${r.version}）`)
-            setVersionContent(null)
+            setNotice(`已恢复 v${target.label} 内容（当前 v${r.version}）`)
+            setCompareTarget(null)
             load()
             void invalidatePages() // 版本变了 ⇒ 列表里的"版本"列与排序都要更新
             void refreshCapabilitiesIfVisible() // 写操作后能力可能已变（见 remove() 的说明）
@@ -1506,15 +1510,6 @@ function WikiDetail(props: {
     )
   }
 
-  const versionHtml = versionContent
-    ? // 与正文同款处理：历史快照也可能以 `# 标题` 开头，直接渲染会出现重复标题
-      renderMarkdownBodyForPreview(
-        stripDuplicateLeadingTitle(versionContent.content, page.title),
-        route,
-        pageTitles,
-        slug,
-      )
-    : ''
 
   return (
     <div className="flex flex-col gap-4">
@@ -1523,7 +1518,16 @@ function WikiDetail(props: {
       {/* 操作条：默认操作（编辑）在最右，破坏性操作（删除）用 danger 变体且与主操作隔开 */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex items-center gap-1.5 text-xs text-muted">
-          <Badge tone="neutral">版本 v{page.version}</Badge>
+          {/*
+            有编辑权 ⇒ 可下拉选版本；无编辑权 ⇒ **纯文本徽标**（不是禁用态按钮）。
+            理由见 `VersionPicker` 文件头：置灰本身就在暗示"这里有个你够不着的能力"，
+            而版本内容对只读者本来就不该开放（快照端点非 canEdit 一律 404）。
+          */}
+          {page.capabilities.canEdit ? (
+            <VersionPicker page={page} onCompare={startCompare} />
+          ) : (
+            <VersionBadge version={page.version} />
+          )}
           <span>更新于 {fmtTime(page.updated_at)}</span>
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -1638,126 +1642,40 @@ function WikiDetail(props: {
 
           <PageLinks slug={page.slug} />
 
-          <Card>
-            <CardHeader
-              title="版本历史"
-              description={
-                page.versions.length === 0 ? (
-                  '暂无历史版本 —— 每次保存正文变化都会在此留档'
-                ) : (
-                  <>
-                    {/*
-                      两个数字的**口径必须分开说**（本批 T1）：
-                      · `page.version` 是当前版本号，后端语义为「历史快照总数 + 1」
-                        （`packages/plugin-wiki/src/index.ts` 的 `Number(totalVersions.n) + 1`）；
-                      · `page.versions.length` 只是**已列出的最近若干条**，受 `recentVersions`
-                        配置限制（默认 10）。
-                      旧文案把后者写成"共 N 个历史快照"，历史上限一被截断就自相矛盾
-                      （明明存过 30 次，却说"以下是 10 个快照"）。
-                    */}
-                    {`当前为 v${page.version}（最新）；共 ${page.version - 1} 个历史快照，下面显示最近 ${page.versions.length} 个`}
-                    {page.version - 1 > page.versions.length ? '（更早的未列出）' : ''}
-                    {'。'}
-                    {page.capabilities.canEdit ? (
-                      '查看快照不会改动当前内容'
-                    ) : (
-                      <span className="text-muted">需编辑权限才能查看快照内容</span>
-                    )}
-                  </>
-                )
-              }
-              actions={<History className="size-4 text-muted" aria-hidden="true" />}
-            />
-            {page.versions.length === 0 ? null : (
-              <div className="overflow-x-auto">
-                <table
-                  tabIndex={0}
-                  aria-label="版本历史"
-                  className="w-full border-collapse text-sm"
-                >
-                  <thead>
-                    <tr>
-                      {/*
-                        「操作」列只在 `canEdit` 时存在。无编辑权的人点"查看内容"必然失败
-                        （历史正文端点要求编辑权）—— 与其给一个点了就报错的入口，
-                        不如不显示这一列；提示改在 CardHeader 的说明里给（见上）。
-                        表头与单元格必须用**同一个判据**同步隐藏，否则列会错位。
-                      */}
-                      {(page.capabilities.canEdit
-                        ? ['版本', '保存时间', '操作']
-                        : ['版本', '保存时间']
-                      ).map((h) => (
-                        <th
-                          key={h}
-                          scope="col"
-                          className="border-b border-line px-4 py-2 text-left text-xs font-semibold whitespace-nowrap text-muted"
-                        >
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {page.versions.map((v, i) => {
-                      const label = page.version - i - 1
-                      const selected = versionContent?.id === v.id
-                      return (
-                        <tr key={v.id} className={cn('transition-colors', selected && 'bg-accent-soft')}>
-                          <td className="border-b border-line px-4 py-2.5 align-top font-medium">
-                            v{label}
-                          </td>
-                          <td className="border-b border-line px-4 py-2.5 align-top text-muted">
-                            {fmtTime(v.saved_at)}
-                          </td>
-                          {page.capabilities.canEdit && (
-                            <td className="border-b border-line px-4 py-2.5 align-top">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  onClick={() => showVersion(v.id, v.saved_at, label)}
-                                  aria-expanded={selected}
-                                >
-                                  {selected ? '收起内容' : '查看内容'}
-                                </Button>
-                                {selected && (
-                                  <Button
-                                    size="sm"
-                                    loading={restoring}
-                                    icon={<RotateCcw className="size-3.5" />}
-                                    onClick={restore}
-                                  >
-                                    恢复此版本
-                                  </Button>
-                                )}
-                              </div>
-                            </td>
-                          )}
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
+          {/*
+            改动记录：**紧凑区块**，取代原先正文下方那张占一大块的「版本历史」卡片。
+            为什么还留在这里、而不是全部收进头部下拉：头部下拉是"选择要对比哪一版"（动作），
+            而这里是"这一页最近改了什么、谁改的"（状态）—— 后者是读者也可能关心的信息。
 
-            {versionContent && (
-              <CardBody className="border-t border-line bg-sunken">
-                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                  <p className="m-0 text-note font-medium text-ink">
-                    v{versionContent.label} 快照预览
-                    <span className="ml-2 font-normal text-muted">{fmtTime(versionContent.saved_at)}</span>
-                  </p>
-                  <Button size="sm" variant="ghost" onClick={() => setVersionContent(null)}>
-                    关闭预览
-                  </Button>
-                </div>
-                <div className="max-h-[360px] overflow-auto rounded-md border border-line bg-surface px-5 py-4">
-                  <MarkdownBody html={versionHtml} className="md-body" />
-                </div>
-              </CardBody>
-            )}
-          </Card>
+            为什么只列 `COMPACT_VERSIONS` 条：版本多时（后端最多 100 条）"全列"就等于把版面
+            撑回原样，那正是要解决的问题。其余走「查看全部改动…」弹窗 —— **用户主动打开的
+            弹窗占版面是合理的，常驻的列表不是**。
+
+            为什么整块受 `canEdit` 门控：无编辑权者进不了对比弹窗（服务端在快照端点上
+            对非 `canEdit` 一律 404），列出"点不动的行"等于给了一条死路。此时只留头部那枚
+            静态版本徽标 —— 版本号本身是可见信息，改动明细不是。
+          */}
+          {page.version > 1 && page.capabilities.canEdit && (
+            <section className="flex flex-col gap-2" aria-label="最近改动">
+              <p className="m-0 flex flex-wrap items-center gap-x-2 gap-y-1 text-note text-muted">
+                <History className="size-3.5" aria-hidden="true" />
+                <span>
+                  当前 v{page.version} · 共 {page.version - 1} 次改动
+                  {page.version - 1 > page.versions.length
+                    ? `（列出最近 ${page.versions.length} 次，更早的未列出）`
+                    : ''}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setTimelineOpen(true)}
+                  className={cn(focusRing, 'cursor-pointer text-accent underline-offset-2 hover:underline')}
+                >
+                  查看全部改动…
+                </button>
+              </p>
+              <VersionList page={page} onPick={startCompare} limit={COMPACT_VERSIONS} />
+            </section>
+          )}
         </div>
 
         {/*
@@ -1770,6 +1688,33 @@ function WikiDetail(props: {
           <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
         </div>
       </div>
+
+      {/*
+        版本对比弹窗。`canRestore` 传的是 `canManageVisibility` 而不是 `canEdit`：
+        恢复会改写页面状态（而服务端的四位一体 restore 端点正是要求这个能力），
+        让只有编辑权的人看到"恢复"按钮会给出一个点了必然失败的入口。
+      */}
+      <VersionDiffDialog
+        slug={slug}
+        page={page}
+        versions={page.versions}
+        target={compareTarget}
+        onClose={() => setCompareTarget(null)}
+        onRestore={restore}
+        restoring={restoring}
+        canRestore={page.capabilities.canManageVisibility}
+      />
+
+      {/* 改动记录时间线（头部下拉里的「查看全部改动…」与正文下方那行紧凑入口共用同一个弹窗） */}
+      <TimelineDialog
+        open={timelineOpen}
+        onOpenChange={setTimelineOpen}
+        page={page}
+        onPick={(v, label) => {
+          setTimelineOpen(false)
+          startCompare(v, label)
+        }}
+      />
 
       {/* 危险操作确认（删除页面 / 恢复历史版本）：确认之后才真的调 api */}
       <ConfirmDialog

@@ -1,0 +1,14 @@
+-- 0020_version_title.sql —— 版本快照补上「改前的标题」（PostgreSQL 对偶）
+--
+-- 与 sqlite 侧 `0020_version_title.sql` 同义：给 `page_versions` 增 `title TEXT`。
+--
+-- ★ 方言对照（sqlite → postgres）：`ALTER TABLE … ADD COLUMN title TEXT;` 两侧同形。
+--   `pages.title` 也是 TEXT，无长度约束需要对齐。
+--
+-- ★ 为什么单独一支迁移、不并进 0019：迁移是 append-only 的历史 —— 0019 已在实机应用，
+--   往它里面追加 ALTER 对已升级的库永不生效（详见 sqlite 侧注释，那里记了本次撞出来的
+--   500 `no such column: v.title`）。
+--
+-- ★ 为什么允许 NULL 且读侧不下结论：0020 之前的行没有值；界面此时只显示正文差异，
+--   不对标题做任何断言（`null` ≠ 空标题，后者是"标题被清空"的真实改动）。
+ALTER TABLE page_versions ADD COLUMN title TEXT;

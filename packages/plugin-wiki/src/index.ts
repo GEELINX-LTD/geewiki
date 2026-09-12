@@ -196,8 +196,30 @@ export interface WikiPageDetail {
   created_at: string
   updated_at: string
   version: number
-  /** 最近版本历史（条数受 config.recentVersions 限制，按 id 倒序） */
-  versions: { id: number; saved_at: string }[]
+  /**
+   * 最近版本历史（条数受 config.recentVersions 限制，按 id 倒序）。
+   *
+   * ★ `author`（0019）：**做出这次改动的人**，不是"快照内容的作者"。
+   * 快照存的是**改动前**的正文（`savePage` 的既有约定："先快照旧的，再改"），
+   * 而 `saved_by` 与 `saved_at` 记的是同一次动作 ⇒ 把「什么时候 + 谁 + 这次改了哪几行」
+   * 对齐成一条改动。落成一句话：**第 i 条快照的作者 = 把它覆盖掉的那个人**。
+   *
+   * `author: null` 的三种来源（读侧一律显示「未记录」，**不编造**）：
+   *   1. 0019 之前写入的历史行（`saved_by` 列还不存在）；
+   *   2. 经 `wiki-service.save()` 跨插件代调用、没有可归属主体的写入；
+   *   3. 该用户已被删除 —— 0019 刻意**不加外键**（历史资产必须留存，见迁移注释），
+   *      所以 id 可能指向一个查不到的账号，LEFT JOIN 会回 NULL。
+   *
+   * `title` 是**该快照当时的标题**。为什么标题也在 `content` 列旁边：`savePage` 允许
+   * 只改标题（正文不变时走 `unchanged` 分支不写历史，但标题+正文同时改会写一条），
+   * 时间线上要能看出"这次连标题一起改了" —— 只给正文的 diff 会漏掉这一半。
+   */
+  versions: {
+    id: number
+    saved_at: string
+    title: string | null
+    author: { id: number; displayName: string | null } | null
+  }[]
   /**
    * ★ P2：当前主体对这条目的**能力**，供前端条件化渲染按钮。
    *
@@ -821,8 +843,27 @@ export const WikiPlugin = {
          */
         grantedBlockIds: await grantedBlockIdsOf(principal),
       })
-      const versions = await adb.query<{ id: number; saved_at: string }>(
-        `SELECT id, saved_at FROM page_versions WHERE page_id = ? ORDER BY id DESC LIMIT ?`,
+      /*
+       * 版本列表连同**作者**一起取（0019）。
+       *
+       * `LEFT JOIN users` 而不是 `INNER JOIN`：作者可能是 NULL（0019 之前的历史行、
+       * 跨插件代调用、或账号已被删除 —— 后者是刻意的，见迁移注释"历史资产必须留存"），
+       * `INNER JOIN` 会把这些行**整条丢掉**，表现为"历史少了几条"这种最难察觉的错误。
+       *
+       * 取 `display_name` 而不是 `email`：版本时间线是给同事看的协作信息，
+       * 邮箱属于身份信息，没有必要为了显示"谁改的"而扩大它的暴露面。
+       */
+      const versions = await adb.query<{
+        id: number
+        saved_at: string
+        title: string | null
+        author_id: number | null
+        author_name: string | null
+      }>(
+        `SELECT v.id, v.saved_at, v.title, v.saved_by AS author_id, u.display_name AS author_name
+           FROM page_versions v
+           LEFT JOIN users u ON u.id = v.saved_by
+          WHERE v.page_id = ? ORDER BY v.id DESC LIMIT ?`,
         [page.id, recentLimit],
       )
       const totalVersions = (
@@ -848,7 +889,20 @@ export const WikiPlugin = {
         // 而 better-sqlite3 返回数字。直接 `+ 1` 在 PG 下会变成字符串拼接（"0"+1 → "01"），
         // 响应里的 version 就成了字符串——契约悄悄变化，且只在 PG 这一种驱动下发生。
         version: Number(totalVersions.n) + 1,
-        versions: versions.map((v) => ({ id: v.id, saved_at: v.saved_at })),
+        versions: versions.map((v) => ({
+          id: v.id,
+          saved_at: v.saved_at,
+          title: v.title ?? null,
+          /*
+           * `author` 只在**两列都拿得到**时给对象：`saved_by` 有值但 `users` 查不到
+           * （账号已删，0019 刻意不加外键）时返回 `null` 而不是 `{ id, displayName: null }`
+           * —— 后者会让界面渲染出"某人（名字缺失）"这种半截信息，不如统一按「未记录」。
+           */
+          author:
+            v.author_id === null || v.author_id === undefined || v.author_name === null
+              ? null
+              : { id: Number(v.author_id), displayName: v.author_name },
+        })),
         capabilities: {
           canEdit: access.canEdit,
           canDelete: access.canDelete,
@@ -1119,7 +1173,19 @@ export const WikiPlugin = {
      * 幂等：标题与正文均未变化时既不更新 updated_at、也不写历史。
      * 入参须已由 normalizeSaveFields 校验（服务与端点都走该校验）。
      */
-    const savePage = async (slug: string, input: WikiSaveInput): Promise<WikiSaveResult> => {
+    const savePage = async (
+      slug: string,
+      input: WikiSaveInput,
+      /**
+       * 本次改动的触发者（`Principal.userId`）。
+       *
+       * **为什么是可选参数而不是必填**：`savePage` 同时被 HTTP 端点与
+       * `wiki-service.save()` 调用，后者是**跨插件契约**、可以在没有 HTTP 主体的
+       * 场合被其它插件调用（例如导入脚本）。这类调用没有可归属的用户，写 `NULL`
+       * 比编一个假 id 诚实；界面据 `null` 显示「未知」而不是「某个人」。
+       */
+      actorId?: number | null,
+    ): Promise<WikiSaveResult> => {
       const now = new Date().toISOString()
       const outcome = await adb.transaction(async (tx): Promise<'created' | 'updated' | 'unchanged'> => {
         const existing = (await tx.query<PageRow>('SELECT id, title, content FROM pages WHERE slug = ?', [slug]))[0]
@@ -1182,9 +1248,22 @@ export const WikiPlugin = {
          * 可能放宽。快照取的是**此刻**（更新之前）的块，正是"变更前状态"。
          */
         const snap = await versionSnapshotOf(tx, existing.id)
+        /*
+         * `saved_by`（0019）：记的是**这次保存的触发者**，与 `saved_at` 同一时刻 ——
+         * 而快照内容存的是"改动前"的正文，两者在时间上并不指同一次动作。
+         * 这个组合正是读侧要的：把「什么时候 + 谁 + 这次改了哪几行」对齐成一条改动。
+         *
+         * `title`（0019）：存**改动前**的标题（`existing.title`，与 `existing.content`
+         * 同一时刻的取值）—— 时间线上"只改了标题"的那一次才不会显示成"正文未变"。
+         *
+         * `origin`（0021）恒为 `'content'`：这条 INSERT 只出现在 `savePage` 里，而
+         * `savePage` 的幂等分支（标题与正文都没变 ⇒ 直接 return `'unchanged'`）保证
+         * 走得到这里时**确实有内容被改**。所以来源不需要由调用方传参 —— 多一个
+         * 可以由调用方写错的参数，不如让它在唯一的写入点上是个常量。
+         */
         await tx.run(
-          `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)`,
-          [existing.id, existing.content, now, snap.blocksJson, snap.aclJson],
+          `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json, saved_by, title, origin) VALUES (?, ?, ?, ?, ?, ?, ?, 'content')`,
+          [existing.id, existing.content, now, snap.blocksJson, snap.aclJson, actorId ?? null, existing.title],
         )
         await tx.run('UPDATE pages SET title = ?, content = ?, updated_at = ?, content_hash = ? WHERE id = ?', [
           input.title,
@@ -1274,10 +1353,46 @@ export const WikiPlugin = {
      *
      * 同样必须在**提交之后**跑：策略层读的是另一条连接，PG 下看不到未提交的删除。
      */
-    const deletePage = async (slug: string): Promise<boolean> => {
+    /**
+     * 删除页面（连同版本历史与出链）。
+     *
+     * 返回**被删条目的摘要**而不是布尔值：删除是本插件里唯一"数据真的没了"的动作
+     * （版本历史随外键级联清空，不可恢复），所以审计必须留下**删掉的是什么** ——
+     * 只记一个 slug 的话，事后无法回答"当时删掉的那篇讲了什么、有多少历史"。
+     * 摘要必须在 `DELETE` **之前**取（删完就查不到了）。
+     */
+    const deletePage = async (
+      slug: string,
+    ): Promise<
+      | false
+      | { title: string; versions: number; bytes: number; createdAt: string; contentHash: string | null }
+    > => {
       const deleted = await adb.transaction(async (tx) => {
-        const page = (await tx.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        const page = (
+          await tx.query<{
+            id: number
+            title: string
+            created_at: string
+            content_hash: string | null
+            bytes: number
+          }>(
+            `SELECT id, title, created_at, content_hash, LENGTH(content) AS bytes FROM pages WHERE slug = ?`,
+            [slug],
+          )
+        )[0]
         if (!page) return false
+        // 摘要与删除同事务取出：事后（甚至并发删除后）再查就会拿到 null 或别人的数据
+        const versionCount = (
+          await tx.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])
+        )[0] as unknown as { n: number }
+        const summary = {
+          title: page.title,
+          // `Number()`：PG 把 COUNT(*) 当字符串回（与 getPage 同款理由）
+          versions: Number(versionCount.n),
+          bytes: Number(page.bytes),
+          createdAt: page.created_at,
+          contentHash: page.content_hash,
+        }
         await tx.run('DELETE FROM page_versions WHERE page_id = ?', [page.id])
         /*
          * ★ P3a：`blocks_fts` **必须手工清** —— `blocks` 行会被下面的 FK CASCADE 带走，
@@ -1303,7 +1418,7 @@ export const WikiPlugin = {
         }
         await tx.run('DELETE FROM pages WHERE id = ?', [page.id])
         await tx.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
-        return true
+        return summary
       })
       if (deleted) await resyncDescendantsReporting(slug)
       return deleted
@@ -1335,7 +1450,12 @@ export const WikiPlugin = {
       remove: async (slug) => {
         assertLive()
         assertValidSlug(slug)
-        return deletePage(slug)
+        /*
+         * 服务契约声明的是 `Promise<boolean>`（跨插件调用方只关心"删没删掉"），
+         * 而内部实现返回的是被删条目的摘要（审计要用）⇒ 在这一层收敛成布尔值。
+         * 不要为了少写这一个转换去改 `WikiService` 的公开契约。
+         */
+        return (await deletePage(slug)) !== false
       },
       backlinks: async (slug, principal) => {
         assertLive()
@@ -1384,6 +1504,381 @@ export const WikiPlugin = {
       }),
     )
 
+    /*
+     * ---------- GET /api/pages/:slug/versions：完整版本列表（分页，带作者） ----------
+     *
+     * 为什么需要它：详情接口里的 `versions` 只给最近 `recentVersions`（默认 10）条且
+     * **没有分页**，所以"把版本号做成可下拉选择"这件事在后端本来没有对应能力 ——
+     * 用户看不到第 11 个版本以前的东西，界面也就无从列出。
+     *
+     * 权限：与单版本快照端点**同口径**（要求 `canEdit`）。历史列表暴露的是"这条改过
+     * 几次、什么时候、谁改的、改了多大"，对只读者属于多余的结构信息 —— 与详情接口
+     * 裁掉 `versions` 的既有决定一致。
+     *
+     * **不下发正文**：一页可能有上百个版本，正文全带上会是几 MB。正文仍走
+     * `GET /api/pages/:slug/versions/:id` 按需取；这里只给"改动"的元数据：
+     * 时间、作者、篇幅（`bytes`/`lines`）—— 够界面算出"这次改了多少"。
+     */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/versions', async (h) => {
+        const slug = h.params.slug ?? ''
+        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        const access = page ? await policy().resolvePage(requirePrincipal(h), slug) : null
+        if (!page || !access || !access.canEdit) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        /*
+         * 查询串里的整数参数：**非法值显式 400**，不静默取默认 ——
+         * `limit=abc` 被当成默认值会表现为"问了却没结果"，正是最难定位的症状
+         * （与 `/api/search` 的 `invalid_limit` 同一纪律）。
+         */
+        const limitRaw = h.url.searchParams.get('limit')
+        let limit = VERSIONS_PAGE_DEFAULT
+        if (limitRaw !== null && limitRaw !== '') {
+          const parsed = Number(limitRaw)
+          if (!Number.isInteger(parsed) || parsed < 1 || parsed > VERSIONS_PAGE_MAX) {
+            h.json(400, {
+              ok: false,
+              error: 'invalid_limit',
+              message: `limit 须为 1..${VERSIONS_PAGE_MAX} 的整数`,
+            })
+            return
+          }
+          limit = parsed
+        }
+        /*
+         * ★ **游标分页**（`before=<id>`），不是 OFFSET。
+         *
+         * 为什么：`OFFSET` 在"翻页期间有人又保存了一次"时会**跳条或重复** —— 新行插在
+         * 列表头部，OFFSET=10 于是指向了另一条。版本列表恰恰是"越旧越稳定、越新越可能
+         * 正在变"的数据，用 OFFSET 正好踩在这个失效模式上。游标以**具体的行 id** 为锚，
+         * 翻到哪里都不会错位（`before` 语义：只取 id 严格更小的那些行 = 更旧的历史）。
+         */
+        const beforeRaw = h.url.searchParams.get('before')
+        let before: number | null = null
+        if (beforeRaw !== null && beforeRaw !== '') {
+          const parsed = Number(beforeRaw)
+          if (!Number.isInteger(parsed) || parsed < 1) {
+            // 用 `invalid_cursor` 而不是 `invalid_offset`：参数名与语义都换了，
+            // 错误码跟着换，调用方才不会按旧语义去重试
+            h.json(400, { ok: false, error: 'invalid_cursor', message: 'before 须为正整数（版本快照 id）' })
+            return
+          }
+          before = parsed
+        }
+        /*
+         * `LEFT JOIN users` 取作者显示名：`INNER JOIN` 会把作者不可归属的行整条丢掉
+         * （0019 之前的历史行、跨插件代调用、账号已删）⇒ 表现为"历史少了几条"。
+         */
+        const viewer = requirePrincipal(h)
+        const rows = await adb.query<{
+          id: number
+          rn: number
+          saved_at: string
+          title: string | null
+          origin: string | null
+          author_id: number | null
+          author_name: string | null
+          content: string
+          blocks_json: string | null
+          acl_json: string | null
+        }>(
+          /*
+           * `ROW_NUMBER()` 算出**权威的版本号**：窗口函数在 SQLite 3.25+ 与 PostgreSQL
+           * 8.0+ 都可用，两侧同形。不能靠 `total - i` 在应用层推 —— 那只在"从最新一页
+           * 开始、且期间没有新写入"时成立；一旦用游标翻到中间，偏移量就无从得知了。
+           */
+          `SELECT * FROM (
+             SELECT v.id, v.saved_at, v.title, v.origin, v.saved_by AS author_id,
+                    u.display_name AS author_name, v.content, v.blocks_json, v.acl_json,
+                    ROW_NUMBER() OVER (ORDER BY v.id DESC) AS rn
+               FROM page_versions v
+               LEFT JOIN users u ON u.id = v.saved_by
+              WHERE v.page_id = ?
+           ) ranked
+            WHERE (? IS NULL OR id < ?)
+            ORDER BY id DESC LIMIT ?`,
+          [page.id, before, before, limit],
+        )
+        /*
+         * `change` 需要每条的**上一条**（更新时间更晚、id 更大那条）作对照 ——
+         * 而它不一定落在同一页里：游标翻到第 3 页时，第一条的"上一条"在第 2 页。
+         * 所以单独查一次"该条之后最近的 1 条"，逐条比对；页大小上限 200，最多 200 次
+         * 索引点查（`idx_page_versions_page_id` 覆盖），代价可接受且换来语义正确。
+         */
+        const ids = rows.map((r) => Number(r.id))
+        const newerOf = new Map<number, { content: string; blocks_json: string | null; acl_json: string | null }>()
+        for (const id of ids) {
+          const n = (
+            await adb.query<{ content: string; blocks_json: string | null; acl_json: string | null }>(
+              'SELECT content, blocks_json, acl_json FROM page_versions WHERE page_id = ? AND id > ? ORDER BY id ASC LIMIT 1',
+              [page.id, id],
+            )
+          )[0]
+          if (n) newerOf.set(id, n)
+        }
+        /*
+         * `hasMore`：本页最后一条（= 最旧的那条）之后还有没有更旧的。
+         * **不要**用"页长 == limit"去猜 —— 恰好整除时会误报"还有更多"，让界面显示出
+         * 一个点了没反应的「加载更早」。这里直接问一次存在性。
+         */
+        const oldestId = ids.length === 0 ? null : Math.min(...ids)
+        const hasMore =
+          oldestId === null
+            ? false
+            : ((
+                await adb.query<{ n: number }>(
+                  'SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ? AND id < ?',
+                  [page.id, oldestId],
+                )
+              )[0] as unknown as { n: number }).n > 0
+        const totalRow = (
+          await adb.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])
+        )[0] as unknown as { n: number }
+        // `Number()` 不可省：PG 把 COUNT(*)（bigint）当字符串回（与 getPage 同款理由）
+        const total = Number(totalRow.n)
+        /*
+         * ★ 作者名只对**有权知道它**的人显示。
+         *
+         * 为什么不能一律回 `display_name`：`GET /api/org/members` 是
+         * `{access:'admin'}` + 组织管理员闸门 —— 普通成员**本来无权枚举组织成员**。
+         * 而在版本列表里回真名等于开了一条旁路：作者 id 是可枚举的整数，逐个翻页就
+         * 能拼出成员名单。这与仓库既有的"置灰即泄露"立场冲突。
+         *
+         * 规则（三档）：
+         *   1. 就是你自己 ⇒ 回你自己的名字（本来就知道）；
+         *   2. 你是 owner/admin ⇒ 回真名（你本来就有成员目录的读取权）；
+         *   3. 其余 ⇒ `displayName: null`，界面显示「另一位成员」。
+         * `id` 一律照回：它是"同一人的多次改动"能聚在一起的最小信息，
+         * 而单看一个不透明的整数并不能得到姓名。
+         */
+        const viewerIsAdmin = viewer.orgRole === 'owner' || viewer.orgRole === 'admin'
+        h.json(200, {
+          ok: true,
+          slug,
+          total,
+          limit,
+          hasMore,
+          versions: rows.map((v) => {
+            const id = Number(v.id)
+            const newer = newerOf.get(id)
+            return {
+              id,
+              /*
+               * 权威版本号 = 窗口函数给的名次（1 = 最新那一条快照）。
+               * `page.version = total + 1`（当前版本号），故快照名次 r 对应 `total + 1 - r`。
+               * **不可能出现 0 或负值**：`rn` 由 `ROW_NUMBER()` 保证落在 `1..total`，
+               * 而 `total + 1 - rn` 的最小值是 1（当 rn = total）。若真出现越界，
+               * 说明 `page_versions` 与本页 `page_id` 的对应关系被破坏了 —— 那是数据事故，
+               * 这里不做"兜底成 1"的掩盖（掩盖只会让事故更难被发现）。
+               */
+              number: total + 1 - Number(v.rn),
+              saved_at: v.saved_at,
+              title: v.title ?? null,
+              // 0021：'content'（正文/标题被改）| 'acl'（只动了权限）| null（升级前的行）
+              origin: v.origin ?? null,
+              author:
+                v.author_id === null || v.author_id === undefined
+                  ? null
+                  : {
+                      id: Number(v.author_id),
+                      displayName:
+                        viewerIsAdmin || Number(v.author_id) === viewer.userId ? (v.author_name ?? null) : null,
+                    },
+              /*
+               * 这一版**相对下一版**（更晚的那条快照）改了什么 —— 也就是说：把这条快照
+               * 覆盖掉的那次编辑做了什么。最早的一版没有对照对象 ⇒ `null`（**不是**
+               * "什么都没改"）。
+               *
+               * `blocksDelta`/`grantsDelta` 是**结构计数差**（块条数、授权条数），
+               * 不是字节差：字节差会被一个字的改动放大成几百，读数没有意义。
+               */
+              change:
+                newer === undefined
+                  ? null
+                  : {
+                      /*
+                       * **比正文本身**，不是比 `blocks_json`：块快照只在"块解析结果"层面
+                       * 相等/不等，而"只改了标题"或"改了空格"这类改动不会体现在块里 ——
+                       * 那会让界面把一次真实的正文编辑说成"正文未变"。
+                       */
+                      contentChanged: v.content !== newer.content,
+                      blocksDelta: countBlocks(v.blocks_json) - countBlocks(newer.blocks_json),
+                      grantsDelta: countGrants(v.acl_json) - countGrants(newer.acl_json),
+                    },
+            }
+          }),
+        })
+      }, { access: 'user' }),
+    )
+
+    /*
+     * ---------- GET /api/pages/:slug/versions/:id/diff：块级结构差异 ----------
+     *
+     * 回答"这一次改动动了哪些块"，**只给结构、绝不给正文**。
+     *
+     * ★★ **安全硬规则：响应体里不得出现块的文本**（不得有 `t` / `text` / `content` 字段）。
+     *    理由：某一块可能是 `granted` 档、而调用者并未被授予 —— 若 diff 回文本，就等于
+     *    让"能编辑本页的人"通过 diff 读到**他自己在正文里看不到的**那段内容。
+     *    而"某一段被单独收紧过"这个**事实**不构成增量泄露：能走到这里的人本来就能读
+     *    历史原文（`canEdit` 可读快照正文，v2 设计已裁决）。
+     *    这条规则由 `packages/plugin-wiki/test/version-diff.test.ts` 的源码守卫钉死。
+     *
+     * ★ 语义：**与更旧的那一版比**（`id` 小于它且最大的那条）。
+     *    快照存的是"改动前"的状态，所以这个差集回答的是：
+     *    「这一版所代表的状态，相对上一版发生了什么」。
+     *
+     * ★ **为什么按 ordinal 归并，而不是复用 `blocks.ts` 的 `lcsPairs`**：
+     *   `lcsPairs` 按 `(kind, contentHash)` 配对，对"文本一字未动、只把某块的可见性
+     *   从 org 收到 granted"这种改动，两侧哈希相同 ⇒ 它根本不认为这是同一块，
+     *   结果会显示成"删掉一块 + 新增一块"，而用户真正做的是**改了一档可见性**。
+     *   本页的块由 `syncBlocksForPage` 维护、ordinal 在保守重解析下稳定（同一块保留
+     *   原 ordinal），所以按 `o` 归并既更贴语义、复杂度也从 O(n·m) 降到 O(n)。
+     *   两侧块数差异大（整段插入/删除）时，多出来的一侧自然落进 added/removed。
+     */
+    cleanups.push(
+      router.register('GET', '/api/pages/:slug/versions/:id/diff', async (h) => {
+        const slug = h.params.slug ?? ''
+        const page = (await adb.query<PageRow>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+        const access = page ? await policy().resolvePage(requirePrincipal(h), slug) : null
+        if (!page || !access || !access.canEdit) {
+          // 与其它版本端点同形：不区分"不存在/无权"，不引入新的探测面
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        const versionId = Number(h.params.id)
+        if (!Number.isInteger(versionId) || versionId < 1) {
+          h.json(400, { ok: false, error: 'invalid_id', message: 'id 须为正整数' })
+          return
+        }
+        const current = (
+          await adb.query<{ id: number; blocks_json: string | null }>(
+            'SELECT id, blocks_json FROM page_versions WHERE id = ? AND page_id = ?',
+            [versionId, page.id],
+          )
+        )[0]
+        if (!current) {
+          h.json(404, { ok: false, error: 'not_found', message: `版本不存在: ${h.params.id}` })
+          return
+        }
+        const previous = (
+          await adb.query<{ id: number; blocks_json: string | null }>(
+            'SELECT id, blocks_json FROM page_versions WHERE page_id = ? AND id < ? ORDER BY id DESC LIMIT 1',
+            [page.id, versionId],
+          )
+        )[0]
+        if (!previous) {
+          /*
+           * 最早的一版没有对照对象。用**独立的错误码**而不是空结果：空结果会被前端
+           * 渲染成"这次什么都没改"，而事实是"无从比较" —— 两者对用户的意义完全不同。
+           */
+          h.json(404, {
+            ok: false,
+            error: 'no_previous',
+            message: '这是最早的一版，没有更早的版本可比',
+          })
+          return
+        }
+        if (current.blocks_json === null || previous.blocks_json === null) {
+          // 早于块级权限功能（0017）的快照没有块快照 —— 给不出块级差异，**不猜**
+          h.json(409, {
+            ok: false,
+            error: 'snapshot_incomplete',
+            message: '两侧之一缺少块快照（该版本早于块级权限功能），无法比较块级结构',
+          })
+          return
+        }
+        /*
+         * 解析失败按"无法比较"处理（409）而不是回一个空的差异：回空差异等于告诉用户
+         * "这次没改块"，而真实情况是我们读不懂那份快照 —— 那是编造。
+         */
+        const parseBlocks = (json: string): { o: number; k: string; v: string; t: string }[] | null => {
+          try {
+            const v: unknown = JSON.parse(json)
+            return Array.isArray(v) ? (v as { o: number; k: string; v: string; t: string }[]) : null
+          } catch {
+            return null
+          }
+        }
+        const curr = parseBlocks(current.blocks_json)
+        const prev = parseBlocks(previous.blocks_json)
+        if (curr === null || prev === null) {
+          h.json(409, {
+            ok: false,
+            error: 'snapshot_incomplete',
+            message: '块快照无法解析，不能给出可靠的块级差异',
+          })
+          return
+        }
+        const prevByOrdinal = new Map<number, { k: string; v: string; t: string }>()
+        for (const b of prev) prevByOrdinal.set(Number(b.o), { k: String(b.k), v: String(b.v), t: String(b.t) })
+        const added: { ordinal: number; kind: string; visibility: string }[] = []
+        const removed: { ordinal: number; kind: string; visibility: string }[] = []
+        const modified: {
+          ordinal: number
+          kind: string
+          visibility: string
+          changed: ('text' | 'visibility')[]
+        }[] = []
+        let unchangedCount = 0
+        for (const b of curr) {
+          const ord = Number(b.o)
+          const old = prevByOrdinal.get(ord)
+          // ★ 只取结构字段进响应；`t`（文本）**刻意不读进任何返回对象**
+          const now = { ordinal: ord, kind: String(b.k), visibility: String(b.v) }
+          if (old === undefined) {
+            added.push(now)
+            continue
+          }
+          prevByOrdinal.delete(ord)
+          const changed: ('text' | 'visibility')[] = []
+          if (old.t !== String(b.t)) changed.push('text')
+          if (old.v !== String(b.v)) changed.push('visibility')
+          if (changed.length === 0) unchangedCount++
+          else modified.push({ ...now, changed })
+        }
+        for (const [ord, old] of prevByOrdinal) {
+          removed.push({ ordinal: ord, kind: old.k, visibility: old.v })
+        }
+        /*
+         * `from`/`to` 用**版本号**而不是行 id（与列表端点的 `number` 同口径）：
+         * 用户看到的是「v3 → v4」，两个内部主键对他没有意义；而界面在别处已经拿到
+         * 权威版本号，两处必须是同一套数字，否则会出现"列表说 v4、diff 说 17"。
+         *
+         * 版本号 = `total + 1 - rank`（rank 由 id DESC 的 ROW_NUMBER 给，1 = 最新快照），
+         * 与 `GET /api/pages/:slug/versions` 完全同源 —— 这里再算一次而不是让调用方传，
+         * 是因为 diff 也可能被直接调用（深链接、curl），不能依赖调用方先查列表。
+         */
+        const rankOf = async (id: number): Promise<number> => {
+          const r = (
+            await adb.query<{ n: number }>(
+              'SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ? AND id >= ?',
+              [page.id, id],
+            )
+          )[0] as unknown as { n: number }
+          return Number(r.n)
+        }
+        const totalRow = (
+          await adb.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])
+        )[0] as unknown as { n: number }
+        const total = Number(totalRow.n)
+        const toNumber = total + 1 - (await rankOf(Number(current.id)))
+        const fromNumber = total + 1 - (await rankOf(Number(previous.id)))
+        h.json(200, {
+          ok: true,
+          // 版本号（与列表端点的 `number` 同源）；行 id 另给 `comparedVersionId` 便于排障
+          from: fromNumber,
+          to: toNumber,
+          comparedVersionId: Number(previous.id),
+          added,
+          removed,
+          modified,
+          unchangedCount,
+        })
+      }, { access: 'user' }),
+    )
+
     /* ---------- GET /api/pages/:slug/versions/:id：读取历史版本快照 ---------- */
     /*
      * ★ P3c：**非 `canEdit` 一律 404**（不是 403、不是裁剪）。
@@ -1403,8 +1898,15 @@ export const WikiPlugin = {
           return
         }
         const version = (
-          await adb.query<{ id: number; content: string; saved_at: string; blocks_json: string | null; acl_json: string | null }>(
-            'SELECT id, content, saved_at, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
+          await adb.query<{
+            id: number
+            content: string
+            saved_at: string
+            title: string | null
+            blocks_json: string | null
+            acl_json: string | null
+          }>(
+            'SELECT id, content, saved_at, title, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
             [Number(h.params.id), page.id],
           )
         )[0]
@@ -1416,6 +1918,11 @@ export const WikiPlugin = {
           id: version.id,
           content: version.content,
           saved_at: version.saved_at,
+          /*
+           * 快照**当时**的标题（0019）。`null` = 0019 之前的行 ⇒ 调用方据此不下标题差异的
+           * 结论（**不猜**"标题没变"）；对照"当前标题"由调用方自己取（它手上就有页面详情）。
+           */
+          title: version.title ?? null,
           // 老版本这两列为 NULL ⇒ 调用方据此提示"该版本早于块级权限功能"
           blocks: version.blocks_json === null ? null : (JSON.parse(version.blocks_json) as unknown),
           acl: version.acl_json === null ? null : (JSON.parse(version.acl_json) as unknown),
@@ -1439,6 +1946,53 @@ export const WikiPlugin = {
      * 删光会让块 id 全变、**授权被静默清空**（见 `blocks.ts` 的说明）。
      */
     const MAX_SNAPSHOT_BYTES = 1_000_000
+
+    /**
+     * 版本列表（`GET /api/pages/:slug/versions`）的分页上限。
+     *
+     * `recentVersions`（默认 10）是**详情载荷**的裁剪量，不是分页量 —— 这条通路是为
+     * "下拉选择版本"服务的另一件事。默认 50：多数页面一次列完；上限 200：每项只有
+     * id/时间/作者/标题/字节数/行数，200 项也就十几 KB，不至于让响应体失控。
+     */
+    const VERSIONS_PAGE_DEFAULT = 50
+    const VERSIONS_PAGE_MAX = 200
+
+    /**
+     * `blocks_json` 里有多少个块。
+     *
+     * 用途：版本列表的 `change.blocksDelta`（这一版相对下一版，块多了还是少了）。
+     * **容错是刻意的**：这一列在老行上可以是 NULL、在极端情况下可能是坏 JSON ——
+     * 而它只用于展示"改动有多大"，不该因为一条历史行格式异常就让整个版本列表 500。
+     * 解析失败按 0 计（差异随之显示为 0），**不猜**成别的数字。
+     */
+    const countBlocks = (json: string | null): number => {
+      if (json === null || json === '') return 0
+      try {
+        const v: unknown = JSON.parse(json)
+        return Array.isArray(v) ? v.length : 0
+      } catch {
+        return 0
+      }
+    }
+
+    /**
+     * `acl_json` 里有几条**额外的**授权（页面级 grants + 块级 grants）。
+     *
+     * 只数"多出来的授权"而不数整份 ACL 的大小：`change.grantsDelta` 要回答的是
+     * "这一次是不是给别人开了权限 / 收了权限"，而 `visibility`/`published_at` 这些
+     * 字段的字符串长度变化与"授权条数"无关，混进来只会让读数变噪声。
+     */
+    const countGrants = (json: string | null): number => {
+      if (json === null || json === '') return 0
+      try {
+        const v = JSON.parse(json) as { grants?: unknown; blockGrants?: unknown }
+        const pageGrants = Array.isArray(v.grants) ? v.grants.length : 0
+        const blockGrants = Array.isArray(v.blockGrants) ? v.blockGrants.length : 0
+        return pageGrants + blockGrants
+      } catch {
+        return 0
+      }
+    }
 
     /** 块级可见性对应的"读者等级"：`granted` 不属于任何等级，只有 admin 覆盖能触及它。 */
     const requiredRankOfBlock = (v: string): number => (v === 'granted' ? 2 : v === 'org' ? 1 : 0)
@@ -1499,7 +2053,7 @@ export const WikiPlugin = {
          */
         if (row.blocks_json === null || row.acl_json === null) {
           const revision = await adb.transaction(async (tx) => {
-            await snapshotAclVersion(tx, slug) // 恢复前记一条 ⇒ 本次恢复可逆
+            await snapshotAclVersion(tx, slug, guard.principal.userId) // 恢复前记一条 ⇒ 本次恢复可逆
             await tx.run('UPDATE pages SET content = ?, content_hash = ?, updated_at = ? WHERE id = ?', [
               row.content,
               sha256Hex(row.content),
@@ -1583,7 +2137,7 @@ export const WikiPlugin = {
 
         const revision = await adb.transaction(async (tx) => {
           // ① 恢复前先记一条版本 ⇒ 恢复可逆
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           // ② 页面级 ACL + 正文
           await tx.run(
             `UPDATE pages SET content = ?, content_hash = ?, updated_at = ?, visibility = ?, inherit = ?, published_at = ?
@@ -1739,7 +2293,34 @@ export const WikiPlugin = {
         }
         let result: WikiSaveResult
         try {
-          result = await savePage(slug, save)
+          /*
+           * ★ 把**当前主体**传给保存：它是 `page_versions.saved_by` 的唯一来源，
+           * 也就是界面里「谁改的」那一列的来源。不传的话这列永远是 NULL。
+           * （`wiki-service.save()` 那条路径刻意不传 —— 跨插件调用没有可归属的主体。）
+           */
+          result = await savePage(slug, save, h.principal?.userId ?? null)
+          /*
+           * ★ **保存也写审计**（T5）。
+           *
+           * 与"版本历史本身就是记录"的分工：`page_versions` 回答"这条**内容**改过几次、
+           * 每次是什么样"，审计回答"**谁在什么时候动过它**"、且能把页面事件与同一时间窗
+           * 内的权限变更、越权尝试放在一条时间线上看。少了它，"谁改的"就只能靠翻版本
+           * 列表逐条查 —— 而运维排查通常是从审计入口进来的。
+           *
+           * 只记 `version`（版本号）与结果类别，**不记正文也不记 hash**：
+           * `packages/core/src/audit.ts` 的 `FORBIDDEN_AUDIT_KEYS` 会**静默删掉** `hash`
+           * 这类键，而正文进审计表意味着"内容永久留档"，与审计表的定位不符。
+           *
+           * `outcome === 'unchanged'` 也记：用户点了保存但内容没变，这本身是有效信息
+           * （"我按了保存却没生效"的排查起点）。这条不产生版本，所以版本号与上一条相同。
+           */
+          void writeAuditLog(adb, {
+            action: 'page.save',
+            targetKind: 'page',
+            targetId: slug,
+            actorId: h.principal?.userId ?? null,
+            after: { outcome: result.outcome, version: result.version },
+          }).catch((err: unknown) => console.error('[@geewiki/wiki] 保存审计写入失败:', err))
         } catch (err) {
           /*
            * 正文里的块标记不合法（旧标记 `role=*`、未知档位、`gated` 区段未闭合、代码围栏
@@ -1796,13 +2377,42 @@ export const WikiPlugin = {
     )
 
     /* ---------- DELETE /api/pages/:slug（版本历史依赖外键级联；此处显式事务删除以防实现差异） ---------- */
+    /*
+     * ★ **删除必须留审计**（与其他写路径的取舍不同）：
+     *   保存/恢复都有 `page_versions` 兜底（可回滚），而删除是本插件里**唯一不可逆**的
+     *   动作 —— 版本历史随外键级联清空，删完就没有任何地方能回答"当时那篇写了什么"。
+     *   此前这条路径**一行审计都不写**（只有 ACL 类动作写），于是"谁把页面删了"在
+     *   审计里查不到，只能靠 `access.denied` 之类的旁证去猜。
+     *
+     *   记的是**被删条目的摘要**（标题/历史条数/字节数/content_hash），不是正文 ——
+     *   审计表要长期留存，把正文抄进去等于复制一份永不可删的内容。
+     *   `content_hash` 足以在事后与外部备份比对"被删的是哪一版"。
+     *
+     *   放在删除**之后**写：删失败（404）不该留一条"删除了"的假记录；
+     *   而 `void … .catch` 让审计写入失败**不回滚**已经完成的删除（数据已经没了，
+     *   报错给用户也无法挽回 —— 与恢复端点"失败不回滚已提交的恢复"同一取舍）。
+     */
     cleanups.push(
       router.register('DELETE', '/api/pages/:slug', async (h) => {
         const slug = h.params.slug ?? ''
-        if (!(await deletePage(slug))) {
+        const removed = await deletePage(slug)
+        if (removed === false) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
         }
+        void writeAuditLog(adb, {
+          action: 'page.delete',
+          targetKind: 'page',
+          targetId: slug,
+          actorId: h.principal?.userId ?? null,
+          after: {
+            title: removed.title,
+            versions: removed.versions,
+            bytes: removed.bytes,
+            created_at: removed.createdAt,
+            content_hash: removed.contentHash,
+          },
+        }).catch((err: unknown) => console.error('[@geewiki/wiki] 删除审计写入失败:', err))
         h.json(200, { ok: true, deleted: slug })
       }, { access: 'user' }),
     )
@@ -1937,15 +2547,40 @@ export const WikiPlugin = {
      * 记的是**变更前**的状态 —— 与 `savePage` 的既有约定一致（"先快照旧的，再改"），
      * 于是"版本 N = 变更 N 之前的状态"，恢复版本 N 得到的就是那一刻。
      */
-    const snapshotAclVersion = async (tx: DatabaseExecutor, slug: string): Promise<void> => {
+    const snapshotAclVersion = async (
+      tx: DatabaseExecutor,
+      slug: string,
+      /**
+       * 本次写入的触发者。可见性/授权/恢复都由 `requireManage` 把关，
+       * 那里一定拿得到主体；传 `null` 只用于"确实没有主体"的服务侧调用。
+       */
+      actorId?: number | null,
+    ): Promise<void> => {
       const page = (
-        await tx.query<{ id: number; content: string }>('SELECT id, content FROM pages WHERE slug = ?', [slug])
+        await tx.query<{ id: number; content: string; title: string }>(
+          'SELECT id, content, title FROM pages WHERE slug = ?',
+          [slug],
+        )
       )[0]
       if (!page) return
       const snap = await versionSnapshotOf(tx, Number(page.id))
+      /*
+       * `origin`（0021）恒为 `'acl'`，同样不需要调用方传参：本函数的语义就是
+       * "为**权限类**变更留一条快照"，它的 8 个调用点全部是档位/发布/授权/申请批准
+       * —— 正文那一条由 `savePage` 自己的 INSERT 负责。让来源在此处成为常量，
+       * 调用方就没有写错的机会。
+       */
       await tx.run(
-        `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json) VALUES (?, ?, ?, ?, ?)`,
-        [Number(page.id), page.content, new Date().toISOString(), snap.blocksJson, snap.aclJson],
+        `INSERT INTO page_versions (page_id, content, saved_at, blocks_json, acl_json, saved_by, title, origin) VALUES (?, ?, ?, ?, ?, ?, ?, 'acl')`,
+        [
+          Number(page.id),
+          page.content,
+          new Date().toISOString(),
+          snap.blocksJson,
+          snap.aclJson,
+          actorId ?? null,
+          page.title,
+        ],
       )
     }
 
@@ -2148,7 +2783,7 @@ export const WikiPlugin = {
            * 若只恢复正文、不恢复权限，「恢复此版本」会把当时的正文配上现在的权限 ——
            * 结果可能是把本该受限的内容放开（见 0017 迁移的说明）。
            */
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           await tx.run('UPDATE pages SET visibility = ?, inherit = ?, published_at = ? WHERE slug = ?', [
             nextVisibility,
             nextInherit,
@@ -2307,7 +2942,7 @@ export const WikiPlugin = {
          */
         const revision = await adb.transaction(async (tx) => {
           // ★ P3c：授予变更也要产生版本（否则恢复旧版本时，当前授予仍在 ⇒ 恢复出的权限更宽）
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           const existing = (
             await tx.query<{ id: number; role: string; expires_at: string | null }>(
               'SELECT id, role, expires_at FROM page_grants WHERE page_slug = ? AND subject_kind = ? AND subject_id = ?',
@@ -2357,7 +2992,7 @@ export const WikiPlugin = {
           ))[0]
           if (!removed) return null
           // ★ P3c：撤销授予同样产生版本 —— **放在存在性检查之后**，否则 404 也会写出一条无意义的版本
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           await tx.run('DELETE FROM page_grants WHERE id = ? AND page_slug = ?', [id, slug])
           const rev = await bumpAclRevision(tx, slug)
           return { rev, removed }
@@ -2606,7 +3241,7 @@ export const WikiPlugin = {
           if (!req) return null
           if (req.status !== 'pending') return { conflict: req.status } as const
           // ★ P3c：批准等同于"新增一条 page_grant" ⇒ 同样必须产生版本
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           const subjectId = String(Number(req.user_id))
           // 幂等 upsert（与 POST /grants 同款）：先查后写，避免把"改角色"伪装成"新授予"
           const existing = (
@@ -2918,7 +3553,7 @@ export const WikiPlugin = {
           )[0]
           if (!block) return null
           // ★ P3c：块级授予同样产生版本 —— 放在校验之后，避免 404 也写出版本
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           // 幂等 upsert（同页面级：先查后写，避免把"改角色"伪装成"新授予"）
           const existing = (
             await tx.query<{ id: number }>(
@@ -2998,7 +3633,7 @@ export const WikiPlugin = {
           )[0]
           if (!removed) return null
           // ★ P3c：撤销块级授予同样产生版本（放在存在性检查之后）
-          await snapshotAclVersion(tx, slug)
+          await snapshotAclVersion(tx, slug, guard.principal.userId)
           await tx.run('DELETE FROM block_grants WHERE id = ? AND block_id = ?', [grantId, blockId])
           return { rev: await bumpAclRevision(tx, slug), removed }
         })

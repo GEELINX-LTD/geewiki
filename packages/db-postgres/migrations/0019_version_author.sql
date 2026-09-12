@@ -1,0 +1,27 @@
+-- 0019_version_author.sql —— 版本快照承载「谁改的」（PostgreSQL 对偶）
+--
+-- 与 sqlite 侧 `0019_version_author.sql` 同义：给 `page_versions` 增 `saved_by INTEGER`。
+--
+-- ★ 方言对照（sqlite → postgres）：
+--   `ALTER TABLE … ADD COLUMN saved_by INTEGER;` 两侧同形，无类型差异 —— `INTEGER`
+--   在 PG 是 4 字节整型，足以容纳 `users.id`（sqlite 侧 INTEGER 是动态宽度，但
+--   本仓库的 id 由自增主键产生，量级一致）。
+--
+-- ★ 与 sqlite 侧逐条一致的三条决定（理由详见 sqlite 侧注释）：
+--   1. **无外键**：与 `pages.created_by` 同款 —— 删用户不得连坐删历史；
+--   2. **允许 NULL**：`wiki-service.save()` 是跨插件契约，代调用时没有可归属的主体，
+--      写 NULL 比编一个假 id 诚实；
+--   3. **记录的是本次改动的触发者**（与 `saved_at` 同一时刻），不是快照内容的作者 ——
+--      快照存的是改动**前**的状态。
+--
+-- ★ 标题那一半（`title` 列）**不在这里**：见 `0020_version_title.sql` —— 迁移是
+--   append-only 的历史，补列一律新开一支。
+--
+-- ⚠️ 本文件曾经**同时**写了 `ADD COLUMN title TEXT`（与上面的说明自相矛盾），后果是
+--   **在 PostgreSQL 上新建库直接起不来**：`0020` 再加一次 `title` 会报
+--   `column "title" of relation "page_versions" already exists`（SQLSTATE 42701），
+--   而 PG 的迁移失败会**整体回滚并中止激活**（SQLite 侧同一处缺陷只表现为日志里一条
+--   `migrate` 报错、应用照常启动，所以它一直没被发现）。这一行已删除，`title` 只由
+--   `0020` 补。之所以能删得干净：本文件在两个方言上都是**尚未发布**的新迁移，
+--   没有已升级的库会跳过它。
+ALTER TABLE page_versions ADD COLUMN saved_by INTEGER;
