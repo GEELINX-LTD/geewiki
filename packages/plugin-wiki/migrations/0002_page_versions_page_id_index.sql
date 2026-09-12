@@ -1,0 +1,39 @@
+-- 0002_page_versions_page_id_index.sql —— 重述 page_versions(page_id) 索引
+--
+-- 背景：页面列表（`listPages`）要按页统计历史快照数。该查询本批从「逐行相关子查询」
+-- 改成「一次聚合 + LEFT JOIN」，两种写法都**必须**有 `page_versions.page_id` 上的索引才有意义：
+-- 索引缺失时，聚合写法只是把 N 次全表扫描换成 1 次全表扫描（仍然慢）。
+-- 同一索引还支撑详情页的 `WHERE page_id = ? ORDER BY id DESC LIMIT ?`，以及**删除页面**时
+-- 按 `page_id` 清理该页版本行的那条级联语句（`deletePage` 里唯一的那处）。
+--
+-- ⚠️ 措辞说明（**不是**可读性妥协）：上一句刻意不把那条语句的字面量抄出来 ——
+-- `@geewiki/authz` 的源码守卫（`packages/plugin-authz/test/audit-appendonly.test.ts` 中
+-- `page_versions` 那一条）逐行扫描全仓 `.ts` / `.sql`，而它的注释剥离只认 `/* */` 与 `//`、
+-- **不认 SQL 的 `--` 行注释**；于是"把语句抄进注释"会被当成一处真实的删除点，报
+-- `expected 'deletePage', actual '(文件顶层)'`（本轮实测）。
+-- 守卫的本意没有任何问题（禁止"保留最近 N 条 / 超过 N 天"那类保留策略清理），
+-- 所以这里改的是**说明文字的措辞**，语义一字未减，断言的强度也不动。
+-- 若要根治，正确做法是给该守卫的注释剥离补一条**只对 `.sql` 生效**的 `--` 规则
+-- （`.ts` 里的 `--` 是自减运算符，不能全局剥），而不是放宽那条断言。
+--
+-- ⚠️ **实测：该索引已经存在**，不是这里新建的 ——
+--   · SQLite：`packages/db-sqlite/src/migrations/0001_init.sql:21`
+--   · PostgreSQL：`packages/db-postgres/migrations/0001_init.sql:37`
+-- 两处都是 `CREATE INDEX IF NOT EXISTS idx_page_versions_page_id`。
+-- 因此本文件在既有部署上是**幂等的空操作**（`_migrations` 会记一行，SQL 本身不改变任何东西）。
+--
+-- 那为什么还要加？三个理由，都是"让本插件不依赖宿主的迁移内容"：
+-- 1. 这条查询的**索引依赖**写在查询代码旁边最容易漂移（改了 SQL 却没人再去核对索引），
+--    本插件的迁移目录是它自己的契约，重述一次能被人 grep 到。
+-- 2. 外部/新方言部署（以及从备份恢复、手工建过表的库）不保证宿主基础迁移的那一份还在；
+--    本插件在 `apply` 里跑自己的迁移目录（见 `WIKI_MIGRATIONS_DIR` 的说明），
+--    于是"我需要的索引"由我自己保证，重复执行无害。
+-- 3. 本批新增的 e2e 断言（`test/e2e-p3a.sh` 的版本数守卫）要在**任何**部署上都跑得动。
+--
+-- 语义要点：
+-- 1. **幂等**：`IF NOT EXISTS` + `db.migrate()` 的 `_migrations` 去重（两道）。
+-- 2. **不写 BEGIN/COMMIT**：`db.migrate()` 已把每个迁移文件包在单个事务里，
+--    脚本内再开事务会嵌套报错（同 0001 的说明）。
+-- 3. 索引名与既有命名（`idx_page_links_target`）一致；两种方言都支持该语法。
+
+CREATE INDEX IF NOT EXISTS idx_page_versions_page_id ON page_versions(page_id);
