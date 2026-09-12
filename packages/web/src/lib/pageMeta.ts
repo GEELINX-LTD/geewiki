@@ -14,6 +14,13 @@ const SECTION_LABEL: Record<string, string> = {
   wiki: '知识库',
   plugins: '插件管理',
   graph: '依赖图',
+  // 权限治理（M1）。它是**独立首段**（`#/access` 与 `#/access/<slug>`），
+  // 不能挂在 `wiki/` 下：`parseWikiRoute` 只保留 search|ask|new|list 四个首段，
+  // `#/wiki/<slug>/access` 会被解析成"slug 含 /access"的页面。
+  access: '权限治理',
+  // 组织与邀请管理（P5-B M4/M5）。同样是独立首段（`#/org`）：它整页按 `administer`
+  // 门控，与权限治理（普通成员也有 manageVisibility）不是同一批人用的入口。
+  org: '组织',
   // 身份相关（P1）。它们不进导航，但会出现在 `document.title` 里 ——
   // 浏览器标签页与历史记录里显示"登录 · GeeWiki"远比显示裸产品名有用。
   login: '登录',

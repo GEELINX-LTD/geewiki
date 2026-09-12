@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   BookText,
   GitBranch,
@@ -8,9 +8,12 @@ import {
   Puzzle,
   ScrollText,
   Search,
+  ShieldCheck,
   UserRound,
+  Users,
 } from 'lucide-react'
 import { Button } from './ui/Button'
+import { ErrorState, SkeletonTable } from './ui'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -32,16 +35,57 @@ import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AdminPage } from './pages/AdminPage'
+import { AccessPage } from './pages/AccessPage'
 import { OpsPage } from './pages/OpsPage'
+import { OrgPage } from './pages/OrgPage'
 import { AccountPage } from './pages/AccountPage'
 import { DeniedPage } from './pages/DeniedPage'
 import { NotFoundPage } from './pages/NotFoundPage'
-import { GraphPage } from './pages/GraphPage'
 import { LoginPage } from './pages/LoginPage'
 import { SetupPage } from './pages/SetupPage'
 import { WikiPage } from './pages/WikiPage'
-import { logout, useAuth } from './lib/authStore'
+import { logout, refreshCapabilitiesIfVisible, useAuth } from './lib/authStore'
 import { cn } from './ui/cn'
+
+/**
+ * 依赖图页面**懒加载**（本批 T7）。
+ *
+ * 为什么必须懒：`pages/GraphPage.tsx` 静态 import 了 `@xyflow/react`（React Flow 全家桶），
+ * 静态 import 会把它打进**主包** —— 于是每一个匿名读者（只想看文档）也要先下载这一大块
+ * 与管理台页面无关的代码。改为动态 `import()` 后它成为独立 chunk，只有真的进
+ * `#/graph` 时才拉取。
+ *
+ * 与 `components/MarkdownEditorLazy.tsx` 同一套形态：`lazy` + `Suspense` 骨架 +
+ * 最小错误边界（chunk 取不到时给 `ErrorState`，而不是白屏）。
+ */
+const LazyGraphPage = lazy(() => import('./pages/GraphPage').then((m) => ({ default: m.GraphPage })))
+
+/**
+ * 依赖图懒加载的**最小错误边界**：chunk 404（离线 / 部署漏拷 assets）时 `React.lazy`
+ * 会抛错，接不住就是整页白屏 —— 而这是一个运维台面页面，不该让读者因此失去整个应用。
+ * 只在 `getDerivedStateFromError` 里切一条路，与 `MarkdownEditorLazy` 的边界同款。
+ */
+class GraphBoundary extends Component<{ children: ReactNode }, { broken: boolean }> {
+  override state = { broken: false }
+
+  static getDerivedStateFromError(): { broken: boolean } {
+    return { broken: true }
+  }
+
+  override componentDidCatch(error: Error): void {
+    console.warn('[geewiki-graph] 依赖图页面加载失败：', error)
+  }
+
+  override render(): ReactNode {
+    if (!this.state.broken) return this.props.children
+    return (
+      <ErrorState
+        title="依赖图加载失败"
+        hint="页面资源可能没有取到。刷新页面可重试；若一直失败，请联系管理员。"
+      />
+    )
+  }
+}
 
 /**
  * 简易 hash 路由：location.hash = '#/wiki/getting-started' → route = 'wiki/getting-started'
@@ -142,6 +186,37 @@ const ADMIN_NAV: NavItem[] = [
    * 用文本正则统计"声明了几个能力"，注释里出现同样的字面量会让它多数出一个。
    */
   { id: 'audit', label: '审计与运维', icon: <ScrollText className="size-4" />, requires: 'administer' },
+  /*
+   * 组织与邀请管理（P5-B M4/M5）。判据与其余运维入口一致（`administer`）：
+   * 成员、用户组、邀请这 12 个端点里除 `GET /api/org` 外全部要 `admin+`
+   * （见 `packages/plugin-org/src/index.ts:277`），所以它属于「管理 ▾」而不是
+   * 与「知识库」平级的产品入口（对比 `GOVERN_NAV` 的 `manageVisibility`，那一个
+   * 普通成员也有）。这里的 `id` 就是路由首段：`#/org`。
+   */
+  { id: 'org', label: '组织', icon: <Users className="size-4" />, requires: 'administer' },
+]
+/**
+ * 权限治理入口（M1）。
+ *
+ * **刻意独立于 `ADMIN_NAV`，也不与「管理 ▾」合并**，两个理由：
+ *
+ * 1. **判据不同**：运维台面要 `administer`（= owner / admin），而改档位与授权是
+ *    "对自己有编辑权的条目"就能做的事 —— 组织角色 `member` 也**有**这个能力
+ *    （`packages/plugin-auth/src/index.ts` 的 `capabilitiesOf`：`manageVisibility`
+ *    对 admin 与 member 都为真）。把它塞进只对 admin 开放的「管理 ▾」，等于让
+ *    最常用它的人看不到入口。
+ * 2. **入口语义不同**：这一项**不是**运维台面，而是产品功能（每一条内容都可能有
+ *    自己的档位与授权）。混进运维下拉会让人以为它只有管理员才用得上。
+ *
+ * 与其它入口**同一套判据**：能力为 `null`（首帧）× 无能力 ⇒ 整个入口不渲染
+ * （`visibleDests()` 的失败关闭，见 `lib/navPlan.ts`），而不是置灰。
+ *
+ * ⚠️ `packages/web/test/navPlan.test.ts` 从 `App.tsx` 抽取 `ADMIN_NAV` 的数组体并统计
+ * "条目数 == 声明能力的次数"。本数组**必须声明在这个数组之外**（放在它之前或之后的
+ * 行首 `]` 之外），否则会被那段正则吞进去，两个计数都会错位。
+ */
+const GOVERN_NAV: NavItem[] = [
+  { id: 'access', label: '权限治理', icon: <ShieldCheck className="size-4" />, requires: 'manageVisibility' },
 ]
 /**
  * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
@@ -156,7 +231,8 @@ function isAuthRoute(id: string): boolean {
 export function App(): ReactNode {
   const route = useRoute()
   const root = route.split('/')[0] ?? 'wiki'
-  const known = [WIKI_ITEM, ...ADMIN_NAV].some((t) => t.id === root) || isAuthRoute(root)
+  const known =
+    [WIKI_ITEM, ...ADMIN_NAV, ...GOVERN_NAV].some((t) => t.id === root) || isAuthRoute(root)
   /*
    * ★ P2：未知路由不再**静默回落**到知识库。
    *
@@ -233,6 +309,28 @@ export function App(): ReactNode {
   const auth = useAuth()
 
   /**
+   * 角色能力**随角色变化重取**（本批 T5 的触发点①）。
+   *
+   * 缺陷：`capabilities` 只在 `loadAuth()`（首帧 / 登录登出）时写过一次，于是**标签页一直开着**
+   * 的用户被管理员降级后，运维入口仍留在顶栏 —— 点进去必然失败（服务端仍会兜底拒绝，
+   * 不是越权，但对用户是"看得见、点不动"）。
+   *
+   * 为什么是 `visibilitychange` 而不是定时器：用户回到这个标签页时，正是"我在别处可能被改了
+   * 角色"这件事最可能已经发生的时刻；定时轮询要为一次几乎不发生的事件持续发请求，
+   * 而这条零成本（切回来才问一次，且 `refreshCapabilitiesIfVisible` 内部还有可见性判据）。
+   *
+   * ⚠️ 本 effect **刻意放在 `ADMIN_NAV` 数组之外**（数组内的 `id:` 字面量被
+   * `test/navPlan.test.ts` 计数，写进去会让"条目数 == 能力声明数"错位）。
+   */
+  useEffect(() => {
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') void refreshCapabilitiesIfVisible()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  /**
    * 按能力过滤后的运维台面入口。**必须在 `auth` 之后算**（依赖 `auth.capabilities`）。
    *
    * 空数组 ⇒ 桌面端整个「管理 ▾」**不渲染**（不是渲染一个空下拉、也不是置灰）。
@@ -240,6 +338,12 @@ export function App(): ReactNode {
    * 关于"失败关闭"的说明：宁可让管理员晚一次请求看到入口，也不让匿名访客先看到再收回。
    */
   const adminDests = visibleDests(ADMIN_NAV, auth.capabilities)
+
+  /**
+   * 权限治理入口（同一判据、同一来源）。空数组 ⇒ 桌面端不渲染任何治理标签、
+   * 窄屏菜单里也不出现这一组（同样不是置灰）。
+   */
+  const governDests = visibleDests(GOVERN_NAV, auth.capabilities)
 
   let body: ReactNode
   if (active === 'wiki')
@@ -249,14 +353,32 @@ export function App(): ReactNode {
         onNavigate={(path) => nav(`wiki/${path}`)}
       />
     )
+  else if (active === 'access')
+    // 治理路由是**独立首段**（`#/access` 与 `#/access/<slug>`）：塞进 `wiki/` 会被
+    // `parseWikiRoute` 当成 slug 的一部分，见 lib/accessPlan.ts 的 parseAccessRoute
+    body = <AccessPage sub={route.slice('access'.length).replace(/^\/+/, '')} onNavigate={nav} />
   else if (active === 'plugins') body = <AdminPage />
   else if (active === 'audit') body = <OpsPage />
+  // 组织与邀请管理（P5-B M4/M5）：独立首段 `#/org`，页面自己按 `administer` 门控
+  else if (active === 'org') body = <OrgPage onNavigate={nav} />
   else if (active === 'login') body = <LoginPage />
   else if (active === 'setup') body = <SetupPage />
   else if (active === 'denied') body = <DeniedPage />
   else if (active === 'account') body = <AccountPage />
   else if (active === 'notfound') body = <NotFoundPage />
-  else body = <GraphPage />
+  else
+    body = (
+      /*
+        依赖图（懒加载）：`Suspense` 的兜底用骨架表而不是"加载中…"——
+        `SkeletonTable` 与本应用其它加载态**同一套反馈**，且能占住相近的高度，减少布局跳动。
+        外层错误边界负责"chunk 没取到"这条路径（见 GraphBoundary）。
+      */
+      <GraphBoundary>
+        <Suspense fallback={<SkeletonTable rows={6} />}>
+          <LazyGraphPage />
+        </Suspense>
+      </GraphBoundary>
+    )
 
   const adminActive = adminDests.some((t) => t.id === active)
 
@@ -300,15 +422,20 @@ export function App(): ReactNode {
             <BookText className="size-5" />
           </span>
           <span className="text-wordmark leading-none font-bold tracking-[0.3px] text-white">GeeWiki</span>
-          {/* 副标题在窄屏隐藏：空间不足时优先保留品牌与导航 */}
-          <span className="ml-1 hidden text-2xs text-header-mute lg:inline">
-            AI-Native 插件化知识库
-          </span>
         </a>
 
         {/* 主导航（≥md 显示）。窄屏折叠进右侧的「菜单」下拉 */}
         <nav aria-label="主导航" className="hidden flex-1 items-center gap-1 md:flex">
           <NavTab item={WIKI_ITEM} active={active === WIKI_ITEM.id} onNavigate={nav} />
+
+          {/*
+            权限治理入口（M1）：与「知识库」平级的**产品入口**，不是运维台面 ——
+            判据是 manageVisibility（member 也有），见 GOVERN_NAV 的注释。
+            与「管理 ▾」同一个失败关闭策略：无能力 ⇒ 一个标签都不渲染。
+          */}
+          {governDests.map((item) => (
+            <NavTab key={item.id} item={item} active={active === item.id} onNavigate={nav} />
+          ))}
 
           {/*
             运维台面入口。**`adminDests` 为空时整个下拉不渲染** —— 这正是本次要修的
@@ -384,6 +511,27 @@ export function App(): ReactNode {
                 {WIKI_ITEM.icon}
                 {WIKI_ITEM.label}
               </DropdownMenuItem>
+              {/*
+                权限治理（窄屏）。**刻意不复用 `NavMenuItems`** —— 那个渲染函数会顺带
+                附挂「系统状态」（运维台面的东西），挂在这里会让普通成员看到一个服务健康
+                入口。两处渲染的是同一个 `governDests`，所以判据不会分叉。
+              */}
+              {governDests.length > 0 && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>权限治理</DropdownMenuLabel>
+                  {governDests.map((item) => (
+                    <DropdownMenuItem
+                      key={item.id}
+                      active={active === item.id}
+                      onSelect={() => nav(item.id)}
+                    >
+                      {item.icon}
+                      {item.label}
+                    </DropdownMenuItem>
+                  ))}
+                </>
+              )}
               {/*
                 与桌面端**同一判据**（同一个 `adminDests`）：无可见的运维目的地时，
                 连分组标题与「系统状态」都不出现。窄屏曾经是这段清单的**复制粘贴**，
