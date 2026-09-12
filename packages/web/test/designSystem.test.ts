@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { formatUptime } from '../src/lib/format'
@@ -101,4 +101,83 @@ test('formatUptime：非法输入回退「未知」而不是 NaN', () => {
   }
   // 小数向下取整（不四舍五入：运行 1.9 秒说"1 秒"比说"2 秒"更诚实）
   assert.equal(formatUptime(1.9), '1 秒')
+})
+
+/* ------------- 源码守卫：未注册的 Tailwind token 不得回流 ------------- */
+
+const SRC = join(here, '..', 'src')
+
+/**
+ * 剥掉块注释与行注释（与 `accessPage.test.ts` 同款写法）。
+ *
+ * **必须剥**：本文件、`accessPage.test.ts` 与若干组件注释里**故意**写着
+ * `text-muted-foreground` 这两个名字（"不要写成……"），不剥就会把自己的说明文字
+ * 当成违规命中 —— 而"注释里的反例"恰恰是防止这种写法回流的文档。
+ */
+function codeOnly(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+}
+
+/** 递归收集 `src` 下所有 .ts/.tsx（此刻约 60 个文件；只收集文件、不跟随符号链接） */
+function walkSources(dir: string, out: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name)
+    if (statSync(full).isDirectory()) walkSources(full, out)
+    else if (/\.tsx?$/.test(full)) out.push(full)
+  }
+  return out
+}
+
+/*
+ * 为什么必须用源码级断言：`text-muted-foreground` / `border-border` 是 Tailwind 的**默认**
+ * token 名（来自它的预置主题），而本仓库走 CSS-first 的 `@theme inline`，只注册了
+ * `muted` / `line` / `ink` 等自有名字。写成默认名时 Tailwind **不会报错**——它只是
+ * 不生成任何样式，症状是"这行字/这条线看起来没生效"，肉眼与构建都极难发现。
+ *
+ * 覆盖范围（本批 R10 收口）：**整个 `src`**。此前只扫 `pages/OpsPage.tsx` 一个文件，
+ * 于是 `pages/WikiPage.tsx` / `App.tsx` / `components/CommandPalette.tsx` 这些大文件
+ * 不在任何 token 守卫覆盖内 —— 单个文件的守卫给不了"全仓没有回流"这个结论。
+ */
+test('设计系统：全仓源码不得使用未注册的 Tailwind token', () => {
+  const files = walkSources(SRC)
+
+  /*
+   * 反空洞（三条）：只有"确实扫到了很多东西"才能支撑下面的负向断言。
+   * 少了它们，一次路径写错（目录改名、cwd 变化）就会让"0 处违规"退化成"0 个文件"，
+   * 测试照样全绿。
+   */
+  assert.ok(files.length > 20, `应扫到 20 个以上源文件（实际 ${files.length}），扫描路径可能不对`)
+  for (const must of [
+    'App.tsx',
+    'pages/WikiPage.tsx',
+    'pages/OpsPage.tsx',
+    'pages/AccessPage.tsx',
+    'components/CommandPalette.tsx',
+  ]) {
+    assert.ok(files.includes(join(SRC, must)), `${must} 必须落在扫描集里（否则它不在任何 token 守卫覆盖内）`)
+  }
+  // 抽样自证：大文件真的读到了内容（不是 0 字节）
+  const wiki = codeOnly(readFileSync(join(SRC, 'pages', 'WikiPage.tsx'), 'utf8'))
+  assert.ok(wiki.length > 5000, `WikiPage.tsx 读入异常（仅 ${wiki.length} 字符），路径可能不对`)
+
+  const hits: string[] = []
+  for (const file of files) {
+    const src = codeOnly(readFileSync(file, 'utf8'))
+    const rel = file.slice(SRC.length + 1)
+    if (src.includes('muted-foreground')) hits.push(`${rel}: text-muted-foreground（应改用 text-muted / text-ink-soft）`)
+    if (src.includes('border-border')) hits.push(`${rel}: border-border（应改用 border-line）`)
+  }
+  assert.deepEqual(hits, [], `发现未注册 token 的用法：\n  ${hits.join('\n  ')}`)
+})
+
+test('设计系统：危险操作确认组件存在，并从 ui barrel 统一导出', () => {
+  const src = readFileSync(join(SRC, 'ui', 'ConfirmDialog.tsx'), 'utf8')
+  // 反空洞：同上，先证明读到了组件本体
+  assert.ok(src.length > 500, `ConfirmDialog.tsx 读入异常（仅 ${src.length} 字符），路径可能不对`)
+  assert.match(src, /export function ConfirmDialog\(/, '应导出 ConfirmDialog 组件')
+  assert.match(src, /export function useConfirm\(/, '应导出 useConfirm（否则调用方无法发起确认）')
+  // barrel 也要导出：否则各页面会绕过统一出口各自 import 文件，替换 window.confirm 时容易漏
+  const barrel = readFileSync(join(SRC, 'ui', 'index.ts'), 'utf8')
+  assert.match(barrel, /from '\.\/ConfirmDialog'/, 'ui/index.ts 应导出 ConfirmDialog 模块')
+  assert.match(barrel, /useConfirm/, 'ui/index.ts 应导出 useConfirm')
 })

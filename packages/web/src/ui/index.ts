@@ -32,4 +32,5 @@ export {
   DropdownMenuLabel,
 } from './DropdownMenu'
 export { Dialog, DialogTrigger, DialogClose, DialogContent } from './Dialog'
+export { ConfirmDialog, useConfirm, type ConfirmRequest } from './ConfirmDialog'
 export { Tooltip, TooltipProvider, TooltipRoot, type TooltipProps } from './Tooltip'

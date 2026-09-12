@@ -10,7 +10,7 @@
  * - 触控目标 ≥24×24（见 a11y.ts 的 `touchTarget`），焦点环统一走 `focusRing`；
  * - 不依赖任何业务概念，图标由调用方以 children 传入（`lucide-react`）。
  */
-import type { ButtonHTMLAttributes, ReactNode } from 'react'
+import type { ButtonHTMLAttributes, ReactNode, Ref } from 'react'
 import { cn } from './cn'
 import { focusRing, touchTarget } from './a11y'
 import { Spinner } from './Spinner'
@@ -46,6 +46,14 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   icon?: ReactNode
   /** 只要图标：此时必须提供 `aria-label`（否则屏幕阅读器读不出用途） */
   iconOnly?: boolean
+  /**
+   * 原生按钮的 ref。
+   *
+   * React 19 起 `ref` 就是**普通 prop**（不再需要 `forwardRef`），而 `ButtonHTMLAttributes`
+   * 这个类型里不带它，故在此显式声明。用途是真实的：确认框打开时要把焦点放到确认按钮上
+   * （见 `ui/ConfirmDialog.tsx`），只靠 `autoFocus` 无法表达"由 Dialog 接管焦点落点"。
+   */
+  ref?: Ref<HTMLButtonElement>
 }
 
 /**

@@ -110,3 +110,27 @@ test('OpsPage：反向展开有真实界面入口（否则 api.accessExplain 定
   assert.match(ops, /htmlFor="ops-explain-slug"/, 'Input 必须配 <label htmlFor>（Input 原语的无障碍要求）')
   assert.match(ops, /id="ops-explain-slug"/, 'label 的 htmlFor 必须能对应到输入框的 id')
 })
+
+/*
+ * 「先确认、后执行」的顺序守卫。
+ *
+ * 三个破坏性端点（吊销会话 / 回收过期条目授权 / 回收过期邀请）都必须**先**过 `confirm(...)`。
+ * 这类回归极隐蔽：把 `api.revokeSession(...)` 直接挪回 `onClick` 里，类型检查、构建、
+ * 甚至大多数手工点击都不会报错 —— 只是危险操作少了一次确认。故用**源码位置**钉死顺序，
+ * 且要求 api 调用保持字面量形态（不抽成变量再调），否则本守卫会失去着力点。
+ */
+test('OpsPage：危险操作先 confirm 再调 api（顺序不得倒过来）', () => {
+  const firstConfirm = ops.indexOf('confirm(')
+  // 反空洞：先证明 `confirm(` 确实出现过（注意 `useConfirm(` 是大写 C，不匹配）
+  assert.ok(firstConfirm >= 0, 'OpsPage 应使用统一确认框（useConfirm 返回的 confirm）')
+  for (const call of ['api.revokeSession(', 'api.purgeGrants(', 'api.purgeInvitations(']) {
+    const at = ops.indexOf(call)
+    assert.ok(at >= 0, `OpsPage 应调用 ${call}（端点改名时请同步更新本守卫）`)
+    assert.ok(
+      firstConfirm < at,
+      `${call} 出现在首个 confirm( 之前 —— 危险操作会不经确认直接执行`,
+    )
+  }
+  // 反空洞：确认请求必须真的被渲染出来，否则点了按钮只会什么都不发生
+  assert.match(ops, /<ConfirmDialog/, '确认框必须渲染在页面上（有状态但没组件等于没有确认）')
+})
