@@ -448,7 +448,11 @@ function SidebarAllPagesLink(props: { onNavigate: (path: string) => void }): Rea
 }
 
 /**
- * 主页右栏的次要区块（`xl` 以上才有右栏）。
+ * 主页右栏的次要区块（`xl` 以上真有右栏 —— 由 `hasRightRail` 计入主页后成立；
+ * 此前主页恒为单栏，它实际被排到正文下方整宽，与本节标题和主页正文的"右侧"说法都不符）。
+ *
+ * ⚠️ 块内左内边距与阅读卡片的 `px-6 sm:px-8` 对齐：数字不同时"最近更新"标题与正文标题
+ * 会差几个像素，看起来像没对齐（栅格保证的是**列**对齐，列内还要各自对齐）。
  *
  * 它是**导航辅助**，不是列表页的复制：只给"最近更新"的几条 + 回列表的入口。
  * 刻意不在这里放检索框/过滤框/新建按钮——那些属于列表页（"管理"语义），
@@ -466,8 +470,8 @@ function HomeAside(props: { pages: PageSummary[] | null; onNavigate: (path: stri
   const recent = pages === null ? [] : pages.slice(0, 5)
   if (recent.length === 0) return null
   return (
-    <aside aria-label="最近更新" className="flex flex-col gap-2">
-      <h2 className="m-0 text-note font-semibold text-ink">最近更新</h2>
+    <aside aria-label="最近更新" className="flex flex-col gap-2 px-6 sm:px-8">
+      <h2 className="m-0 text-sm font-semibold text-ink">最近更新</h2>
       <ul className="m-0 flex list-none flex-col gap-1 p-0">
         {recent.map((p) => (
           <li key={p.slug} className="min-w-0">
@@ -475,7 +479,7 @@ function HomeAside(props: { pages: PageSummary[] | null; onNavigate: (path: stri
               href={wikiHref(p.slug)}
               title={p.title}
               className={cn(
-                'block truncate rounded-md px-2 py-1.5 text-note text-ink-soft',
+                'block truncate rounded-md px-2 py-1.5 -ml-2 text-note text-ink-soft',
                 'transition-colors duration-150 ease-standard hover:bg-hover hover:text-ink',
                 focusRing,
               )}
@@ -493,7 +497,7 @@ function HomeAside(props: { pages: PageSummary[] | null; onNavigate: (path: stri
       <a
         href="#/wiki/list"
         className={cn(
-          'rounded-md px-2 py-1.5 text-note text-accent-ink',
+          'inline-block rounded-md px-2 py-1.5 -ml-2 text-note text-accent-ink',
           'transition-colors duration-150 ease-standard hover:bg-hover',
           focusRing,
         )}
@@ -806,15 +810,36 @@ function WikiList(props: {
         />
         {/*
           可滚动区域的键盘可达性：`tabIndex={0}` 让键盘用户能把焦点落到表格上，
-          随后用方向键滚动（否则横向溢出时键盘用户看不到右侧列）。
+          随后用方向键滚动（容器现在**双向**可滚：横向溢出看右侧列，纵向溢出看下面的行）。
           这是 WCAG 2.1.1（键盘）在"可滚动区域"上的具体要求，VitePress 等实现亦如此。
           `aria-label` 给这个可聚焦区域一个名字（否则屏幕阅读器只念"表格"）。
+          焦点必须**可见**（2.4.7）：故同时给 `focusRing`，不能只靠浏览器默认轮廓。
         */}
         {/*
           正文与头部**读同一个 `listState`**（互斥四态），因此不可能再出现
           "头部说加载中、正文说出错"。优先级由 `resolveAreaState` 承担并有单测
           （错误 > 加载 > 空 > 就绪）。
           注意：这里是**唯一**的错误呈现点与**唯一**的重试入口（页头那个 chip 已删除）。
+        */}
+        {/*
+          就绪分支的表格包裹层**必须自己纵向可滚动**，粘性表头才会真的吸附。
+
+          ⚠️ 这是本页最容易被"看起来对、其实没生效"骗到的一处，两件事必须同时成立：
+          ① `sticky` 的吸附参照系是**最近的滚动容器**（CSS 规范：一轴非 `visible` 会让
+             另一轴的 `visible` 计算为 `auto`）。所以仅写 `overflow-x-auto` 就足以让它
+             成为参照系 —— 吸附位置从此不再相对视口；
+          ② 但若只写横向、不给高度上限，该容器 `clientHeight == scrollHeight`，纵向
+             **永远不滚** ⇒ 表头随页面一起滚走，`sticky` 形同虚设。
+             2026-09-12 实测（1440×600）：页面滚 300 时表头矩形 top = -20，滚满 362 时
+             top = -82，**完全滚出视口**。
+             故给 `max-h` + `overflow-auto`：容器真能滚，表头吸附在**容器顶部**。此时
+             `top-0` 是正确写法（容器顶就在顶栏之下）；写成 `top-[var(--spacing-header)]`
+             反而会把表头往表格内部推进 56px 压住首行。
+          ⚠️ 表头背景必须**不透明**：悬停时它盖住行文字，半透明会让下面的字透出来形成
+             "字叠字"。2026-09-12 实测计算值：`bg-surface` = `rgb(255, 255, 255)`、
+             `bg-bg` = `rgb(245, 247, 250)`，两者**都完全不透明**（此前注释称 `bg-surface`
+             是 85% 不透明，属未经验证的错误依据，已按实测改正）。这里仍显式给 `bg-bg`
+             以取页面底色、与行底色区分开。
         */}
         {listState === 'error' ? (
           <ErrorState
@@ -854,28 +879,12 @@ function WikiList(props: {
             }
           />
         ) : (
-          <div className="overflow-x-auto">
+          <div className="max-h-[calc(100vh-12rem)] overflow-auto rounded-md">
             <table
               tabIndex={0}
               aria-label="知识库页面列表"
-              className="w-full border-collapse text-sm"
+              className={cn('w-full border-collapse text-sm', focusRing)}
             >
-              {/*
-                粘性表头：长列表滚到下面时仍能看到列名。
-
-                ⚠️ `top-0` 而不是 `top-[var(--spacing-header)]`：这一层的祖先里有一个
-                `overflow-x: auto` 的包裹 div（见上方容器），它同时把纵向也变成 `auto`
-                （CSS 规范：一轴非 visible 会让另一轴的 visible 计算为 auto），于是它成为
-                **最近的滚动容器**，sticky 的吸附参照系是它、不是视口。参照系换成这个容器后，
-                再写 56px 的顶栏偏移就不再是"避开顶栏"，而是把表头**往下推进表格内部 56px**，
-                正好压住首行 —— 2026-09-12 实测：滚动 0 时表头矩形 y=336、tbody y=312.5，
-                整宽 972px、相交 32.5px 叠在首行文字上。
-                该包裹层纵向不可滚动（clientHeight == scrollHeight），所以容器顶部本身就在
-                顶栏之下，表头贴在容器顶部即可，不需要也不可能靠 top 偏移避开顶栏。
-                ⚠️ 背景必须**不透明**：`bg-surface` 实际解析为 oklab(… / 0.85)（85% 不透明），
-                表头压住行文字时文字会透出来 → 观感就是"字叠字"。这里显式给 `bg-bg`
-                （页面底色，完全不透明），避免半透明背景让下面的内容隐约可见。
-              */}
               <thead className="sticky top-0 z-10 bg-bg">
                 <tr>
                   {['标题', '页面标识', '版本', '最近更新'].map((h) => (
@@ -1215,6 +1224,14 @@ function WikiDetail(props: {
   const activeId = useActiveHeading(tocIds)
 
   /*
+   * 右栏开不开，必须与**两处组件的返回条件**同时对齐，否则会留下"列在、内容不在"的空轨道：
+   *   - `TableOfContents`：`entries.length < MIN_ENTRIES(=2)` 时返回 null（TableOfContents.tsx:29,79）
+   *   - `HomeAside`：最近更新为空时返回 null（下面它的实现里）
+   * 主页额外计入：它通常没有 2 个以上标题，但「最近更新」有内容 ⇒ 右栏该开。
+   */
+  const hasRightRail = rendered.toc.length >= 2 || (homeMode && siblings !== null && siblings.length > 0)
+
+  /*
    * 锚点滚动：URL 带 `?a=<id>` 时滚到该小节。
    *
    * 依赖 `rendered.html`：首次进入（或刷新带锚点的链接）时正文刚注入 DOM，
@@ -1548,24 +1565,27 @@ function WikiDetail(props: {
       </div>
 
       {/*
-        两栏：正文（含历史）在左，目录在右。
+        两栏：正文（含历史）在左，目录/最近更新在右。
         `xl`（1280px）以下回落成单栏，目录改为正文上方的可折叠块（两份 TOC 由组件内部
         用 `xl:hidden` / `hidden xl:block` 互斥显示，因此任何时刻只有一份出现在无障碍树里）。
       */}
       {/*
-        两栏（正文 + 目录）**只在真的有目录时才开**：`TableOfContents` 在标题数不足 2 时
-        返回 `null`，但栅格列仍然会占着 240px —— 右侧于是出现一整条没有任何内容的空白，
-        而正文那一列还被 `minmax(0,1fr)` 压在 710px。2026-09-12 实测：`welcome` 页栅格
-        `710px 240px`，右列 `innerText` 为空、视觉上就是"右边空了一大块"。
-        没有目录时回落单栏，正文列直接拿到全部宽度。
+        右栏**只在真的有东西时**才开：`TableOfContents` 在标题数不足 2 时返回 `null`，
+        `HomeAside` 在列表为空时也返回 `null`，而栅格列照样占着 240px —— 右侧于是出现
+        一整条没有任何内容的空白，而正文那一列还被 `minmax(0,1fr)` 压窄。
+        2026-09-12 实测：`welcome` 页栅格 `710px 240px`，右列 `innerText` 为空、
+        视觉上就是"右边空了一大块"。没有内容时回落单栏，正文列直接拿到全部宽度。
 
-        判定阈值与组件内的 `MIN_ENTRIES = 2` 对齐（组件在 `entries.length < 2` 时返回
-        `null`）；两处必须同步，否则又会留下"列在、内容不在"的空轨道。
+        ⚠️ 主页必须**单独计入**：主页正文通常没有 2 个以上标题（`rendered.toc` 为空），
+        于是此前主页永远是单栏 ⇒ 「最近更新」被排到正文**下方整宽**，实测 1440 视口下
+        它落在 y=1017.8（首屏 900 之外），而主页正文却写着"或右侧「最近更新」里的入口"
+        —— 指引指向的位置根本不在首屏、也不在右侧。计入后主页在 xl 以上得到真正的右栏，
+        指引与实际渲染一致（正文文案同时已订正为"右侧栏"）。
       */}
       <div
         className={cn(
           'grid gap-6',
-          rendered.toc.length >= 2 && 'xl:grid-cols-[minmax(0,1fr)_15rem]',
+          hasRightRail && 'xl:grid-cols-[minmax(0,var(--spacing-measure))_15rem]',
         )}
       >
         <div className="flex min-w-0 flex-col gap-4">

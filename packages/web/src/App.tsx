@@ -363,9 +363,15 @@ export function App(): ReactNode {
    * 同作用域重复声明会让整包 `tsc` 报 TS2451、**类型检查直接不过**。
    */
   const wikiSubForShell = route.slice('wiki'.length).replace(/^\/+/, '')
+  /*
+   * ⚠️ 空子路径（`#/`、`#/wiki`）是**主页面**，它渲染的是一篇长文 ⇒ **阅读态**，
+   * 与详情页、版本预览同档。此前把它也算进 wide，导致主页在 1920 视口下拿到 1552px
+   * 外壳，而正文卡片只有 800px ⇒ 左右各空 ~376px，正是"两边空得太多"最刺眼的一处，
+   * 且与上面那段注释（明写"主页"属阅读态）自相矛盾 —— 注释与行为不一致本身就是缺陷。
+   * 扫描态只留真正列扫描型内容的三个去处：列表（`list`）、检索（`search`）、问答（`ask`）。
+   */
   const wideShell =
     active !== 'wiki' ||
-    wikiSubForShell === '' ||
     wikiSubForShell === 'list' ||
     wikiSubForShell.startsWith('search') ||
     wikiSubForShell.startsWith('ask')
