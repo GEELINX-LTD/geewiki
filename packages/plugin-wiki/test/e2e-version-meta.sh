@@ -284,7 +284,72 @@ else
 fi
 
 echo
-echo "=== 6. 块级 diff：只回结构，绝不回块文本 ==="
+echo "=== 6. 作者名的可见性：三档规则不得退化成「一律回真名」 ==="
+# 规则（`packages/plugin-wiki/src/index.ts` 的版本列表端点，规则注释与实现同处）：
+#   1. 就是你自己 ⇒ 真名；2. 你是 owner/admin ⇒ 真名；3. 其余 ⇒ `displayName: null`。
+#
+# 为什么必须断言这条：`author.id` 是**可枚举的整数**，作者名一律下发等于给普通成员开了一条
+# 枚举组织成员的旁路（`GET /api/org/members` 本来是 admin 闸门）—— 逐个翻页就能拼出名单。
+# 静默退化的表现是"功能看起来更好用了"，不会有人报 bug。
+#
+# 取一版「正文由管理员保存」的快照，再用不同身份的会话读同一个列表。viewer 这一档能否覆盖
+# 取决于阶段 1 记录的组织内 `canEdit` 缺口（若该缺口定案收紧，这里会自然变红 ⇒ 应改期望，
+# 不能把"读不到列表"当成"看不到名字"而悄悄删掉断言）。
+grab_author() { # grab_author <文件> <作者 id> [字段] —— 打印该行的 author.id / displayName（null 原样打印）
+  # 为什么**显式传文件名**而不是读 stdin：viewer 的请求是通过 `vreq` 发的，它会把响应写在
+  # `$TMP/body`（同一个文件）—— 若这里读的是 `$TMP/body`，就会在"管理员取到的内容"与
+  # "viewer 取到的内容"之间悄悄串台，断言看起来在验权限、实际在验同一个响应。
+  node -e '
+    const fs = require("fs")
+    const s = fs.readFileSync(process.argv[1], "utf8")
+    const i = s.indexOf("{"); const o = JSON.parse(i >= 0 ? s.slice(i) : s)
+    const v = (o.versions || []).find((x) => x.author && Number(x.author.id) === Number(process.argv[2]))
+    // 不用顶层 `return`：Node 22 在 `-e` 下可能按 ESM 求值，顶层 return 会直接语法报错
+    // （实测报 "Return statement is not allowed here" —— 看起来像"找不到行"，其实是脚本没跑起来）
+    if (!v) {
+      console.log("<找不到该行>")
+    } else {
+      const d = v.author.displayName === null || v.author.displayName === undefined ? "null" : String(v.author.displayName)
+      console.log(process.argv[3] === "id" ? String(v.author.id) : d)
+    }
+  ' "$1" "$2" "${3:-name}"
+}
+if [[ -n "${ACTOR_ID:-}" ]]; then
+  sess GET "/api/pages/$SLUG/versions?limit=20" > /dev/null
+  cp "$TMP/body" "$TMP/versions-author.json"
+  ADMIN_AUTHOR_NAME="$(grab_author "$TMP/versions-author.json" "$ACTOR_ID")"
+  # 反空洞：先确认"这一档身份 + 查找函数"真的能取到行，否则下面的"看不到真名"可能只是没取到行
+  if [[ "$ADMIN_AUTHOR_NAME" == "版本管理员" ]]; then
+    ok "管理员读版本列表 ⇒ 看得到作者真名（你本来就有成员目录的读取权）"
+  else
+    bad "管理员读版本列表看不到作者真名，实际：$ADMIN_AUTHOR_NAME"
+  fi
+  check_field_absent "★ 版本列表不下发 users 表原字段（只应给 author 对象）" "$TMP/versions-author.json" "display_name"
+  if [[ -n "${JAR2:-}" ]]; then
+    V_CODE="$(vreq GET "/api/pages/$SLUG/versions?limit=20")"
+    if [[ "$V_CODE" == "200" ]]; then
+      cp "$TMP/body" "$TMP/versions-author-viewer.json"
+      VIEWER_AUTHOR_NAME="$(grab_author "$TMP/versions-author-viewer.json" "$ACTOR_ID")"
+      if [[ "$VIEWER_AUTHOR_NAME" == "null" ]]; then
+        ok "★ 普通 viewer 读同一条 ⇒ 只有 id、没有真名（id 是聚合改动所需的最小信息）"
+      else
+        bad "★ 普通 viewer 看到了别人的真名：$VIEWER_AUTHOR_NAME —— 这是成员名单的枚举旁路"
+      fi
+      check "同一时刻 author.id 仍然下发（不把可用信息一起砍掉）" "$ACTOR_ID" "$(grab_author "$TMP/versions-author-viewer.json" "$ACTOR_ID" id)"
+      # 反空洞：不存在的作者 id 必须取不到行 —— 否则"找到行"这件事本身是恒真的
+      check "反空洞：不存在的作者 id 取不到行" "<找不到该行>" "$(grab_author "$TMP/versions-author-viewer.json" 99999999)"
+    else
+      skip "组织内 viewer 读不到版本列表（$V_CODE）⇒ 作者名第 3 档未覆盖（authz 缺口定案后应改期望）"
+    fi
+  else
+    skip "viewer 会话不可用 ⇒ 作者名第 3 档（其余 ⇒ 只有 id）未覆盖"
+  fi
+else
+  bad "取不到任何带 author 的版本行 ⇒ 作者名可见性断言未覆盖"
+fi
+
+echo
+echo "=== 7. 块级 diff：只回结构，绝不回块文本 ==="
 sess GET "/api/pages/$SLUG/versions?limit=1" >/dev/null
 NEW_ID="$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);console.log(o.versions[0].id)})" < "$TMP/body")"
 check "diff 正常 ⇒ 200" "200" "$(sess GET "/api/pages/$SLUG/versions/$NEW_ID/diff")"
@@ -302,19 +367,41 @@ fi
 if grep -qF '受限段落在这一块里' "$TMP/diff.json"; then bad "★ diff 响应里泄漏了受限段落的正文！"; else ok "★ diff 响应不含受限段落正文（唯一串 0 命中）"; fi
 
 echo
-echo "=== 7. 最早一版：no_previous（不是空结果）==="
+echo "=== 8. 最早一版：no_previous（不是空结果）==="
 sess GET "/api/pages/$SLUG/versions?limit=10" >/dev/null
 OLD_ID="$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);console.log(o.versions[o.versions.length-1].id)})" < "$TMP/body")"
 check "最早一版的 diff ⇒ 404" "404" "$(sess GET "/api/pages/$SLUG/versions/$OLD_ID/diff")"
 check "错误码是 no_previous" "no_previous" "$(field 'error')"
 
 echo
-echo "=== 8. 回归：既有单版本快照端点仍可用（且现在带 title）==="
+echo "=== 9. 回归：既有单版本快照端点仍可用（且现在带 title）==="
 check "单版本快照 ⇒ 200" "200" "$(sess GET "/api/pages/$SLUG/versions/$NEW_ID")"
 check "快照含 title 字段（可能为 null）" "true" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);console.log(Object.prototype.hasOwnProperty.call(o,'title'))})" < "$TMP/body")"
+# `title` 存的是**改动前**的标题（`existing.title`，与 `existing.content` 同一时刻），
+# 不是改动后的。理由（`packages/plugin-wiki/src/index.ts` 的 INSERT 旁注释）：快照内容与
+# 标题必须同属"变更前那一份"，否则时间线上"只改了标题"的那次会显示成"正文未变"。
+# 断言方式：把标题改掉保存，再读**最新一版快照**的 title —— 它应当是**改之前**的标题。
+# 为什么不复用 `NEW_ID`：它在第 7 节取的是当时的版本 id，而本节之后还有恢复/可见性写入，
+# 版本会继续增长；用 `limit=1` 现取最新一版，语义才是"刚刚那次改动留下的快照"。
+SLUG_ENC="$(urlenc "$SLUG")"
+put_page "$SLUG" "$BODY1" '标题改过了' > /dev/null
+sess GET "/api/pages/$SLUG" > /dev/null
+check "改标题后当前标题确已生效" "标题改过了" "$(field 'title')"
+sess GET "/api/pages/$SLUG/versions?limit=1" > /dev/null
+# 读的是 **versions[0].title**（列表里最新那一版快照的标题）。注意 `$TMP/body` 此时是**列表**响应，
+# 没有顶层 `title` 字段 —— 早先按顶层字段断言过，写错了对象（探针抓出来才看见）。
+check "列表里最新一版带 title 字段" "true" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);console.log(o.versions&&Object.prototype.hasOwnProperty.call(o.versions[0],'title'))})" < "$TMP/body")"
+NEWEST_SNAP_TITLE="$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);const t=o.versions&&o.versions[0]?o.versions[0].title:undefined;console.log(t===null||t===undefined?'null':String(t))})" < "$TMP/body")"
+check "★ 最新一版快照的 title 是「改动前」的标题（不是改动后的）" "版本探针" "$NEWEST_SNAP_TITLE"
+if [[ "$NEWEST_SNAP_TITLE" == "标题改过了" ]]; then
+  bad "★ 快照 title 存成了改动后的值 —— 时间线上「只改了标题」的那次会显示成改动后，看不出改了什么"
+fi
+put_page "$SLUG" "$BODY1" '版本探针' > /dev/null
+sess GET "/api/pages/$SLUG" > /dev/null
+check "标题已还原（不影响后续阶段）" "版本探针" "$(field 'title')"
 
 echo
-echo "=== 9. 非 canEdit 主体的 /diff 闸门（与 /versions 同判定，需真实版本 id）==="
+echo "=== 10. 非 canEdit 主体的 /diff 闸门（与 /versions 同判定，需真实版本 id）==="
 # 放在这里而不是阶段 1：`/diff` 需要一个**真实存在的版本 id**，而阶段 1 时还没有任何版本。
 if [[ -n "${JAR2:-}" ]]; then
   # 与阶段 1 同款：组织内页上 viewer 会被放行（同一个 authz 缺口，已在那处详述）。
@@ -331,7 +418,7 @@ else
 fi
 
 echo
-echo "=== 10. ★ 恢复历史版本产生的快照必须标 origin=content（真机回归）==="
+echo "=== 11. ★ 恢复历史版本产生的快照必须标 origin=content（真机回归）==="
 # 失效模式：`snapshotAclVersion` 原先把 `origin` 写死成 `'acl'`，而恢复路径改的**就是正文**
 # ⇒ 界面会告诉用户"这次只动了权限"，恰好说反。这条断言就是钉住那个说反。
 #
@@ -393,7 +480,7 @@ if [[ "$PG_MODE" != "1" ]]; then
 fi
 
 echo
-echo "=== 11. audit 里不再出现 content_hash（审计不记内容派生物）==="
+echo "=== 12. audit 里不再出现 content_hash（审计不记内容派生物）==="
 # 失效模式：`page.delete` 的审计 `after` 里落进了整串 sha256（注释却声称不记 hash）。
 # `FORBIDDEN_AUDIT_KEYS` 是**精确匹配**（`key.toLowerCase()`），所以 `content_hash` 逃过了 `hash`。
 # 删除前先确认审计里确实有东西可查（否则"没有 content_hash"只是因为审计表是空的，属假绿）。

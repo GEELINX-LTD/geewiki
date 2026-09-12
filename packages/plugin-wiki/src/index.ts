@@ -2054,8 +2054,14 @@ export const WikiPlugin = {
           return
         }
         const row = (
-          await adb.query<{ id: number; content: string; blocks_json: string | null; acl_json: string | null }>(
-            'SELECT id, content, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
+          await adb.query<{
+            id: number
+            content: string
+            title: string | null
+            blocks_json: string | null
+            acl_json: string | null
+          }>(
+            'SELECT id, content, title, blocks_json, acl_json FROM page_versions WHERE id = ? AND page_id = ?',
             [versionId, page.id],
           )
         )[0]
@@ -2115,7 +2121,29 @@ export const WikiPlugin = {
             targetKind: 'page',
             targetId: slug,
             actorId,
-            after: { restored_version: versionId, block_acls_restored: false },
+            /*
+             * ★ 「从哪一版回到哪一版」必须写在审计里（本批补）。
+             *
+             * 只记 `restored_version` 时，这条审计回答的是"恢复了**哪个快照**"，而恢复
+             * **之后**页面变成第几版是另一个数 —— 排查"这条内容现在到底对应哪一版、
+             * 是哪次恢复弄成这样的"时，两者缺一不可。
+             *
+             * `to_version` 与详情端点的 `page.version` 同源：`COUNT(page_versions) + 1`。
+             * 上面事务里 `snapshotAclVersion` 已经插入了一行（恢复前的状态），所以
+             * **恢复后**的版本号就是"当前行数 + 1" —— 这里不再多查一次库。
+             *
+             * `from_title` 取的是**被覆盖掉的**那一版标题（与快照 `title` 列同一语义）；
+             * 老行（0020 之前）为 NULL，读侧当"未记录"，不编造。
+             */
+            after: {
+              restored_version: versionId,
+              restored_title: row.title ?? null,
+              to_version: (await adb.query<{ n: number }>(
+                'SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?',
+                [page.id],
+              ))[0]!.n + 1,
+              block_acls_restored: false,
+            },
           }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
           h.json(200, {
             ok: true,
@@ -2268,18 +2296,36 @@ export const WikiPlugin = {
          */
         const resync = await resyncDescendantsReporting(slug)
 
+        /*
+         * 与"只恢复正文"那条分支同款：把「从哪一版回到哪一版」写进审计。
+         * `to_version = COUNT(page_versions) + 1`（事务里已插入"恢复前"那一行快照，
+         * 故恢复后的版本号就是当前行数 + 1），与详情端点的 `page.version` 同源。
+         */
+        const toVersion = (await adb.query<{ n: number }>(
+          'SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?',
+          [page.id],
+        ))[0]!.n + 1
+
         void writeAuditLog(adb, {
           action: 'acl.change',
           targetKind: 'page',
           targetId: slug,
           actorId,
-          after: { restored_version: versionId, block_acls_restored: true, acl_revision: revision },
+          after: {
+            restored_version: versionId,
+            restored_title: row.title ?? null,
+            to_version: toVersion,
+            block_acls_restored: true,
+            acl_revision: revision,
+          },
         }).catch((err: unknown) => console.error('[@geewiki/wiki] 审计写入失败:', err))
 
         h.json(200, {
           ok: true,
           slug,
           restored: versionId,
+          // ★ 恢复**之后**的版本号：界面据此说"已恢复到 v{n} 并生成新版本"
+          version: toVersion,
           acl_revision: revision,
           warnings: [],
           // 子孙块被重算的条数（0 = 没有子孙）
@@ -2356,7 +2402,16 @@ export const WikiPlugin = {
             targetKind: 'page',
             targetId: slug,
             actorId: h.principal?.userId ?? null,
-            after: { outcome: result.outcome, version: result.version },
+            /*
+             * ★ 补上 `title`（本批）：只有 `{outcome, version}` 时，审计能回答"谁在什么时候
+             * 把页面推到了哪一版"，但回答不了"**改的是标题还是正文**" —— 而时间线上这两类
+             * 改动长得很像（`outcome` 都是 `updated`，版本号都 +1）。
+             *
+             * `title` 是**用户自己填的页面标题**（不是正文的派生物），进审计与仓库"只记结构
+             * 与归属、不记内容"的纪律不冲突；真正的正文与它的哈希一律**不进审计**
+             * （`FORBIDDEN_AUDIT_KEYS` 连 `hash`/`content_hash` 都禁）。
+             */
+            after: { outcome: result.outcome, version: result.version, title: save.title },
           }).catch((err: unknown) => console.error('[@geewiki/wiki] 保存审计写入失败:', err))
         } catch (err) {
           /*
