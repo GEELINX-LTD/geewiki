@@ -114,3 +114,30 @@ export interface CapabilitiesResponse {
   /** 降级时的人类可读说明（已脱敏） */
   message: string
 }
+
+/**
+ * AI 辅助写作的动作（MVP 四个）。
+ *
+ * 与问答的 `AskResponse` 分开定义，因为两者的**降级语义不同**：
+ * 问答没有模型时仍可用（检索 + 抽取式摘要），而写作**没有模型就是不可用**——
+ * 抽取式摘要冒充不了"续写"。
+ */
+export type AiAssistAction = 'continue' | 'rewrite' | 'polish' | 'summarize'
+
+/**
+ * `POST /api/ai/assist` 的响应体（跨包稳定面：前端与测试都依赖它）。
+ *
+ * **不变式**：`mode === 'unavailable'` 时 `text` 恒为 `null` 且 `degraded` 非空；
+ * `mode === 'generated'` 时 `text` 是模型产物（可能为空串，但绝不是"降级后的替代文本"）。
+ * 前端的预览弹窗据此决定是"显示产物"还是"显示不可用原因 + 重试"。
+ */
+export interface AiAssistResponse {
+  ok: boolean
+  mode: 'generated' | 'unavailable'
+  /** 回显本次动作，便于前端在弹窗里标注"这是续写还是改写" */
+  action: AiAssistAction
+  /** 生成产物；`unavailable` 时恒为 `null`（**绝不用其它文本兜底**） */
+  text: string | null
+  degraded: Degraded | null
+  elapsedMs: number
+}

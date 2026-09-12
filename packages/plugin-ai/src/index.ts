@@ -10,6 +10,13 @@
  *   POST /api/ai/ask            body { q, limit?, extractive? }
  *   GET  /api/ai/ask?q=&limit=  同语义（便于 curl 排障与可分享链接）
  *   GET  /api/ai/capabilities   前端据此决定是否显示"未配置模型"提示
+ *   POST /api/ai/assist         编辑器 AI 辅助写作（续写/改写/润色/摘要）
+ *
+ * 问答与辅助写作的**降级语义不同**（刻意如此）：
+ * 问答没有模型时仍可用（检索 + 零成本抽取式摘要），辅助写作**没有模型就是不可用** ——
+ * 抽取式摘要冒充不了"续写"。故 assist 在无可用 provider 时返回 502 且 `text: null`。
+ * 另外 assist **不做任何检索**：上下文只来自请求体（前端从编辑器缓冲区取出），
+ * 因此用户看不到的受限段落结构上不可能进入模型上下文（见 ./assist.ts 文件头）。
  *
  * 三个刻意的不做（都有理由，不是遗漏）：
  * 1. **不做流式**：SSE 出口与宿主的排空（drain）契约耦合，必须一起设计（见
@@ -49,8 +56,24 @@ import {
   type Watchdog,
 } from './sse.js'
 import type { AskResponse, AskSource, CapabilitiesResponse, Degraded } from './types.js'
+import { assist, type AssistPageAccess } from './assist.js'
 
 export type { AskResponse, AskSource, CapabilitiesResponse, Degraded, DegradedReason } from './types.js'
+export type { AiAssistAction, AiAssistResponse } from './types.js'
+export {
+  ASSIST_ACTIONS,
+  ASSIST_TEXT_MAX,
+  assist,
+  buildAssistMessages,
+  hasEditContent,
+  missingInput,
+  pageEditableFrom,
+  parseAssistBody,
+  type AssistDeps,
+  type AssistInput,
+  type AssistOutcome,
+  type AssistPageAccess,
+} from './assist.js'
 export { buildContext, buildMessages, SYSTEM_PROMPT, type ContextSource } from './prompt.js'
 export { selectSources, type Selection, type SelectionOptions } from './select.js'
 export { extractiveSummary, EXTRACT_MAX_CHARS, EXTRACT_MAX_SOURCES, type ExtractInput } from './extract.js'
@@ -972,13 +995,49 @@ export const AiPlugin = {
       }),
     )
 
+    // ---------------- AI 辅助写作（MVP：非流式；纯生成、不做检索） ----------------
+    //
+    // 与问答的关系：`ask` = 检索 + 生成，`assist` = 只有生成。上下文**只来自请求体**
+    // （前端从编辑器缓冲区取出的 selection/before），服务端不读页面正文、不查索引 ——
+    // 这是块级权限红线：用户看不到的受限段落，结构上不可能进入模型上下文。
+    // `slug` 只用于一次编辑权限判定，绝不用于取正文。详见 `./assist.ts` 的文件头。
+    cleanups.push(
+      router.register('POST', '/api/ai/assist', async (h: RouteHandlerContext) => {
+        try {
+          const raw = await readBody(h)
+          const outcome = await assist(h.principal, raw, {
+            getLlm: () => ctx.get('llm-service') as LlmService | undefined,
+            /**
+             * 页级收紧：与"能改这一页"同权。
+             *
+             * `policy-service` 未激活（@geewiki/authz 缺失）时返回 null ⇒ `pageEditableFrom`
+             * **失败关闭**（宁可不可用，不可放行）。注意本函数**只取访问结论**、不取任何正文 ——
+             * 红线就在这一行。
+             */
+            resolveEditAccess: async (principal, slug) => {
+              const policy = ctx.get('policy-service') as
+                | { resolvePage(p: Principal, s: string): Promise<AssistPageAccess> }
+                | undefined
+              if (!policy) return null
+              const access = await policy.resolvePage(principal as Principal, slug)
+              return { level: access.level, canEdit: access.canEdit }
+            },
+            preGenerationDegraded: () => preGenerationDegraded(),
+          })
+          h.json(outcome.status, outcome.body)
+        } catch (err) {
+          failFromError(h, err)
+        }
+      }),
+    )
+
     // 真正创建 cordis 服务：manifest 的 provides 只是依赖图 token，不会建服务。
     // 两者名字**必须一致**（'ai-service'），否则消费方 ctx.get 拿到 undefined，
     // 表现为"AI 功能静默不可用"这类极难定位的症状（同 @geewiki/search 的教训）。
     const unprovide = ctx.provide('ai-service', svc)
 
     console.log(
-      '[@geewiki/ai] 已激活: POST/GET /api/ai/ask、POST /api/ai/stream、GET /api/ai/capabilities、ai-service 服务（检索-only 降级可用）',
+      '[@geewiki/ai] 已激活: POST/GET /api/ai/ask、POST /api/ai/stream、GET /api/ai/capabilities、POST /api/ai/assist、ai-service 服务（问答检索-only 降级可用；辅助写作无模型时明确不可用）',
     )
     return () => {
       // 先立"已卸载"标志：此后任何仍持有 svc 引用的调用都会显式报错而非返回空结果
