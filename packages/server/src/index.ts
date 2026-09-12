@@ -719,6 +719,14 @@ class HttpRouter implements HttpRouterService {
       }
       const denial = verdictDenial(raw)
       if (denial) {
+        /*
+         * ★ 拒绝响应一律 `no-store`（T6）。**为什么在这里设**：附件能力的 401/403 是在
+         * `gateThenInvoke` 里发出的 —— 那时**插件的处理器还没跑**，插件在自己的处理器入口
+         * 设的 `cache-control` 根本轮不到。错误响应的语义是"此刻的状态不允许"，它不可复用；
+         * 缺了它，浏览器可以启发式缓存 401/403（拿到授权后仍复用旧拒绝，表现为"登录了还是被挡"）。
+         * 成功响应不受影响：这条路径只走拒绝分支。
+         */
+        h.res.setHeader('cache-control', 'no-store')
         // 错误信封与 gateThenInvoke 的拒绝**保持同一形状**（含 details.access）：
         // 同为"拒绝"，两处形状不一致会让前端文案与告警匹配规则产生漂移。
         h.json(denial.status, {
@@ -751,6 +759,8 @@ class HttpRouter implements HttpRouterService {
     const credentialSource = envAdminToken() !== null || this.identity.credentialSourceProbe?.() === true
     const denial = judgeAccess(route.access, h.principal ?? anonymousPrincipal(), credentialSource)
     if (denial) {
+      /* ★ 同上（T6）：网关层的拒绝（401 `unauthorized` / 403 `forbidden`）也必须是 `no-store` */
+      h.res.setHeader('cache-control', 'no-store')
       h.json(denial.status, {
         ok: false,
         error: denial.code,

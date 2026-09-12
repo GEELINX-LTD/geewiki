@@ -23,6 +23,12 @@
  */
 
 import { createHash } from 'node:crypto'
+/*
+ * **类型专用导入**（`import type`）：`projectPageContentFor` 的入参需要主体类型。
+ * 它不会产生任何运行期 import —— 本文件被前端镜像（见 §9 R3：`packages/core` 不能进
+ * 浏览器包），而类型在编译后被完全擦除，故这条导入不破坏"前端只镜像纯逻辑"的约定。
+ */
+import type { Principal } from '@geewiki/core'
 
 /** 块级可见性三档（§2.2）。**不含"仅编辑者"** —— 那一档在 v4 已被 `granted` 取代。 */
 export type BlockVisibility = 'public' | 'org' | 'granted'
@@ -806,6 +812,67 @@ export interface BlockWriter {
 /** 只读侧的最小形状（`readExistingBlocks` 的入参；事务执行器与适配器都满足） */
 export interface BlockReader {
   query<T>(sql: string, params?: readonly unknown[]): Promise<T[]>
+}
+
+/**
+ * ★ 附件批次（M3）：把某页正文投影成**该主体可见的样子**（受限块替换为显式占位）。
+ *
+ * ## 为什么从 `index.ts` 提到这里
+ *
+ * 本函数原先是 `packages/plugin-wiki/src/index.ts` 的私有 `projectPageContent`，
+ * 只有"读页面详情"一个消费者。附件下载端点需要**同一条判据**来决定
+ * "这一份附件是否出现在该主体看得见的正文里"，而附件判定必须与正文投影**逐字同源** ——
+ * 若各写一份，"页面里看不到那段正文、却能下载那段正文里的附件"就是一个不会报错的漏洞。
+ * 于是它必须是**导出**：抬到块模型这一层，让 `projectBlocks` 与它的消费者在同一模块里。
+ *
+ * ## 三条要点（与 P3a 的原始说明一致，语义一字未改）
+ *
+ * 1. **优先读 `blocks` 表**（由 `syncBlocksForPage` 在写入事务里维护）。
+ * 2. **`blocks` 为空时现场解析 `pages.content`** —— P3a 之前保存的历史页面没有块行，
+ *    若此时直接返回 `page.content`，那些页面里可能存在的受限区段就会被**原样吐出**。
+ *    读路径不能依赖"写入路径已经跑过"：那是可被绕过的假设（旧数据、直接改库、迁移未回填
+ *    都能让它不成立），而它一旦不成立就是泄漏。
+ * 3. **读者等级只看组织角色**：匿名 = `0`，有组织角色 = `1`；`granted` 档由
+ *    `projectBlocks` 的授权分支放行（`grantedBlockIds` 缺失 ⇒ 空集 ⇒ 失败关闭）。
+ *
+ * @param db 只读执行器（`BlockReader`）。**结构类型**，故适配器与事务执行器都能直接传入。
+ */
+export async function projectPageContentFor(
+  db: BlockReader,
+  args: { pageId: number; content: string; principal: Principal; grantedBlockIds?: readonly number[] },
+): Promise<{ text: string; gatedCount: number }> {
+  /*
+   * ★ P3b：**必须把 `id` 一起取出来**。授权分支是拿块 id 去查的
+   * （`block_grants.block_id`），少了这一列，被授予的 `granted` 块会**对授权者也
+   * 不可见** —— 症状是"授权明明写进去了却看不到"，而且不报任何错。
+   */
+  const rows = await db.query<{ id: number; ordinal: number; text: string; visibility: string }>(
+    'SELECT id, ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
+    [args.pageId],
+  )
+  const blocks =
+    rows.length > 0
+      ? rows.map((r) => ({
+          // 块 id 必须原样带过去 —— 它是授权分支唯一的键
+          id: Number(r.id),
+          ordinal: r.ordinal,
+          text: r.text,
+          visibility: r.visibility as BlockVisibility,
+        }))
+      : /*
+         * 现场解析的降级路径：**没有块 id** ⇒ 授权分支必然落空
+         * （见 `ProjectableBlock.id` 的说明 —— 拿会漂移的 ordinal 去查权限表是错的）。
+         * 也就是说，**P3a 之前保存、且尚未被回填的历史页面里，`granted` 块对被授权者
+         * 也不可见**，直到该页被重新保存为止。方向是失败关闭。
+         */
+        parseBlocks(args.content)
+  const anonymous = args.principal.kind === 'anonymous'
+  const tier: ReaderTier = anonymous ? 0 : 1
+  return projectBlocks(blocks, {
+    tier,
+    anonymous,
+    grantedBlockIds: args.grantedBlockIds ?? [],
+  })
 }
 
 /**
