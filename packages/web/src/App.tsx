@@ -28,7 +28,6 @@ import { ThemeToggle } from './components/ThemeToggle'
 import { SystemStatusDialog } from './components/SystemStatusDialog'
 import { MAIN_CONTENT_ID } from './lib/domIds'
 import { hashQueryOf, stripHashQuery } from './lib/hashAnchor'
-import { parseWikiRoute } from './lib/wikiRoute'
 import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
 import { titleForRoute } from './lib/pageMeta'
 import { visibleDests, type NavDest } from './lib/navPlan'
@@ -376,43 +375,28 @@ export function App(): ReactNode {
   const governDests = visibleDests(GOVERN_NAV, auth.capabilities)
 
   /*
-   * 外壳宽度分档（**按内容类型**，不是按页面）：
-   *   - 阅读态（知识库详情/主页/版本预览）：保持 1280px。长文的可读性由正文的
-   *     `--spacing-measure`（中文 35~45 字/行）把关，外壳再宽只是徒增两侧空白。
-   *   - 扫描态（列表/检索/问答/管理台面）：放宽到 `--spacing-wide`（1552px）。这些页面是
-   *     表格与多列信息，宽度直接等于"一屏能看多少"。
-   * 2026-09-12 实测（修复前）：1920 视口下 `main` 恒为 1280px，左右各 320px 空白，
-   * 列表表格只占视口 50.6%。
+   * 外壳宽度：**所有页面统一用 `--spacing-wide`（1552px）**，不再按内容类型分档。
+   *
+   * 曾经分两档（阅读态 1280 / 扫描态 1552），理由写在 tokens.css 里："长文的可读性由
+   * `--spacing-measure` 把关，外壳再宽只是徒增两侧空白"。这个推理**只对了一半**：
+   * 外壳多出来的宽度确实不该给正文，但也不该留成空白 —— 当时阅读态把宽度留在了卡片
+   * **内部**（实测 1920 视口：卡片 974px、正文 630px ⇒ 卡内右侧空 279~344px），而且
+   * 详情页与列表页的外壳宽度不一致（1280 vs 1552），同一站点跳一次页面左右留白就变一次。
+   *
+   * 现在的分工：**外壳负责"用掉屏幕"，列宽负责"读得舒服"** —— 阅读栅格的正文列封在
+   * `--spacing-measure`（`WikiPage.tsx` 的 `READ_GRID_*`），多出来的宽度给右栏
+   * （目录 / 最近更新）。可读性硬指标一点没动。
+   *
+   * 2026-09-12 实测（基线）：`main` 在列表页 1552、在详情页 1280，后者左右各 320px
+   * 空白、卡内右侧另空 279px；统一后三者（列表/详情/主页）都是 1552。
    *
    * 用内联 `style.maxWidth` 而不是 `max-w-[var(--spacing-wide)]`：Tailwind 对
    * "任意值里再嵌 var()" 的写法不生成工具类（实测产物 CSS 命中 0 次），静默失效比写死更危险。
-   * `data-shell` 属性同时给出 CSS 侧的稳定挂钩（见 styles.css），供后续按档位加规则。
+   * `data-shell` 属性同时给出 CSS 侧的稳定挂钩（见 styles.css）。
    */
-  /*
-   * ⚠️ 变量名不能叫 `wikiSub`：上面（记录"最近访问"那段）已有同名变量，
-   * 同作用域重复声明会让整包 `tsc` 报 TS2451、**类型检查直接不过**。
-   */
-  const wikiSubForShell = route.slice('wiki'.length).replace(/^\/+/, '')
-  /*
-   * 分档的判据是**解析出来的路由种类**，不是路径前缀的 `startsWith`：
-   * `searchfoo`、`ask-me` 都是**合法 slug**（首段只要不是保留段就当页面），
-   * 用前缀匹配会把它们误分档成扫描态（正文被拉到 1552px 外壳里）。
-   * `parseWikiRoute` 是同一份纯函数，路由怎么解析、外壳就怎么分档，不存在第二种口径。
-   *
-   * ⚠️ 空子路径（`#/`、`#/wiki`）是**主页面**，它渲染的是一篇长文 ⇒ **阅读态**，
-   * 与详情页、版本预览同档（`kind === 'home'` 不在下面的扫描态集合里）。
-   * 此前把它也算进 wide，导致主页在 1920 视口下拿到 1552px 外壳，而正文卡片只有 630px
-   * ⇒ 左右各空出近一半，正是"两边空得太多"最刺眼的一处。
-   * 扫描态只留真正列扫描型内容的三个去处：列表、检索、问答。
-   */
-  const shellRoute = parseWikiRoute(wikiSubForShell)
-  const wideShell =
-    active !== 'wiki' ||
-    shellRoute.kind === 'list' ||
-    shellRoute.kind === 'search' ||
-    shellRoute.kind === 'ask'
   /** 与 tokens.css 的 `--spacing-wide` 同值。写具体值而不是 var()：`@theme` 里的自定义
-   *  尺寸变量只在被工具类引用时才输出到 `:root`，内联 var() 引用可能落空（静默失效）。 */
+   *  尺寸变量只在被工具类引用时才输出到 `:root`，内联 var() 引用可能落空（静默失效）。
+   *  两处必须同值，`test/contrastPlan.test.ts` 会盯着。 */
   const WIDE_MAX_WIDTH = '1552px'
 
   let body: ReactNode
@@ -650,8 +634,8 @@ export function App(): ReactNode {
       <main
         id={MAIN_CONTENT_ID}
         tabIndex={-1}
-        data-shell={wideShell ? 'wide' : 'read'}
-        style={wideShell ? { maxWidth: WIDE_MAX_WIDTH } : undefined}
+        data-shell="wide"
+        style={{ maxWidth: WIDE_MAX_WIDTH }}
         className={cn(
           'mx-auto w-full max-w-[1280px] flex-1 px-[var(--spacing-gutter)] py-[var(--spacing-gutter)]',
           // 程序化聚焦容器（跳转链接的落点）不画焦点环：它没有交互语义，

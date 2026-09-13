@@ -203,24 +203,56 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 .md-body th, .md-body td { border: 1px solid var(--gw-line); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 3); }
 .md-body hr { border: 0; border-top: 1px solid var(--gw-line); margin: 1.4em 0; }
 /*
+  阅读栅格的列宽（`WikiPage.tsx` 的 `.gw-reader-grid`）。
+
+  列宽 = **正文内容盒 + 卡片两侧内边距**：`--spacing-measure`（630px，中文 45 字/行）
+  约束的是 `.md-body` 的**内容**宽度，而内边距是卡片自己吃的（`px-6` ⇒ 24px；
+  `sm:px-8` ⇒ 32px）⇒ 列宽必须比它宽出 2 倍内边距。
+
+  ⚠️ **只写 `var(--spacing-measure)` 是不够的**（2026-09-12 实测踩过）：列宽等于 630px 时，
+  正文只剩 564px（40 字/行），比可读性硬指标窄 66px。
+
+  ⚠️ 也**不要**把列宽写成和式或引用那个变量：`minmax()` 的 max 位置放
+  `calc(630px + 32px)` / `calc(630px + 2rem)` / 变量里的 `em` 时，轨道会**退化成内容宽度**
+  —— 实测得 662px、正文 596px，而写 `min(694px, 100%)` 才是 694px、正文 628px
+  （同一页同一时刻的受控对照）。故这里写死 694px。
+
+  ⚠️ 双栏只在 **`xl`（1280px）** 以上生效：`md`~`xl` 之间用两列会把正文列挤到 177px
+  （2026-09-12 实测）。
+
+  ⚠️ 这里**只设列宽，不设宽高与居中** —— 卡片一旦自己限宽/居中，就会与同列其它卡片
+  错开（历史上出现过"正文卡 x=443.5、版本历史卡 x=357.5、错开 86px"的阶梯）。
+*/
+.gw-reader-grid {
+  /* 单栏：正文内容盒 630 + 2×32（`sm:px-8`）；`min(…, 100%)` 保证窄屏不溢出 */
+  grid-template-columns: minmax(0, min(694px, 100%));
+}
+@media (min-width: 1280px) {
+  .gw-reader-grid.has-rail {
+    /* 双栏：右栏 `1fr` 吃掉剩余宽度，整块上限由 `md:max-w-[1504px]` 把关 */
+    grid-template-columns: minmax(0, 694px) minmax(15rem, 1fr);
+  }
+}
+/*
   阅读卡片：宽度由**栅格列**决定，不再自己限宽居中。
 
-  背景（2026-09-12 实测）：正文 `.md-body` 有 `max-width: var(--spacing-measure)`，而卡片
-  此前撑满栅格列（约 974px，正文只占 630px）⇒ 卡片右侧空出近一半，观感就是"左右两边
-  空得太多"。空洞在**卡片内部**，加宽外壳解决不了。
+  背景（2026-09-12 实测，1920×1080）：正文 `.md-body` 有 `max-width: var(--spacing-measure)`
+  （630px），而卡片撑满栅格列 974px ⇒ **卡内右侧空 279~344px**，观感就是"左右两边空得太多"。
+  空洞在**卡片内部**，加宽外壳解决不了 —— 这也是"列表页好了、详情页没好"的原因：
+  当时 `xl:grid-cols-…` 只在 `hasRightRail` 为真时生效，而 `welcome` 没有右栏 ⇒
+  栅格只剩 `grid gap-6`，单列 `1fr` 直接吃掉外层 `flex-1` 的 974px。
 
   曾试过"卡片限宽 + `margin-inline: auto` 居中"，它消掉了卡内空白，但引入了新问题：
   同列的其它卡片（「版本历史」「上一篇/下一篇」）仍撑满整列 ⇒ 实测同一页内
   `article.gw-reader` 左缘在 x=443.5、版本历史卡片在 x=357.5，**左右各错开 86px**，
   形成视觉上的"阶梯"。居中是"单张卡片自扫门前雪"的做法，列里只要还有别的卡片就必然对不齐。
 
-  现在的做法：**栅格列上限就是行宽** + 整块栅格居中 ——
-  `WikiPage.tsx` 的 `xl:grid-cols-[minmax(0,var(--spacing-measure))_15rem]`：
-  左列最多 `--spacing-measure`（630px）、右列 15rem，整块由外层居中。
-  于是列内所有卡片左缘一致、宽度一致，正文照旧受 `--spacing-measure` 约束
-  ⇒ 40 字/行的可读性硬指标没有被牺牲（2026-09-12 实测：`.md-body` clientWidth 564px、
-  字号 14px ⇒ 40 字/行；这是为什么不直接放大 `--spacing-measure`）。
-  没有右栏时（`hasRightRail` 为假）回落单栏，列宽同样由 `--spacing-measure` 封顶。
+  现在的做法：**列宽由 `.gw-reader-grid`（本文件上方）给出**，只有一处定义，
+  口径与实测对照都写在那里；`WikiPage.tsx` 只负责挂类名（`.gw-reader-grid`，
+  有右栏时再加 `.has-rail`）。
+
+  于是列内所有卡片左缘一致、宽度一致，正文内容盒稳定在 630px（字号 14px ⇒ 中文 45 字/行，
+  可读性硬指标没有被牺牲）。
 
   ⚠️ 因此这里**不要再给卡片加 width/margin-inline**：一旦加上，卡片又会与同列其它卡片错开。
 

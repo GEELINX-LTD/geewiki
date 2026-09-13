@@ -1823,10 +1823,9 @@ function WikiDetail(props: {
       */}
       {/*
         右栏**只在真的有东西时**才开：`TableOfContents` 在标题数不足 2 时返回 `null`，
-        `HomeAside` 在列表为空时也返回 `null`，而栅格列照样占着 240px —— 右侧于是出现
-        一整条没有任何内容的空白，而正文那一列还被 `minmax(0,1fr)` 压窄。
-        2026-09-12 实测：`welcome` 页栅格 `710px 240px`，右列 `innerText` 为空、
-        视觉上就是"右边空了一大块"。没有内容时回落单栏，正文列直接拿到全部宽度。
+        `HomeAside` 在列表为空时也返回 `null`。没有内容时回落单栏 —— 单栏分支**同样**
+        把列宽封在 `--spacing-measure`（见下面栅格上的注释），所以"没有右栏"不等于
+        "正文列被拉满整屏"，两件事必须分开处理。
 
         ⚠️ 主页必须**单独计入**：主页正文通常没有 2 个以上标题（`rendered.toc` 为空），
         于是此前主页永远是单栏 ⇒ 「最近更新」被排到正文**下方整宽**，实测 1440 视口下
@@ -1837,18 +1836,36 @@ function WikiDetail(props: {
       <div
         className={cn(
           'grid gap-6',
-          hasRightRail && 'xl:grid-cols-[minmax(0,var(--spacing-measure))_15rem]',
+          /*
+            阅读栅格：**两个分支都要显式给列宽**，不能只在"有右栏"时给。
+            此前单栏分支只有 `grid gap-6` ⇒ 列宽是默认的 `1fr`，直接吃掉外层
+            `flex-1` 的整个宽度（实测 1920 视口：外层 974px ⇒ 列 974px ⇒ 卡片 974px），
+            而正文 `.md-body` 仍被 `--spacing-measure` 封在 630px ⇒ **卡内右侧空 344px**。
+            空洞在卡片内部，光放宽外壳解决不了（这正是上一轮"列表页好了、详情页没好"的原因）。
+
+            现在的四条硬约束，缺一条就会退回老样子：
+              1. 正文的**内容盒**仍被 `--spacing-measure` 封在 630px（可读性硬指标）；
+              2. 列宽必须**把卡片内边距算进去**：内边距在 `article.gw-reader` 上
+                 （`px-6 … sm:px-8` ⇒ 24/32px 每侧），而 `--spacing-measure` 只管内容宽度
+                 ⇒ 列宽只写 `var(--spacing-measure)` 会让正文被内边距挤窄（实测 1920 视口
+                 正文 564px ⇒ 40 字/行，比硬指标窄 66px）；
+              3. 有右栏的页面，双栏只在 `xl`（1280px）以上生效（`styles.css` 的
+                 `.gw-reader-grid`）：`md`~`xl` 之间用两列会把正文列挤到 177px；
+              4. 列里所有卡片共用同一个栅格列 ⇒ 左缘天然一致，**不要再给卡片加
+                 `width`/`margin-inline`**（历史上"卡片限宽 + 居中"造成过 86px 阶梯）。
+          */
+          'gw-reader-grid md:max-w-[1504px]',
+          hasRightRail && 'has-rail',
         )}
       >
         <div className="flex min-w-0 flex-col gap-4">
           <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="inline" />
 
           {/*
-            阅读卡片：`gw-reader` 让卡片宽度**跟着正文行宽走**（styles.css）。
-            此前卡片撑满栅格列（1440 视口下约 974px），而正文 `.md-body` 受
-            `--spacing-measure`（`min(46rem, 45em)`，14px 正文下即 630px = 45 字/行）约束
-            ⇒ 卡片右侧空出 400px 以上，
-            观感即"左右两边空得太多"。空洞在**卡片内部**，加宽外壳解决不了。
+            阅读卡片：宽度**跟着栅格列走**，自己不设宽（口径见 styles.css 那段长注释）。
+            卡片与同列的「上一篇/下一篇」「相关页面」共用同一个栅格列 ⇒ 左缘天然一致；
+            正文 `.md-body` 另有 `--spacing-measure`（`min(46rem, 45em)`，14px 下 630px
+            = 45 字/行）封顶，所以列里也不会出现"卡片很宽、正文很窄"的空洞。
           */}
           <article className="gw-reader rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
             <h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>
