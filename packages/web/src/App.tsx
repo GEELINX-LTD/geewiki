@@ -397,7 +397,7 @@ export function App(): ReactNode {
   /** 与 tokens.css 的 `--spacing-wide` 同值。写具体值而不是 var()：`@theme` 里的自定义
    *  尺寸变量只在被工具类引用时才输出到 `:root`，内联 var() 引用可能落空（静默失效）。
    *  两处必须同值，`test/contrastPlan.test.ts` 会盯着。 */
-  const WIDE_MAX_WIDTH = '1552px'
+  const WIDE_MAX_WIDTH = '1840px'
 
   let body: ReactNode
   if (active === 'wiki')

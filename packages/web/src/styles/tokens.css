@@ -401,7 +401,7 @@
 @theme {
   --spacing-gutter: 22px; /* 外壳左右内边距，与既有 styles.css 的 22px 对齐 */
   --spacing-header: 56px; /* 顶栏高度，跳过链接与 sticky 定位都要用它 */
-  --spacing-measure: min(53rem, 50em); /* 正文行宽：中文 50 字/行（clreq 35~50 的上沿）。
+  --spacing-measure: min(70rem, 66em); /* 正文行宽：中文 60 字/行（宽屏上为填满页面而放宽，见 styles.css 三档表）。
                                 `50em` 锚在正文实际字号（14px ⇒ 700px ⇒ 50 字/行），`53rem` 只作
                                 根字号被放大时的上限兜底（默认 16px 下不生效）。为什么既不是 68ch
                                 也不是 46rem：见上方口径说明（两者都不等于一个汉字）。 */
@@ -425,7 +425,7 @@
   可读性硬指标（中文 50 字/行）一点没动。
 */
 @theme {
-  --spacing-wide: 1552px; /* 外壳上限（阅读态与扫描态同值）：1280 + 2×136，宽屏下把空白让给内容。
+  --spacing-wide: 1840px; /* 外壳上限（阅读态与扫描态同值）：1280 + 2×136，宽屏下把空白让给内容。
                              实际由 App.tsx 以同值内联样式施加（见那里的注释），
                              `test/contrastPlan.test.ts` 盯着两处必须同值。 */
 }

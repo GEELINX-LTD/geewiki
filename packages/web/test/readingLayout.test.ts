@@ -54,23 +54,66 @@ test('阅读栅格：列宽用变量，不再写死 694px/15rem 这类旧值', (
 test('阅读栅格：右栏宽度分档且随断点单调不减', () => {
   /*
     真机依据（1920×1080）：右栏 240 时两列之和 958，而阅读区 1246 ⇒ 居中后两侧各空 144。
-    现取 272 / 296 / 320 三档，覆盖 1280 / 1440 / 1600 三个断点。
+    现取 300 / 320 / 360 三档，覆盖 1280 / 1440 / 1600 三个断点。
+
+    ⚠️ 同一断点下可能有多条 `.gw-reader-grid.has-rail` 规则（列宽一条、补偿一条），
+    所以这里按"媒体块"归并后再找右栏宽度，不能假设"一个断点只有一条、且第一条就是列宽"。
   */
-  const blocks = Array.from(css.matchAll(/@media\s*\(min-width:\s*(\d+)px\)\s*\{\s*\.gw-reader-grid\.has-rail\s*\{([^}]*)\}/g)).map((m) => ({
-    min: Number(m[1]),
-    body: m[2] as string,
-  }))
-  assert.ok(blocks.length >= 3, `应有三档右栏宽度规则，实际找到 ${blocks.length} 条`)
-  const railPx = blocks.map((b) => {
-    const rail = /minmax\(0,\s*(\d+)px\)/.exec(b.body)
-    assert.ok(rail, `断点 ${b.min} 的 has-rail 规则里找不到右栏像素宽度：${b.body.trim()}`)
-    return { min: b.min, px: Number(rail[1]) }
-  })
+  const byBreakpoint = new Map<number, string[]>()
+  for (const m of css.matchAll(/@media\s*\(min-width:\s*(\d+)px\)\s*\{\s*\.gw-reader-grid\.has-rail\s*\{([^}]*)\}/g)) {
+    const min = Number(m[1])
+    byBreakpoint.set(min, [...(byBreakpoint.get(min) ?? []), m[2] as string])
+  }
+  assert.ok(byBreakpoint.size >= 3, `应有三档右栏规则，实际找到 ${byBreakpoint.size} 个断点`)
+  const railPx = [...byBreakpoint.entries()]
+    .map(([min, bodies]) => {
+      /*
+        ⚠️ 右栏列必须写成**裸像素**（`… var(--gw-read)) 360px`）。
+        曾经写成 `minmax(300px, 1fr)`：`1fr` 会按栅格可用空间解析 ⇒ 1920 下右栏被拉成
+        **526px**，而「本页信息」只有四行短文字 ⇒ 卡内空出几百像素（用户看到的"右栏被拉宽、
+        内部反而空"）。也**不能**写 `minmax(0, Npx)`：下限 0 让轨道可被压到 0 宽。
+        故这里取"轨道的裸像素宽度"，并要求它落在窄栏区间内（内容相称，不随视口膨胀）。
+      */
+      const found = bodies
+        .map((b) => /var\(--gw-read\)\)\s*(\d+)px/.exec(b))
+        .filter((r): r is RegExpExecArray => r !== null)
+      assert.ok(found.length > 0, `断点 ${min} 的 has-rail 规则里找不到右栏像素宽度（该断点规则体：${bodies.join(' | ').trim()}）`)
+      const px = Number(found[0]![1])
+      assert.ok(px >= 260 && px <= 400, `右栏宽度 ${px}px 超出窄栏区间 260~400：右栏应与内容相称，不吃满余量`)
+      return { min, px }
+    })
+    .sort((a, b) => a.min - b.min)
   for (let i = 1; i < railPx.length; i += 1) {
     assert.ok(railPx[i]!.min > railPx[i - 1]!.min, '右栏断点必须严格递增（否则后写的规则永远盖住前一条）')
     assert.ok(railPx[i]!.px >= railPx[i - 1]!.px, `右栏宽度不得随视口变宽而变窄：${railPx[i - 1]!.px} → ${railPx[i]!.px}`)
   }
   assert.ok(railPx[0]!.px > 240, '最窄一档也必须比旧的 240px 宽，否则又回到"两列撑不满阅读区"')
+})
+
+test('阅读栅格：块宽按内容定宽 + 居中，且 ≥1440 补偿阅读区偏移', () => {
+  /*
+    两件互相牵制的事，缺一条就会退回用户抱怨的形态（2026-09-13 实测）：
+      · 块宽写 `100%`（撑满）⇒ 两列只占一段、`margin-inline: auto` 没有余量可分
+        ⇒ 块右对齐、文章贴左，右侧空一大条；
+      · 只居中不补偿 ⇒ 阅读区本身被左侧栏右推 131px，块跟着右偏（实测 1920 左空 487 / 右空 225）。
+    实测补偿后：1920 356/356、1600 196/196、1440 153/153（左右完全相等）。
+  */
+  const grid = /^\.gw-reader-grid\s*\{([\s\S]*?)\n\}/m.exec(css)
+  assert.ok(grid, '应能找到 .gw-reader-grid 规则')
+  const body = grid[1]!
+  assert.match(body, /width:\s*max-content/, '块宽必须 max-content（按内容定宽，才能被 auto 边距居中）')
+  assert.match(body, /margin-inline:\s*auto/, '块必须 margin-inline: auto 居中')
+  assert.doesNotMatch(body, /(^|[^-])width:\s*100%/, '块宽不得写 100%：撑满后居中失效、内容贴左')
+  assert.match(
+    css,
+    /@media\s*\(min-width:\s*1440px\)\s*\{\s*\.gw-reader-grid\.has-rail\s*\{\s*transform:\s*translateX/,
+    '≥1440 有右栏时必须补偿阅读区偏移（否则块相对视口右偏约 131px）',
+  )
+  assert.match(
+    css,
+    /@media\s*\(min-width:\s*1280px\)\s*\{\s*\.gw-reader-grid:not\(\.has-rail\)\s*\{\s*transform:\s*translateX/,
+    '≥1280 无右栏时的补偿规则不得被删（窄屏无侧栏，两者中心重合）',
+  )
 })
 
 test('阅读栅格：1280~1439 有右栏时收窄正文列（否则内容贴右缘）', () => {
