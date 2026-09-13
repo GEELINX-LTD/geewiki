@@ -8,7 +8,6 @@ import { ChevronLeft, ChevronRight, FileText, History, List as ListIcon, LogIn, 
  * 相对/绝对时间的唯一真源（`lib/timePlan.ts`）：右栏「本页信息」与版本下拉共用同一套口径，
  * 避免"11小时前"与"2026/9/12 15:56:59"两种写法在同一个页面里各说各的。
  */
-import { absoluteTime, relativeTime } from '../lib/timePlan'
 import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary, type VersionMeta } from '../api'
 import { ApplyAccessDialog } from '../components/access/ApplyAccessDialog'
 import { PageAccessPanel } from '../components/access/PageAccessPanel'
