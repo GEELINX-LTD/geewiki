@@ -13,7 +13,6 @@ import {
   createParam,
   loginForEditPage,
   loginForNewPage,
-  loginForWikiPath,
   newPageEntry,
   type NewPageEntry,
 } from '../lib/newPageGate'
