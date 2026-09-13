@@ -4,6 +4,11 @@ import { hashQueryOf, stripHashQuery } from '../lib/hashAnchor'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
 import { ChevronLeft, ChevronRight, FileText, History, List as ListIcon, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
+/*
+ * 相对/绝对时间的唯一真源（`lib/timePlan.ts`）：右栏「本页信息」与版本下拉共用同一套口径，
+ * 避免"11小时前"与"2026/9/12 15:56:59"两种写法在同一个页面里各说各的。
+ */
+import { absoluteTime, relativeTime } from '../lib/timePlan'
 import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary, type VersionMeta } from '../api'
 import { ApplyAccessDialog } from '../components/access/ApplyAccessDialog'
 import { PageAccessPanel } from '../components/access/PageAccessPanel'
@@ -565,6 +570,59 @@ function HomeAside(props: { pages: PageSummary[] | null; onNavigate: (path: stri
       >
         全部页面 →
       </a>
+    </aside>
+  )
+}
+
+/**
+ * 右栏的**本页信息**：什么时候更新的、第几版、什么时候建的。
+ *
+ * 为什么右栏需要它：右栏此前只有「目录」与（主页的）「最近更新」，两者都自带空态返回
+ * `null` ⇒ 一篇**没有两级标题**的普通页（例如 `welcome`）右栏整条消失，正文列独自居中，
+ * 视口两侧各空 ~578px。用户的原话是「居中好歹把整体页面填充满啊，两边空着这么多是什么意思」。
+ * 本页信息对**每一篇**页面都成立，因此右栏在任何页面都有内容可放 —— 它同时把
+ * "本页最近什么时候被动过"摆到读者眼前，与页头的版本下拉（"谁改的、改了哪几版"）互补。
+ *
+ * ⚠️ 时间文案的两条口径（不要改成"日期 + 时间"那种冗余写法）：
+ *   · **相对时间**给"多久以前"的直觉，与版本下拉的 `versionMetaText` 同源（`lib/timePlan.ts`）；
+ *   · 绝对时间放 `title`，供需要精确时刻的场景（悬停可见）。
+ *
+ * ⚠️ 这里**不放「本页引用了 / 被引用」**：那是编辑视角的信息，`PageLinks` 已作为正文下方的
+ * 区块承担（它自带空态与错误态）。右栏是**导航与元信息**的地方，不堆编辑面板。
+ */
+function PageInfoAside(props: { page: PageDetail }): ReactNode {
+  const { page } = props
+  const rows: { label: string; value: string; absolute: string }[] = [
+    {
+      label: '最近更新',
+      value: relativeTime(page.updated_at),
+      absolute: absoluteTime(page.updated_at),
+    },
+    {
+      /* 版本号语义已核对：`version` = 历史快照数 + 1，即**当前**版本号（不是历史条数） */
+      label: '当前版本',
+      value: `v${page.version}`,
+      absolute: `共 ${page.version - 1} 个历史快照`,
+    },
+    {
+      label: '创建于',
+      value: relativeTime(page.created_at),
+      absolute: absoluteTime(page.created_at),
+    },
+  ]
+  return (
+    <aside aria-label="本页信息" className="flex flex-col gap-2 px-2">
+      <h2 className="m-0 text-sm font-semibold text-ink">本页信息</h2>
+      <dl className="m-0 flex flex-col gap-1.5">
+        {rows.map((r) => (
+          <div key={r.label} className="flex items-baseline justify-between gap-3">
+            <dt className="text-note text-muted">{r.label}</dt>
+            <dd className="m-0 text-note text-ink-soft" title={r.absolute}>
+              {r.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
     </aside>
   )
 }
@@ -1391,12 +1449,20 @@ function WikiDetail(props: {
   const activeId = useActiveHeading(tocIds)
 
   /*
-   * 右栏开不开，必须与**两处组件的返回条件**同时对齐，否则会留下"列在、内容不在"的空轨道：
+   * 右栏开不开。
+   *
+   * ⚠️ 2026-09-13 起**恒为真**：右栏新增了「本页信息」（`PageInfoAside`），它对**每一篇**
+   * 页面都有内容（更新时间/版本/创建时间），因此不再依赖"有没有两级标题"。
+   * 为什么必须这样改：此前判据是"目录 ≥2 条或有『最近更新』"，一篇没有两级标题的普通页
+   * （`welcome` 就是）右栏整条消失 ⇒ 正文列独自居中，1920 视口两侧各空 ~578px，
+   * 正是用户抱怨的「两边空着这么多」。
+   *
+   * 与两处组件的返回条件**仍然对齐**（它们各自"没内容就返回 null"，不会留下空轨道）：
    *   - `TableOfContents`：`entries.length < MIN_ENTRIES(=2)` 时返回 null（TableOfContents.tsx:29,79）
    *   - `HomeAside`：最近更新为空时返回 null（下面它的实现里）
-   * 主页额外计入：它通常没有 2 个以上标题，但「最近更新」有内容 ⇒ 右栏该开。
+   *   - `PageInfoAside`：**不返回 null** —— 它才是"任何页面都有右栏"的依据
    */
-  const hasRightRail = rendered.toc.length >= 2 || (homeMode && siblings !== null && siblings.length > 0)
+  const hasRightRail = true
 
   /*
    * 锚点滚动：URL 带 `?a=<id>` 时滚到该小节。
@@ -1839,21 +1905,23 @@ function WikiDetail(props: {
             阅读栅格：**列宽、块宽、居中三件事都归 `styles.css` 的 `.gw-reader-grid`**，
             这里只挂类名。要点（缺一条就会退回老样子）：
 
-              1. 正文的**内容盒**仍被 `--spacing-measure` 封在 630px（可读性硬指标）；
+              1. 正文的**内容盒**仍被 `--spacing-measure` 封在 700px（中文 50 字/行，clreq 上沿）；
               2. 列宽必须**把卡片内边距算进去**：内边距在 `article.gw-reader` 上
                  （`px-6 … sm:px-8` ⇒ 24/32px 每侧），而 `--spacing-measure` 只管内容宽度
                  ⇒ 列宽只写 `var(--spacing-measure)` 会让正文被内边距挤窄（实测 1920 视口
-                 正文 564px ⇒ 40 字/行，比硬指标窄 66px）；
+                 正文 564px ⇒ 40 字/行，比硬指标窄 136px）；
               3. 双栏只在 `xl`（1280px）以上生效：`md`~`xl` 之间用两列会把正文列挤到 177px；
               4. 栅格要**收缩到内容宽度并整体居中**（`width: fit-content` +
-                 `margin-inline: auto`）—— 否则块级栅格撑满阅读区、列只占 694 ⇒
+                 `margin-inline: auto`）—— 否则块级栅格撑满阅读区、列只占一列宽 ⇒
                  文章偏左、右侧空出几百像素（2026-09-12 实测 1920 下右空 574）；
                  居中的参照是**阅读区**（`flex-1` 那一格），不是整个视口：左边栏
                  （240px）与阅读区并排，阅读区自身的中心本就在视口中心左侧，
                  所以正文在视口尺度上会左偏约半个侧栏宽 —— 这是布局结构的必然结果，
                  不是缺陷（窄屏/无侧栏时两者重合，实测 1024 下左右各 296）。
               5. 列里所有卡片共用同一个栅格列 ⇒ 左缘天然一致，**不要再给卡片加
-                 `width`/`margin-inline`**（历史上"卡片限宽 + 居中"造成过 86px 阶梯）。
+                 `width`/`margin-inline`**（历史上"卡片限宽 + 居中"造成过 86px 阶梯）；
+              6. 列宽**随视口分档**（`--gw-read`：`lg`~`xl` 侧栏出现后阅读区反而变窄，
+                 必须收窄到 654px 才不溢出；≥1440 用满 764px）。分档表与实测见 styles.css。
 
               `md:max-w-[1504px]` **已移除**：它落在 `utilities` 层，会盖住
               `.gw-reader-grid` 的 `margin-inline: auto`（层叠顺序 utilities > legacy），
@@ -1870,8 +1938,8 @@ function WikiDetail(props: {
           {/*
             阅读卡片：宽度**跟着栅格列走**，自己不设宽（口径见 styles.css 那段长注释）。
             卡片与同列的「上一篇/下一篇」「相关页面」共用同一个栅格列 ⇒ 左缘天然一致；
-            正文 `.md-body` 另有 `--spacing-measure`（`min(46rem, 45em)`，14px 下 630px
-            = 45 字/行）封顶，所以列里也不会出现"卡片很宽、正文很窄"的空洞。
+            正文 `.md-body` 另有 `--spacing-measure`（`min(53rem, 50em)`，14px 下 700px
+            = 50 字/行）封顶，所以列里也不会出现"卡片很宽、正文很窄"的空洞。
           */}
           <article className="gw-reader rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
             <h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>
@@ -1913,11 +1981,18 @@ function WikiDetail(props: {
         </div>
 
         {/*
-          右栏：主页模式优先放「最近更新」这类**导航辅助**；页内目录留在其后。
-          两者都是"没有内容就自己返回 null"（TOC 在标题数不足 `MIN_ENTRIES` 时、HomeAside 在
-          列表为空时），所以既不会出现空栏，也不会有两份内容同时出现。
+          右栏：**本页信息恒在**（它保证任何页面都有右栏 —— 见 `hasRightRail` 的注释），
+          主页模式在其上再加「最近更新」，页内目录留在最后。
+          后两者都是"没有内容就自己返回 null"（TOC 在标题数不足 `MIN_ENTRIES` 时、
+          HomeAside 在列表为空时），所以不会出现半空的分区。
+
+          ⚠️ `xl:flex` 不是装饰：栅格在 **1280px 以下**是单列（`.gw-reader-grid` 的双栏
+          规则带 `@media (min-width: 1280px)` 门槛），若这里不隐藏，右栏三块会作为**第二行**
+          落在正文下方 —— 实测 1024 档「本页信息」被摊成整宽 703px，栅格高度凭空多出一截，
+          且该行的 x 变成父容器的 x（与正文列不再对齐）。隐藏后窄屏回到"纯单栏"，与改动前一致。
         */}
-        <div className="flex min-w-0 flex-col gap-4">
+        <div className="hidden min-w-0 flex-col gap-4 xl:flex">
+          <PageInfoAside page={page} />
           {homeMode && <HomeAside pages={siblings} onNavigate={onNavigate} />}
           <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
         </div>
