@@ -843,7 +843,11 @@ export interface OrgGroup {
 export interface OrgInvitationView {
   /** **字符串**（后端 `randomBytes(16).toString('hex')`），不是数字 —— 别当 number 处理 */
   id: string
-  email: string
+  /**
+   * `null` = **通用码**（不绑定邮箱，持码者注册时自填）；非 null = 定向码（注册邮箱必须相等）。
+   * 见 `packages/db-sqlite/src/migrations/0022_invitation_open_code.sql`。
+   */
+  email: string | null
   /** null = **Guest 通道**（不给组织角色），与 `viewer` 不同 */
   orgRole: OrgRole | null
   /** 入伙时一并加入的用户组（null = 不入组） */
@@ -886,6 +890,19 @@ export const api = {
       password,
       ...(displayName === undefined || displayName === '' ? {} : { displayName }),
     }),
+  /**
+   * 改自己的**邮箱 / 用户名**。
+   *
+   * 必须带当前口令：邮箱是**登录标识符**，只凭会话 cookie 就能改的话，
+   * 一个被盗的会话等于账号接管（见 plugin-auth 该端点的注释）。
+   * 空串 = "这一项不改"。
+   */
+  authProfile: (body: { currentPassword: string; email?: string; displayName?: string }) =>
+    request<{ ok: true; changed: boolean; user: { id: number; email: string; displayName: string } }>(
+      'POST',
+      '/api/auth/profile',
+      body,
+    ),
   authChangePassword: (currentPassword: string, newPassword: string) =>
     request<{ ok: true; revokedOtherSessions: boolean }>('POST', '/api/auth/password', {
       currentPassword,
@@ -1234,8 +1251,28 @@ export const api = {
    * 签发 owner 邀请需要 owner（否则 403）。
    * 响应里的 `token` **只此一次**（见 `InvitationCreated`）。
    */
-  createInvitation: (body: { email: string; orgRole?: OrgRole | null; groupId?: number | null }) =>
+  createInvitation: (body: { email?: string; orgRole?: OrgRole | null; groupId?: number | null }) =>
     request<InvitationCreated>('POST', '/api/org/invitations', body),
+  /**
+   * 凭邀请码**开户**（匿名可调，这是新用户唯一的入口）。
+   *
+   * - `email` 对**通用码**必填（`email_required`），对定向码必须与邀请一致（`email_mismatch`）；
+   * - 成功后返回 `userId`。**本端点不建会话**（会话的建立属于身份域）——
+   *   调用方拿刚设的邮箱口令去 `authLogin` 即可。
+   */
+  redeemInvitation: (body: { token: string; email: string; password: string; displayName?: string }) =>
+    request<{ ok: true; userId: number; email: string; alreadyMember: boolean; orgRole: OrgRole | null }>(
+      'POST',
+      '/api/org/invitations/redeem',
+      body,
+    ),
+  /** 已登录用户凭邀请码**入伙**（不再开户） */
+  acceptInvitation: (token: string) =>
+    request<{ ok: true; alreadyMember: boolean; orgRole: OrgRole | null }>(
+      'POST',
+      '/api/org/invitations/accept',
+      { token },
+    ),
   /**
    * 撤销邀请：服务端**不区分是否已接受**，无条件删行；已接受者的成员身份不受影响
    * （接受时已写入 `org_members`）—— 界面对"已接受"的行必须说清这一点，

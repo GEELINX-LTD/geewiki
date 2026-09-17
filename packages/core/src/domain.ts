@@ -515,6 +515,12 @@ export const RESERVED_ROUTE_IDS: readonly string[] = [
   'org',
   'login',
   'setup',
+  /*
+   * 邀请码开户页（`#/invite/<token>`）是**宿主**页面（`pages/InvitePage.tsx`）：
+   * 它必须在**未登录**时可达，而插件页面的产物加载依赖入口表与已登录的 UI 同步 ——
+   * 冷启动链路里多一环，收益却只是"形式上更像插件"。故与 login/setup/account 同列。
+   */
+  'invite',
   'denied',
   'account',
   'notfound',

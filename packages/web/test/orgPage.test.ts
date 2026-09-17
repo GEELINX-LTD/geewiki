@@ -112,7 +112,8 @@ test('api.ts：12 个组织端点方法齐备，且 purgeInvitations 保持原�
     'addGroupMember: (groupId: number, userId: number) =>',
     'removeGroupMember: (groupId: number, userId: number) =>',
     "orgInvitations: () =>",
-    'createInvitation: (body: { email: string; orgRole?: OrgRole | null; groupId?: number | null }) =>',
+    // email 自 2026-09-17 起**可选**：留空 = 通用码（持码者自填邮箱，见 0022 迁移）
+    'createInvitation: (body: { email?: string; orgRole?: OrgRole | null; groupId?: number | null }) =>',
     'revokeInvitation: (id: string) =>',
   ]
   for (const line of expected) {
@@ -160,15 +161,18 @@ test('★ 邀请卡片：令牌只在创建成功的分支里渲染（写入点 
   const code = invites.code
   // 反空洞：先证明三条都抽到了
   assert.ok(
-    code.includes('setCreated({ token: r.token, email: r.invitation.email })'),
-    '应能看到令牌的写入点（只存令牌与邮箱）',
+    code.includes('setCreated({ token: r.token, email: r.invitation.email, link })'),
+    '应能看到令牌的写入点（只存令牌、邮箱与拼好的链接）',
   )
   assert.ok(code.includes('setCreated(null)'), '应能看到令牌的清空点（关闭 / 重新签发）')
-  assert.ok(code.includes('value={created.token}'), '应能看到令牌的渲染点（只读输入框）')
+  assert.ok(
+    code.includes('value={created.link}'),
+    '应能看到邀请链接的渲染点（只读输入框）—— 显示**链接**而不是裸令牌：后者对方还得自己拼地址',
+  )
 
   // 渲染点必须在 `created !== null` 分支之内
   const guardAt = code.indexOf('{created !== null &&')
-  const renderAt = code.indexOf('value={created.token}')
+  const renderAt = code.indexOf('value={created.link}')
   assert.ok(guardAt > 0, '令牌区块必须以 `created !== null` 为条件')
   assert.ok(renderAt > guardAt, '令牌的渲染点必须落在"刚创建成功"的分支里')
   assert.ok(
@@ -176,9 +180,13 @@ test('★ 邀请卡片：令牌只在创建成功的分支里渲染（写入点 
     '令牌区块必须在列表**之前**（列表里永远不该出现令牌）',
   )
 
-  // 全文件对令牌的读取**恰好两处**：只读输入框的 value 与复制动作 —— 多一处就是第二个回显面
+  /*
+   * 全文件对**裸令牌**的读取恰好一处：创建区块里那行「邀请码原文」。
+   * 它必须留着 —— 链接可能被聊天工具截断、或对方只想手抄一串码；
+   * 但多一处就是多一个回显面，所以钉死数量。
+   */
   const reads = code.match(/created\.token/g) ?? []
-  assert.equal(reads.length, 2, `令牌只应有两处读取（实际 ${reads.length} 处）`)
+  assert.equal(reads.length, 1, `裸令牌只应有一处读取（实际 ${reads.length} 处）`)
 
   // 关闭即清空：清空点必须存在，且是"关闭/重新签发"走的路
   assert.ok(code.includes('onClick={() => setCreated(null)}'), '必须有显式的关闭动作把令牌清掉')
@@ -187,7 +195,7 @@ test('★ 邀请卡片：令牌只在创建成功的分支里渲染（写入点 
   assert.ok(code.includes('e.currentTarget.select()'), '聚焦即全选，便于手动复制')
   assert.ok(code.includes('aria-label="邀请链接（只显示一次）"'), '令牌输入框的可访问名称按约定')
   assert.ok(
-    code.includes('这串令牌只显示一次，关闭后无法再次查看 —— 请立即复制并安全地发给受邀人。'),
+    code.includes('这条链接只显示一次，关闭后无法再次查看 —— 请立即复制并发给受邀人。'),
     '必须有一句"只显示一次"的提示（否则用户关掉就永久失去它）',
   )
 })
@@ -200,10 +208,25 @@ test('★ 邀请卡片：令牌不得有任何外流通道（URL / 本地存储 
   const raw = invites.raw
   assert.doesNotMatch(raw, /localStorage|sessionStorage/, '令牌不得写入任何本地存储')
   assert.doesNotMatch(raw, /console\./, '令牌不得进控制台（排障者会顺手复制走它）')
+  /*
+   * ★ 2026-09-17 收窄：原先这里**一律禁止** `window.location`，理由是"令牌不得进 URL"。
+   * 那条判据的前提（"本界面没有接受邀请的页面"）已经不成立了 —— 现在有
+   * `pages/InvitePage.tsx`（`#/invite/<token>`），而邀请**只有**以链接形式传递才可用。
+   *
+   * 于是改成禁**写入**、允许**读 origin 拼接**，并把剩余的暴露面写清楚：
+   *   · 哈希片段**不发给服务端** ⇒ 不进访问日志、不随 Referer 外泄（`?token=` 两样都会）；
+   *   · 残留风险只有**被邀请人自己**的浏览器历史，而那是"点链接加入"无法避免的；
+   *   · 这里仍**只读** origin，绝不写 location / history —— 后者才是会把一次性凭据
+   *     变成长期凭据的那一步。
+   */
   assert.doesNotMatch(
     raw,
-    /window\.location|location\.hash|location\.replace|history\.(push|replace)State/,
-    '令牌不得进 URL（历史、Referer、日志都会留下它）',
+    /(?:window\.)?location\.(?:hash|href|replace|assign)\s*=|history\.(?:push|replace)State/,
+    '令牌不得被**写入** URL / 历史（读 origin 拼接链接是允许的，见上）',
+  )
+  assert.ok(
+    raw.includes('window.location.origin'),
+    '反空洞：链接必须真的由 origin 拼出来（否则上面那条负向断言可能只是没匹配到东西）',
   )
   // fetch 只允许出现在 api.ts —— 卡片里不该自己拼一次性令牌的请求
   assert.doesNotMatch(invites.code, /\bfetch\(/, '卡片不得绕过 api.ts 自己发请求')

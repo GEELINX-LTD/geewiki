@@ -73,7 +73,16 @@ export function InvitationsCard(): ReactNode {
    * 刚签发的**一次性令牌**。只存令牌与邮箱（不存整条邀请）：少存一份就少一处被顺手回显的机会。
    * 关闭（关闭按钮 / 重新签发）即置 `null`。
    */
-  const [created, setCreated] = useState<{ token: string; email: string } | null>(null)
+/**
+   * `email === null` ⇒ **通用码**（不绑定邮箱）。
+   * `link` 在**创建那一刻**就拼好（见 `submit`），于是渲染期不碰 `location` ——
+   * 该拼一次的东西拼一次，也让"复制的是链接"这件事只有一个真源。
+   */
+  const [created, setCreated] = useState<{
+    token: string
+    email: string | null
+    link: string
+  } | null>(null)
   const [copyHint, setCopyHint] = useState('')
 
   const load = useCallback(async (): Promise<void> => {
@@ -103,10 +112,21 @@ export function InvitationsCard(): ReactNode {
   )
 
   const submit = useCallback(async (): Promise<void> => {
-    const bad = emailError(email)
-    if (bad !== null) {
-      setFormErr(bad)
-      return
+    /*
+     * 邮箱**可选**（2026-09-17 起）：留空 ⇒ 签发**通用码**，持码者注册时自填邮箱。
+     * 填了 ⇒ 定向码，注册邮箱必须与它一致。
+     *
+     * 注意"可选"不等于"不校验"：一旦填了，格式仍然要走同一份规则（`emailError`）——
+     * 否则一个拼错的邮箱会签发出一条**永远无法兑换**的定向码，而管理员看不出来
+     * （他以为只是"发给了那个人"）。
+     */
+    const typed = email.trim()
+    if (typed !== '') {
+      const bad = emailError(email)
+      if (bad !== null) {
+        setFormErr(bad)
+        return
+      }
     }
     setFormErr(null)
     setBusy(true)
@@ -121,11 +141,22 @@ export function InvitationsCard(): ReactNode {
     setCreated(null)
     try {
       const r = await api.createInvitation({
-        email: email.trim().toLowerCase(),
+        // 留空即不传：服务端据此落成 NULL（通用码）
+        ...(typed === '' ? {} : { email: typed.toLowerCase() }),
         orgRole: invitationRoleValue(roleValue),
         groupId: groupValue === NO_GROUP_VALUE ? null : Number(groupValue),
       })
-      setCreated({ token: r.token, email: r.invitation.email })
+      /*
+       * ★ 邀请链接在**这里**拼：`#/invite/<token>`（哈希路由，见 `pages/InvitePage.tsx`）。
+       *
+       * 选哈希而不是查询串是刻意的：**URL 片段不会发给服务端** —— 它不进访问日志、
+       * 也不随 Referer 外泄（`?token=` 两样都会）。唯一残留是**被邀请人自己**的浏览器历史，
+       * 而那是"点链接加入"这种形态无法避免的（也是业界标准做法）。
+       *
+       * 本文件从头到尾**只读** `location.origin`，绝不写 location / history —— 有守卫钉住。
+       */
+      const link = `${window.location.origin}/#/invite/${r.token}`
+      setCreated({ token: r.token, email: r.invitation.email, link })
       setEmail('')
       await load()
     } catch (e: unknown) {
@@ -138,11 +169,11 @@ export function InvitationsCard(): ReactNode {
 
   const copyToken = useCallback(async (): Promise<void> => {
     if (created === null) return
-    const outcome = await copyText(created.token)
+    const outcome = await copyText(created.link)
     setCopyHint(
       outcome === 'ok'
         ? '已复制到剪贴板。'
-        : '当前环境不允许自动复制，请手动选中上面的令牌后按 ⌘/Ctrl+C。',
+        : '当前环境不允许自动复制，请手动选中上面的链接后按 ⌘/Ctrl+C。',
     )
   }, [created])
 
@@ -150,7 +181,7 @@ export function InvitationsCard(): ReactNode {
     (inv: OrgInvitationView): void => {
       const accepted = inv.acceptedAt !== null
       confirm({
-        title: `撤销发给 ${inv.email} 的邀请？`,
+        title: `撤销${inv.email === null ? '这个通用邀请码' : `发给 ${inv.email} 的邀请`}？`,
         body: (
           <>
             <p className="m-0 text-sm leading-relaxed text-ink-soft">
@@ -178,7 +209,7 @@ export function InvitationsCard(): ReactNode {
           setNotice('')
           try {
             await api.revokeInvitation(inv.id)
-            setNotice(`已撤销发给 ${inv.email} 的邀请`)
+            setNotice(`已撤销${inv.email === null ? '该通用邀请码' : `发给 ${inv.email} 的邀请`}`)
             await load()
           } catch (e: unknown) {
             // 失败原因写在卡片上（确认框照常关闭），不让用户隔着遮罩猜
@@ -222,7 +253,7 @@ export function InvitationsCard(): ReactNode {
           <div className="grid gap-3 sm:grid-cols-3">
             <div className="flex flex-col gap-1">
               <label htmlFor="invite-email" className="text-xs font-medium text-ink-soft">
-                受邀人邮箱
+                受邀人邮箱（可选）
               </label>
               <Input
                 id="invite-email"
@@ -295,7 +326,9 @@ export function InvitationsCard(): ReactNode {
         {created !== null && (
           <div className="mt-3 rounded-md border border-ok-line bg-ok-bg p-3">
             <p role="status" className="m-0 text-note text-ok-ink">
-              已为 {created.email} 签发邀请。
+              {created.email === null
+                ? '已签发一个通用邀请码（不限定邮箱）。'
+                : `已为 ${created.email} 签发邀请。`}
             </p>
             <div className="mt-2 flex flex-wrap items-end gap-2">
               <div className="flex min-w-[18rem] flex-1 flex-col gap-1">
@@ -305,7 +338,7 @@ export function InvitationsCard(): ReactNode {
                 <Input
                   id="invite-token"
                   readOnly
-                  value={created.token}
+                  value={created.link}
                   aria-label="邀请链接（只显示一次）"
                   className="font-mono text-xs"
                   // 聚焦即全选：用户按 ⌘/Ctrl+C 就能拿到，不必自己拖选（剪贴板降级路径要用到）
@@ -325,12 +358,14 @@ export function InvitationsCard(): ReactNode {
               </Button>
             </div>
             <p className="m-0 mt-2 text-xs leading-relaxed text-ink-soft">
-              这串令牌只显示一次，关闭后无法再次查看 —— 请立即复制并安全地发给受邀人。
+              这条链接只显示一次，关闭后无法再次查看 —— 请立即复制并发给受邀人。
+            </p>
+            <p className="m-0 mt-1 break-all font-mono text-xs leading-relaxed text-muted">
+              邀请码原文：{created.token}
             </p>
             <p className="m-0 mt-1 text-xs leading-relaxed text-muted">
-              上面是**令牌原文**（不是可点击的网址）：本界面目前没有「接受邀请」页面，
-              兑换由服务端的邀请兑换路径完成（对方已有账号则登录后凭它入伙；还没有账号则用它自助开户，
-              邮箱取自这条邀请、不能自选）。
+              对方点开链接即进入注册页：未登录就可以填**自己的**邮箱、用户名与口令开户；
+              若他已有账号，则会用当前账号直接入伙。两种都走同一个邀请码，且只能用一次。
             </p>
             {copyHint !== '' && (
               <p role="status" className="m-0 mt-1 text-xs text-ink-soft">
@@ -389,7 +424,13 @@ export function InvitationsCard(): ReactNode {
                     const state = invitationState(inv)
                     return (
                       <tr key={inv.id} className="border-t border-line">
-                        <td className="py-1.5 pr-3 font-mono text-xs">{inv.email}</td>
+                        <td className="py-1.5 pr-3 font-mono text-xs">
+                          {inv.email === null ? (
+                            <span className="text-muted">通用码（不限定邮箱）</span>
+                          ) : (
+                            inv.email
+                          )}
+                        </td>
                         <td className="py-1.5 pr-3">
                           {inv.orgRole === null ? (
                             /*

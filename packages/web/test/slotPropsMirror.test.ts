@@ -413,7 +413,7 @@ test('路由常量不再是镜像：pluginUiPlan 转出的必须是 core 的**�
   assert.equal(plan.PLUGIN_ROUTE_ID.test('a/b'), false)
   // 注：`audit` 已从保留清单移出（2026-09-17 搬成插件 @geewiki/ops），故不在此列 ——
   // 它现在的归属由 packages/web/test/opsOwnership.test.ts 钉住
-  for (const id of ['wiki', 'plugins', 'graph', 'org', 'account']) {
+  for (const id of ['wiki', 'plugins', 'graph', 'org', 'account', 'invite']) {
     assert.ok(plan.RESERVED_ROUTE_IDS.includes(id), `${id} 应当在保留清单里`)
   }
 })
