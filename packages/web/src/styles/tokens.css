@@ -171,6 +171,12 @@
   --gw-accent-soft: var(--gw-blue-50);
   --gw-accent-soft-line: var(--gw-blue-200);
   --gw-accent-soft-ink: var(--gw-blue-800);
+  /*
+   * 编辑器选区（`blue-600` 的 30%）。
+   * **必须是半透明**：选区画在**文字之上**（见 MarkdownEditor.tsx 里那段说明），
+   * 不透明色会把被选中的字盖住 —— 那是比"看不见选区"更糟的失败方式。
+   */
+  --gw-selection-bg: rgb(37 99 235 / 30%);
 
   --gw-ok: var(--gw-green-600);
   --gw-ok-bg: var(--gw-green-50);
@@ -270,6 +276,8 @@
   --gw-accent-soft: var(--gw-dk-blue-bg);
   --gw-accent-soft-line: var(--gw-dk-blue-line);
   --gw-accent-soft-ink: var(--gw-dk-blue-ink);
+  /* 编辑器选区（`blue-500` 的 35%）：半透明，理由同浅色模式那份 */
+  --gw-selection-bg: rgb(59 130 246 / 35%);
 
   --gw-ok: #34d399;
   --gw-ok-bg: var(--gw-dk-green-bg);
@@ -330,6 +338,8 @@
     --gw-accent-soft: var(--gw-dk-blue-bg);
     --gw-accent-soft-line: var(--gw-dk-blue-line);
     --gw-accent-soft-ink: var(--gw-dk-blue-ink);
+  /* 编辑器选区（`blue-500` 的 35%）：半透明，理由同浅色模式那份 */
+  --gw-selection-bg: rgb(59 130 246 / 35%);
 
     --gw-ok: #34d399;
     --gw-ok-bg: var(--gw-dk-green-bg);
