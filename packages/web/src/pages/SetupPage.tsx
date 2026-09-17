@@ -5,14 +5,14 @@
  * （或用户手输这个 hash），则引回登录页 —— 服务端 `POST /api/auth/setup` 也会
  * 在已有账号时返回 409 `setup_already_done`（自守卫），前端这层只是不让用户白填一遍表单。
  *
- * 与登录页一样：口令错误/校验失败是**本次提交**的结果，显示在表单内。
+ * 与登录页一样：密码错误/校验失败是**本次提交**的结果，显示在表单内。
  */
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { ShieldCheck } from 'lucide-react'
 import { Button, Card, CardBody, CardHeader, ErrorNotice, Input, LoadingState } from '../ui'
 import { setup, useAuth } from '../lib/authStore'
 
-/** 后端 `PASSWORD_MIN`：口令长度下限（前后端各持一份，改后端时必须同步） */
+/** 后端 `PASSWORD_MIN`：密码长度下限（前后端各持一份，改后端时必须同步） */
 const PASSWORD_MIN = 8
 
 export function SetupPage(): ReactNode {
@@ -33,8 +33,8 @@ export function SetupPage(): ReactNode {
     e.preventDefault()
     setFailure(null)
     if (password !== confirm) {
-      // 本地先挡一道：口令不一致是纯客户端可判定的事实，没必要打一次网络往返
-      setFailure(new Error('两次输入的口令不一致'))
+      // 本地先挡一道：密码不一致是纯客户端可判定的事实，没必要打一次网络往返
+      setFailure(new Error('两次输入的密码不一致'))
       return
     }
     setSubmitting(true)
@@ -84,7 +84,7 @@ export function SetupPage(): ReactNode {
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted">
-              口令（至少 {PASSWORD_MIN} 位）
+              密码（至少 {PASSWORD_MIN} 位）
               <Input
                 type="password"
                 name="password"

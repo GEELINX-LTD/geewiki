@@ -46,9 +46,9 @@ export function setAuthFailureHandler(handler: AuthFailureHandler): void {
 /**
  * **提交凭据**的端点：它们返回 401 表示"这次提交的凭据不对"，而不是"你的会话失效了"。
  *
- * 必须排除在全局出口之外，否则用户在登录页输错口令会被"跳转到登录页"（页面上刚显示的
+ * 必须排除在全局出口之外，否则用户在登录页输错密码会被"跳转到登录页"（页面上刚显示的
  * 错误提示随之消失，表现为"点了一下登录、页面闪了一下什么都没发生"），
- * 改口令时输错当前口令也会被踢到登录页。
+ * 改密码时输错当前密码也会被踢到登录页。
  */
 const CREDENTIAL_ENDPOINTS = new Set(['/api/auth/login', '/api/auth/password'])
 
@@ -855,6 +855,16 @@ export interface OrgInvitationView {
   expiresAt: string
   /** 非 null ⇒ 已被接受（这是一条**入伙记录**，删除它不会移除已入伙的成员） */
   acceptedAt: string | null
+  /**
+   * 凭这条邀请入伙的**用户 id**（0023 起）。
+   *
+   * `null` 有两种含义，靠 `acceptedAt` 区分：还没被用；或者这是一条 0023 之前的
+   * 历史记录（**不做回溯猜测** —— 猜错比留空更坏）。界面据 `acceptedAt` 分别显示
+   * 「—」与「—（历史记录）」。
+   *
+   * 它是 **id 而不是姓名**：服务端不查 users 表（那是身份域），界面拿成员列表自己映射。
+   */
+  acceptedBy: number | null
   createdAt: string
 }
 
@@ -893,7 +903,7 @@ export const api = {
   /**
    * 改自己的**邮箱 / 用户名**。
    *
-   * 必须带当前口令：邮箱是**登录标识符**，只凭会话 cookie 就能改的话，
+   * 必须带当前密码：邮箱是**登录标识符**，只凭会话 cookie 就能改的话，
    * 一个被盗的会话等于账号接管（见 plugin-auth 该端点的注释）。
    * 空串 = "这一项不改"。
    */
@@ -912,7 +922,7 @@ export const api = {
   /* 外部身份绑定（P1.5） */
   /**
    * 我的外部身份列表。`hasPassword` 用于前端判断"能不能解绑"
-   * （没有口令且只剩一个身份时服务端会 409 `last_credential`，前端先hide入口更友好）。
+   * （没有密码且只剩一个身份时服务端会 409 `last_credential`，前端先hide入口更友好）。
    */
   authIdentities: () =>
     request<{ ok: true; hasPassword: boolean; identities: AuthIdentity[] }>(
@@ -1258,7 +1268,7 @@ export const api = {
    *
    * - `email` 对**通用码**必填（`email_required`），对定向码必须与邀请一致（`email_mismatch`）；
    * - 成功后返回 `userId`。**本端点不建会话**（会话的建立属于身份域）——
-   *   调用方拿刚设的邮箱口令去 `authLogin` 即可。
+   *   调用方拿刚设的邮箱密码去 `authLogin` 即可。
    */
   redeemInvitation: (body: { token: string; email: string; password: string; displayName?: string }) =>
     request<{ ok: true; userId: number; email: string; alreadyMember: boolean; orgRole: OrgRole | null }>(

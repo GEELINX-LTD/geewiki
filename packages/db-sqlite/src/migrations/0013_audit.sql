@@ -27,7 +27,7 @@ INSERT OR IGNORE INTO acl_revision (id, revision) VALUES (1, 1);
 -- target_kind：page | user | group | grant | session | org
 --
 -- **为什么不记正文**：OWASP 指出日志"太多"本身也是弱点（CWE-779）—— 敏感数据被无谓写进
--- 日志。审计只记元数据与差异：before_json/after_json 里**不得**出现页面正文、口令、
+-- 日志。审计只记元数据与差异：before_json/after_json 里**不得**出现页面正文、密码、
 -- 令牌或任何凭据值。
 --
 -- 两类事件的用途**刻意分开**（文档 §9 反模式）：`access.denied` 是**安全事件**（要告警），

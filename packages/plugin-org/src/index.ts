@@ -795,9 +795,11 @@ export const OrgPlugin = {
             group_id: number | null
             expires_at: string
             accepted_at: string | null
+            /** 凭这条邀请入伙的用户（0023）；null = 还没被用，或是 0023 之前的历史行 */
+            accepted_by: number | null
             created_at: string
           }>(
-            `SELECT id, email, org_role, group_id, expires_at, accepted_at, created_at
+            `SELECT id, email, org_role, group_id, expires_at, accepted_at, accepted_by, created_at
                FROM invitations WHERE org_id = ? ORDER BY created_at DESC LIMIT 200`,
             [DEFAULT_ORG_ID],
           )
@@ -812,6 +814,12 @@ export const OrgPlugin = {
               groupId: r.group_id === null ? null : Number(r.group_id),
               expiresAt: r.expires_at,
               acceptedAt: r.accepted_at,
+              /*
+               * `acceptedBy` 是**用户 id**，不是姓名 —— 本插件不查 users 表（那是身份域），
+               * 界面拿成员列表自己映射（`GET /api/org/members`，access:'user'）。
+               * 与审计页 `actorId` 的处理同款：这里如实给出 id，不假装已经解析过。
+               */
+              acceptedBy: r.accepted_by === null ? null : Number(r.accepted_by),
               createdAt: r.created_at,
             })),
           })
@@ -1194,10 +1202,15 @@ export const OrgPlugin = {
             ])
           }
         }
-        await tx.run('UPDATE invitations SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL', [
-          now,
-          invite.id,
-        ])
+        /*
+         * `accepted_by` 与 `accepted_at` **同一条语句**写入：它们是同一件事的两个面
+         * （谁、什么时候），分开写就存在"标记了已接受但没记下是谁"的中间态。
+         * `AND accepted_at IS NULL` 那条守卫是一次性消费的原子判据，保留不动。
+         */
+        await tx.run(
+          'UPDATE invitations SET accepted_at = ?, accepted_by = ? WHERE id = ? AND accepted_at IS NULL',
+          [now, userId, invite.id],
+        )
       })
       return { alreadyMember, orgRole, groupId }
     }
@@ -1290,7 +1303,7 @@ export const OrgPlugin = {
      * 后者是默认形态，因为"登录标识符"是账号最私人的属性，不该由管理员代填。
      * 防滥用改为依赖"一次性 + 有效期 + 可随时吊销"，而不是"码只发给某个人"。
      *
-     * 开户成功后**不在本端点里建会话**：客户端拿用户自己刚设的口令去调
+     * 开户成功后**不在本端点里建会话**：客户端拿用户自己刚设的密码去调
      * `/api/auth/login` 即可 —— 会话的建立属于身份域，绕开它去手搓 cookie
      * 等于把会话令牌的纪律复制到第二个地方。
      */
@@ -1320,7 +1333,7 @@ export const OrgPlugin = {
           }
 
           /*
-           * 口令与邮箱格式的校验在 auth-service 内部（身份域的规则不该在组织插件里
+           * 密码与邮箱格式的校验在 auth-service 内部（身份域的规则不该在组织插件里
            * 再写一份）。displayName 缺省取邮箱 @ 前的部分，与 setup 的取舍一致。
            */
           const authSvc = ctx.get('auth-service') as AuthServiceLike | undefined
@@ -1372,7 +1385,7 @@ export const OrgPlugin = {
               })
               return
             }
-            h.json(400, { ok: false, error: created.error, message: created.error === 'invalid_email' ? '邮箱格式不合法' : '口令长度不合法' })
+            h.json(400, { ok: false, error: created.error, message: created.error === 'invalid_email' ? '邮箱格式不合法' : '密码长度不合法' })
             return
           }
 

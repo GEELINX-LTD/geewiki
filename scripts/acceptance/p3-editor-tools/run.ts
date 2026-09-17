@@ -216,7 +216,7 @@ function parseFrames(text: string): Frame[] {
 /*
  * **为什么不用 `POST /api/auth/setup`**：数据目录是 `data/geewiki.db` 的副本，
  * 里面**已经有账号**，setup 会（正确地）返回 409 `setup_already_done`；而那个账号的
- * 口令我们不知道。所以这里直接往副本里插一个口令已知的主体。
+ * 密码我们不知道。所以这里直接往副本里插一个密码已知的主体。
  *
  * **为什么必须是 `user` 而不是 `break-glass`**：本仓的实测发现（探针 E5）——
  * break-glass 的 `orgRole` 是 null，而策略层判"组织级可见"要求

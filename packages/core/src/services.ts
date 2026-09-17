@@ -194,7 +194,7 @@ export interface AuthService {
    *
    * **必须同步返回**：消费方是 `judgeAccess`（纯函数），用于区分
    * 503 `bootstrap_required`（根本没东西可登录）与 401 `unauthorized`（请去登录）。
-   * 实现是进程内缓存的布尔值（激活时查一次，setup / 口令变更后就地更新）。
+   * 实现是进程内缓存的布尔值（激活时查一次，setup / 密码变更后就地更新）。
    */
   hasCredentialSource(): boolean
   /** 解析原始会话令牌（cookie 值）→ 用户；无效 / 过期 / 已吊销 / 账号停用一律 `undefined` */
@@ -222,7 +222,7 @@ export interface AuthService {
    * （org 用的是一个 256 位熵、未过期、未消费、且邮箱匹配的邀请令牌）。
    * 因此**绝不要**把它直接接到任何 HTTP 端点上。
    *
-   * 好处是口令哈希、邮箱唯一性、`credentialSource` 的维护都留在身份域内，
+   * 好处是密码哈希、邮箱唯一性、`credentialSource` 的维护都留在身份域内，
    * 不会被复制到第二个插件里（复制出来的那份将来必然漏掉算法升级）。
    */
   createLocalUser(input: {

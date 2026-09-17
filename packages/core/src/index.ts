@@ -18,7 +18,7 @@ export type { FiberLike } from './cordis-env.js'
 
 /* 审计日志写入设施（`audit_log` 表，见 docs/design/access-control.md §3.4）。
    放在 core 是因为该表由 db 插件的迁移建立、属核心基础设施，而写入方横跨
-   server（access.break_glass）与 plugin-auth（login.* / 口令变更）两个包。
+   server（access.break_glass）与 plugin-auth（login.* / 密码变更）两个包。
    注意：`core` 顶层 `import 'node:fs'`，**本模块不得被前端包引入**（见 §9 R3）。 */
 export {
   auditIpHash,
@@ -658,9 +658,9 @@ export const PAGE_DELETED_EVENT = 'geewiki/page-deleted'
  */
 
 /**
- * 用户**登录成功**（本地口令或 SSO 都走这一个）。
+ * 用户**登录成功**（本地密码或 SSO 都走这一个）。
  *
- * ⚠️ 负载**不含任何凭据**（口令、会话 id、token 一律没有）：事件是广播的。
+ * ⚠️ 负载**不含任何凭据**（密码、会话 id、token 一律没有）：事件是广播的。
  * `method` 只说"走的是哪条路"，用于审计与差异化提示，不能用来做安全判定。
  */
 export const USER_LOGIN_EVENT = 'geewiki/user-login'

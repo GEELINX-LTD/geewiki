@@ -7,8 +7,8 @@
  *    `window.location.hash`。取值必须过 `normalizeRedirect()`（挡 `//evil.com` 这类外部地址）。
  * 2. **没有初始化时不该停在这一页**：库里还没有账号时登录必然失败，页面直接引导去 `#/setup`。
  *    这正是 503 `bootstrap_required` 与 401 必须分开的原因（见 `lib/authFailure.ts`）。
- * 3. **口令错误的提示来自本次提交**，而不是全局 401 出口 —— 全局出口会把
- *    "口令错"误当成"会话失效"再跳一次登录页，用户会看到页面刷新而错误消失。
+ * 3. **密码错误的提示来自本次提交**，而不是全局 401 出口 —— 全局出口会把
+ *    "密码错"误当成"会话失效"再跳一次登录页，用户会看到页面刷新而错误消失。
  *    故 `api.ts` 对 `/api/auth/login` 这类"提交凭据"的端点**不触发**全局出口。
  * 4. **SSO（P1.5）是真实链接而不是按钮点击处理**：`<a href="/api/auth/oidc/start?…">`
  *    走完整导航，IdP 回跳才能落回本站；用 fetch 会因为跨站与 cookie 语义而失败。
@@ -168,7 +168,7 @@ export function LoginPage(): ReactNode {
             <p className="m-0 text-note text-muted">
               {auth.authenticated
                 ? '你已登录。请到账号页确认把这次登录的 SSO 身份绑定到当前账号。'
-                : '请先用该邮箱的本地口令登录，然后到账号页确认绑定。'}
+                : '请先用该邮箱的本地密码登录，然后到账号页确认绑定。'}
             </p>
             {auth.authenticated && (
               <div className="mt-3">
@@ -198,7 +198,7 @@ export function LoginPage(): ReactNode {
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted">
-              口令
+              密码
               <Input
                 type="password"
                 name="password"
@@ -245,7 +245,7 @@ export function LoginPage(): ReactNode {
 
       {/*
         连不上服务时给出可操作的信息（`describeError` 分级），而不是只显示表单让用户干试。
-        这不是错误提示的重复：网络不可达与口令错误是**完全不同的下一步**。
+        这不是错误提示的重复：网络不可达与密码错误是**完全不同的下一步**。
       */}
       {auth.error !== null && <ErrorNotice error={auth.errorValue} />}
     </div>

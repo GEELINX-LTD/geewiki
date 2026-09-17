@@ -2,7 +2,7 @@
 --
 -- 见 docs/design/access-control.md §3.1。四张表一次建全：
 --   users            本地账号
---   user_credentials 口令哈希（算法名 + 参数 + salt 都入库，便于将来升级算法）
+--   user_credentials 密码哈希（算法名 + 参数 + salt 都入库，便于将来升级算法）
 --   sessions         会话（DB 只存令牌哈希）
 --   user_identities  外部身份（OIDC 骨架）
 --
