@@ -89,6 +89,7 @@ import {
   setRegionTier,
 } from '../lib/editorBlocks'
 import { readStoredMode, storeMode, type EditorMode } from '../lib/editorModePlan'
+import { DEFAULT_EDITOR_MIN_HEIGHT } from '../lib/editorHeightPlan'
 import { minimalEdit, type FormatAction } from '../lib/markdownActions'
 import type { BlockVisibility, PageVisibility } from '../api'
 
@@ -116,6 +117,20 @@ const baseTheme = EditorView.theme({
     borderRadius: 'var(--radius-md)',
     backgroundColor: 'var(--gw-surface)',
     color: 'var(--gw-ink)',
+    /*
+     * ★ 编辑面必须**撑满宿主容器**，否则会露出一片"假空白"。
+     *
+     * 宿主（下面那个 `host` div）只有 `min-height`。而 `.cm-editor` 的高度由内容决定 ——
+     * 短文档下它比宿主矮，于是边框只围住上半截，下半截是**既不属于编辑面、点了也没有反应**
+     * 的空白（实测：宿主 480px、`.cm-editor` 247px，中间 233px 死区）。
+     *
+     * `inherit` 取的是宿主 `min-height` 的**计算值**（宿主由 `props.minHeight` 内联设定），
+     * 于是两者永远一致：宿主多高，编辑面就多高。用 `inherit` 而不是把数值再抄一遍，
+     * 是因为抄一遍就等于又造一处镜像 —— 而镜像正是这片空白的成因之一。
+     *
+     * 长文档不受影响：这是 `min-height` 不是 `height`，内容更长时编辑面照常长高。
+     */
+    minHeight: 'inherit',
   },
   '&.cm-focused': {
     outline: '2px solid var(--gw-focus-ring)',
@@ -871,7 +886,7 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       <div
         ref={host}
         className="overflow-hidden rounded-md"
-        style={{ minHeight: props.minHeight ?? '420px' }}
+        style={{ minHeight: props.minHeight ?? DEFAULT_EDITOR_MIN_HEIGHT }}
         /*
           这里**刻意不加** `role="group"` / `aria-label`：可访问名称已由上面的
           `contentAttributes` 交给 `.cm-content`（真正的 role="textbox"）。
