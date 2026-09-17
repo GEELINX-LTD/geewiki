@@ -5,13 +5,17 @@
   "type": "module",
   "description": "GeeWiki 共享类型与常量：manifest 规范、DatabaseAdapter 接口",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./slots": "./src/slots.ts",
+    "./domain": "./src/domain.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "devDependencies": {
-    "cordis": "^4.0.0-rc.10"
+    "cordis": "^4.0.0-rc.10",
+    "@types/node": "^22.0.0"
   },
   "dependencies": {
     "schemastery": "3.18.0"
