@@ -55,7 +55,7 @@ import { cn } from './ui/cn'
  * 为什么必须懒：`pages/GraphPage.tsx` 静态 import 了 `@xyflow/react`（React Flow 全家桶），
  * 静态 import 会把它打进**主包** —— 于是每一个匿名读者（只想看文档）也要先下载这一大块
  * 与管理台页面无关的代码。改为动态 `import()` 后它成为独立 chunk，只有真的进
- * `#/graph` 时才拉取。
+ * `#/plugins` 时才拉取。
  *
  * 与 `components/MarkdownEditorLazy.tsx` 同一套形态：`lazy` + `Suspense` 骨架 +
  * 最小错误边界（chunk 取不到时给 `ErrorState`，而不是白屏）。
@@ -236,9 +236,10 @@ const ADMIN_NAV: NavItem[] = [
    * 「插件管理」与「依赖图」已**合二为一**（用户要求）：插件的启停、配置、临时变更
    * 全部搬到依赖图页里——点节点开弹窗。于是这里只留一项：原先两项并存意味着
    * "同一个插件有两个管理界面"，配置表单和状态措辞迟早分叉。
-   * 保留的 id 仍是 `graph`；旧链接 `#/plugins` 在路由解析处改写成 `graph`（见下方 `root`）。
+   * id 用 `plugins`（这页的实际身份）；`graph` 作为**旧 id** 仍在解析处改写过来
+   * （见下方 `root`），所以老书签、老文档里的 `#/graph` 依然可用。
    */
-  { id: 'graph', label: '插件管理', icon: <GitBranch className="size-4" />, requires: 'administer' },
+  { id: 'plugins', label: '插件管理', icon: <GitBranch className="size-4" />, requires: 'administer' },
   /*
    * 审计与运维（P4）。能力键用既有的 `administer`（`AuthCapabilities` 只有
    * editContent / administer / manageVisibility 三个），不新开字段 —— 它对应的
@@ -299,14 +300,14 @@ export function App(): ReactNode {
    */
   const routeQuery = useRouteQuery()
   /*
-   * 旧路由 `#/plugins`（「插件管理」已并入依赖图）在这里**解析处改写**成 `graph`。
+   * 旧路由 `#/graph` 在这里**解析处改写**成 `plugins`（这页此前的 id 叫 `graph`）。
    *
    * 为什么不按 `LEGACY_ROUTES` 那条老路（占位页 + 渲染期重定向）：那条路是为"页面还在、
    * 只是权限/内容换了"设计的，需要多一个组件与 effect；而这里根本就是**同一个页面**，
-   * 一个三元表达式就够。文档、书签、聊天记录里的 `#/plugins` 因此仍然可用。
+   * 一个三元表达式就够。文档、书签、聊天记录里的 `#/graph` 因此仍然可用。
    */
   const root0 = route.split('/')[0] || 'wiki'
-  const root = root0 === 'plugins' ? 'graph' : root0
+  const root = root0 === 'graph' ? 'plugins' : root0
   /*
    * F2：插件页面路由。
    *

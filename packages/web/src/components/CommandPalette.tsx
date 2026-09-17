@@ -181,7 +181,7 @@ export function CommandPalette({
         keywords: 'graph plugins dependencies admin',
         icon: <GitBranch className="size-4" aria-hidden="true" />,
         requires: 'administer',
-        run: () => go('graph'),
+        run: () => go('plugins'),
       },
       {
         id: 'action:theme',

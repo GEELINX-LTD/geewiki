@@ -18,13 +18,12 @@ test('titleForRoute：产品名后缀与分区名', () => {
   assert.equal(titleForRoute(''), `知识库 · ${APP_NAME}`)
   assert.equal(titleForRoute('wiki'), `知识库 · ${APP_NAME}`)
   assert.equal(titleForRoute('wiki/'), `知识库 · ${APP_NAME}`)
-  assert.equal(titleForRoute('graph'), `插件管理 · ${APP_NAME}`)
+  assert.equal(titleForRoute('plugins'), `插件管理 · ${APP_NAME}`)
   /*
-   * `plugins` 已不再是独立分区（并入「插件管理」），故它按"未知分区"回退到产品名——
-   * 顺带钉住 `#/plugins` 不会因为分区表里少了一项而崩掉标题。
-   * 注意路由本身仍可用：`App.tsx` 在解析处把它改写成 `graph`（老书签不会 404）。
+   * `graph` 是这页的**旧 id**：`App.tsx` 在解析处把它改写成 `plugins`，所以标题表里
+   * 只需要规范 id 一项。这里顺带钉住"少了一项也不会崩"——`graph` 按未知分区回退到产品名。
    */
-  assert.equal(titleForRoute('plugins'), APP_NAME)
+  assert.equal(titleForRoute('graph'), APP_NAME)
 })
 
 test('titleForRoute：详情页用页面标题，取不到时退化为「知识库」而不是 slug', () => {
