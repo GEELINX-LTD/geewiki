@@ -29,6 +29,10 @@ data/
 # 运行期会话清单（运行时被改写，属本机状态；基础层清单 plugins.base.json 保留入库）
 config/plugins.session.json
 
+# 密钥文件（模型 API key 等 role:'secret' 字段的落盘位置：绝不进版本库）
+# 注意：plugins.base.json / plugins.session.json 里**只有**"是否已配置"，没有值
+config/secrets.json
+
 # 日志
 logs/
 *.log

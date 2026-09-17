@@ -11,8 +11,13 @@
     "dev:web": "pnpm --filter @geewiki/web run dev",
     "build": "pnpm -r --if-present run build",
     "start": "tsx packages/server/src/index.ts",
-    "typecheck": "pnpm -r --no-bail --if-present run typecheck",
-    "test": "pnpm -r --no-bail --if-present run test"
+    "typecheck": "pnpm -r --no-bail --if-present run typecheck && tsc --noEmit -p tsconfig.scripts.json",
+    "test": "pnpm -r --no-bail --if-present run test",
+    "new:plugin": "tsx scripts/create-plugin.ts",
+    "clean:tmp": "tsx scripts/clean-tmp.ts",
+    "backup": "tsx scripts/backup.ts",
+    "restore": "tsx scripts/restore.ts",
+    "install-plugin": "tsx scripts/install-plugin.ts"
   },
   "engines": {
     "node": ">=22"

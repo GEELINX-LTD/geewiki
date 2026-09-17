@@ -24,6 +24,9 @@ importers:
         specifier: 3.18.0
         version: 3.18.0
     devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
       cordis:
         specifier: ^4.0.0-rc.10
         version: 4.0.0-rc.10
@@ -79,8 +82,131 @@ importers:
         specifier: 3.18.0
         version: 3.18.0
 
-  packages/plugin-ai:
+  packages/plugin-ai-admin:
     dependencies:
+      '@geewiki/ai-journal':
+        specifier: workspace:*
+        version: link:../plugin-ai-journal
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-assistant:
+    dependencies:
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      '@geewiki/llm':
+        specifier: workspace:*
+        version: link:../plugin-llm
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-journal:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
+      '@geewiki/db-sqlite':
+        specifier: workspace:*
+        version: link:../db-sqlite
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-kb:
+    dependencies:
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      '@geewiki/search':
+        specifier: workspace:*
+        version: link:../plugin-search
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@geewiki/wiki':
+        specifier: workspace:*
+        version: link:../plugin-wiki
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-nav:
+    dependencies:
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-pages:
+    dependencies:
+      '@geewiki/ai-journal':
+        specifier: workspace:*
+        version: link:../plugin-ai-journal
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
+      '@geewiki/db-sqlite':
+        specifier: workspace:*
+        version: link:../db-sqlite
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-summary:
+    dependencies:
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
       '@geewiki/core':
         specifier: workspace:*
         version: link:../core
@@ -97,9 +223,57 @@ importers:
       '@geewiki/db-sqlite':
         specifier: workspace:*
         version: link:../db-sqlite
-      '@geewiki/search':
+      '@geewiki/wiki':
         specifier: workspace:*
-        version: link:../plugin-search
+        version: link:../plugin-wiki
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-tools:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-web-search:
+    dependencies:
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-ai-writing:
+    dependencies:
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.1
@@ -132,6 +306,31 @@ importers:
         specifier: 3.18.0
         version: 3.18.0
     devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
+  packages/plugin-builtin-docs:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+      schemastery:
+        specifier: 3.18.0
+        version: 3.18.0
+    devDependencies:
+      '@geewiki/authz':
+        specifier: workspace:*
+        version: link:../plugin-authz
+      '@geewiki/db-sqlite':
+        specifier: workspace:*
+        version: link:../db-sqlite
+      '@geewiki/wiki':
+        specifier: workspace:*
+        version: link:../plugin-wiki
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.1
@@ -267,15 +466,45 @@ importers:
 
   packages/server:
     dependencies:
-      '@geewiki/ai':
+      '@geewiki/ai-admin':
         specifier: workspace:*
-        version: link:../plugin-ai
+        version: link:../plugin-ai-admin
+      '@geewiki/ai-assistant':
+        specifier: workspace:*
+        version: link:../plugin-ai-assistant
+      '@geewiki/ai-journal':
+        specifier: workspace:*
+        version: link:../plugin-ai-journal
+      '@geewiki/ai-kb':
+        specifier: workspace:*
+        version: link:../plugin-ai-kb
+      '@geewiki/ai-nav':
+        specifier: workspace:*
+        version: link:../plugin-ai-nav
+      '@geewiki/ai-pages':
+        specifier: workspace:*
+        version: link:../plugin-ai-pages
+      '@geewiki/ai-summary':
+        specifier: workspace:*
+        version: link:../plugin-ai-summary
+      '@geewiki/ai-tools':
+        specifier: workspace:*
+        version: link:../plugin-ai-tools
+      '@geewiki/ai-web-search':
+        specifier: workspace:*
+        version: link:../plugin-ai-web-search
+      '@geewiki/ai-writing':
+        specifier: workspace:*
+        version: link:../plugin-ai-writing
       '@geewiki/auth':
         specifier: workspace:*
         version: link:../plugin-auth
       '@geewiki/authz':
         specifier: workspace:*
         version: link:../plugin-authz
+      '@geewiki/builtin-docs':
+        specifier: workspace:*
+        version: link:../plugin-builtin-docs
       '@geewiki/core':
         specifier: workspace:*
         version: link:../core
@@ -336,6 +565,9 @@ importers:
       '@codemirror/view':
         specifier: ^6.43.11
         version: 6.43.11
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
       '@lezer/highlight':
         specifier: ^1.2.3
         version: 1.2.3

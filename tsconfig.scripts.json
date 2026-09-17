@@ -1,0 +1,15 @@
+{
+  // ★ 优化点 6：scripts/ 此前**不在任何 tsconfig 内**，因此从未被类型检查。
+  // 这本身是个真实缺口：F21 的 CLI 第一版把块注释写早了闭合（注释文本里出现了
+  // 块注释的结束序列），后果是后面的注释变成代码并抛 ReferenceError ——
+  // 而 tsc 是会直接把它报出来的。故新增这份配置，并接进根 typecheck。
+  //
+  // `scripts/acceptance` 被**有意、有期限地**排除：那些是各批次的一次性验证 runner
+  // （p1-tools / p4-undo / p6-summary / plugin-runtime-disable 等），首次检查有 16 处
+  // 既有错误（含 web 源码在 NodeNext 下的扩展名问题）。它们不在产品路径上、
+  // 也不参与 `pnpm test`，故本轮只把「新写的、作者天天会用的脚本」纳入检查，
+  // 不顺手改一批一次性脚本 —— 那属于另一个独立决定（修好，或按批次归档删除）。
+  "extends": "./tsconfig.base.json",
+  "include": ["scripts"],
+  "exclude": ["scripts/acceptance"]
+}
