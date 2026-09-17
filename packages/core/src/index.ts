@@ -121,36 +121,6 @@ export interface GeeWikiClient {
   // （无 assets 字段：见上）
 }
 
-/**
- * 插件页面路由 id 的语法（A2/F2）：小写 kebab，**不含 `/`**。
- *
- * 为什么不含 `/`：`id` 就是 hash 的**首段**（`#/<id>` 或 `#/<id>/<sub>`），
- * 与内置路由（`wiki` / `graph` / `org` …）落在同一个命名空间里，必须同构。
- * 子路径通过 `sub` 传给插件页面自己解析，不由 id 承载。
- */
-export const PLUGIN_ROUTE_ID = /^[a-z][a-z0-9-]*$/
-
-/**
- * **宿主保留**的路由首段（内置页面 + 旧路由 + 身份路由）。
- *
- * 插件**不得**声明这些 id：不是"先到先得"，而是**直接拒绝**——
- * 若允许顶替，一个插件就能用 `wiki` 覆盖知识库首页，那是最坏的一类事故
- * （用户以为自己在看自己的 wiki，实际是插件页面），且没有任何提示。
- * 这条与插槽的"自定义名必须含 `/`"是同一个思路：把宿主的命名空间与插件的切开。
- */
-export const RESERVED_ROUTE_IDS: readonly string[] = [
-  'wiki',
-  'plugins', // 「插件管理」页（原 id 为 graph，本轮转正）
-  'graph', // 旧 id：仍须保留 —— 它在路由解析处被改写成 plugins，且不得被插件声明占用
-  'access', // 旧的权限治理路由（现为占位重定向页）
-  'audit',
-  'org',
-  'login',
-  'setup',
-  'denied',
-  'account',
-  'notfound',
-]
 
 /**
  * 插件**声明式**的页面路由（manifest 的 `geewiki.routes`，F2 新增）。
@@ -577,6 +547,8 @@ export const MIGRATION_TABLE = '_migrations'
  * 这里**转出**以保持既有 `import { PLUGIN_UI_ASSET_PATH } from '@geewiki/core'` 可用。
  */
 export {
+  PLUGIN_ROUTE_ID,
+  RESERVED_ROUTE_IDS,
   PLUGIN_UI_PREFIX,
   PLUGIN_UI_FILE_SEGMENT,
   PLUGIN_UI_ASSET_PATH,

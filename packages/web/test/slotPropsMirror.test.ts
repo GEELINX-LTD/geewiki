@@ -384,29 +384,36 @@ for (const { name, required } of ROUTE_MIRRORED_INTERFACES) {
   })
 }
 
-test('PLUGIN_ROUTE_ID 镜像：core 与 pluginUiPlan 两处正则源码逐字一致', () => {
-  const patterns = [CORE_FILE, PLAN_FILE].map((file) => {
-    const match = /export const PLUGIN_ROUTE_ID\s*=\s*(\/.*?\/[a-z]*)\s*$/m.exec(read(file))
-    assert.ok(match, `未能从 ${file} 解析出 PLUGIN_ROUTE_ID 字面量（正则失效即红）`)
-    return match[1] as string
-  })
-  assert.equal(new Set(patterns).size, 1, `两处 PLUGIN_ROUTE_ID 不一致：${JSON.stringify(patterns)}`)
-})
+/*
+ * ★ 镜像已**消除**，故判据从"内容相等"升级为**引用同一性**。
+ *
+ * 原先这两项在 core 与 `pluginUiPlan.ts` 各有一份，由"逐元素相等/逐字一致"的守卫钉住。
+ * 那条守卫的弱点很具体：**它只在漂移之后才红**，而"内容相等"在有人刚抄完一份时是
+ * **通过**的。真源已搬进浏览器安全的 `@geewiki/core/domain`，web 侧改为转出 ——
+ * 于是判据可以变成「是不是同一个对象」，而**副本无法伪装成同一个对象**。
+ *
+ * 这仍是一条**安全边界**（不是洁癖）：后端拒绝插件声明保留 id，前端（运行期注册）
+ * 也必须拒绝。最坏的漂移方向是**前端少了一个保留 id** —— 插件页面顶掉 `#/wiki`，
+ * 用户以为自己在看自己的 wiki。
+ */
+test('路由常量不再是镜像：pluginUiPlan 转出的必须是 core 的**同一个对象**', async () => {
+  const plan = await import('../src/lib/pluginUiPlan')
+  const core = await import('@geewiki/core/domain')
 
-test('RESERVED_ROUTE_IDS 镜像：core 与 pluginUiPlan 逐元素相等且顺序一致', () => {
-  const parse = (file: string): string[] => {
-    const match = /export const RESERVED_ROUTE_IDS[^=]*=\s*\[([^\]]*)\]/.exec(read(file))
-    assert.ok(match, `未能从 ${file} 解析出 RESERVED_ROUTE_IDS 数组字面量（正则失效即红）`)
-    const names = [...(match[1] as string).matchAll(/'([^']+)'/g)].map((m) => m[1] as string)
-    assert.ok(names.length > 0, `${file} 解析出的保留路由清单为空`)
-    return names
+  assert.ok(core.RESERVED_ROUTE_IDS.length > 0, 'core 的保留清单不得为空')
+  assert.equal(
+    plan.RESERVED_ROUTE_IDS,
+    core.RESERVED_ROUTE_IDS,
+    'RESERVED_ROUTE_IDS 必须是同一个对象（若有人又抄了一份，这里会红）',
+  )
+  assert.equal(plan.PLUGIN_ROUTE_ID, core.PLUGIN_ROUTE_ID, 'PLUGIN_ROUTE_ID 必须是同一个对象')
+
+  // 顺带钉住"运行期真的在用这份清单"，而不是只把它转出却没用
+  assert.equal(plan.PLUGIN_ROUTE_ID.test('board'), true)
+  assert.equal(plan.PLUGIN_ROUTE_ID.test('a/b'), false)
+  for (const id of ['wiki', 'plugins', 'graph', 'audit', 'org', 'account']) {
+    assert.ok(plan.RESERVED_ROUTE_IDS.includes(id), `${id} 应当在保留清单里`)
   }
-  /*
-   * ★ 这条守的是**安全边界**：后端拒绝插件声明保留 id，前端（`routes.tsx` 的运行期注册）
-   * 也必须拒绝。两处清单若漂移，就会出现"后端放行的 id 前端仍接受"或反之——
-   * 而最坏的方向是**前端少了一个保留 id**：插件页面顶掉 `#/wiki`，用户以为自己在看自己的 wiki。
-   */
-  assert.deepEqual(parse(PLAN_FILE), parse(CORE_FILE), '两处保留路由清单漂移')
 })
 
 test('isLazyOnlyEntry：声明了页面路由的插件**一律不推迟**（F2 的反向判据）', async () => {
