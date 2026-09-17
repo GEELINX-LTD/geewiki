@@ -78,6 +78,24 @@
   --gw-red-700: #b91c1c;
   --gw-red-900: #7f1d1d;
 
+  /*
+   * 会话层（临时启用）与临时停用：**两支新色相**。
+   *
+   * 为什么不能复用既有的蓝/绿/琥珀/红：那四个已经各自被语义占满了（点击态 / 运行中 /
+   * 异常 / 危险），把"临时"状态挤进去必然撞车；而这两种状态恰恰要靠颜色一眼分开
+   * （图形上五种状态并存），复用等于把问题从"没颜色"换成"两个意思一个颜色"。
+   * 选青（cyan）与紫（violet）纯粹是按"离既有四色最远"挑的，与品牌蓝同处蓝紫区间但不重叠。
+   */
+  --gw-cyan-50: #ecfeff;
+  --gw-cyan-200: #a5f3fc;
+  --gw-cyan-600: #0891b2;
+  --gw-cyan-800: #155e75;
+
+  --gw-violet-50: #f5f3ff;
+  --gw-violet-200: #ddd6fe;
+  --gw-violet-600: #7c3aed;
+  --gw-violet-700: #6d28d9;
+
   /* 深色模式专用的「状态底色」：浅色模式的 50 号色在深色下会刺眼，故单独给出暗底 */
   --gw-dk-green-bg: #0d2a1c;
   --gw-dk-green-line: #1d5136;
@@ -91,14 +109,22 @@
   --gw-dk-blue-bg: #10203a;
   --gw-dk-blue-line: #1e3a68;
   --gw-dk-blue-ink: #93c5fd;
+  --gw-dk-cyan-bg: #0a2b33;
+  --gw-dk-cyan-line: #17505c;
+  --gw-dk-cyan-ink: #67e8f9;
+  --gw-dk-violet-bg: #241b3d;
+  --gw-dk-violet-line: #463073;
+  --gw-dk-violet-ink: #c4b5fd;
 
-  /* 顶栏：两种主题下都保持深色（产品外壳的既有观感），因此不随主题切换 */
-  --gw-header-bg: #0f1a28;
-  --gw-header-ink: #e8eef6;
-  --gw-header-ink-dim: #c3d0df;
-  --gw-header-ink-mute: #8fa3ba;
-  --gw-header-hover: rgb(255 255 255 / 8%);
-  --gw-header-active: rgb(255 255 255 / 14%);
+  /* 深色代码块底色（`.md-body pre` 与它右上角的复制按钮）。
+   *
+   * **必须与顶栏解耦**：这两个值原先叫 `--gw-header-bg` / `--gw-header-ink`，被顶栏与
+   * 代码块**共用**。顶栏改用跟随主题的语义色时，共用会让代码块在浅色主题下一起变白
+   * （深底代码块是刻意保留的既有观感，不该被这次改动波及）—— 一个变量两个职责，
+   * 改一边必然误伤另一边。现在代码块只认这两个名字，两种主题下取值相同。
+   * 复制按钮的浅色前景也取自它（见 styles/markdown.css）。 */
+  --gw-code-bg: #0f1a28;
+  --gw-code-ink: #e8eef6;
 
   /* 字体栈：中文优先落到系统黑体，等宽用于标识符与代码。
    *
@@ -169,8 +195,46 @@
   --gw-danger-line: var(--gw-red-200);
   --gw-danger-ink: var(--gw-red-700);
 
+  /* 会话层（临时启用）：只写入会话清单，正常重启仍在、异常崩溃恢复时被丢弃 */
+  --gw-session: var(--gw-cyan-600);
+  --gw-session-bg: var(--gw-cyan-50);
+  --gw-session-line: var(--gw-cyan-200);
+  --gw-session-ink: var(--gw-cyan-800);
+
+  /* 临时停用（进程内停用基础层插件）：不落盘，重启即恢复 */
+  --gw-suspended: var(--gw-violet-600);
+  --gw-suspended-bg: var(--gw-violet-50);
+  --gw-suspended-line: var(--gw-violet-200);
+  --gw-suspended-ink: var(--gw-violet-700);
+
   --gw-focus-ring: var(--gw-blue-600);
   --gw-overlay: rgb(15 26 40 / 45%);
+
+  /*
+   * 顶栏（浅色模式）：**跟随主题**的白底深字，而不是"两种主题都深色"。
+   *
+   * 为什么必须改：浅色页面顶上压一条深色横条，那是**深色主题的样式** —— 与整页其它表面
+   * （白卡片、`--gw-surface-sunken` 浅灰底）割裂，实测反馈即"浅色主题的顶部还是暗色主题的样式"。
+   * 顶栏是页面外壳的一部分，两种主题下都该由本主题的表面色系构成。
+   *
+   * 对比度（WCAG 1.4.3：正文 ≥4.5:1，取本文件既有的实测口径）：
+   *   · 主文字 `--gw-gray-850`(#1c2733) 对白底 ≈ 15.5:1
+   *   · 次级文字（导航未选中项、图标）用 `--gw-gray-600`(#55637a) 对白底 = 6.08:1
+   *     —— 与 `--gw-ink-muted` 同一档，正是本主题里"浅色背景上仍达标"的那一档
+   *     （`--gw-gray-500` 对白底只有 4.38，不达标，故不用）。两种前景在 hover 底
+   *     （7% 深色叠加 ≈ #eceef1）上依然达标。
+   */
+  --gw-header-bg: var(--gw-gray-0);
+  --gw-header-ink: var(--gw-gray-850);
+  --gw-header-ink-dim: var(--gw-gray-600);
+  --gw-header-ink-mute: var(--gw-gray-600);
+  /* hover / 选中态底色：浅色主题下用**深色低透明**叠加（深色主题里则是白色叠加），
+     这样同一个工具类 `bg-header-hover` 在两种主题下都是"轻微变色"而不会突兀 */
+  --gw-header-hover: rgb(15 26 40 / 7%);
+  --gw-header-active: rgb(15 26 40 / 12%);
+  /* 顶栏与正文之间的分界：浅色下白顶栏与页面之间靠一条 hairline，而不是重阴影 */
+  --gw-header-line: var(--gw-line);
+  --gw-header-shadow: 0 1px 2px rgb(15 26 40 / 6%);
 }
 
 /* ---------------------------------------------------------------------------
@@ -222,8 +286,29 @@
   --gw-danger-line: var(--gw-dk-red-line);
   --gw-danger-ink: var(--gw-dk-red-ink);
 
+  --gw-session: #22d3ee;
+  --gw-session-bg: var(--gw-dk-cyan-bg);
+  --gw-session-line: var(--gw-dk-cyan-line);
+  --gw-session-ink: var(--gw-dk-cyan-ink);
+
+  --gw-suspended: #a78bfa;
+  --gw-suspended-bg: var(--gw-dk-violet-bg);
+  --gw-suspended-line: var(--gw-dk-violet-line);
+  --gw-suspended-ink: var(--gw-dk-violet-ink);
+
   --gw-focus-ring: var(--gw-blue-300);
   --gw-overlay: rgb(0 0 0 / 62%);
+
+  /* 顶栏（深色模式）：沿用既有深色外观 —— 它本来就是为深色主题设计的，
+     只是不再"强制"浅色主题也用它。取值与原 `--gw-header-*` 逐字相同。 */
+  --gw-header-bg: #0f1a28;
+  --gw-header-ink: #e8eef6;
+  --gw-header-ink-dim: #c3d0df;
+  --gw-header-ink-mute: #8fa3ba;
+  --gw-header-hover: rgb(255 255 255 / 8%);
+  --gw-header-active: rgb(255 255 255 / 14%);
+  --gw-header-line: #263243;
+  --gw-header-shadow: 0 1px 4px rgb(0 0 0 / 18%);
 }
 
 /* 3b. 未手动选择时跟随系统偏好 */
@@ -261,14 +346,48 @@
     --gw-danger-line: var(--gw-dk-red-line);
     --gw-danger-ink: var(--gw-dk-red-ink);
 
+    --gw-session: #22d3ee;
+    --gw-session-bg: var(--gw-dk-cyan-bg);
+    --gw-session-line: var(--gw-dk-cyan-line);
+    --gw-session-ink: var(--gw-dk-cyan-ink);
+
+    --gw-suspended: #a78bfa;
+    --gw-suspended-bg: var(--gw-dk-violet-bg);
+    --gw-suspended-line: var(--gw-dk-violet-line);
+    --gw-suspended-ink: var(--gw-dk-violet-ink);
+
     --gw-focus-ring: var(--gw-blue-300);
     --gw-overlay: rgb(0 0 0 / 62%);
+
+    /* 顶栏（深色模式，同 3a）——系统偏好路径必须与显式 `.dark` 逐值一致，
+       否则"选了跟随系统"与"手动选深色"会看到两种顶栏 */
+    --gw-header-bg: #0f1a28;
+    --gw-header-ink: #e8eef6;
+    --gw-header-ink-dim: #c3d0df;
+    --gw-header-ink-mute: #8fa3ba;
+    --gw-header-hover: rgb(255 255 255 / 8%);
+    --gw-header-active: rgb(255 255 255 / 14%);
+    --gw-header-line: #263243;
+    --gw-header-shadow: 0 1px 4px rgb(0 0 0 / 18%);
   }
 }
 
 /* ---------------------------------------------------------------------------
  * 4. 注册进 Tailwind：语义色 + 尺度
  *    语义色「间接」指向 --gw-*，这样 .dark 覆盖 --gw-* 时工具类自动跟随。
+ *
+ *    ⚠️ 这里有一个**只影响插件产物**的陷阱，2026-09-15 实测后记档：
+ *
+ *    `@theme inline` 的语义是「把值内联进生成的工具类」，Tailwind 因此**不再输出
+ *    `--color-*` 变量声明本身**（实测产物里一个都没有）。宿主自己的界面不受影响
+ *    （工具类里已经写死了 `var(--gw-ink)` 这样的真值），但插件 CSS 住在
+ *    packages 下的 plugin-xxx 包内，只能引用变量名 —— 于是：
+ *      · 没写回退值的声明直接变成 invalid-at-computed-value-time（摘要条没底色、
+ *        边框退回 currentColor）；
+ *      · 写了浅色回退值的在深色主题下变成白块。
+ *
+ *    所以第 4b 节用一段**普通的 :root** 把插件可引用的名字无条件钉死。
+ *    两节必须一起看：上面这节服务宿主工具类，下面那节服务插件产物。
  * ------------------------------------------------------------------------- */
 
 @theme inline {
@@ -305,10 +424,26 @@
   --color-danger-line: var(--gw-danger-line);
   --color-danger-ink: var(--gw-danger-ink);
 
+  /* 插件状态色：会话层（临时启用）与临时停用。与 ok/warn/danger 同级语义，故同样成对注册 */
+  --color-session: var(--gw-session);
+  --color-session-bg: var(--gw-session-bg);
+  --color-session-line: var(--gw-session-line);
+  --color-session-ink: var(--gw-session-ink);
+  --color-suspended: var(--gw-suspended);
+  --color-suspended-bg: var(--gw-suspended-bg);
+  --color-suspended-line: var(--gw-suspended-line);
+  --color-suspended-ink: var(--gw-suspended-ink);
+
   --color-header: var(--gw-header-bg);
   --color-header-ink: var(--gw-header-ink);
   --color-header-dim: var(--gw-header-ink-dim);
   --color-header-mute: var(--gw-header-ink-mute);
+  /* 顶栏的 hover / 选中态底色与分界线也走语义色：组件里**不得**再写死
+     `hover:bg-white/10 hover:text-white` —— 那是给深色顶栏写死的值，浅色主题下
+     白字压白底会直接看不见（本次修复前顶栏正是这个状态）。 */
+  --color-header-hover: var(--gw-header-hover);
+  --color-header-active: var(--gw-header-active);
+  --color-header-line: var(--gw-header-line);
 
   --color-focus-ring: var(--gw-focus-ring);
   --color-overlay: var(--gw-overlay);
@@ -359,6 +494,8 @@
   /* 动效 */
   --ease-standard: cubic-bezier(0.2, 0, 0.13, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  /* 大位移（抽屉/面板展开收起）。前两条都是给 150ms 的颜色·小位移调的，见第 4b 节 */
+  --ease-move: cubic-bezier(0.15, 0.08, 0.5, 1);
 
   /* z-index 阶（集中管理，避免各处随手写 20/30/40 造成层叠打架） */
   --z-base: 0;
@@ -367,6 +504,81 @@
   --z-overlay: 50;
   --z-modal: 60;
   --z-toast: 70;
+}
+
+/* ---------------------------------------------------------------------------
+ * 4b. 插件产物可引用的宿主变量 —— 显式契约块（2026-09-15 新增）
+ *
+ *    为什么必须再写一遍：第 4 节的 `@theme inline` **不输出这些名字**（见那里的说明）。
+ *    插件 CSS 只能引用变量，拿不到声明就等于没有颜色。
+ *
+ *    这里用一段**不分层的普通 `:root`**：`@theme` 的产物在 layer theme 里，未分层
+ *    规则优先级更高；而值仍然只是「指向 --gw-*」，深浅色由 `.dark` 与
+ *    `prefers-color-scheme` 下的 --gw-* 决定，故**两种主题自动跟随**，本块一行都不用改。
+ *
+ *    试过的两条错路（都记下来，别再走）：
+ *      · `@theme static inline` 与 `@theme static` —— 本仓这份 Tailwind 会把自定义色
+ *        工具类一起弄没（.text-ink 直接不再生成），不可用；
+ *      · 把整份 @theme 抄一遍 —— 立刻就有两份会漂的名单，代价是「插件悄悄变色」。
+ *    故只收插件真的会用的名字。
+ *
+ *    ⚠️ 删改本块 = 破坏插件界面。packages/web/test/pluginUi.test.ts 有守卫盯着：
+ *    插件 CSS 里出现的每个 var(--…) 都必须能在本块里找到定义。
+ * ------------------------------------------------------------------------- */
+
+:root {
+  --color-bg: var(--gw-bg);
+  --color-surface: var(--gw-surface);
+  --color-sunken: var(--gw-surface-sunken);
+  --color-hover: var(--gw-surface-hover);
+  --color-ink: var(--gw-ink);
+  --color-ink-soft: var(--gw-ink-soft);
+  --color-muted: var(--gw-ink-muted);
+  --color-line: var(--gw-line);
+  --color-line-strong: var(--gw-line-strong);
+  /* 主操作按钮（AI 助手的「发送」）：强调色必须成对给出，否则深色下会出现
+     "浅底浅字"——前景色与背景色必须由同一套主题同时决定。 */
+  --color-accent: var(--gw-accent);
+  --color-accent-hover: var(--gw-accent-hover);
+  --color-accent-ink: var(--gw-accent-ink);
+  --color-danger: var(--gw-danger);
+  --color-danger-bg: var(--gw-danger-bg);
+  --color-warn: var(--gw-warn);
+  --color-warn-bg: var(--gw-warn-bg);
+  --color-warn-line: var(--gw-warn-line);
+  --color-warn-ink: var(--gw-warn-ink);
+  --color-danger-ink: var(--gw-danger-ink);
+  --color-session: var(--gw-session);
+  --color-session-bg: var(--gw-session-bg);
+  --color-session-line: var(--gw-session-line);
+  --color-session-ink: var(--gw-session-ink);
+  --color-suspended: var(--gw-suspended);
+  --color-suspended-bg: var(--gw-suspended-bg);
+  --color-suspended-line: var(--gw-suspended-line);
+  --color-suspended-ink: var(--gw-suspended-ink);
+  /* 尺度档：--text-xxx 与 --radius-xxx 眼下确实被输出，但那是 Tailwind 裁剪的副产品
+     （恰好被某条工具类捎带上），不是承诺。既然插件 CSS 已经在用，就一并纳入契约。 */
+  --text-3xs: 0.625rem;
+  --text-2xs: 0.6875rem;
+  --text-note: 0.8125rem;
+  --text-md: 0.9375rem;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  /* 动效曲线。第 4 节的 `--ease-standard` 只在 `@theme inline` 里，**不进产物**，
+     而插件界面已经开始做过渡（`@geewiki/ai-assistant` 的 dock 展开/收起）。曲线是
+     宿主的设计决定，插件不该各抄一份——抄出来的那份会在宿主改曲线时悄悄与宿主不一致。
+     与颜色同理：值只是"指向同一个曲线"，故深浅色、主题切换都不影响它。 */
+  --ease-standard: cubic-bezier(0.2, 0, 0.13, 1);
+  /* 大位移专用（抽屉/面板的展开收起）。**不能拿上面两条凑**——两条都是给 150ms 的
+     颜色变化与小位移调的，前段极陡：`--ease-standard` 在 25% 的时间里就走完了 50% 的
+     距离、峰值速度是平均值的 2.9 倍（184px 的位移 ⇒ 单帧 37px）；`--ease-out`
+     （0.16, 1, 0.3, 1）更陡，峰值 6.2 倍、83%。用在抽屉上就是"一冲一顿"。
+     本条：峰值 1.6 倍（同样 184px/240ms ⇒ 单帧 20.5px，降 44%），
+     25/50/75% 时间走过 35/70/92% 距离——起步仍然跟手（25% 走 35%），
+     尾巴却不再"爬"，这是大位移读起来"丝滑"的关键。 */
+  --ease-move: cubic-bezier(0.15, 0.08, 0.5, 1);
 }
 
 /*
@@ -401,10 +613,11 @@
 @theme {
   --spacing-gutter: 22px; /* 外壳左右内边距，与既有 styles.css 的 22px 对齐 */
   --spacing-header: 56px; /* 顶栏高度，跳过链接与 sticky 定位都要用它 */
-  --spacing-measure: min(70rem, 66em); /* 正文行宽：中文 60 字/行（宽屏上为填满页面而放宽，见 styles.css 三档表）。
-                                `50em` 锚在正文实际字号（14px ⇒ 700px ⇒ 50 字/行），`53rem` 只作
-                                根字号被放大时的上限兜底（默认 16px 下不生效）。为什么既不是 68ch
-                                也不是 46rem：见上方口径说明（两者都不等于一个汉字）。 */
+  --spacing-measure: min(84rem, 92em); /* 正文行宽上限：14px 正文下 92em = 1288px。
+                                2026-09-13 第二版由 `min(70rem, 66em)`（924px）放宽 —— 用户选定
+                                "正文列吃满侧栏与目录之间的全部宽度、行宽上限同步放宽"。
+                                有右栏时它**不会生效**（正文列最宽 1278px，见 styles.css 的
+                                `.gw-reader-grid`），真正的用武之地是**没有右栏的单列页**。 */
 }
 /*
   外壳宽度：**不再按内容类型分档** —— 阅读态与扫描态统一用 `--spacing-wide`。

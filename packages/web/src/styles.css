@@ -120,11 +120,14 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 
 /*
   正文行宽（measure）：口径是**每行多少个汉字**，不是多少 ch。
-  中文通行区间见 W3C《中文排版需求》(clreq)：35~50 字/行（上界是 50；早期把 45 当上界
-  是误读，2026-09-13 订正）；`{--spacing-measure}` 取 `min(53rem, 50em)` 落在区间上沿
-  （14px 正文下 50em = 700px = 50 字/行）。
+  中文通行区间见 W3C《中文排版需求》(clreq)：35~50 字/行。
   为什么不能直接写 `68ch`：`ch` 是「数字 0」的宽度（本主题约 8px），与汉字（14px）无关——
   2026-09-12 实测 `68ch` 得到 734px ⇒ 一行塞 52.4 个汉字，超出中文舒适区。
+
+  ⚠️ 2026-09-13 第二版把上限从 `min(70rem, 66em)`（924px）放到 `min(84rem, 92em)`（1288px）：
+  用户选定"正文列吃满侧栏与目录之间的全部宽度、行宽上限同步放宽"。
+  有右栏时这个上限**根本不生效**（正文列最宽 1278px，见 styles.css 的 `.gw-reader-grid`）；
+  它真正的用武之地是**没有右栏的单列页**（那里正文块若吃满外壳，超宽屏上会拉到 1500px 以上）。
   只约束 .md-body（正文），不约束表格/代码块——它们可以横向溢出并各自滚动。
 */
 .md-body { line-height: 1.75; overflow-wrap: anywhere; max-width: var(--spacing-measure); }
@@ -143,7 +146,9 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
  * 颜色 + 下划线（不只靠颜色区分，WCAG 1.4.1）、hover、focus-visible、以及 missing 变体。
  */
 .md-body pre {
-  background: var(--gw-header-bg); color: var(--gw-header-ink); padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3.5); border-radius: var(--radius-md);
+  /* 代码块底色是**独立的深色语义色**，不再借用 `--gw-header-bg`：顶栏现在跟随主题
+     （浅色下是白的），借它会让代码块在浅色主题里一起变白。见 tokens.css 的 --gw-code-bg */
+  background: var(--gw-code-bg); color: var(--gw-code-ink); padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3.5); border-radius: var(--radius-md);
   overflow-x: auto; max-width: 100%; font-size: var(--text-note);
 }
 .md-body code { font-family: var(--font-mono); }
@@ -204,181 +209,102 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 .md-body th, .md-body td { border: 1px solid var(--gw-line); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 3); }
 .md-body hr { border: 0; border-top: 1px solid var(--gw-line); margin: 1.4em 0; }
 /*
-  阅读栅格的列宽（`WikiPage.tsx` 的 `.gw-reader-grid`）。
+  阅读页栅格（`WikiPage.tsx` 的 `.gw-reader-grid`）。**2026-09-13 第二版定稿**：
 
-  列宽 = **正文内容盒 + 卡片两侧内边距**：`--spacing-measure`（700px，中文 50 字/行）
-  约束的是 `.md-body` 的**内容**宽度，而内边距是卡片自己吃的（`px-6` ⇒ 24px；
-  `sm:px-8` ⇒ 32px）⇒ 列宽必须比它宽出 2 倍内边距（700 + 2×32 = 764px）。
+  ## 形态
+  ≥1280px 且这一页有右栏时两列 —— `[正文列 minmax(0,1fr)] [右栏 var(--gw-rail)]`；
+  列里从上到下：面包屑 / 动作条 / （预览条）/ 正文、（右栏：目录）。左缘全部对齐正文。
 
-  ⚠️ **只写 `var(--spacing-measure)` 是不够的**（2026-09-12 实测踩过）：列宽等于内容盒宽时，
-  正文会被内边距再挤掉 2 倍内边距（当时 630 列宽 ⇒ 正文只剩 564px = 40 字/行）。
+  ## 为什么删掉了"左侧留白 + 整页居中补偿"（第一版的形态）
+  第一版是 `[留白 240] [正文] [右栏 240]` 外加一条 `transform: translateX(-131px)`，
+  目的是让正文落在**视口**中心。实测（1920×1080）的代价：
+    · 侧栏右缘 302、正文左缘 489 ⇒ 中间一条 **187px 的空白带**（用户原话"空得太多了"，
+      并在截图里框住了它）；
+    · 面包屑写的是 `grid-column: 1 / -1`，起点因此落在左侧留白列里（x=193）—— 与侧栏
+      同一横向区间，看着像侧栏多出来的一行（用户原话"面包屑的位置奇怪"）；
+    · `transform` 不参与布局，于是整个栅格盒子**压在侧栏右半边之上**：实测
+      `document.elementFromPoint(194, 135)` 返回的就是 `DIV.gw-reader-grid` ——
+      侧栏每条链接的右半截点不动（"切换文章"时点不动、看着像闪）。
+  用户随后选定"正文列吃满中间、行宽上限同步放宽"，故留白列与两条补偿全部删除。
 
-  ⚠️ 也**不要**把列宽写成和式或引用那个变量：`minmax()` 的 max 位置放
-  `calc(700px + 32px)` / `calc(700px + 2rem)` / 变量里的 `em` 时，轨道会**退化成内容宽度**
-  —— 实测得 662px、正文 596px（同一页同一时刻与写死列宽的受控对照）。故这里写死 764px。
-  （这条对照取自**加 `fit-content` 之前**的构建；加了 `fit-content` 之后 `100%` 另有
-  循环依赖问题，见下方那条，两件事不要混。）
+  ## 右栏为什么必须是**裸像素定宽**
+  · `1fr` 会按"吃满剩余空间"解析 ⇒ 实测 1920 下右栏被拉成 526px，而目录只有百来像素宽；
+  · `max-content` 由**列里最宽的东西**决定，而这一列里还有动作条（版本 + 更新时间 + 按钮，
+    实测 445px）和可能很长的标题 ⇒ 正文列被白白挤窄（实测正文只剩 777px）；
+  · 定宽还保证**预览历史版本时右栏不跳**：预览态会隐藏「权限…/删除/编辑」三个按钮，
+    若右栏宽度由按钮组算出来，进预览时右栏会当场塌掉、正文列跟着变宽（实测 445 → 130）。
+  动作条自己占满整行、按钮靠 `ml-auto` 推到最右 ⇒ 按钮组与右栏**同右缘**，
+  "本页目录的宽度与上面那三个按钮整体同宽"由"同一条列 + 同一个右缘"落实。
 
-  ⚠️ **列宽档位随视口变**（2026-09-13 为"两侧空白太多"引入）：`md`~`lg`（1024~1280）
-  这一档**没有左侧栏**（侧栏是 `lg:block`），阅读区反而更宽（1002px）⇒ 用得上更大的列宽；
-  而 `lg`~`xl`（1280~1440）侧栏出现，阅读区被挤到 974px ⇒ 必须回到小档，否则
-  `764 + 24 + 272 = 1060 > 974` 会横向溢出。故列宽分两档（见下面的 `--gw-read`）：
-  `1024~1280` 用 764px、`1280~1440` 用 726px（732 已超）、`≥1440` 用 764px。
-  两个数值都有实测依据，见 `--gw-read` 那段注释。
-
-  ⚠️ 双栏只在 **`xl`（1280px）** 以上生效：`md`~`xl` 之间用两列会把正文列挤到 177px
-  （2026-09-12 实测）。若将来要放开这条，**必须先解决"侧栏出现时阅读区反而变窄"**——
-  这正是上面那个 1280 档必须收窄列宽的原因。
-
-  ⚠️ 栅格**不能用默认的"撑满父容器 + 列左对齐"**（2026-09-12 实测的缺陷）：
-  块级栅格宽度 = 阅读区宽，而单栏列只有 764 ⇒ 列贴在块的**左缘**、
-  块的右缘空出一大条。观感就是"文章偏左、右侧一大条空白"。改用 `justify-content`
-  也救不了：它只挪"列在块内"的位置，块本身仍撑着，右侧空白照旧。
-
-  正确形态是**让内容整体在阅读区里居中**：栅格先收缩到内容宽度（`fit-content`），
-  再由 `margin-inline: auto` 把这一块居中。居中的是"整块内容"，不是某一张卡片 ——
-  列内所有卡片共用同一个栅格列，左缘天然一致（对照见下方 `article.gw-reader` 那段）。
-
-  ⚠️ 单栏列**不要写 `min(764px, 100%)`**：`100%` 在 `fit-content` 容器里是循环依赖
-  （块宽取决于列宽、列宽又取决于块宽），实测会让轨道退化成内容宽度 ⇒ 列 626、
-  正文 560（比硬指标窄 140px）。裸长度无循环，实测稳定。
-  窄屏靠栅格自己的 `max-width: 100%` 兜住（块宽 = 父容器宽，列退到 100%，不溢出）。
-
-  ⚠️ `WikiPage.tsx` 那个 `md:max-w-[1504px]` **必须去掉**：它落在 `utilities` 层，
-  会盖住这里的 `margin-inline: auto`（层叠顺序：utilities > legacy），把"fit-content +
-  居中"变成"fit-content + 右溢"——实测 1920 下块宽被限到 1504 后右移 42px。
-
-  ⚠️ 这里**不要**改成给卡片自己加 `width`/`margin-inline`：卡片一旦各自限宽/居中，
-  就会与同列其它卡片错开（历史上出现过"正文卡 x=443.5、版本历史卡 x=357.5、错开
-  86px"的阶梯）。居中是栅格的事，不是卡片的事。
-*/
-/*
-  阅读页栅格（2026-09-13 用户定稿）。**两行三列**：
-    第一行：头部（面包屑 + 标题），跨全部列
-    第二行：[留白] [正文] [右栏]
-  · 第 1 列的 240px 留白是为了让正文在**整页**里居中（左有侧栏 240px、右有 240px 留白）；
-  · 第 3 列的 240px 是右栏（目录 / 主页「最近更新」），它与动作条上的按钮组**同列同宽**；
-  · 正文列不设上限：屏幕多出来的宽度交给正文，而不是留成两侧空白
-    （`--spacing-measure` 仍然封住 `.md-body` 的**内容盒**，见它自己的注释）。
+  ## 其它必须保留的结论
+  · 双栏只在 **`xl`（1280px）** 以上生效：`md`~`xl` 之间侧栏已在，阅读区只有 974px，
+    两列会把正文列挤到 177px（2026-09-12 实测）。窄屏回落单栏，右栏容器自己 `hidden xl:flex`。
+  · **右栏 TOC 的 sticky 要求"包含块被撑高"**（2026-09-16 用户实测"目录不跟随下滑"）：`position: sticky`
+    只能在自己的**包含块**内部滑动，而本容器是 `flex flex-col`，**flex 纵轴不拉伸**（`align-items: stretch`
+    只管横轴）⇒ 里面的 `<aside>` 停在内容高度（真浏览器实测 516px，与目录自身等高），本容器却被栅格行拉到
+    8818px（= 正文高度）⇒ 目录**一格都滑不动**（滚 1800px 后它的顶边跑到 −1645）。修法是给包含块 `xl:grow`。
+    诊断顺序值得记：**先查祖先链的 overflow，再查包含块高度**——本例祖先链 overflow 全部正常
+    （唯一非 visible 的是 nav 自己的 `overflow-y-auto`），真凶是高度。守卫见 `test/readingLayout.test.ts`。
+  · **不要给卡片加 `width`/`margin-inline`**：卡片一旦各自限宽/居中就会与同列其它卡片错开
+    （历史上出现过"正文卡 x=443.5、版本历史卡 x=357.5、错开 86px"的阶梯）。
+    宽度归栅格列，见下方 `article.gw-reader` 那段。
 */
 .gw-reader-grid {
-  --gw-rail: 240px; /* 右栏宽度＝动作条按钮组宽度，两处只此一处定义 */
+  --gw-rail: 240px; /* 右栏宽度；动作条按钮组与它同右缘，两处只此一处定义 */
   display: grid;
   gap: 16px;
   grid-template-columns: minmax(0, 1fr);
-  margin-inline: auto;
 }
 .gw-reader-grid > .gw-reader-main,
 .gw-reader-grid > .gw-reader-rail {
   min-width: 0;
 }
 /*
-  头部（面包屑 + 标题 + 动作条）**不换行**：面包屑与动作条同处第一行，
-  二者之间的 `gap-6` 由动作条自己的 `ml-auto` 补足。
+  面包屑、预览条与正文**同列同左缘**。
+
+  ⚠️ 这三条 `grid-column: 1` 不是装饰，是**自动放置的前提**：动作条占满整行（见下），
+  自动放置的游标在它之后落到第 2 列；任何没写列号的子项都会被塞进右栏那一列
+  （预览条此前就是这样被丢进左侧留白列的，宽 240px、与侧栏重叠）。
 */
-.gw-reader-grid > nav[aria-label='面包屑'] {
-  grid-column: 1 / -1;
+.gw-reader-grid > nav[aria-label='面包屑'],
+.gw-reader-grid > .gw-reader-main,
+.gw-reader-grid > .gw-reader-preview {
+  grid-column: 1;
 }
+/*
+  动作条：占满整行（正文列 + 右栏列），左侧元信息、`ml-auto` 把按钮推到最右缘
+  ⇒ 按钮组与右栏**同右缘**。整行不设宽度：错误/提示条也活在这一行里，
+  宽度若按内容算，一条长报错会把正文列挤窄。
+*/
 .gw-reader-actions {
   grid-column: 1 / -1;
-  justify-self: end;
-  width: var(--gw-rail);
+  justify-self: stretch;
 }
 @media (min-width: 1280px) {
   .gw-reader-grid.has-rail {
-    /*
-      ⚠️ 两侧留白用 `minmax(0, var(--gw-rail))` 而**不是**裸 `var(--gw-rail)`：
-      1280~1535 这一档外壳已封顶（`--spacing-wide: 1840px` 之下还有更小的实际可用宽），
-      裸固定值会把正文列挤到只剩十几像素（实测 1440 档正文每侧仅 11px）。
-      `minmax(0, …)` 让留白先收缩、正文优先保住宽度；留白在最窄档降到 0 时，
-      "左右对称"自然退化成"正文居中"，不会溢出。
-    */
-    grid-template-columns: minmax(0, var(--gw-rail)) minmax(0, 1fr) minmax(0, var(--gw-rail));
-  }
-  .gw-reader-grid.has-rail > .gw-reader-align {
-    grid-column: 1;
-  }
-  .gw-reader-grid.has-rail > .gw-reader-main {
-    grid-column: 2;
+    grid-template-columns: minmax(0, 1fr) var(--gw-rail);
   }
   .gw-reader-grid.has-rail > .gw-reader-rail {
-    grid-column: 3;
-  }
-  /*
-    动作条落在第 2 列 ⇒ 它与正文同宽、与右栏同右缘，不需要在 JSX 里再写一次宽度。
-    这一条是"本页目录的宽度与上面那三个按钮整体同宽"的落点。
-  */
-  .gw-reader-grid.has-rail > .gw-reader-actions {
     grid-column: 2;
-    width: 100%;
-    justify-self: stretch;
   }
 }
 /*
-  **没有右栏**的页面（目录不足两条且非主页）：正文整块居中，动作条与正文**同右缘**。
-  为什么不留一条空轨道：空轨道会让动作条与正文右缘错开一整个栏宽（用户明确要求
-  "本页目录的宽度与上面那三个按钮整体同宽" —— 没有目录时那条轨道里的东西是空的，
-  留它只会让按钮飘在右边、与正文对不齐）。
+  **没有右栏**的页面（目录不足两条且非主页，或 1280 以下）：单列。
+
+  ⚠️ 正文**左对齐**（不再 `margin-inline: auto` 居中），与有右栏时同一左缘：
+  1920 下正文列在两种情况下分别是 324..1602（有右栏）与 324..1612（无右栏），
+  只有 10px 的宽度差、**没有横向位移** —— 于是"从有目录的文章切到没目录的文章"
+  （侧栏里 `getting-started` → `welcome` 就是这样）不会整块左右跳 123px。
+  居中的写法会让这两种页面在同一个位置左右错开一截，那正是"切换文章时闪烁"的一种。
+
+  为什么仍要封顶 `--spacing-measure`：没有右栏时若让正文吃满外壳，超宽屏上正文会拉到
+  1500px 以上而没有任何东西与之平衡（"卡片里一条长文"的坏形态）。
+  有右栏时这个上限**不会生效** —— 正文列最宽也就 1278px（外壳 1840 − 内边距 44 −
+  侧栏 240 − 间距 22 − 右栏 240 − 列间距 16），见 tokens.css 里 `--spacing-measure` 的口径。
 */
-/*
-  ⚠️ **单列页仍需这一条补偿**（三列页不需要 —— 那一边靠对称留白列解决，见上面的三列定义）。
-  原因：外壳内是「侧栏 240px + 间距 22px + 阅读区」，单列页的正文块在**阅读区**里居中 ⇒
-  相对视口必然左偏约 (240+22)/2 = 131px（实测未补偿时正文 x 629→1553，右缘几乎贴住外壳右缘）。
-  这条只作用于 `:not(.has-rail)`，因此**不会**与三列留白叠加成"补偿两次"。
-  `transform` 而非外边距：块宽由 `width: min(100%, var(--spacing-measure))` + `margin-inline: auto`
-  决定，改单侧外边距会重新分配余量、结果不可预测（`503ce98` 逐个实测过四种写法）。
-*/
-@media (min-width: 1280px) {
-  .gw-reader-grid:not(.has-rail) {
-    transform: translateX(calc((240px + var(--spacing-gutter)) / -2));
-  }
-}
 @media (min-width: 1280px) {
   .gw-reader-grid:not(.has-rail) > .gw-reader-main {
-    /*
-      正文列封顶 `--spacing-measure`：没有右栏时若让它吃满外壳，超宽屏上正文会拉到
-      1500px 以上而没有任何东西与之平衡，那正是"卡片里一条长文"的坏形态。
-    */
     width: min(100%, var(--spacing-measure));
-    margin-inline: auto;
-  }
-  .gw-reader-grid:not(.has-rail) > .gw-reader-actions {
-    width: min(100%, var(--spacing-measure));
-    margin-inline: auto;
-  }
-}
-@media (min-width: 1536px) {
-  /* 更宽的屏幕上留白同步长到 280，正文继续吃满（避免超宽屏上正文被拉得过长） */
-  .gw-reader-grid.has-rail {
-    --gw-rail: 280px;
-  }
-}
-
-/*
-  阅读区相对视口的**居中补偿**（两条，作用域互斥，不会叠加）：
-
-  背景：外壳内是「侧栏 240px + 间距 22px + 阅读区」，阅读区中心比视口中心右移 131px。
-  `margin-inline: auto` 只能把内容在**阅读区**里居中 ⇒ 相对视口必然左偏 131px。
-  两条规则分别补齐两种页面的这个偏移：
-
-    1. `:not(.has-rail)`（单列页，≥1280）：正文块在阅读区里居中 ⇒ 左偏 131px
-       （实测未补偿时正文 x 629→1553，右缘几乎贴住外壳右缘）。
-    2. `.has-rail`（三列页，≥1440）：第 1 列的对称留白只有 240/280px，而总的左偏是 131px
-       的**一半关系**，实测未补偿时 1920 档块左空 487 / 右空 225；平移后三档左右空完全相等
-       （实测 356/356、196/196、153/153）。
-
-  ⚠️ 断点不同是**故意的**：`transform` 不参与布局，余量不够就会横向溢出。
-  1280~1439 档块 944、阅读区 974 ⇒ 余量仅 15px < 131 ⇒ 该档**不补偿**
-  （实测块左空 299 / 右空 37，仍好于"右空 22"的旧坏形态；`scrollWidth` 保持 1280）。
-  1440 档余量恰好 131px（实测平移后 `scrollWidth` 仍 = 1440）。
-
-  ⚠️ 用 `transform` 而不是外边距：块宽由 `width: min(100%, var(--spacing-measure))` +
-  `margin-inline: auto` 决定，改单侧外边距会**重新分配**余量、结果不可预测
-  （`503ce98` 逐个实测过四种写法，只有 transform 命中）。
-*/
-@media (min-width: 1440px) {
-  .gw-reader-grid.has-rail {
-    transform: translateX(calc((240px + var(--spacing-gutter)) / -2));
   }
 }
 /*
@@ -454,6 +380,17 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 }
 
 /*
+  插槽出口的**宿主侧布局**：只管"多个贡献者之间怎么排"，插件内部归插件自己的样式表。
+  - `editor-toolbar` 多占用：多个插件各贡献一组按钮 ⇒ 横向排开、窄屏换行；
+  - 单占用的出口由各自的组件决定块级/宽度，这里不替代它们定版式。
+    （`.slot-outlet-ask` 曾给 `wiki-ask` 面板用，随 P8 拆除该插槽一并删除——
+    留一条只挂在已删插槽上的规则，会让后来的人以为那个出口还在。）
+  刻意**不写任何"面板长什么样"的规则**：那会让插件停用后仍残留别人的视觉痕迹，
+  也使插件无法自带一份自洽的样式（宿主样式表不是插件可以依赖的东西）。
+*/
+.slot-outlet-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: calc(var(--spacing) * 2); }
+
+/*
   插件编辑器路径上的附件兜底提示（`lib/slots.tsx` 的 `EditorSlotOutlet`，X1）。
   用中性色而不是 warn：这不是"哪里坏了"，而是"当前这个编辑器没有这个能力"——
   换回内置编辑器即可，是可选的下一步，不是需要排查的故障。
@@ -473,8 +410,17 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 .schema-field { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1); }
 .schema-label { font-size: var(--text-xs); color: var(--gw-ink-soft); display: flex; gap: calc(var(--spacing) * 1.5); align-items: baseline; flex-wrap: wrap; }
 .schema-label .required { color: var(--gw-danger); font-style: normal; }
+/*
+ * 输入类控件**逐个列类型**（不写 `.schema-field input` 通配）：`.schema-field` 里还嵌着
+ * `.schema-checkbox` 的 checkbox，通配会把方框也套上边框/内边距。
+ * 列出来的时候别漏 `password` —— 写一次密钥字段（`role:'secret'`，如 LLM 的 apiKey）和
+ * `role:'password'` 字段渲染的都是密码框，漏掉它就退化成浏览器默认样式：没有边框和内边距，
+ * 同一张表单里它和 baseUrl 这类文本框明显不像同一种控件（`ui/Input` 是 Tailwind 类实现，
+ * 管不到这里的原生 input）。
+ */
 .schema-field input[type='text'],
 .schema-field input[type='number'],
+.schema-field input[type='password'],
 .schema-field select,
 .schema-field textarea {
   border: 1px solid var(--gw-line); border-radius: var(--radius-sm); padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2);
@@ -482,6 +428,8 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   resize: vertical; width: 100%; box-sizing: border-box;
 }
 .schema-field input:focus, .schema-field select:focus, .schema-field textarea:focus { border-color: var(--gw-accent); }
+/* 密钥字段勾选"清除已保存的值"后输入框禁用：不给底色就看不出它已经不能输入了。 */
+.schema-field input:disabled { background: var(--gw-surface-hover); color: var(--gw-ink-muted); cursor: not-allowed; }
 .schema-checkbox { display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); font-size: var(--text-note); }
 .schema-group {
   border: 1px solid var(--gw-line); border-radius: var(--radius-md); padding: calc(var(--spacing) * 2.5) calc(var(--spacing) * 3);
@@ -494,21 +442,66 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
 .schema-json { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1); }
 .schema-errors { margin-top: calc(var(--spacing) * 0.5); }
 
-.search-form, .ask-form { display: flex; gap: calc(var(--spacing) * 2); align-items: center; flex: 1; min-width: 260px; }
-.search-input, .ask-input {
+/*
+ * 「输入框 + 一个动作按钮」（模型清单的「获取模型」）。
+ * 输入框吃掉剩余宽度，按钮保持自身宽度并允许换行前的完整文案。
+ */
+.schema-inline { display: flex; gap: calc(var(--spacing) * 1.5); align-items: stretch; }
+.schema-inline > input { flex: 1; }
+.schema-inline > button {
+  flex: none; white-space: nowrap; cursor: pointer;
+  font-size: var(--text-note); font-family: inherit; color: var(--gw-ink-soft);
+  border: 1px solid var(--gw-line); border-radius: var(--radius-sm); background: var(--gw-surface);
+  padding: 0 calc(var(--spacing) * 2.5);
+}
+.schema-inline > button:disabled { color: var(--gw-ink-muted); background: var(--gw-surface-hover); cursor: not-allowed; }
+
+/*
+ * 折叠的「高级选项」（schema 上带 `.collapse()` 的字段都收在这里）。
+ * 用原生 details：折叠态不需要额外状态，也不给表单加一层假组件。
+ */
+.schema-advanced {
+  border: 1px dashed var(--gw-line); border-radius: var(--radius-md);
+  padding: calc(var(--spacing) * 2) calc(var(--spacing) * 2.5);
+  display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5);
+}
+.schema-advanced > summary { font-size: var(--text-xs); color: var(--gw-ink-muted); cursor: pointer; list-style: none; }
+.schema-advanced > summary::-webkit-details-marker { display: none; }
+.schema-advanced[open] > summary { color: var(--gw-ink-soft); }
+
+/*
+ * 探测详情：上游报错原文（服务端已脱敏 + 截断）。
+ * 等宽 + 保留换行，是因为这段文本经常本身就是一段 JSON 或多行说明；
+ * 限高滚动则是防止一个长 HTML 错误页把整张表单顶出屏幕。
+ */
+.probe-detail {
+  margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--text-note); line-height: 1.5;
+  background: var(--gw-surface-sunken); border: 1px solid var(--gw-line); border-radius: var(--radius-sm);
+  padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2);
+}
+.probe-result {
+  display: flex; flex-direction: column; gap: calc(var(--spacing) * 1);
+  border: 1px solid var(--gw-line); border-radius: var(--radius-md);
+  background: var(--gw-surface-sunken);
+  padding: calc(var(--spacing) * 2) calc(var(--spacing) * 2.5);
+}
+
+.search-form { display: flex; gap: calc(var(--spacing) * 2); align-items: center; flex: 1; min-width: 260px; }
+.search-input {
   flex: 1; min-width: 200px; border: 1px solid var(--gw-line); border-radius: var(--radius-md);
   padding: calc(var(--spacing) * 1.75) calc(var(--spacing) * 3); font-size: var(--text-sm); background: var(--gw-surface); color: var(--gw-ink);
 }
-.search-input:focus, .ask-input:focus { border-color: var(--gw-accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 12%); outline: none; }
+.search-input:focus { border-color: var(--gw-accent); box-shadow: 0 0 0 3px rgb(37 99 235 / 12%); outline: none; }
 .search-input:disabled { background: var(--gw-surface-hover); color: var(--gw-ink-muted); cursor: not-allowed; }
 
-.search-meta, .ask-meta { padding: 0 calc(var(--spacing) * 0.5); }
+.search-meta { padding: 0 calc(var(--spacing) * 0.5); }
 
 .search-hit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .search-hit { padding: calc(var(--spacing) * 2.5) 0; border-bottom: 1px solid var(--gw-line); display: flex; flex-direction: column; gap: calc(var(--spacing) * 1); }
 .search-hit:last-child { border-bottom: 0; }
 .search-hit-head { display: flex; align-items: center; gap: calc(var(--spacing) * 2); flex-wrap: wrap; }
-.search-hit-title, .ask-source-title {
+.search-hit-title {
   border: 0; background: transparent; padding: 0; cursor: pointer;
   font-size: var(--text-sm); font-weight: 600; color: var(--gw-accent); text-align: left;
   /*
@@ -518,59 +511,28 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   */
   text-decoration: none;
 }
-.search-hit-title:hover, .ask-source-title:hover { text-decoration: underline; }
+.search-hit-title:hover { text-decoration: underline; }
 /*
   键盘可达性：`.gw-focus-ring` 只挂在部分元素上，而这里是从 `<button>` 换成 `<a>` 的入口，
   必须补一条 `:focus-visible`（Tab 到时看得见焦点在哪；鼠标点击不显示，与 focus.css 同一取舍）。
 */
-.search-hit-title:focus-visible, .ask-source-title:focus-visible {
+.search-hit-title:focus-visible {
   outline: 2px solid var(--gw-focus-ring);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
-.search-snippet, .ask-snippet { margin: 0; font-size: var(--text-note); color: var(--gw-ink-soft); line-height: 1.7; overflow-wrap: anywhere; }
+.search-snippet { margin: 0; font-size: var(--text-note); color: var(--gw-ink-soft); line-height: 1.7; overflow-wrap: anywhere; }
 
 /* 服务端高亮：必须给 <mark> 可见样式，否则高亮"生效了却看不出来" */
-.search-snippet mark, .ask-snippet mark, .md-body mark {
+.search-snippet mark, .md-body mark {
   background: var(--gw-warn-line); color: var(--gw-warn-ink); padding: 0 calc(var(--spacing) * 0.5); border-radius: 3px;
 }
 
-.ask-card { display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); }
-.ask-head { display: flex; align-items: baseline; gap: calc(var(--spacing) * 2.5); flex-wrap: wrap; }
-.ask-head h2 { margin: 0; }
-.ask-answer { font-size: var(--text-sm); }
-.ask-answer-plain { white-space: pre-wrap; line-height: 1.75; overflow-wrap: anywhere; }
+/*
+  问答面板的样式**不在这里**（本批的归属修正）。宿主曾经自带 `.ask-*` 一整套（面板、来源列表、
+  降级提示条、流式光标），而面板本身已经迁入 `@geewiki/ai-qa` 自带的 `client.css` ——
+  样式留在宿主里等于"插件停了，界面还替它留着骨架"，而且宿主与插件两处各写一份必然漂移。
+  上面 `.search-*` 与 `.ask-*` 的合并选择器也已拆开：那是两拨人写的、两拨人改的东西。
+*/
 
-/* 降级提示条：信息性，不用 error 配色淹没结果 */
-.ask-degraded { border-radius: var(--radius-md); padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3); font-size: var(--text-note); }
-
-.ask-sources { display: flex; flex-direction: column; gap: calc(var(--spacing) * 1.5); }
-.ask-sources h3 { margin: 0; font-size: var(--text-note); color: var(--gw-ink-muted); }
-.ask-source-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); }
-.ask-source { padding: calc(var(--spacing) * 2) 0; border-bottom: 1px solid var(--gw-line); display: flex; flex-direction: column; gap: calc(var(--spacing) * 1); }
-.ask-source:last-child { border-bottom: 0; }
-.ask-source-head { display: flex; align-items: center; gap: calc(var(--spacing) * 2); flex-wrap: wrap; }
-.ask-source-unused { opacity: 0.62; }
-
-/* 流式渲染：生成中的光标 + 失败态。
-   用既有 `--muted`/`--err` 变量，不新造配色。 */
-.ask-answer-streaming { position: relative; }
-.ask-cursor {
-  display: inline-block;
-  width: 7px;
-  height: 1em;
-  margin-left: calc(var(--spacing) * 0.5);
-  vertical-align: text-bottom;
-  background: var(--gw-ink-muted);
-  animation: ask-cursor-blink 1s steps(2, start) infinite;
-}
-@keyframes ask-cursor-blink {
-  to { visibility: hidden; }
-}
-/* 尊重"减少动效"偏好：不要为了好看而违反无障碍设置 */
-@media (prefers-reduced-motion: reduce) {
-  .ask-cursor { animation: none; }
-}
-.ask-answer-error { color: var(--gw-danger); }
-.ask-answer-error .muted { color: var(--gw-ink-muted); }
 

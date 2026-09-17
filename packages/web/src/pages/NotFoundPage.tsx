@@ -17,20 +17,21 @@
 import type { ReactNode } from 'react'
 import { Compass } from 'lucide-react'
 import { Button, Card, CardBody, EmptyState } from '../ui'
+import { t } from '../lib/i18n'
 
 export function NotFoundPage(): ReactNode {
   return (
     <div className="mx-auto flex w-full max-w-[34rem] flex-col gap-4 py-6">
-      <h1 className="m-0 text-lg font-semibold text-ink">页面不存在</h1>
+      <h1 className="m-0 text-lg font-semibold text-ink">{t('host.notfound.title')}</h1>
       <Card>
         <CardBody>
           <EmptyState
             icon={<Compass className="size-6" />}
-            title="这个地址没有对应的页面"
-            hint="链接可能拼错了，或者它指向的功能已被移除。"
+            title={t('host.notfound.empty.title')}
+            hint={t('host.notfound.empty.hint')}
             action={
               <Button variant="primary" onClick={() => (window.location.hash = '/wiki')}>
-                返回知识库
+                {t('host.notfound.back')}
               </Button>
             }
           />

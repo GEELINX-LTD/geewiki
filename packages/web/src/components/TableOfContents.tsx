@@ -98,7 +98,19 @@ export function TableOfContents({
   }
 
   return (
-    <aside className="hidden xl:block" data-gw-no-toc>
+    /*
+     * ⚠️ `xl:grow` 不是装饰，是 sticky **能不能生效的前提**（2026-09-16 用户实测："目录要求随下滑一直显示在右侧"）。
+     *
+     * `position: sticky` 只能在自己的**包含块**内部滑动，包含块就是这层 `<aside>`。
+     * 而右栏容器 `.gw-reader-rail` 是 `flex flex-col`：flex **纵轴不拉伸**，`align-items: stretch`
+     * 只作用于横轴 ⇒ `<aside>` 留在内容高度（实测 516px，与目录自身等高），
+     * 而 rail 被栅格行拉到 8818px（= 正文高度）——于是目录**一格都滑不动**，
+     * `position: sticky` 形同虚设（实测滚 1800px 后目录顶跑到 -1645，仍在文档流里被推走）。
+     * 给包含块 `grow`，它才吃掉 rail 的剩余高度，sticky 才有滑动余量。
+     * 祖先链的 `overflow` 全都正常（唯一非 visible 的是 nav 自己的 `overflow-y-auto`），
+     * 所以这里**不是** overflow 问题——真凶是高度。
+     */
+    <aside className="hidden xl:block xl:grow" data-gw-no-toc>
       <nav
         aria-label="页内目录"
         className="sticky top-[calc(var(--spacing-header)+16px)] max-h-[calc(100vh-var(--spacing-header)-32px)] overflow-y-auto"

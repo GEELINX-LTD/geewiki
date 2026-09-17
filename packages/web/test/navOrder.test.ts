@@ -11,7 +11,8 @@ import assert from 'node:assert/strict'
 import { buildNavTree, flattenPages, neighborsOf, type NavPage } from '../src/lib/navTree'
 
 function page(slug: string, title = slug): NavPage {
-  return { slug, title, updated_at: '2026-01-01T00:00:00.000Z', version: 1 }
+  // 导航批起多了两个必填字段：这里一律"未隐藏、没排过序"（顺序只由树决定，与本文件主题一致）
+  return { slug, title, updated_at: '2026-01-01T00:00:00.000Z', version: 1, nav_hidden: false }
 }
 
 /** 与用户实测场景同构：guides 组 + operations 组，且 guides 自身也是一个页面 */
@@ -118,11 +119,11 @@ test('顺序由层级决定，**与 updated_at 无关**（旧实现按"最近修
    * 树顺序下两者互不相邻，且结果不随 updated_at 变化。
    */
   const biased: NavPage[] = [
-    { slug: 'guides', title: '指南', updated_at: '2026-01-02T00:00:00.000Z', version: 1 },
-    { slug: 'guides/authoring', title: '撰写指南', updated_at: '2026-01-01T00:00:00.000Z', version: 1 },
-    { slug: 'guides/plugins', title: '插件开发', updated_at: '2026-01-03T00:00:00.000Z', version: 1 },
-    { slug: 'operations', title: '运维手册', updated_at: '2026-01-04T00:00:00.000Z', version: 1 },
-    { slug: 'operations/backup', title: '备份与恢复', updated_at: '2026-01-09T00:00:00.000Z', version: 1 },
+    { slug: 'guides', title: '指南', updated_at: '2026-01-02T00:00:00.000Z', version: 1, nav_hidden: false },
+    { slug: 'guides/authoring', title: '撰写指南', updated_at: '2026-01-01T00:00:00.000Z', version: 1, nav_hidden: false },
+    { slug: 'guides/plugins', title: '插件开发', updated_at: '2026-01-03T00:00:00.000Z', version: 1, nav_hidden: false },
+    { slug: 'operations', title: '运维手册', updated_at: '2026-01-04T00:00:00.000Z', version: 1, nav_hidden: false },
+    { slug: 'operations/backup', title: '备份与恢复', updated_at: '2026-01-09T00:00:00.000Z', version: 1, nav_hidden: false },
   ]
   const tree = buildNavTree(biased)
   const mid = neighborsOf(tree, 'guides/authoring')

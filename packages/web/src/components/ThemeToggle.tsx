@@ -52,9 +52,11 @@ export function ThemeToggle(): ReactNode {
               iconOnly
               icon={<ChoiceIcon choice={choice === 'system' ? resolved : choice} />}
               aria-label={triggerText}
-              // 顶栏是深色，ghost 变体的默认色（--muted）在上面对比度不足，
-              // 故这里覆盖为顶栏专用前景色（两者都是为深底设计的令牌）
-              className="text-header-dim hover:bg-white/10 hover:text-white"
+              // ghost 变体的默认前景是 `--muted`，在顶栏上对比度不足（浅色主题下尤其），
+              // 故覆盖为**顶栏语义色**：它与顶栏底色是一对，两种主题下都达标
+              // （浅色 = gray-600 对白底 6.08:1，深色 = header-dim 对 #0f1a28 约 9:1）。
+              // 不要写死 `text-white hover:bg-white/10`：那是深色顶栏专用的值。
+              className="text-header-dim hover:bg-header-hover hover:text-header-ink"
             />
           </DropdownMenuTrigger>
         </Tooltip>

@@ -16,7 +16,7 @@
  * ① 提示是否**只在** `outcome === 'created'` 分支出现（`updated` 是"覆盖了已存在的页"，
  *    口径完全不同，混进去就是把"新建"说成"覆盖"）；
  * ② 提示是否**可见**（`role="status"`，不是只挂 `title`）；
- * ③ 提示是否带得走下一步（指路「权限…」档位与「已发布」开关）。
+ * ③ 提示是否带得走下一步（指路「权限」档位与「已发布」开关）。
  * 这三条都只能对着声明点断言。
  *
  * ## 反空洞
@@ -41,7 +41,7 @@ function codeOnly(source: string): string {
 const raw = readFileSync(join(SRC, 'pages', 'WikiPage.tsx'), 'utf8')
 const wiki = codeOnly(raw)
 
-test('主页创建提示：文案与可访问性齐备，且指向「权限…」的档位与发布开关', () => {
+test('主页创建提示：文案与可访问性齐备，且指向「权限」的档位与发布开关', () => {
   // 反空洞①：文件真的读进来了
   assert.ok(raw.length > 5000, `WikiPage.tsx 内容异常短（${raw.length} 字符），疑似读错文件`)
 
@@ -62,12 +62,14 @@ test('主页创建提示：文案与可访问性齐备，且指向「权限…�
   assert.match(block, /\{homeCreatedNotice\}/, '渲染块没有渲染 homeCreatedNotice（提示与 state 对不上）')
   assert.match(block, /role="status"/, '提示缺少 role="status"：必须能被屏幕阅读器播报')
 
-  // 提示必须给出**下一步动作**：去「权限…」把档位设为公开 + 打开发布
+  // 提示必须给出**下一步动作**：去「权限」把档位设为公开 + 打开发布
   // （文案在赋值处，动作词一并落在赋值的字符串里 —— 故对文案本体断言）
   const noticeAt = wiki.indexOf(NOTICE)
   assert.ok(noticeAt >= 0, '剥离注释后找不到文案，说明它只写在注释里（反空洞失败）')
   const noticeLiteral = wiki.slice(noticeAt, noticeAt + 200)
-  assert.match(noticeLiteral, /「权限…」/, '提示没有指路页面上的「权限…」入口')
+  assert.match(noticeLiteral, /「权限」/, '提示没有指路页面上的「权限」入口')
+  // ★ 按钮文案是「权限」而**不带省略号**（作者要求）：省略号读起来像"还有没显示出来的东西"
+  assert.doesNotMatch(noticeLiteral, /「权限…」/, '入口名不带省略号')
   assert.match(noticeLiteral, /档位设为公开/, '提示没说清要把档位设为公开')
   assert.match(noticeLiteral, /已发布/, '提示没说清要打开「已发布」开关')
 })

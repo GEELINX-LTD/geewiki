@@ -57,6 +57,40 @@ export interface FieldDescriptor {
   note?: string
   /** 敏感值（meta.role === 'password'）：用密码输入框，不明文回显 */
   secret?: boolean
+  /**
+   * **写一次、不可回读**（meta.role === 'secret'）：
+   * 值由服务端单独保管，`GET /config` 恒返回空串 + `secrets[label]` 报"是否已配置"。
+   * 界面语义：留空 = 不修改，填新值 = 替换，另有显式的"清除"动作。
+   */
+  writeOnlySecret?: boolean
+  /** 选项由**运行期数据**决定（模型服务商 / 模型清单 / 思考强度档位） */
+  dynamicOptions?: DynamicOptions
+  /**
+   * 收进折叠的「高级选项」区（schema 上的 `.collapse()`）。
+   *
+   * 它是**渲染期**的分组，不是数据形状：配置项嵌进嵌套对象会被 cordis 按 schema
+   * 裁掉未声明的顶层键，等于让存量部署里的该项静默失效——所以"少显示几项"必须由
+   * 界面来做，不能靠改配置结构。
+   */
+  collapse?: boolean
+}
+
+/** 动态选项来源（schema `meta.role` 的取值 → 数据源） */
+export type DynamicOptions = 'llm-providers' | 'llm-models' | 'llm-efforts'
+
+/** 字符串字段的角色 → 控件/数据源；其余角色只在界面标注 `role=…` 提示 */
+const KNOWN_ROLES = new Set(['textarea', 'password', 'secret', 'llm-provider', 'llm-model', 'llm-effort'])
+
+/**
+ * `role` → 动态选项来源。
+ *
+ * 三者都**不是**封闭枚举：服务商来自运行期注册的插件，模型清单来自端点自己，
+ * 思考强度只是建议档位——所以下拉之外一律还能手填（见 SchemaForm 里的三个专用控件）。
+ */
+const ROLE_DYNAMIC_OPTIONS: Record<string, DynamicOptions> = {
+  'llm-provider': 'llm-providers',
+  'llm-model': 'llm-models',
+  'llm-effort': 'llm-efforts',
 }
 
 /** 最大递归深度（schema 允许 lazy 自引用与 DAG 共享，必须设上限） */
@@ -100,6 +134,7 @@ export function describeNode(
     description,
     required: meta['required'] === true,
     default: meta['default'],
+    collapse: meta['collapse'] === true || undefined,
   }
 
   // S-13：hidden 字段**不渲染**（仅保留 schema 默认值），不是只读展示
@@ -124,14 +159,21 @@ export function describeNode(
         max: asNumber(meta['max']),
         step: asNumber(meta['step']),
       }
-    case 'string':
+    case 'string': {
       // role=password → 密码输入框（否则密钥会明文回显在管理台）
+      // role=secret   → 密码输入框 **且**服务端不回显（写一次、不可回读）
+      // role=llm-provider → 下拉，选项来自运行期注册的适配器（不写死在 schema 里，
+      //                     否则"装了 @geewiki/deepseek 就多一个选项"必须改代码）
+      const writeOnly = role === 'secret'
       return {
         ...base,
         kind: role === 'textarea' ? 'textarea' : 'text',
-        secret: role === 'password',
-        note: role && role !== 'textarea' && role !== 'password' ? `role=${role}` : undefined,
+        secret: role === 'password' || writeOnly,
+        writeOnlySecret: writeOnly || undefined,
+        dynamicOptions: role !== undefined ? ROLE_DYNAMIC_OPTIONS[role] : undefined,
+        note: role && !KNOWN_ROLES.has(role) ? `role=${role}` : undefined,
       }
+    }
     case 'const':
       return { ...base, kind: 'static' }
     case 'any':
@@ -226,4 +268,16 @@ export function setByPath(
   }
   clone[key] = setByPath((current ?? {}) as Record<string, unknown>, rest, value)
   return clone
+}
+
+/**
+ * 该字段树里是否存在某个动态选项来源（管理台据此决定"要不要去拉一次服务商列表"）。
+ *
+ * 放在纯函数层而不是 React 组件里：组件只负责渲染，不负责判断要不要发请求 ——
+ * 否则"哪个角色需要联网"这条信息会散落在组件与载荷两处。
+ */
+export function hasDynamicOptions(root: FieldDescriptor, kind: DynamicOptions): boolean {
+  if (root.dynamicOptions === kind) return true
+  if (root.item && hasDynamicOptions(root.item, kind)) return true
+  return (root.fields ?? []).some((f) => hasDynamicOptions(f, kind))
 }

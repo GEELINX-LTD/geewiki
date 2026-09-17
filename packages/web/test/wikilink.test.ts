@@ -12,12 +12,19 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { marked } from 'marked'
 import '../src/lib/wikilink.ts'
 import { WIKILINK_ATTR, WIKILINK_AUTO_ATTR } from '../src/lib/wikilink'
+import { activeMarked } from '../src/lib/markdownExt'
 
-const inline = (src: string): string => marked.parseInline(src) as string
-const block = (src: string): string => marked.parse(src) as string
+/*
+ * ★ F8：改打**注册表装配出来的实例**，而不是全局 `marked` 单例。
+ *
+ * 这不是"换个入口"那么简单 —— 它正是本次改造要保证的事：本模块的扩展现在登记在
+ * `markdownExt` 的注册表里，渲染时由 `activeMarked()` 按版本装配。
+ * 若这里仍打全局单例，测试会**继续通过但测的是另一条路径**：真实渲染早已不走它了。
+ */
+const inline = (src: string): string => activeMarked().parseInline(src) as string
+const block = (src: string): string => activeMarked().parse(src) as string
 
 test('基本语法：[[slug]] 渲染为站内 hash 链接', () => {
   const html = inline('见 [[getting-started]] 一节')

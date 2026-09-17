@@ -17,10 +17,15 @@
  */
 import { errorLine } from './errorText'
 import { useCallback, useEffect, useSyncExternalStore } from 'react'
-import { api, type PageSummary } from '../api'
+import { api, type NavOrderGroup, type PageSummary } from '../api'
 
 export interface PagesState {
   pages: PageSummary[] | null
+  /**
+   * 同级顺序（父级 → item 列表）。与 `pages` 同一次请求下发、同一份缓存：
+   * 侧栏与「全部页面」必须按同一个顺序渲染，分两次取会出现"顺序是旧的、隐藏是新的"。
+   */
+  navOrder: readonly NavOrderGroup[]
   error: string | null
   /**
    * 原始错误值（未经加工的 thrown 值）。`error` 是给人看的字符串，而**分类**（连不上服务/
@@ -33,7 +38,7 @@ export interface PagesState {
   loading: boolean
 }
 
-const EMPTY: PagesState = { pages: null, error: null, errorValue: null, loading: true }
+const EMPTY: PagesState = { pages: null, navOrder: [], error: null, errorValue: null, loading: true }
 
 let state: PagesState = EMPTY
 let inflight: Promise<void> | null = null
@@ -61,13 +66,13 @@ export function loadPages(options: { force?: boolean } = {}): Promise<void> {
 
   if (state.pages === null) {
     // 首次加载显示 loading；已有数据时的静默刷新不闪骨架屏
-    setState({ pages: null, error: null, errorValue: null, loading: true })
+    setState({ pages: null, navOrder: [], error: null, errorValue: null, loading: true })
   }
 
   inflight = api
     .pages()
     .then((r) => {
-      setState({ pages: r.pages, error: null, errorValue: null, loading: false })
+      setState({ pages: r.pages, navOrder: r.nav_order, error: null, errorValue: null, loading: false })
     })
     .catch((e: unknown) => {
       /*
@@ -79,7 +84,7 @@ export function loadPages(options: { force?: boolean } = {}): Promise<void> {
       const human = errorLine(e)
       console.debug('[geewiki-pages] 页面列表加载失败：', e instanceof Error ? e.message : e)
       // 失败时**不保留旧数据也不写缓存**：让 UI 能显示错误并允许重试
-      setState({ pages: null, error: human, errorValue: e, loading: false })
+      setState({ pages: null, navOrder: [], error: human, errorValue: e, loading: false })
     })
     .finally(() => {
       inflight = null

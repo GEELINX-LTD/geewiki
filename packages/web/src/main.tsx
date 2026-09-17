@@ -10,6 +10,12 @@ import './styles/index.css'
 import { App } from './App'
 import { TooltipProvider } from './ui/Tooltip'
 import { startPluginUiSync } from './lib/pluginUi'
+import { initI18n } from './lib/i18n'
+
+// ★ F15：定初始界面语言并写 `<html lang>`。放在渲染之前是为了让首帧的 lang 就是对的
+// （lang 影响屏幕阅读器发音与浏览器断词）；它内部的网络请求**不阻塞**渲染，
+// 插件文案到了会通知订阅者重渲染。
+initI18n()
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

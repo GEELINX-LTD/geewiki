@@ -23,7 +23,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { visibleDests, type NavDest } from '../src/lib/navPlan'
+import { visibleDests, pluginNavDests, NAV_CAPABILITIES, type NavDest } from '../src/lib/navPlan'
+import { BUILTIN_CAPABILITIES } from '@geewiki/core/domain'
 import type { AuthCapabilities } from '../src/api'
 
 const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'src')
@@ -121,7 +122,8 @@ function adminNavBlock(): string {
 test('App：确有效果物 —— ADMIN_NAV 数组体能被抽取出来（防正则写坏导致 0===0）', () => {
   const block = adminNavBlock()
   assert.ok(block.length > 40, `应能抽取出 ADMIN_NAV 的数组体（实际 ${block.length} 字符）`)
-  assert.ok(block.includes("id: 'plugins'"), 'ADMIN_NAV 里应含插件管理')
+  // 合并后管理面只剩依赖图一项（原「插件管理」的表格已并入该页），故这里钉的是它
+  assert.ok(block.includes("id: 'graph'"), 'ADMIN_NAV 里应含依赖图（插件管理的唯一入口）')
 })
 
 test('App：ADMIN_NAV 的**每一项**都必须声明 requires: administer', () => {
@@ -179,17 +181,19 @@ function actionBlock(id: string): string {
 }
 
 test('命令面板：确有效果物 —— 动作片段能被抽取出来（防正则写坏导致 0===0）', () => {
-  for (const id of ['action:new', 'action:list', 'action:plugins', 'action:graph', 'action:theme']) {
+  for (const id of ['action:new', 'action:list', 'action:graph', 'action:theme']) {
     assert.ok(actionBlock(id).length > 20, `应能抽取出 ${id} 的声明（实际 ${actionBlock(id).length} 字符）`)
   }
 })
 
-test('命令面板：两个运维动作必须要求 administer（与顶栏同一判据、同一来源）', () => {
+test('命令面板：管理动作必须要求 administer（与顶栏同一判据、同一来源）', () => {
   /*
    * 命令面板是顶栏之外的第二条入口。若只藏顶栏而漏了这里，用户按 ⌘K
    * 仍能搜到并跳进插件管理 —— 那正是"藏了个寂寞"。
+   * 合并后管理面只剩这一条（原 `action:plugins` 已并入它），故这里只钉它：
+   * 少掉的那个 id 不是放宽了守卫，而是入口真的只剩一个。
    */
-  for (const id of ['action:plugins', 'action:graph']) {
+  for (const id of ['action:graph']) {
     assert.match(
       actionBlock(id),
       /requires: 'administer'/,
@@ -227,4 +231,106 @@ test('命令面板：动作清单确实经过 visibleDests 过滤（而不是声
     /from '\.\.\/lib\/navPlan'/,
     '判据只能来自 lib/navPlan —— 各渲染点自己写一套判断就会分叉',
   )
+})
+
+/* ==================== F2：插件声明路由 → 导航项 ==================== */
+
+test('pluginNavDests：缺 label 或 group 的路由不进导航（只可被链接访问）', () => {
+  const dests = pluginNavDests([
+    { id: 'a', label: '看板', group: 'main' as const },
+    { id: 'b', group: 'main' as const }, // 无 label
+    { id: 'c', label: '报表' }, // 无 group
+    { id: 'd' }, // 两者都无
+  ])
+  assert.deepEqual(dests.map((d) => d.id), ['a'])
+})
+
+test('pluginNavDests：能力键缺省 = 所有人可见；给出则必须是已知能力键', () => {
+  const dests = pluginNavDests([
+    { id: 'public', label: '公开页', group: 'main' as const },
+    { id: 'admin', label: '台面页', group: 'admin' as const, requires: 'administer' },
+  ])
+  assert.equal(dests[0]!.requires, undefined)
+  assert.equal(dests[1]!.requires, 'administer')
+
+  // 缺省（无 requires）⇒ 匿名也可见；要求 administer ⇒ 匿名看不到。判据与内置项同一条。
+  const caps = { editContent: false, administer: false, manageVisibility: false } as AuthCapabilities
+  assert.deepEqual(visibleDests(dests, caps).map((d) => d.id), ['public'])
+  const admin = { editContent: true, administer: true, manageVisibility: true } as AuthCapabilities
+  assert.deepEqual(visibleDests(dests, admin).map((d) => d.id), ['public', 'admin'])
+})
+
+test('pluginNavDests：**未知**能力键 ⇒ 丢弃并告警，绝不放行（失败关闭）', () => {
+  /*
+   * ★ 这条是最重要的一条。若把未知能力键当作"无要求"放行，一个把 `administer`
+   *   拼成 `adminster` 的插件页面就会**对所有匿名访客可见**。服务端仍会拦（前端隐藏
+   *   不是安全措施），但用户会看到一个点进去必然失败的入口——正是 P2-M5 修掉的那个形态。
+   */
+  const dests = pluginNavDests([
+    { id: 'typo', label: '台面页', group: 'admin' as const, requires: 'adminster' },
+    { id: 'ok', label: '真台面', group: 'admin' as const, requires: 'administer' },
+  ])
+  assert.deepEqual(dests.map((d) => d.id), ['ok'], '未知能力键的项必须被丢弃')
+})
+
+test('NAV_CAPABILITIES 与 AuthCapabilities 一致（运行期清单不得漂移）', () => {
+  // ★ F9：真源已归一到 `@geewiki/core/domain`，这里断言转出的就是 core 的那一份
+  // （**同一个对象**，不是"内容相等"——副本无法伪装成同一个数组）
+  assert.equal(NAV_CAPABILITIES, BUILTIN_CAPABILITIES)
+  assert.deepEqual([...NAV_CAPABILITIES].sort(), ['administer', 'editContent', 'manageVisibility'])
+})
+
+test('★ F9：插件命名空间的能力键被接受（此前插件根本没法要求一个新能力）', () => {
+  /*
+   * F9 之前 `navPlan` 的判据是"必须命中内置三键"，于是插件声明 `review/approve`
+   * 时会被当成**非法键丢弃** —— 那个导航项永远不出现。现在它必须被接受，
+   * 且取值仍然走同一条 `=== true` 失败关闭判据。
+   */
+  const dests = pluginNavDests([
+    { id: 'review', label: '待审', group: 'main' as const, requires: 'review/approve' },
+  ])
+  assert.deepEqual(dests.map((d) => d.id), ['review'])
+  assert.equal(dests[0]!.requires, 'review/approve')
+
+  // 服务端没发这个键 ⇒ 不显示（失败关闭）；发了 true 才显示
+  const without = { editContent: true, administer: true, manageVisibility: true } as AuthCapabilities
+  assert.deepEqual(visibleDests(dests, without).map((d) => d.id), [])
+  const withCap = { ...without, 'review/approve': true } as AuthCapabilities
+  assert.deepEqual(visibleDests(dests, withCap).map((d) => d.id), ['review'])
+})
+
+test('★ F9：放宽键空间**没有**牺牲拼写错误的可见性', () => {
+  /*
+   * 这是 F9 最需要被钉住的一条：`isCapabilityName` 放宽为"内置 ∪ 含 `/` 的插件名"。
+   * 若有人图省事把它改成"任意字符串都算合法"，下面第一条就会**静默放行** ——
+   * 一次拼写错误于是变成一次越权（前端显示一个点进去必然失败的入口）。
+   * 斜杠把两个命名空间切开，正是为了保住这条可见性。
+   */
+  const dests = pluginNavDests([
+    { id: 'typo', label: '台面页', group: 'admin' as const, requires: 'adminster' },
+    { id: 'slashless', label: '缺斜杠', group: 'admin' as const, requires: 'reviewapprove' },
+    { id: 'ok', label: '真台面', group: 'admin' as const, requires: 'administer' },
+    { id: 'custom', label: '自定义', group: 'admin' as const, requires: 'review/approve' },
+  ])
+  assert.deepEqual(dests.map((d) => d.id), ['ok', 'custom'], '拼错的内置名与缺斜杠的名字都必须被丢弃')
+})
+
+test('App.tsx 守卫：插件路由已接入「已知路由」判定与页面分派（不是只声明不接线）', () => {
+  assert.match(
+    appSource,
+    /declaredRoutes\.some\(\(r\) => r\.id === root\)/,
+    '插件路由必须参与「已知路由」判定，否则访问它会落 notfound',
+  )
+  assert.match(
+    appSource,
+    /registeredRoute\(active\)/,
+    '插件路由必须查注册表取组件，否则永远渲染占位',
+  )
+  assert.match(
+    appSource,
+    /<PluginRoutePendingPage id=\{active\} \/>/,
+    '"已声明未注册"必须有独立占位（不得落 notfound：那会把插件故障误导成地址不存在）',
+  )
+  // 反空洞：确认抽取到的是真的 App 源码
+  assert.ok(appSource.includes('WIKI_ITEM'), '未读到 App.tsx（守卫会空洞通过）')
 })

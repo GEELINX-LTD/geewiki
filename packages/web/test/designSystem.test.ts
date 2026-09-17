@@ -170,6 +170,61 @@ test('设计系统：全仓源码不得使用未注册的 Tailwind token', () =>
   assert.deepEqual(hits, [], `发现未注册 token 的用法：\n  ${hits.join('\n  ')}`)
 })
 
+test('设计系统：顶栏不得写死"为深色底设计"的颜色（text-white / bg-white）', () => {
+  /*
+   * 为什么需要这条守卫（它对应一个真实的用户反馈）：顶栏此前**在两种主题下都保持深色**，
+   * 于是其子元素写了 `text-white` / `hover:bg-white/10` 这类**为深色底写死**的值。
+   * 顶栏改成跟随主题后，同一个类在浅色主题下就是"白字压白底"（直接看不见）——
+   * 而 Tailwind 不会为此报任何错，构建也照样过。这类缺陷只在真浏览器里、且只在浅色主题下
+   * 才看得见，正是最该被源码级断言钉住的那类（同上面 `muted-foreground` / `border-border` 的思路）。
+   *
+   * 判据刻意只认 `text-white` / `bg-white` 两个**完整**类名：
+   * 不能用裸 `white` 子串——`whitespace-nowrap` 里就含它，会误报一片。
+   * 比较用的是**已剥注释**的源码，所以"不要写 text-white"这类说明文字不会把自己判违规。
+   */
+  const hits: string[] = []
+  for (const file of walkSources(SRC)) {
+    const src = codeOnly(readFileSync(file, 'utf8'))
+    const rel = file.slice(SRC.length + 1)
+    for (const cls of ['text-white', 'bg-white']) {
+      // 允许带透明度后缀（bg-white/10）与状态前缀（hover:bg-white/10）
+      if (new RegExp(`(^|[\\s'"\`:])(hover:|focus:|active:)?${cls}(\\/[0-9]+)?`).test(src)) {
+        hits.push(`${rel}: ${cls}（顶栏跟随主题后应改用 text-header-ink / bg-header-hover 等语义色）`)
+      }
+    }
+  }
+  assert.deepEqual(hits, [], `顶栏相关的写死颜色回流：\n  ${hits.join('\n  ')}`)
+})
+
+test('设计系统：顶栏与代码块的底色是两个独立令牌（顶栏随主题、代码块恒深）', () => {
+  const tokens = readFileSync(join(SRC, 'styles', 'tokens.css'), 'utf8')
+  const code = codeOnly(tokens)
+  /*
+   * 反空洞：先证明读到的是真的 tokens.css。
+   * 然后钉住**解耦**这件事本身——曾经 `--gw-code-bg` 就是 `--gw-header-bg`，
+   * 于是"顶栏改成跟随主题"会让浅色主题下的代码块一起变白（深底代码块是刻意保留的观感）。
+   * 这里不检查具体色值（值可以调），只检查**职责分离**：两套名字都在，且代码块不借用顶栏的。
+   */
+  assert.ok(tokens.length > 2000, `tokens.css 读入异常（仅 ${tokens.length} 字符）`)
+  assert.match(code, /--gw-code-bg:/, 'tokens.css 必须定义 --gw-code-bg（代码块底色）')
+  assert.match(code, /--gw-code-ink:/, 'tokens.css 必须定义 --gw-code-ink（代码块前景）')
+  // 代码块的两个令牌不得指向顶栏令牌（一旦如此，两个职责又合并了）
+  const codeBg = /--gw-code-bg:\s*([^;]+);/.exec(code)?.[1] ?? ''
+  const codeInk = /--gw-code-ink:\s*([^;]+);/.exec(code)?.[1] ?? ''
+  assert.ok(
+    !codeBg.includes('gw-header') && !codeInk.includes('gw-header'),
+    `代码块的令牌不得引用顶栏令牌（bg=${codeBg.trim()}, ink=${codeInk.trim()}）`,
+  )
+  // 顶栏底色必须在**三处**主题作用域里各自赋值：浅色 :root / 显式 .dark / 系统偏好 media
+  const occurrences = code.match(/--gw-header-bg:/g)?.length ?? 0
+  assert.equal(
+    occurrences,
+    3,
+    `--gw-header-bg 应在浅色 :root、.dark 与 prefers-color-scheme 三处各赋值一次（实际 ${occurrences} 处）——` +
+      '只在常量块里赋值一次就等于"顶栏不随主题切换"，正是本次修掉的缺陷',
+  )
+})
+
 test('设计系统：危险操作确认组件存在，并从 ui barrel 统一导出', () => {
   const src = readFileSync(join(SRC, 'ui', 'ConfirmDialog.tsx'), 'utf8')
   // 反空洞：同上，先证明读到了组件本体

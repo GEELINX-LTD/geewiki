@@ -320,10 +320,14 @@ test('守卫：编辑页接上了上传，且"新建页面"给出可执行提示
 test('守卫：插件编辑器路径必须拦住默认拖放，并给出可见提示（X1 兜底）', () => {
   /*
    * 这条守的是**真机上抓到的那次数据丢失**：插件占了 `editor` 插槽时内置编辑器根本不渲染，
-   * 而 `EditorSlotProps` 契约里没有上传通道 ⇒ 用户拖入文件时 0 个请求、无提示，
+   * 而 `EditorSlotProps` 契约里**当时**没有上传通道 ⇒ 用户拖入文件时 0 个请求、无提示，
    * 浏览器还会把窗口**导航到那个文件**，正在编辑的正文一起丢（target 数 6→7）。
    * 兜底只能靠源码级守卫钉住：`preventDefault()` 与 `role="status"` 都"删掉也能跑"，
    * 而删掉之后的表现恰好是"没有任何表现"——这正是最难靠人工发现的一类回归。
+   *
+   * ★ F5 之后契约**有了** `onUploadFiles`，但兜底路径**仍然必要**：它守的是"宿主没提供上传通道"
+   * 这一情形（例如宿主降级、或将来某个部署裁剪掉附件功能）。判据随之变成"提供才放行"，
+   * 见紧随其后的那条守卫。
    */
   const slots = readCode('lib/slots.tsx')
   const from = slots.indexOf('export function EditorSlotOutlet(')
@@ -352,7 +356,35 @@ test('守卫：插件编辑器路径必须拦住默认拖放，并给出可见�
   const hint = slots.match(/export const EDITOR_SLOT_NO_UPLOAD_HINT =\s*\n?\s*'([^']+)'/)
   assert.ok(hint !== null, '应存在导出的兜底文案常量（界面与测试共用同一份来源）')
   const text = hint[1] as string
-  assert.ok(text.includes('插件管理'), '文案要指出下一步去哪（插件管理）')
+  // 入口已并入依赖图页（原先的「插件管理」导航项已删除），文案随之指向新落点
+  assert.ok(text.includes('依赖图'), '文案要指出下一步去哪（依赖图页）')
   assert.ok(text.includes('内置编辑器'), '文案要点名该换成哪个编辑器')
   assert.ok(!text.includes('已上传') && !text.includes('已插入'), '兜底提示不得暗示上传成功')
+})
+
+test('★ F5：宿主提供了 onUploadFiles 时不再拦截拖放/粘贴（上传交给插件编辑区）', () => {
+  /*
+   * 上一条守卫的前提是"宿主没有上传通道"。F5 之后 `EditorSlotProps` **有了** `onUploadFiles`
+   * （审计 B3），于是同一个出口有了两种正确行为，判据必须跟着变：
+   * - 宿主提供了上传 ⇒ **放行**事件，让插件编辑区接住（拦下来反而让插件永远收不到那次拖放）；
+   * - 宿主没提供 ⇒ 维持原来的拦截 + 可见提示。
+   *
+   * 这条最容易发生的回归是"只加了 props 忘了改拦截"：界面看起来完全正常，
+   * 用户拖入文件却毫无反应（事件被外层 preventDefault 吃掉了，插件拿不到），
+   * 而且**没有任何报错**——属于最难人工发现的一类。
+   */
+  const slots = readCode('lib/slots.tsx')
+  const from = slots.indexOf('export function EditorSlotOutlet(')
+  assert.ok(from > 0, '应能找到 EditorSlotOutlet（结构变了即红）')
+  const region = slots.slice(from)
+  assert.match(
+    region,
+    /const uploadSupported = props\.onUploadFiles !== undefined/,
+    '拦截与否必须以「宿主是否提供 onUploadFiles」为判据，不能无条件拦',
+  )
+  assert.equal(
+    (region.match(/if \(uploadSupported\) return/g) ?? []).length,
+    3,
+    'dragover / drop / paste 三条路径都要在提供上传时放行（漏一条 ⇒ 插件编辑器收不到那次拖放，且无任何报错）',
+  )
 })

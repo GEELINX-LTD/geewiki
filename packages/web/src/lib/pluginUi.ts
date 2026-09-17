@@ -1,6 +1,8 @@
 import { registerSlotByName, type AnySlotComponent } from './slots'
+import { registerRoute, unregisterRoutes, type PluginRouteProps } from './routes'
 import { hostSdk, type GeeWikiHostSdk } from './hostSdk'
 import { errorDetail } from './errorText'
+import type { ComponentType } from 'react'
 import {
   PLUGIN_UI_TABLE_PATH,
   SLOT_TABLE_PATH,
@@ -10,6 +12,8 @@ import {
   parseUiTable,
   planUiSync,
   pluginUiBase as baseOf,
+  type BuiltinSlotName,
+  type PluginRouteDecl,
   type SlotName,
   type SuppressedOwners,
   type UiSkipped,
@@ -35,7 +39,7 @@ import {
  * ## 生命周期：跟着 fork 走
  *
  * `startPluginUiSync()` 建立三个触发点，全部收敛到幂等、单飞的 {@link syncPluginUi}：
- * ① 管理台动作成功后（`AdminPage` 的 `load()` 是四条变更成功路径的汇聚点，只挂一处）；
+ * ① 插件页动作成功后（`pages/GraphPage.tsx` 的 `load()` 是四条变更成功路径的汇聚点，只挂一处）；
  * ② `visibilitychange` 变可见时；③ 可见期低频轮询（默认 15s，`If-None-Match` 让空闲期几乎零成本）。
  * 轮询存在的理由：**外部变更不经过前端**——看门狗试用期回滚会在后端异步 `disable()`，
  * 其它标签页/CLI/直接改清单同理，只靠"动作后刷新"会让界面长期与后端不一致。
@@ -52,6 +56,23 @@ export interface PluginUiHost {
   readonly jsxRuntime: { jsx: unknown; jsxs: unknown; Fragment: unknown }
   registerSlot(name: string, component: AnySlotComponent): () => void
   unregisterSlot(name: string, token?: unknown): void
+  /**
+   * 把 markdown 渲染成**已消毒**的 HTML（宿主 `lib/sanitize.ts` 的同一条管线）。
+   *
+   * 为什么这是宿主能力而不是插件自带：消毒白名单是**安全边界**，一份实现才有审计点。
+   * 插件拿到的是可直接 `dangerouslySetInnerHTML` 的字符串；往里面**再拼**未经消毒的串
+   * 就绕过了这条边界，属插件的契约违约（阅读页同源，风险面一致）。
+   */
+  renderMarkdown(markdown: string): string
+  /**
+   * 注册本插件的一个**页面组件**（F2）。返回幂等的注销函数。
+   *
+   * `id` 必须已在 `package.json#geewiki.routes` 里声明——路由参与"要不要加载这个产物"
+   * 的决策，未声明的 id 没有加载依据（详见实现处的说明）。
+   */
+  registerRoute(id: string, component: ComponentType<PluginRouteProps>): () => void
+  /** 注销某来源的全部路由（卸载/重载的统一出口） */
+  unregisterRoutes(source: string): void
   readonly version: string
   readonly pluginName: string
 }
@@ -136,6 +157,61 @@ function failureSnapshot(): readonly PluginUiFailure[] {
 export function pluginUiFailed(): readonly PluginUiFailure[] {
   return cachedFailures
 }
+
+/** {@link pluginUiFailedFor} 的按插槽缓存（引用稳定性同 {@link failureSnapshot} 的理由） */
+const cachedFailuresBySlot = new Map<SlotName, readonly PluginUiFailure[]>()
+/** {@link pluginUiDeclaredFor} 的按插槽缓存（同上：引用稳定性是 `useSyncExternalStore` 的硬要求） */
+const cachedDeclaredBySlot = new Map<SlotName, readonly string[]>()
+
+/**
+ * **某个插槽**的加载失败清单：只保留"入口表里声明过该插槽"的插件。
+ *
+ * 为什么需要按插槽过滤：{@link pluginUiFailed} 是全局清单，`app-header` 的 outlet 把它渲染一遍、
+ * `app-footer` 再渲染一遍，而某个插槽的出口若也照抄全局清单，就会出现"文章摘要卡说某个页脚插件
+ * 加载失败"这种毫不相干的提示——用户照着去查，查到的却是另一个插件。
+ * 判据用入口表的 `slots`（后端从 manifest × 仲裁派生），因此"插件声明了 `article-summary`
+ * 而它的 bundle 加载失败"这件事只会出现在那个插槽里，且随失败自愈而消失。
+ *
+ * 引用稳定：`useSyncExternalStore` 要求状态未变时返回同一对象，故比对内容后复用旧数组。
+ */
+export function pluginUiFailedFor(slot: SlotName): readonly PluginUiFailure[] {
+  const next = cachedFailures.filter((f) => (desired[f.name]?.slots ?? []).includes(slot))
+  const prev = cachedFailuresBySlot.get(slot)
+  if (prev !== undefined && prev.length === next.length && prev.every((x, i) => x === next[i])) {
+    return prev
+  }
+  const frozen = Object.freeze(next)
+  cachedFailuresBySlot.set(slot, frozen)
+  return frozen
+}
+
+/**
+ * **入口表里声明了某插槽、且该插槽归它生效**的插件名（不要求 bundle 已加载）。
+ *
+ * 这是"宿主该不该显示某个功能的入口"的**唯一正确判据**。两个看起来更直接的判据都错：
+ * - 用"已注册的插槽组件"判 ⇒ **自锁**：懒加载插槽（`ON_DEMAND_SLOTS` 里的那些）的
+ *   组件只有**进入那个视图之后**才会加载，而入口按钮恰恰在进入之前才需要出现。用它判等于
+ *   "按钮永远不出现，除非按钮已经出现过"（实测踩过：列表页的"AI 问答"入口恒不渲染，
+ *   而那个入口与插槽已随 P8 拆除——判据本身仍然成立，且现在依然被断言守着）。
+ * - 用 `GET /api/plugins` 的激活态 + 硬编码插件名判 ⇒ 把功能的归属写死在宿主里，换名/换实现/
+ *   第三方接管都会让入口静默错位（本批要消除的第一件事）。
+ *
+ * 入口表由后端从"清单 × 激活集合 × 产物存在性 × 插槽仲裁"派生，`slots` 字段是**已裁决的生效集**
+ * （被抑制的单占用声明者不在其中），因此它恰好回答"点进去之后真的有人渲染面板吗"。
+ *
+ * 引用稳定：与 {@link pluginUiFailedFor} 同理由（`useSyncExternalStore` 要求未变化时同一对象）。
+ */
+export function pluginUiDeclaredFor(slot: SlotName): readonly string[] {
+  const next = Object.keys(desired)
+    .filter((name) => (desired[name]?.slots ?? []).includes(slot))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const prev = cachedDeclaredBySlot.get(slot)
+  if (prev !== undefined && prev.length === next.length && prev.every((x, i) => x === next[i])) return prev
+  const frozen = Object.freeze(next)
+  cachedDeclaredBySlot.set(slot, frozen)
+  return frozen
+}
+
 /**
  * 已按需推迟的条目（插件名 → 决定推迟时的 rev）。
  *
@@ -247,6 +323,51 @@ export function pluginUiState(): PluginUiState {
 /** 未列出 UI 的插件与原因（排障/测试用）。 */
 export function pluginUiSkipped(): readonly UiSkipped[] {
   return lastSkipped
+}
+
+/** 一条归属明确的**生效路由声明**（入口表 × 插件名，F2） */
+export interface DeclaredRoute extends PluginRouteDecl {
+  /** 声明它的插件名 */
+  readonly plugin: string
+}
+
+/**
+ * 已声明路由的**稳定快照**。
+ *
+ * 与 `cachedState` 同样的理由：`useSyncExternalStore` 要求数据未变时返回同一引用，
+ * 现算数组会让 React 无限重渲染。故只在 `desired` 变化时重建（见 {@link rebuildRoutes}）。
+ */
+let routesSnapshot: readonly DeclaredRoute[] = Object.freeze([])
+
+/**
+ * 从当前入口表重建路由快照。
+ *
+ * 排序规则在这里定死（不是在 App 里）：`group`（main 在前）→ `order`（缺省 100）→ `label` → `id`。
+ * 放在这里是因为**导航有多处渲染点**（桌面标签、窄屏菜单、命令面板），
+ * 若各处自己排一遍，迟早出现"桌面顺序对、命令面板顺序不对"这类只在某个入口复现的漂移
+ * （`navPlan.ts` 的注释记录过同一条教训）。
+ */
+function rebuildRoutes(): void {
+  const out: DeclaredRoute[] = []
+  for (const name of Object.keys(desired).sort()) {
+    const entry = desired[name]
+    for (const route of entry?.routes ?? []) out.push({ ...route, plugin: name })
+  }
+  out.sort((a, b) => {
+    const ga = a.group === 'main' ? 0 : 1
+    const gb = b.group === 'main' ? 0 : 1
+    if (ga !== gb) return ga - gb
+    const oa = a.order ?? 100
+    const ob = b.order ?? 100
+    if (oa !== ob) return oa - ob
+    return (a.label ?? a.id).localeCompare(b.label ?? b.id) || a.id.localeCompare(b.id)
+  })
+  routesSnapshot = Object.freeze(out)
+}
+
+/** 当前全部**生效的**插件页面路由声明（按导航展示顺序；稳定引用）。 */
+export function pluginUiRoutes(): readonly DeclaredRoute[] {
+  return routesSnapshot
 }
 
 /**
@@ -370,6 +491,35 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
       return off
     },
     unregisterSlot: sdk.unregisterSlot,
+    renderMarkdown: (markdown: string) => sdk.renderMarkdown(markdown),
+    /*
+     * F2：插件页面路由的组件注册。
+     *
+     * **必须按清单已声明的 id 注册**：入口表里的 `routes` 是真源（后端已裁决冲突、
+     * 且据此把该插件标为不可推迟加载）。这里再挡一道"该 id 是否真在本插件的生效声明里"——
+     * 否则插件可以注册一个它没声明过的 id，而后端从未为它把产物标成"必须加载"，
+     * 于是那个页面在某些加载路径下会是空白（与 `slots` 的次判据完全同一条理由）。
+     *
+     * 放宽的情形：入口表**没有** `routes` 键（后端在空值时省略）⇒ 说明该插件未声明路由 ⇒ 拒绝。
+     * 但纯浏览器侧注册的插件（不在后端 owners 里）会因此被拒——这是**刻意的**：
+     * 路由参与"要不要加载这个产物"的决策，不走声明的路由没有加载保证，
+     * 允许它注册只会制造"有时能打开、有时打不开"的不确定。
+     */
+    registerRoute: (id, component) => {
+      const declared = meta.routes ?? []
+      if (!declared.some((r) => r.id === id)) {
+        console.warn(
+          `[geewiki-plugin-ui] 插件 ${name} 尝试注册未声明的路由 "${id}"，已忽略` +
+            `（该插件生效路由：${declared.map((r) => r.id).join(', ') || '无'}）。` +
+            '路由必须先在 package.json#geewiki.routes 里声明，否则宿主没有加载该产物的依据。',
+        )
+        return () => {}
+      }
+      const off = registerRoute(id, component, name)
+      disposers.push(off)
+      return off
+    },
+    unregisterRoutes: (source) => unregisterRoutes(source),
   }
   try {
     const cleanup = register(host)
@@ -493,6 +643,8 @@ async function doSync(force: boolean): Promise<void> {
   lastRevision = table.revision
   desired = table.entries
   lastSkipped = Object.freeze(table.skipped)
+  // 路由快照紧随入口表重建（F2）：导航项来自声明，必须在 bundle 加载**之前**就可见
+  rebuildRoutes()
 
   /*
    * 取权威插槽仲裁（与入口表**并行**，不额外增加一轮往返）。
@@ -546,7 +698,7 @@ async function doSync(force: boolean): Promise<void> {
  *
  * 单飞的理由与 `syncPluginUi` 相同：编辑视图挂载与用户手动刷新可能同时打过来。
  */
-export function ensureSlotLoaded(slot: SlotName): Promise<void> {
+export function ensureSlotLoaded(slot: BuiltinSlotName): Promise<void> {
   const existing = onDemandInflight.get(slot)
   if (existing) return existing
   const run = (async () => {
@@ -627,7 +779,7 @@ declare global {
       /** 当前被推迟（等按需触发）的插件名，供懒加载验收断言 */
       deferred: () => string[]
       /** 按需加载某插槽的贡献者（幂等、单飞），供懒加载验收直接驱动 */
-      ensureSlot: (slot: SlotName) => Promise<void>
+      ensureSlot: (slot: BuiltinSlotName) => Promise<void>
     }
   }
 }

@@ -15,7 +15,10 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { projectForAudience } from '../src/lib/gatedPreview'
+import {
+  projectForAudience,
+  looksProjected,
+} from '../src/lib/gatedPreview'
 
 /* ------------------------------ 行为 ------------------------------ */
 
@@ -118,6 +121,42 @@ test('守卫：占位文案的关键措辞两边一致（措辞按读者而非�
     assert.ok(src.includes('需登录查看'), `${name} 应含匿名措辞「需登录查看」`)
     assert.ok(src.includes('需更高权限查看'), `${name} 应含已登录措辞「需更高权限查看」`)
   }
+})
+
+/**
+ * ★ 本批：`looksProjected` 是**编辑路径的安全网**。
+ *
+ * 它要认出的正是上面那句话 —— 服务端在"读者看不到某段"时写进正文的占位。
+ * 一旦编辑页拿到这样的正文，保存就会把占位写进正文并丢掉段落权限标记
+ * （受限段落静默变公开），故识别器必须对**服务端生成的两种措辞**都为真。
+ */
+test('looksProjected：认得出服务端生成的两种占位（编辑路径的安全网）', () => {
+  // 两个措辞各一条（匿名 / 已登录但权限不够），以及多行正文里的情形
+  assert.equal(looksProjected('> 🔒 此处有 2 段内容需登录查看'), true, '匿名措辞必须被认出')
+  assert.equal(looksProjected('> 🔒 此处有 12 段内容需更高权限查看'), true, '已登录措辞必须被认出')
+  assert.equal(
+    looksProjected('前言\n\n> 🔒 此处有 1 段内容需登录查看\n\n结尾'),
+    true,
+    '混在正文里也要认得出来（多行匹配）',
+  )
+  // 不许误伤：普通的引用、普通的正文、以及**没有被遮蔽**的说明文字
+  assert.equal(looksProjected('> 说明：占位的措辞按读者选择'), false, '普通引用不得被误判')
+  assert.equal(looksProjected('这一段是公开的。'), false, '普通正文不得被误判')
+  assert.equal(looksProjected('此处有 3 段内容需登录查看'), false, '没有引用前缀的行不是占位（服务端总会写成引用块）')
+})
+
+test('守卫：识别器与服务端占位文案同源（措辞改了必须一起改）', () => {
+  /*
+   * 正则里写死了「此处有 / 段内容 / 需登录查看 / 需更高权限查看」这几个片段。
+   * 若哪天服务端改了措辞（比如「需登录后查看」），`looksProjected` 会**静默失效**
+   * —— 那正是安全网最危险的失效方式（不报错、只是不再拦）。故这里钉住：
+   * 正则中的片段必须仍出现在服务端的占位语句里。
+   */
+  for (const fragment of ['此处有', '段内容', '需登录查看', '需更高权限查看']) {
+    assert.ok(SERVER.includes(fragment), `服务端占位文案应仍含「${fragment}」（否则识别器要跟着改）`)
+  }
+  assert.ok(MIRROR.includes('GATED_PLACEHOLDER_RE'), '镜像应导出识别式')
+  assert.ok(MIRROR.includes('looksProjected'), '镜像应导出识别函数')
 })
 
 test('守卫：服务端只接受 org / granted（镜像不得放宽）', () => {

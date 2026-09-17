@@ -32,8 +32,6 @@ import {
   FilePlus,
   GitBranch,
   List,
-  Puzzle,
-  ShieldCheck,
   SunMoon,
   Users,
 } from 'lucide-react'
@@ -177,19 +175,10 @@ export function CommandPalette({
         run: () => go('wiki/list'),
       },
       {
-        id: 'action:plugins',
-        label: '插件管理',
-        hint: '启用、停用插件与调整配置',
-        keywords: 'plugins admin',
-        icon: <Puzzle className="size-4" aria-hidden="true" />,
-        requires: 'administer',
-        run: () => go('plugins'),
-      },
-      {
         id: 'action:graph',
-        label: '依赖图',
-        hint: '查看插件之间的依赖关系',
-        keywords: 'graph dependencies',
+        label: '依赖图与插件',
+        hint: '看依赖关系、点节点启停与改配置',
+        keywords: 'graph plugins dependencies admin',
         icon: <GitBranch className="size-4" aria-hidden="true" />,
         requires: 'administer',
         run: () => go('graph'),
@@ -203,25 +192,13 @@ export function CommandPalette({
         run: onToggleTheme,
       },
       /*
-       * 权限治理（M1）。
-       *
-       * ⚠️ **必须追加在 `action:theme` 之后**：`navPlan.test.ts` 的 `actionBlock(id)`
-       * 把一段声明切片到"下一个 `id: 'action:`"为止，并断言 `action:theme` 那一段里
-       * **不含** `requires:`（公开动作不得加能力限制）。插在中间会让 `action:theme`
-       * 的片段吞掉下面这项的 `requires`，把公开动作的守卫测红。
-       *
-       * 判据与顶栏**同一来源**（同一个 `visibleDests`）：`manageVisibility` 对
-       * 组织成员也为真，所以它不是"运维专属"动作 —— 与「插件管理」「依赖图」不同。
+       * ⚠️ 这里曾有一项「权限治理」（`action:access`）。**已移除**：
+       * 独立的治理台本身没用了（段落档位只能看，因为它就是正文标记解析出来的），
+       * 权限已跟着动作走 —— 页面档位在阅读页的「权限…」对话框与**编辑页的「权限」区**，
+       * 段落档位在编辑器工具栏的锁按钮里（写的是正文标记）。
+       * 若把这一项留下，用户点进 `#/access` 只会被重定向回页面，等于让命令面板骗人一次。
+       * 旧地址 `#/access/<slug>` 仍然可用（它跳转到该页的权限对话框），只是不再被"推荐"。
        */
-      {
-        id: 'action:access',
-        label: '权限治理',
-        hint: '设置页面档位、例外授予与访问申请',
-        keywords: 'visibility access grant permission acl',
-        icon: <ShieldCheck className="size-4" aria-hidden="true" />,
-        requires: 'manageVisibility',
-        run: () => go('access'),
-      },
       /*
        * 组织与邀请管理（P5-B M4/M5）。
        *

@@ -10,7 +10,7 @@
  * 组件（`components/CommandPalette.tsx`）只负责：把数据接进来、把 `run` 挂上去、
  * 渲染与键盘/ARIA 接线。
  */
-import { HOME_SLUG, parseWikiRoute } from './wikiRoute'
+import { HOME_SLUG, isUnreachableSlug, parseWikiRoute } from './wikiRoute'
 
 /** 分组 id（顺序即展示顺序的语义，具体顺序由 {@link buildPaletteGroups} 决定） */
 export type PaletteGroupId = 'recent' | 'page' | 'action'
@@ -229,7 +229,14 @@ export function moveIndex(current: number, delta: number, total: number): number
 export function visitedSlugFromSub(sub: string): string | null {
   const route = parseWikiRoute(sub)
   if (route.kind === 'home') return HOME_SLUG
-  return route.kind === 'detail' ? route.slug : null
+  if (route.kind !== 'detail') return null
+  /*
+   * 保留段开头的 slug 结构上不可能存在（后端拒建），不该进"最近访问"。
+   * P8 拆掉 `#/wiki/ask/<q>` 之前这条走不到——那时 `ask` 有自己的 kind；
+   * 现在它会落到 detail，于是判据必须显式挡一道，否则一次误点就会把一个
+   * 永远打不开的 slug 写进最近访问，而且点它还会再写一次。
+   */
+  return isUnreachableSlug(route.slug) ? null : route.slug
 }
 
 /* ------------------------------- 最近访问 ------------------------------- */

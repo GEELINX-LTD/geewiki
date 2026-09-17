@@ -29,21 +29,24 @@
 /** 后端入口表端点（`GET /api/plugins/ui`） */
 export const PLUGIN_UI_TABLE_PATH = '/api/plugins/ui'
 
-/**
- * UI 资产文件名（单段）：与 core 的 `PLUGIN_UI_FILE_SEGMENT` **同一规则**。
- * web 侧不引入 `@geewiki/core`（它顶层 `import 'node:fs'`，进不了浏览器），故保留同名副本；
- * 两处一致性由测试的同一张输入表钉住（`packages/web/test/pluginUiPlan.test.ts`）。
+/*
+ * ★ F13：**本文件原先自带 `PLUGIN_UI_PREFIX` 与 `PLUGIN_UI_FILE_SEGMENT` 两份副本**，
+ * 理由是"web 进不了 `@geewiki/core`（顶层 `import 'node:fs'`）"。
+ *
+ * 那个理由在 F5/F9 之后**已经不成立**：现在有浏览器安全子路径
+ * `@geewiki/core/slots` 与 `@geewiki/core/domain`，而这些规则本身是纯字符串判定，
+ * 正属于该放进去的东西。两份副本已删除，改为从 `@geewiki/core/domain` 转出。
+ *
+ * 这正是 `core/src/slots.ts` 文件头点名的那种镜像：**副本无法伪装成同一个对象**，
+ * 而"内容相等"在有人刚抄完一份时是通过的，只在漂移发生后才红。
  */
-export const PLUGIN_UI_FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
-
-/** UI 资产 URL 前缀（与 core 的 `PLUGIN_UI_PREFIX` 同一常量值） */
-export const PLUGIN_UI_PREFIX = '/plugins-ui'
+export { PLUGIN_UI_PREFIX, PLUGIN_UI_FILE_SEGMENT } from '@geewiki/core/domain'
 
 /** 入口表中单个插件的条目 */
 export interface UiTableEntry {
-  /** UI 入口文件名（单段） */
+  /** UI 入口**相对路径**（★ F13：单段文件名或分层路径，见 `isPluginUiEntryPath`） */
   entry: string
-  /** 可选样式文件名（单段） */
+  /** 可选样式的相对路径（同 `entry` 的规则） */
   css?: string
   /** 该插件产物指纹（后端 stat 出来的 mtime-大小哈希）；**只用于变更检测，不进 URL** */
   rev: string
@@ -58,19 +61,86 @@ export interface UiTableEntry {
    * 后端在无生效插槽时**省略该键**（保持既有部署的 `revision` 不变），故这里可能缺省。
    */
   slots?: SlotName[]
+  /**
+   * 该插件**生效的**页面路由声明（F2，后端经 `resolveRouteDecls` 裁决后下发）。
+   *
+   * 用途是 {@link isLazyOnlyEntry} 的反向判据：声明了路由的插件**不得被推迟加载**——
+   * 它的产物里带着一个页面，而"用户何时点那个导航项"宿主无法预知
+   * （没有 `ensureSlotLoaded` 那样的触发点）。若被推迟，症状是**点进去一片空白且不报错**。
+   *
+   * 同样空值时后端省略该键。
+   */
+  routes?: PluginRouteDecl[]
 }
 
 /**
- * 插槽白名单：与 core 的 `SLOT_NAMES` / `slots.tsx` 的 `SLOT_NAMES` 是同一份事实的镜像。
- * web 侧不引 `@geewiki/core`（顶层 `import 'node:fs'`），故保留副本；
- * 三处一致性由 `packages/web/test/editorSlotProps.test.ts` 的源码级守卫钉住。
+ * 插件页面路由 id 语法 —— **core 的镜像**（`packages/core/src/index.ts` 的 `PLUGIN_ROUTE_ID`）。
+ * 与内置路由同处 hash 首段，故同样是小写 kebab、不含 `/`。
  */
-export type SlotName = 'app-header' | 'app-footer' | 'editor'
+export const PLUGIN_ROUTE_ID = /^[a-z][a-z0-9-]*$/
 
-export const SLOT_NAMES: readonly SlotName[] = ['app-header', 'app-footer', 'editor']
+/**
+ * 宿主保留的路由首段 —— **core 的镜像**（`RESERVED_ROUTE_IDS`）。
+ *
+ * 前端也留一份是必要的：后端的裁决保证"不会有两个插件抢同一个 id"，
+ * 但前端仍要能判断"某个已注册 id 是不是宿主的页面"——否则插件可能渲染出一个
+ * 与内置页面同名、但内容完全不同的页面（后端拒绝的是**声明**，而运行期注册无法被后端预知）。
+ */
+export const RESERVED_ROUTE_IDS: readonly string[] = [
+  'wiki',
+  'plugins',
+  'graph',
+  'access',
+  'audit',
+  'org',
+  'login',
+  'setup',
+  'denied',
+  'account',
+  'notfound',
+]
+
+/** 插件页面路由声明 —— **core 的镜像**（字段名/可选性必须逐字对应，由守卫测试钉住） */
+export interface PluginRouteDecl {
+  readonly id: string
+  readonly label?: string
+  readonly requires?: string
+  readonly group?: 'main' | 'admin'
+  readonly order?: number
+}
+
+/**
+ * 插槽白名单与判定函数：**由 `@geewiki/core/slots` 转出**（真源唯一）。
+ *
+ * ## 这里曾经是第三份（乃至第四份）镜像
+ * 原先本文件、`slots.tsx`、core 各有一份 `BuiltinSlotName` 联合 + `SLOT_NAMES` 数组，
+ * 理由是"web 侧不引 `@geewiki/core`（顶层 `import 'node:fs'`）"。
+ * core 把这份纯常量拆到 `src/slots.ts` 并开了 `./slots` 子路径导出之后，该理由消失，
+ * 镜像全部删除（连 A1 批次为防漂移而加的那对 `Expect<A extends B>` 编译期断言也一并删除：
+ * 没有了第二份事实，就没有需要同步的东西）。
+ *
+ * ## 本文件为什么可以直接引 core，却仍然不能引 `slots.tsx`
+ * 本文件要能在 node 下被**纯函数测试**直接 import，而 `slots.tsx` 会牵进 react 与插件加载器。
+ * `@geewiki/core/slots` 是**无依赖的纯常量模块**（不得出现 `node:*` / `cordis` / `schemastery`，
+ * 由 `packages/core/test/slots-browser-safe.test.ts` 源码级钉住），
+ * 故它对"能在 node 下跑"与"能进浏览器 bundle"两个场景**同时**成立 —— 这正是它能当单一真源的前提。
+ */
+import {
+  PLUGIN_SLOT_NAME,
+  SLOT_NAMES,
+  type BuiltinSlotName,
+  type SlotName,
+} from '@geewiki/core/slots'
+import { PLUGIN_UI_PREFIX, isPluginUiEntryPath } from '@geewiki/core/domain'
+
+export { PLUGIN_SLOT_NAME, SLOT_NAMES }
+export type { BuiltinSlotName, SlotName }
 
 function isSlotName(value: unknown): value is SlotName {
-  return typeof value === 'string' && (SLOT_NAMES as readonly string[]).includes(value)
+  return (
+    typeof value === 'string' &&
+    ((SLOT_NAMES as readonly string[]).includes(value) || PLUGIN_SLOT_NAME.test(value))
+  )
 }
 
 /** 入口表的 `slots` 字段：非数组按缺省处理、未知插槽名逐条丢弃（前向兼容）。 */
@@ -91,17 +161,53 @@ function readSlots(raw: unknown): SlotName[] | undefined {
 }
 
 /**
- * 只有 `editor` 一个生效插槽的条目 ⇒ **可以推迟加载**。
+ * **按需加载的插槽**：宿主只在对应视图真正挂载时才 `ensureSlotLoaded(slot)`。
+ *
+ * - `editor`：编辑视图（`WikiPage` 的编辑态）
+ * - `editor-toolbar`：同上，与编辑区同生同死
+ * - `app-dock`：**已登录**时才渲染（决策 5），故也归"宿主决定何时要"
+ *
+ * `app-header` / `app-footer` **不在**这个集合里：它们首屏就在 App 外壳里渲染，推迟只会
+ * 造成"先空位再补内容"的抖动。
+ *
+ * ## `app-dock` 为什么在这里（一处对设计文档 §5.2 的修正）
+ * §5.2 说"决策 5（只有登录用户）让匿名不加载 AI bundle 这件事自动消失"。**那句话
+ * 只在下述前提下才成立**：dock 必须归本集合，由宿主在**真正要渲染它**（即已登录）时
+ * 才 `ensureSlotLoaded('app-dock')`。
+ *
+ * 反过来说就错了：若不把它列进来，宿主会**首屏对所有人**加载该插件产物，
+ * 匿名读者照样下载一整套聊天 bundle——恰恰是 §5.2 想避免的那件事。
+ * 故这里的判据不是"它是否首屏位置"（它是），而是"**宿主是否掌握'现在要不要它'**"（是）。
+ */
+export const ON_DEMAND_SLOTS: readonly BuiltinSlotName[] = [
+  'editor',
+  'editor-toolbar',
+  'app-dock',
+  'article-summary',
+  // 只有账号页用得到：匿名读者与绝大多数页面都不该为它下载一份 SSO 界面
+  'account-identities',
+]
+
+/**
+ * 生效插槽**全部**是按需插槽 ⇒ **可以推迟加载**。
  *
  * ## 为什么这是一个可推导的判据，而不是拍脑袋的启发式
  * 懒加载的目的：**首屏不该为一个"用户大概率用不到"的插件付出加载成本**。
  * 而"用户何时需要它"取决于它贡献到哪个插槽：
  * - `app-header` / `app-footer` **首屏就渲染**（在 App 外壳里），推迟它们毫无意义，
  *   反而会先渲染空位再补内容（视觉抖动）；
- * - `editor` 只在进入编辑视图时才渲染，而绝大多数访问**只看文档**——正是值得推迟的那一类。
+ * - `editor` / `editor-toolbar` 只在进入编辑视图时才渲染，
+ *   而绝大多数访问**只看文档**——正是值得推迟的那一类（AI 两类界面的 bundle 因此
+ *   对"读文档"这个主路径成本为零）；
+ * - `app-dock` **每页都在**，但"每页都要"的前提是**已登录**（决策 5）——匿名读者一次
+ *   都不该为它付出加载成本，所以宿主仍然掌握着"要不要"这个判据（详见
+ *   {@link ON_DEMAND_SLOTS} 的说明）。
  *
- * 因此：**生效插槽非空且全部是 `editor`** 的插件，其 `client.js` 推迟到编辑视图真正挂载时再取。
- * 若它同时还贡献了 header/footer，则**不推迟**（首屏就要用）。
+ * 因此：**生效插槽非空且全部落在 {@link ON_DEMAND_SLOTS} 内**的插件，其 `client.js` 推迟到
+ * 对应视图真正挂载时再取。若它同时还贡献了 header/footer，则**不推迟**（首屏就要用）。
+ *
+ * **F2 补充判据**：声明了 `geewiki.routes`（页面路由）的插件**一律不推迟**——
+ * 页面没有 `ensureSlotLoaded` 那样的显式触发点，推迟它只会让用户点进去看到空白页。
  *
  * ## 已知边界（这是本判据的局限，已作为范围外发现上报）
  * 后端 manifest 目前只能声明 `slots: SlotName[]`，**表达不了"某个插槽贡献是懒的"**——
@@ -111,9 +217,19 @@ function readSlots(raw: unknown): SlotName[] | undefined {
  * 标志（需改 core 契约）。
  */
 export function isLazyOnlyEntry(entry: UiTableEntry): boolean {
+  /*
+   * F2 的反向判据：**声明了页面路由的插件一律不推迟**。
+   *
+   * 为什么必须挡在前面：按需加载的前提是"宿主掌握'现在要不要它'"。插槽有 `ensureSlotLoaded`
+   * 这个显式触发点；而页面路由**没有**——用户点哪个导航项是自由行为，宿主无法预知。
+   * 若把带页面的插件判为可推迟，症状是：导航项在（它来自入口表，不需要 bundle），
+   * 点进去**一片空白、且 console 里什么错都没有**（bundle 从未被加载过，
+   * 连"路由未注册"的告警都不会出现，因为那个告警只在"声明了却没注册"时才有意义）。
+   */
+  if (entry.routes !== undefined && entry.routes.length > 0) return false
   const slots = entry.slots
   if (slots === undefined || slots.length === 0) return false
-  return slots.every((slot) => slot === 'editor')
+  return slots.every((slot) => (ON_DEMAND_SLOTS as readonly string[]).includes(slot))
 }
 
 /* ===================== 插槽仲裁（单占用被抑制者不得注册） ===================== */
@@ -191,7 +307,7 @@ export interface ParsedUiTable {
    * 未被列出 UI 的插件与原因。**注意**：`revision` 只覆盖 `plugins`，不含 `skipped`
    * （见后端 `buildPluginUiTable` 的哈希输入），所以"新装了一个未启用/无界面的插件"这类
    * 变化**不会**改变 `revision`。管理台要看到这种情况必须走 `syncPluginUi({ force: true })`
-   * 拉一次完整表（见 `AdminPage` 的 `load()`）。
+   * 拉一次完整表（见 `pages/GraphPage.tsx` 的 `load()`）。
    */
   skipped: UiSkipped[]
 }
@@ -246,11 +362,18 @@ export function pluginUiBase(name: string, origin: string): string | undefined {
 function readEntry(raw: unknown): UiTableEntry | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
   const item = raw as { entry?: unknown; css?: unknown; rev?: unknown; slots?: unknown }
-  // entry 缺失或文件名非法 → 整条丢弃（后端保证不会发生，这里防的是中间层/旧版本)
-  if (typeof item.entry !== 'string' || !PLUGIN_UI_FILE_SEGMENT.test(item.entry)) return undefined
+  /*
+   * entry 缺失或路径非法 → 整条丢弃（后端保证不会发生，这里防的是中间层/旧版本）。
+   *
+   * ★ F13：判据与后端同源（`isPluginUiEntryPath`）—— 原先这里是**手抄**的
+   * `PLUGIN_UI_FILE_SEGMENT`，与 core 的单段规则是同一条约束的两个副本。
+   * 放宽入口路径时把它的语义也一并收进 core，避免"后端接受了、前端整条丢弃"
+   * 这种最难查的分裂（症状是插件明明激活了却完全不加载）。
+   */
+  if (typeof item.entry !== 'string' || !isPluginUiEntryPath(item.entry)) return undefined
   // css 非法同样整条丢弃：与后端 `pluginUiEntryOf` 的"坏声明整体视为未声明"保持一致，
   // 避免出现"入口可用但样式名是穿越路径"这种半可信状态
-  if (item.css !== undefined && (typeof item.css !== 'string' || !PLUGIN_UI_FILE_SEGMENT.test(item.css))) {
+  if (item.css !== undefined && (typeof item.css !== 'string' || !isPluginUiEntryPath(item.css))) {
     return undefined
   }
   // rev 只用于变更检测；不是字符串时整条丢弃（后端必定下发，宁可少加载一个也不做无依据的变更判断）
@@ -259,12 +382,55 @@ function readEntry(raw: unknown): UiTableEntry | undefined {
   // 坏掉的 slots 不该让整条 UI 加载失败——按缺省（无生效插槽）处理，
   // 后果只是"该插件不能注册插槽 / 不被推迟"，而不是"界面消失"。
   const slots = readSlots(item.slots)
+  // routes 同样从宽（F2）：坏掉的路由声明只该让"这个插件不被特殊对待 / 导航里没有它"，
+  // 不该让整个插件的界面消失。
+  const routes = readRoutes((raw as { routes?: unknown }).routes)
   return {
     entry: item.entry,
     rev: item.rev,
     ...(item.css === undefined ? {} : { css: item.css }),
     ...(slots === undefined ? {} : { slots }),
+    ...(routes === undefined ? {} : { routes }),
   }
+}
+
+/**
+ * 解析入口表的 `routes` 字段（F2）：逐条宽松校验，坏条目丢弃而不拖垮整条。
+ *
+ * 挡两道：`id` 必须是合法的小写 kebab，且**不得与宿主保留路由重名**。后者后端已经拒绝过，
+ * 前端再挡一次不是重复劳动——如果哪天有中间层（缓存/代理）改写了响应，前端这一道就是
+ * 唯一还站着的防线；而"插件页面顶掉 `#/wiki`"是所有失败模式里最难被用户识破的一种。
+ */
+function readRoutes(raw: unknown): PluginRouteDecl[] | undefined {
+  if (!Array.isArray(raw)) {
+    if (raw !== undefined) console.debug('[geewiki-plugin-ui] 入口表 routes 不是数组，按缺省处理')
+    return undefined
+  }
+  const out: PluginRouteDecl[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+    const r = item as { id?: unknown; label?: unknown; requires?: unknown; group?: unknown; order?: unknown }
+    if (typeof r.id !== 'string' || !PLUGIN_ROUTE_ID.test(r.id)) {
+      console.debug(`[geewiki-plugin-ui] 入口表路由 id 非法，已忽略：${String(r.id)}`)
+      continue
+    }
+    if (RESERVED_ROUTE_IDS.includes(r.id)) {
+      console.debug(`[geewiki-plugin-ui] 入口表路由 id 与宿主保留路由冲突，已忽略：${r.id}`)
+      continue
+    }
+    if (seen.has(r.id)) continue
+    seen.add(r.id)
+    const group = r.group === 'main' || r.group === 'admin' ? r.group : undefined
+    out.push({
+      id: r.id,
+      ...(typeof r.label === 'string' && r.label !== '' ? { label: r.label } : {}),
+      ...(typeof r.requires === 'string' && r.requires !== '' ? { requires: r.requires } : {}),
+      ...(group === undefined ? {} : { group }),
+      ...(typeof r.order === 'number' && Number.isFinite(r.order) ? { order: r.order } : {}),
+    })
+  }
+  return out.length === 0 ? undefined : out
 }
 
 function isSkipReason(value: unknown): value is UiSkipReason {

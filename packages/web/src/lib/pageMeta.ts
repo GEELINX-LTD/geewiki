@@ -12,7 +12,6 @@ export const APP_NAME = 'GeeWiki'
 /** 路由首段 → 展示名（不含详情页的动态标题） */
 const SECTION_LABEL: Record<string, string> = {
   wiki: '知识库',
-  plugins: '插件管理',
   graph: '依赖图',
   // 权限治理（M1）。它是**独立首段**（`#/access` 与 `#/access/<slug>`），
   // 不能挂在 `wiki/` 下：`parseWikiRoute` 只保留 search|ask|new|list 四个首段，
@@ -30,11 +29,16 @@ const SECTION_LABEL: Record<string, string> = {
   account: '账号',
 }
 
-/** 知识库下的保留子路由 → 展示名 */
+/**
+ * 知识库下的**有自己视图**的保留子路由 → 展示名。
+ *
+ * `ask` 曾在表里（P8 随 `#/wiki/ask/<q>` 一起删除，决策 17）。它仍是**保留段**
+ * （`WIKI_RESERVED_FIRST_SEGMENTS`，见 lib/wikiRoute.ts 的理由），只是不再有视图——
+ * 于是 `#/wiki/ask` 现在按详情页解析，标题退化为「知识库」或该 slug 的标题。
+ */
 const WIKI_SUB_LABEL: Record<string, string> = {
   new: '新建页面',
   search: '搜索',
-  ask: '问答',
 }
 
 /**
@@ -62,7 +66,7 @@ export function titleForRoute(route: string, pageTitle?: string | null): string 
     const sub = seg[1] as string
     const subLabel = WIKI_SUB_LABEL[sub]
     if (subLabel !== undefined && subLabel !== '') {
-      // search/<q>、ask/<q> 的第二段是查询串：不进标题（可能很长），只显示分区名
+      // search/<q> 的第二段是查询串：不进标题（可能很长），只显示分区名
       return withAppName(subLabel)
     }
     // 到这里 seg[1] 是 slug：详情页（seg[2] === 'edit' 时为编辑页）

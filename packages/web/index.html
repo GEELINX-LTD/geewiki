@@ -6,14 +6,19 @@
       靠这张 import map 解析到宿主单例（public/host-sdk/*.js）。
       必须是 head 的第一个元素：import map 只对"解析时尚未加载"的 module script 生效，
       Vite 构建时还会把它前移到第一个 module script 之前（见 docs/plugin-platform-plan.md D-8）。
-      注意：映射的目标必须是**真实存在**的 shim，因此这里只列 react 与 react/jsx-runtime，
-      不映射 react-dom / react-dom/client（插件不得自带框架）。
+      注意：映射的目标必须是**真实存在**的 shim。
+      `react-dom` / `react-dom/client` 在 F6 加入（SDK 0.6.0）：插件**仍然不得自带框架**，
+      映射的目的是让它们共用**宿主这一个** react-dom 实例——两份实例会让 portal 出去的元素
+      丢失事件与 context（症状是"点击没反应"，且不报错）。
+      有了它们，插件才能做全屏浮层（`createPortal`）与样式隔离（shadow DOM + `createRoot`）。
     -->
     <script type="importmap">
       {
         "imports": {
           "react": "/host-sdk/react.js",
-          "react/jsx-runtime": "/host-sdk/jsx-runtime.js"
+          "react/jsx-runtime": "/host-sdk/jsx-runtime.js",
+          "react-dom": "/host-sdk/react-dom.js",
+          "react-dom/client": "/host-sdk/react-dom-client.js"
         }
       }
     </script>
@@ -23,7 +28,8 @@
       深色模式用户会看到明显的白闪（FOUC）。内联脚本在 <head> 里同步执行，
       早于任何绘制，因此不会闪。
 
-      与 src/lib/theme.ts 的约定（test/theme.test.ts 会校验两处一致）：
+      与 src/lib/theme.ts 的约定（test/designSystem.test.ts 会校验两处一致——
+      注意**不是** test/theme.test.ts，那个文件从来不存在）：
       - 存储键名 `geewiki-theme`；
       - 三态语义：'light' | 'dark' | 其它/缺失 = 跟随系统；
       - 脚本**最小化**：不引依赖、失败静默（try/catch）——主题脚本报错会阻塞解析，

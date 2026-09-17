@@ -110,7 +110,13 @@ export function LoginPage(): ReactNode {
     try {
       await login(email.trim(), password)
       // 绑定时先把用户带到账号页确认，否则才回跳原目标
-      window.location.hash = query.linkRequired ? '/account' : query.redirect
+      /*
+       * ⚠️ 必须带上 `?link=required`：账号页/插件据此才显示"确认绑定"卡片。
+       * 此前写的是 `'/account'`（把参数丢了），于是 SSO 回跳后**确认卡片永远不出现**——
+       * 用户被带到账号页却没有任何可确认的东西，身份绑定这条流程实际是断的
+       * （2026-09-16，由插件侧的子任务在核对"提示从哪来"时发现）。
+       */
+      window.location.hash = query.linkRequired ? '/account?link=required' : query.redirect
     } catch (err) {
       setFailure(err)
     } finally {

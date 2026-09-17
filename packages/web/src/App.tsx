@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import {
   BookText,
   GitBranch,
@@ -30,11 +30,13 @@ import { MAIN_CONTENT_ID } from './lib/domIds'
 import { hashQueryOf, stripHashQuery } from './lib/hashAnchor'
 import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
 import { titleForRoute } from './lib/pageMeta'
-import { visibleDests, type NavDest } from './lib/navPlan'
+import { visibleDests, pluginNavDests, type NavDest } from './lib/navPlan'
+import { pluginUiRoutes, subscribePluginUiState } from './lib/pluginUi'
+import { PluginRouteOutlet, registeredRoute, useRouteEntries } from './lib/routes'
 import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice } from './lib/theme'
+import { AppDock } from './components/AppDock'
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
-import { AdminPage } from './pages/AdminPage'
 import { AccessPage } from './pages/AccessPage'
 import { OpsPage } from './pages/OpsPage'
 import { OrgPage } from './pages/OrgPage'
@@ -183,6 +185,38 @@ interface NavItem extends NavDest {
   icon: ReactNode
 }
 
+/**
+ * 插件声明的导航项 → 宿主 `NavItem`（F2）。
+ *
+ * 图标只能由宿主补：插件清单是 JSON，给不出 React 节点。统一用一个中性的「拼图」图标——
+ * 刻意**不做**"按插件名挑图标"的映射（那会让不同插件的观感参差不齐，且用户无从预期）。
+ */
+function pluginDestsToNavItems<T extends NavDest>(dests: readonly T[]): NavItem[] {
+  return dests.map((dest) => ({ ...dest, icon: <Puzzle className="size-4" aria-hidden /> }))
+}
+
+/**
+ * 插件页面「**已声明、但组件尚未注册**」的占位（F2）。
+ *
+ * 为什么必须与 `NotFoundPage` 分开：这两种状态对用户与排障者意味着完全不同的事——
+ * - `notfound` ⇒ **地址错了**，该去检查 URL / 链接；
+ * - 本占位 ⇒ **插件坏了**（产物加载失败、版本不匹配、清单声明了但客户端没注册），
+ *   该去检查插件。
+ *
+ * 合成一个的代价在实测里很具体：用户把"插件页面打不开"报成"这个链接失效了"，
+ * 而实际原因在插件侧。文案因此刻意给出**可执行的下一步**（去依赖图页看状态）。
+ */
+function PluginRoutePendingPage({ id }: { id: string }): ReactNode {
+  return (
+    <div className="mx-auto w-full max-w-2xl p-6" data-plugin-route-pending={id}>
+      <ErrorState
+        title="插件页面未就绪"
+        hint={`路由「${id}」已在插件清单里声明，但它的页面组件还没注册。通常意味着该插件的界面产物加载失败，或声明的路由与客户端注册的 id 不一致。请到「依赖图」页检查该插件的状态与产物。`}
+      />
+    </div>
+  )
+}
+
 const WIKI_ITEM: NavItem = { id: 'wiki', label: '知识库', icon: <BookText className="size-4" /> }
 /**
  * 运维/开发台面：收进「管理 ▾」，不与产品主入口平级。
@@ -198,7 +232,12 @@ const WIKI_ITEM: NavItem = { id: 'wiki', label: '知识库', icon: <BookText cla
  * 正确做法是把它**移出这个分组**，而不是给它单开一个能力字段。
  */
 const ADMIN_NAV: NavItem[] = [
-  { id: 'plugins', label: '插件管理', icon: <Puzzle className="size-4" />, requires: 'administer' },
+  /*
+   * 「插件管理」与「依赖图」已**合二为一**（用户要求）：插件的启停、配置、临时变更
+   * 全部搬到依赖图页里——点节点开弹窗。于是这里只留一项：原先两项并存意味着
+   * "同一个插件有两个管理界面"，配置表单和状态措辞迟早分叉。
+   * 保留的 id 仍是 `graph`；旧链接 `#/plugins` 在路由解析处改写成 `graph`（见下方 `root`）。
+   */
   { id: 'graph', label: '依赖图', icon: <GitBranch className="size-4" />, requires: 'administer' },
   /*
    * 审计与运维（P4）。能力键用既有的 `administer`（`AuthCapabilities` 只有
@@ -213,33 +252,33 @@ const ADMIN_NAV: NavItem[] = [
    * 组织与邀请管理（P5-B M4/M5）。判据与其余运维入口一致（`administer`）：
    * 成员、用户组、邀请这 12 个端点里除 `GET /api/org` 外全部要 `admin+`
    * （见 `packages/plugin-org/src/index.ts:277`），所以它属于「管理 ▾」而不是
-   * 与「知识库」平级的产品入口（对比 `GOVERN_NAV` 的 `manageVisibility`，那一个
+   * 与「知识库」平级的产品入口（对比 `LEGACY_ROUTES` 里那条 `manageVisibility` 的旧路由，
    * 普通成员也有）。这里的 `id` 就是路由首段：`#/org`。
    */
   { id: 'org', label: '组织', icon: <Users className="size-4" />, requires: 'administer' },
 ]
 /**
- * 权限治理入口（M1）。
+ * **已并入页面本身的旧路由**（原来是独立的「权限治理」入口）。
  *
- * **刻意独立于 `ADMIN_NAV`，也不与「管理 ▾」合并**，两个理由：
+ * 为什么还留着这个数组：`#/access` 与 `#/access/<slug>` 在文档、书签、聊天记录里都出现过，
+ * 而路由首段**必须仍然被认识** —— 否则老链接会落到「页面不存在」，用户会以为页面没了
+ * （见 `pages/AccessPage.tsx` 的文件头：它现在只做重定向）。
  *
- * 1. **判据不同**：运维台面要 `administer`（= owner / admin），而改档位与授权是
- *    "对自己有编辑权的条目"就能做的事 —— 组织角色 `member` 也**有**这个能力
- *    （`packages/plugin-auth/src/index.ts` 的 `capabilitiesOf`：`manageVisibility`
- *    对 admin 与 member 都为真）。把它塞进只对 admin 开放的「管理 ▾」，等于让
- *    最常用它的人看不到入口。
- * 2. **入口语义不同**：这一项**不是**运维台面，而是产品功能（每一条内容都可能有
- *    自己的档位与授权）。混进运维下拉会让人以为它只有管理员才用得上。
- *
- * 与其它入口**同一套判据**：能力为 `null`（首帧）× 无能力 ⇒ 整个入口不渲染
- * （`visibleDests()` 的失败关闭，见 `lib/navPlan.ts`），而不是置灰。
+ * 但它**不再出现在任何导航里**（桌面标签、窄屏菜单、命令面板都移除）：那一页在原地几乎
+ * 做不了事（段落档位只能看，因为档位是从正文标记解析出来的），权限已经跟着动作走 ——
+ * 页面档位在阅读页的「权限…」对话框与**编辑页的「权限」区**，段落档位写在正文里。
  *
  * ⚠️ `packages/web/test/navPlan.test.ts` 从 `App.tsx` 抽取 `ADMIN_NAV` 的数组体并统计
- * "条目数 == 声明能力的次数"。本数组**必须声明在这个数组之外**（放在它之前或之后的
- * 行首 `]` 之外），否则会被那段正则吞进去，两个计数都会错位。
+ * "条目数 == 声明能力的次数"。本数组**必须声明在它之外**（放在行首 `]` 之外），
+ * 否则会被那段正则吞进去，两个计数都会错位。
  */
-const GOVERN_NAV: NavItem[] = [
-  { id: 'access', label: '权限治理', icon: <ShieldCheck className="size-4" />, requires: 'manageVisibility' },
+const LEGACY_ROUTES: NavItem[] = [
+  {
+    id: 'access',
+    label: '权限治理（已并入页面）',
+    icon: <ShieldCheck className="size-4" />,
+    requires: 'manageVisibility',
+  },
 ]
 /**
  * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
@@ -259,9 +298,32 @@ export function App(): ReactNode {
    * 拿到的就永远是第一次渲染时的值（实测症状：从创建主页入口走到普通新建页，标题与预填 slug 不变）。
    */
   const routeQuery = useRouteQuery()
-  const root = route.split('/')[0] ?? 'wiki'
+  /*
+   * 旧路由 `#/plugins`（「插件管理」已并入依赖图）在这里**解析处改写**成 `graph`。
+   *
+   * 为什么不按 `LEGACY_ROUTES` 那条老路（占位页 + 渲染期重定向）：那条路是为"页面还在、
+   * 只是权限/内容换了"设计的，需要多一个组件与 effect；而这里根本就是**同一个页面**，
+   * 一个三元表达式就够。文档、书签、聊天记录里的 `#/plugins` 因此仍然可用。
+   */
+  const root0 = route.split('/')[0] || 'wiki'
+  const root = root0 === 'plugins' ? 'graph' : root0
+  /*
+   * F2：插件页面路由。
+   *
+   * 两个来源缺一不可，且**刻意分开**：
+   * - 声明（`pluginUiRoutes()`，来自入口表）回答"有没有这个路由、导航里叫它什么"，
+   *   它在插件 bundle **加载之前**就有值——这正是路由必须声明在 manifest 里的原因；
+   * - 注册（`useRouteEntries()`）提供真正的页面组件。
+   *
+   * 只声明未注册 ⇒ 渲染"页面未就绪"占位并给出原因，**不落 notfound**：
+   * 那会把"插件坏了"误导成"这个地址不存在"，用户会去检查 URL 而不是去检查插件。
+   */
+  const declaredRoutes = useSyncExternalStore(subscribePluginUiState, pluginUiRoutes, pluginUiRoutes)
+  const registeredRoutes = useRouteEntries()
   const known =
-    [WIKI_ITEM, ...ADMIN_NAV, ...GOVERN_NAV].some((t) => t.id === root) || isAuthRoute(root)
+    [WIKI_ITEM, ...ADMIN_NAV, ...LEGACY_ROUTES].some((t) => t.id === root) ||
+    isAuthRoute(root) ||
+    declaredRoutes.some((r) => r.id === root)
   /*
    * ★ P2：未知路由不再**静默回落**到知识库。
    *
@@ -366,13 +428,22 @@ export function App(): ReactNode {
    * 加载中（`capabilities === null`）同样为空 —— 见 `lib/navPlan.ts` 里
    * 关于"失败关闭"的说明：宁可让管理员晚一次请求看到入口，也不让匿名访客先看到再收回。
    */
-  const adminDests = visibleDests(ADMIN_NAV, auth.capabilities)
-
-  /**
-   * 权限治理入口（同一判据、同一来源）。空数组 ⇒ 桌面端不渲染任何治理标签、
-   * 窄屏菜单里也不出现这一组（同样不是置灰）。
-   */
-  const governDests = visibleDests(GOVERN_NAV, auth.capabilities)
+  const adminDests = [
+    ...visibleDests(ADMIN_NAV, auth.capabilities),
+    /*
+     * F2：插件声明的运维台面入口，与内置项走**同一个** `visibleDests` 判据。
+     *
+     * 合并（而不是替换）：插件不该能挤掉内置项——"我的依赖图不见了"若由一个插件引起，
+     * 用户根本无从排查。顺序：内置在前，插件按声明顺序（group → order → label）在后，
+     * 该顺序在 `pluginUi.ts` 的 `rebuildRoutes()` 里定死，这里只做拼接。
+     */
+    ...pluginDestsToNavItems(
+      visibleDests(
+        pluginNavDests(declaredRoutes).filter((d) => d.group === 'admin'),
+        auth.capabilities,
+      ),
+    ),
+  ]
 
   /*
    * 外壳宽度：**所有页面统一用 `--spacing-wide`（1552px）**，不再按内容类型分档。
@@ -410,10 +481,12 @@ export function App(): ReactNode {
       />
     )
   else if (active === 'access')
-    // 治理路由是**独立首段**（`#/access` 与 `#/access/<slug>`）：塞进 `wiki/` 会被
-    // `parseWikiRoute` 当成 slug 的一部分，见 lib/accessPlan.ts 的 parseAccessRoute
+    /*
+      旧治理路由（`#/access` 与 `#/access/<slug>`）：仍走**独立首段**（塞进 `wiki/` 会被
+      `parseWikiRoute` 当成 slug 的一部分，见 lib/accessPlan.ts 的 parseAccessRoute），
+      但页面本身只做重定向 —— 权限已并入页面（见 LEGACY_ROUTES 与 pages/AccessPage.tsx）。
+    */
     body = <AccessPage sub={route.slice('access'.length).replace(/^\/+/, '')} onNavigate={nav} />
-  else if (active === 'plugins') body = <AdminPage />
   else if (active === 'audit') body = <OpsPage />
   // 组织与邀请管理（P5-B M4/M5）：独立首段 `#/org`，页面自己按 `administer` 门控
   else if (active === 'org') body = <OrgPage onNavigate={nav} />
@@ -422,6 +495,25 @@ export function App(): ReactNode {
   else if (active === 'denied') body = <DeniedPage />
   else if (active === 'account') body = <AccountPage />
   else if (active === 'notfound') body = <NotFoundPage />
+  else if (declaredRoutes.some((r) => r.id === active)) {
+    /*
+     * F2：插件页面。
+     *
+     * `sub` 与内置页面同一约定：hash 首段之后的部分（去掉前导 `/`）交给页面自己解析——
+     * 宿主不规定插件页面内部的路径结构，那正是"最大自由度"的落点。
+     *
+     * 两种状态刻意分开渲染（见下方 PluginRoutePendingPage）：**声明了但没注册组件**
+     * 与"地址根本不存在"是两件事，前者是插件故障、后者是用户走错，混成同一个 notfound
+     * 会让排障方向整体跑偏。
+     */
+    const entry = registeredRoute(active)
+    const sub = route.slice(active.length).replace(/^\/+/, '')
+    body = entry ? (
+      <PluginRouteOutlet entry={entry} props={{ sub, query: routeQuery, onNavigate: nav }} />
+    ) : (
+      <PluginRoutePendingPage id={active} />
+    )
+  }
   else
     body = (
       /*
@@ -457,10 +549,17 @@ export function App(): ReactNode {
 
       <header
         className={cn(
-          // 顶栏在两种主题下都保持深色（产品外壳的既有观感），故用 --color-header 系列
+          /*
+           * 顶栏**跟随主题**：浅色主题下是白底深字，深色主题下才是深色的。
+           * 此前这里是"两种主题都保持深色"，症状就是"浅色主题的顶部还是暗色主题的样式"。
+           * 因此本元素及其所有子元素**只准用 `--color-header*` 语义色**，
+           * 不得写死 `text-white` / `bg-white/10` 这类"为深底写死"的值 —— 它们在浅色主题下
+           * 要么白字压白底（看不见），要么白底压白底（无反馈）。
+           * 分界用 `--color-header-line` + `--gw-header-shadow`（浅色下轻、深色下重）。
+           */
           'sticky top-0 z-[var(--z-sticky)] flex h-[var(--spacing-header)] items-center',
-          'gap-3 bg-header px-[var(--spacing-gutter)] text-header-ink',
-          'shadow-[0_1px_4px_rgb(0_0_0/18%)] sm:gap-6',
+          'gap-3 border-b border-header-line bg-header px-[var(--spacing-gutter)] text-header-ink',
+          'shadow-[var(--gw-header-shadow)] sm:gap-6',
         )}
       >
         {/* 品牌：可点回首页。用 <a href="#/wiki"> 而非带 onClick 的 div——
@@ -477,19 +576,23 @@ export function App(): ReactNode {
           <span aria-hidden="true" className="self-center text-accent">
             <BookText className="size-5" />
           </span>
-          <span className="text-wordmark leading-none font-bold tracking-[0.3px] text-white">GeeWiki</span>
+          <span className="text-wordmark leading-none font-bold tracking-[0.3px] text-header-ink">GeeWiki</span>
         </a>
 
         {/* 主导航（≥md 显示）。窄屏折叠进右侧的「菜单」下拉 */}
         <nav aria-label="主导航" className="hidden flex-1 items-center gap-1 md:flex">
           <NavTab item={WIKI_ITEM} active={active === WIKI_ITEM.id} onNavigate={nav} />
-
           {/*
-            权限治理入口（M1）：与「知识库」平级的**产品入口**，不是运维台面 ——
-            判据是 manageVisibility（member 也有），见 GOVERN_NAV 的注释。
-            与「管理 ▾」同一个失败关闭策略：无能力 ⇒ 一个标签都不渲染。
+            F2：声明 `group: 'main'` 的插件页面与「知识库」平级。
+            判据同样是 `visibleDests`（`requires` 缺省 = 所有人可见，含未登录）——
+            插件页面因此可以既是匿名可读的公开页，也可以是要 `administer` 的台面页。
           */}
-          {governDests.map((item) => (
+          {pluginDestsToNavItems(
+            visibleDests(
+              pluginNavDests(declaredRoutes).filter((d) => d.group === 'main'),
+              auth.capabilities,
+            ),
+          ).map((item) => (
             <NavTab key={item.id} item={item} active={active === item.id} onNavigate={nav} />
           ))}
 
@@ -507,8 +610,8 @@ export function App(): ReactNode {
                     'inline-flex h-8 items-center gap-1.5 rounded-md px-4 text-sm',
                     'transition-colors duration-150 ease-standard',
                     adminActive
-                      ? 'bg-white/15 font-semibold text-white'
-                      : 'text-header-dim hover:bg-white/10 hover:text-white',
+                      ? 'bg-header-active font-semibold text-header-ink'
+                      : 'text-header-dim hover:bg-header-hover hover:text-header-ink',
                     focusRing,
                   )}
                 >
@@ -540,7 +643,7 @@ export function App(): ReactNode {
             size="sm"
             icon={<Search className="size-4" />}
             onClick={openPalette}
-            className="hidden text-header-dim hover:bg-white/10 hover:text-white sm:inline-flex"
+            className="hidden text-header-dim hover:bg-header-hover hover:text-header-ink sm:inline-flex"
             aria-label="打开命令面板（快捷键 ⌘K 或 /）"
             aria-haspopup="dialog"
             title="搜索页面或执行命令（⌘K 或 /）"
@@ -559,7 +662,7 @@ export function App(): ReactNode {
                 iconOnly
                 icon={<MenuIcon className="size-4" />}
                 aria-label="打开导航菜单"
-                className="text-header-dim hover:bg-white/10 hover:text-white md:hidden"
+                className="text-header-dim hover:bg-header-hover hover:text-header-ink md:hidden"
               />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
@@ -567,27 +670,6 @@ export function App(): ReactNode {
                 {WIKI_ITEM.icon}
                 {WIKI_ITEM.label}
               </DropdownMenuItem>
-              {/*
-                权限治理（窄屏）。**刻意不复用 `NavMenuItems`** —— 那个渲染函数会顺带
-                附挂「系统状态」（运维台面的东西），挂在这里会让普通成员看到一个服务健康
-                入口。两处渲染的是同一个 `governDests`，所以判据不会分叉。
-              */}
-              {governDests.length > 0 && (
-                <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuLabel>权限治理</DropdownMenuLabel>
-                  {governDests.map((item) => (
-                    <DropdownMenuItem
-                      key={item.id}
-                      active={active === item.id}
-                      onSelect={() => nav(item.id)}
-                    >
-                      {item.icon}
-                      {item.label}
-                    </DropdownMenuItem>
-                  ))}
-                </>
-              )}
               {/*
                 与桌面端**同一判据**（同一个 `adminDests`）：无可见的运维目的地时，
                 连分组标题与「系统状态」都不出现。窄屏曾经是这段清单的**复制粘贴**，
@@ -655,6 +737,17 @@ export function App(): ReactNode {
       <footer className="app-footer">
         <SlotOutlet name="app-footer" />
       </footer>
+
+      {/*
+        常驻 AI 输入条（决策 1 / 17）：**放在 `<main>` 之外**，与页头页脚同一位置。
+
+        位置本身就是设计的一部分：App 不随路由重挂 ⇒ 组件实例连同它内部的会话状态
+        在切页时存活（决策 9 的"切页不丢会话"）。挪进任何一条路由的组件树都会让这条失效，
+        且症状很隐蔽——会话不是报错，只是"切一次页就没了"。
+
+        dock 自身的登录判定与按需加载都在 `AppDock` 里（见该文件头：为什么三者必须同生同死）。
+      */}
+      <AppDock route={route} openPage={(slug) => nav(`wiki/${slug}`)} />
     </div>
   )
 }
@@ -690,7 +783,7 @@ function AuthArea({
             variant="ghost"
             size="sm"
             icon={<UserRound className="size-4" />}
-            className="text-header-dim hover:bg-white/10 hover:text-white"
+            className="text-header-dim hover:bg-header-hover hover:text-header-ink"
             aria-label={`账号菜单（当前身份：${auth.user.displayName}）`}
           >
             <span className="hidden max-w-[12ch] truncate sm:inline">{auth.user.displayName}</span>
@@ -716,7 +809,7 @@ function AuthArea({
   }
   if (auth.loading) {
     // 占位保持宽度稳定；`aria-hidden` 是因为它没有语义（读屏不该播报一个空按钮）
-    return <span aria-hidden="true" className="inline-block h-8 w-16 rounded-md bg-white/10" />
+    return <span aria-hidden="true" className="inline-block h-8 w-16 rounded-md bg-header-hover" />
   }
   const needsSetup = auth.setupRequired === true
   return (
@@ -725,7 +818,7 @@ function AuthArea({
       size="sm"
       icon={<LogIn className="size-4" />}
       onClick={() => (window.location.hash = needsSetup ? '/setup' : '/login')}
-      className="text-header-dim hover:bg-white/10 hover:text-white"
+      className="text-header-dim hover:bg-header-hover hover:text-header-ink"
     >
       {needsSetup ? '初始化' : '登录'}
     </Button>
@@ -791,8 +884,8 @@ function NavTab({
         'inline-flex h-8 items-center gap-1.5 rounded-md px-4 text-sm',
         'transition-colors duration-150 ease-standard',
         active
-          ? 'bg-white/15 font-semibold text-white'
-          : 'text-header-dim hover:bg-white/10 hover:text-white',
+          ? 'bg-header-active font-semibold text-header-ink'
+          : 'text-header-dim hover:bg-header-hover hover:text-header-ink',
         focusRing,
       )}
     >

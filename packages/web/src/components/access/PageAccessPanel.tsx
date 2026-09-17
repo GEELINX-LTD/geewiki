@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { FileText, Lock, RefreshCw } from 'lucide-react'
-import { api, type PageDetail, type PageVisibility } from '../../api'
+import { api, type PageDetail } from '../../api'
 import { Button } from '../../ui/Button'
 import { Card, CardBody, CardHeader } from '../../ui/Card'
 import { EmptyState } from '../../ui/EmptyState'
@@ -29,11 +29,28 @@ import { LoadingState } from '../../ui/LoadingState'
 import { Skeleton } from '../../ui/Skeleton'
 import { describeError } from '../../lib/errorText'
 import { invalidatePages } from '../../lib/pagesStore'
-import { BlocksSection } from './BlocksSection'
 import { GrantsSection } from './GrantsSection'
 import { RequestsSection } from './RequestsSection'
 import { VisibilitySection } from './VisibilitySection'
 
+/**
+ * 页面的权限面板：**页面档位 + 例外授予 + 访问申请**，三块。
+ *
+ * ## 为什么没有"块级"那一块
+ *
+ * 曾经有第四块 `BlocksSection`（逐块的档位与授权名单）。实测它是作者最用不上的一块：
+ * 段落档位**就是正文里的标记**（在**编辑器**里用工具栏的锁按钮改，与正文一起保存、
+ * 一起进版本历史），而"给某一段单独授权"要先把那一段标记成 `granted` 才有意义 ——
+ * 那件事发生在编辑器里，不在这里。留在弹窗里只会让它更长、更不像"设置这一页对谁可见"。
+ *
+ * ⚠️ **界面收起、能力不删**：`components/access/BlocksSection.tsx` 仍在，服务端的
+ * `GET /api/pages/:slug/blocks` 与块授权端点也仍在。要恢复这一块，把它加回下面的渲染即可。
+ *
+ * ## 为什么只有这一份实现
+ *
+ * 阅读页的「权限」对话框与旧的 `#/access/<slug>` 落点用的是**同一个组件** ——
+ * 任何"另写一份治理界面"的做法都会与服务端的判据漂移，而漂移的后果是权限被改错。
+ */
 export function PageAccessPanel({
   slug,
   onNavigate,
@@ -44,9 +61,6 @@ export function PageAccessPanel({
 }): ReactNode {
   const [page, setPage] = useState<PageDetail | null>(null)
   const [err, setErr] = useState<unknown>(null)
-  /** 块的档位选项要按**页面当前档位**收敛 ⇒ 档位保存成功后由 VisibilitySection 回传更新 */
-  const [visibility, setVisibility] = useState<PageVisibility>('private')
-
   const load = useCallback(async (): Promise<void> => {
     setErr(null)
     try {
@@ -60,7 +74,6 @@ export function PageAccessPanel({
        */
       const p = await api.page(slug)
       setPage(p)
-      setVisibility(p.visibility ?? 'private')
     } catch (e: unknown) {
       setErr(e)
       setPage(null)
@@ -167,13 +180,9 @@ export function PageAccessPanel({
           inherit: page.inherit ?? true,
           published: page.published === true,
         }}
-        onSaved={(next) => {
-          setVisibility(next.visibility)
-          afterWrite()
-        }}
+        onSaved={() => afterWrite()}
       />
       <GrantsSection slug={page.slug} onChanged={afterWrite} />
-      <BlocksSection slug={page.slug} pageVisibility={visibility} onChanged={afterWrite} />
       {/*
         审批区在**有能力时**才渲染（这里已经过了 canManageVisibility 判定）；
         无能力时整个面板根本走不到这一段 —— 不显示禁用按钮。

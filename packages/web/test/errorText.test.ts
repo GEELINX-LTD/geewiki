@@ -8,7 +8,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ApiError } from '../src/api'
-import { cleanHint, describeError, streamErrorText } from '../src/lib/errorText'
+import { cleanHint, describeError } from '../src/lib/errorText'
+/*
+ * `streamErrorText`（LLM 内部错误码 → 人话）原先住在这里，随问答界面一起迁入了
+ * `@geewiki/ai-qa` 自带的界面：那套码（RATE_LIMIT / NO_ADAPTER / …）是模型契约的词汇，
+ * 只有问答面板会见到。宿主留着它就等于替别人的功能维护文案。
+ */
 
 test('cleanHint：剥掉 API 路径与英文堆栈，并截断', () => {
   // 纯技术串（无中文）一律不展示 —— 这对用户零信息量
@@ -77,16 +82,3 @@ test('describeError：非 Error 的抛出值也不会把原始值泄漏到标题
   assert.ok(!v.hint.includes('/api/'))
 })
 
-test('streamErrorText：已知码给人话，未知码有兜底且**不回显内部码**', () => {
-  const rate = streamErrorText('RATE_LIMIT')
-  assert.match(rate.title, /限流/)
-  assert.ok(!rate.title.includes('RATE_LIMIT'), '内部错误码不得出现在标题里')
-
-  const unknown = streamErrorText('SOMETHING_NEW')
-  assert.ok(unknown.title.length > 0)
-  assert.ok(!unknown.title.includes('SOMETHING_NEW'))
-  // 每个分支都必须有"怎么办"
-  for (const code of ['RATE_LIMIT', 'TIMEOUT', 'AUTH', 'NETWORK', 'ABORTED', 'NOPE']) {
-    assert.ok(streamErrorText(code).hint.length > 0, `${code} 必须有 hint`)
-  }
-})

@@ -18,8 +18,13 @@ test('titleForRoute：产品名后缀与分区名', () => {
   assert.equal(titleForRoute(''), `知识库 · ${APP_NAME}`)
   assert.equal(titleForRoute('wiki'), `知识库 · ${APP_NAME}`)
   assert.equal(titleForRoute('wiki/'), `知识库 · ${APP_NAME}`)
-  assert.equal(titleForRoute('plugins'), `插件管理 · ${APP_NAME}`)
   assert.equal(titleForRoute('graph'), `依赖图 · ${APP_NAME}`)
+  /*
+   * `plugins` 已不再是独立分区（并入依赖图），故它按"未知分区"回退到产品名——
+   * 顺带钉住 `#/plugins` 不会因为分区表里少了一项而崩掉标题。
+   * 注意路由本身仍可用：`App.tsx` 在解析处把它改写成 `graph`（老书签不会 404）。
+   */
+  assert.equal(titleForRoute('plugins'), APP_NAME)
 })
 
 test('titleForRoute：详情页用页面标题，取不到时退化为「知识库」而不是 slug', () => {
@@ -36,10 +41,14 @@ test('titleForRoute：详情页用页面标题，取不到时退化为「知识�
 test('titleForRoute：知识库下的保留子路由', () => {
   assert.equal(titleForRoute('wiki/new'), `新建页面 · ${APP_NAME}`)
   assert.equal(titleForRoute('wiki/search'), `搜索 · ${APP_NAME}`)
-  assert.equal(titleForRoute('wiki/ask'), `问答 · ${APP_NAME}`)
   // 带查询串：查询串不进标题（可能很长）
   assert.equal(titleForRoute('wiki/search/%E6%A3%80%E7%B4%A2'), `搜索 · ${APP_NAME}`)
-  assert.equal(titleForRoute('wiki/ask/%E6%A3%80%E7%B4%A2'), `问答 · ${APP_NAME}`)
+  /*
+   * `wiki/ask` 已无视图（P8 / 决策 17），故它落到详情页分支：没有页面标题时退化为「知识库」。
+   * 钉住这一条是为了防止"删了视图却留下标题映射"——那种残留会让 tab 上出现一个
+   * 点不进去的分区名。
+   */
+  assert.equal(titleForRoute('wiki/ask'), `知识库 · ${APP_NAME}`)
   // 详情编辑页
   assert.equal(titleForRoute('wiki/getting-started/edit'), `编辑页面 · ${APP_NAME}`)
 })

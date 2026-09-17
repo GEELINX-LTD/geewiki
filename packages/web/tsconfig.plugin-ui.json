@@ -1,0 +1,44 @@
+{
+  /**
+   * 插件自带界面（`packages/plugin-{ai-assistant,ai-summary,oidc}/ui/**`）的**独立** typecheck 配置。
+   *
+   * ## 为什么不并进 `tsconfig.json`
+   * 那几个目录**不在** `packages/web` 里：`tsconfig.json` 的 `include` 是 `["src","test","vite.config.ts"]`，
+   * 把插件源码塞进去会让"web 自己的类型检查"依赖别的包的文件布局。单独一份配置、由
+   * `@geewiki/web` 的 `typecheck` 脚本按序跑两次，边界清楚（谁坏了看脚本名就知道）。
+   *
+   * ## 为什么不放进插件包自己的 tsconfig
+   * 插件包的 `tsconfig.json` 是**服务端**配置：`extends ../../tsconfig.base.json` ⇒
+   * `moduleResolution: NodeNext` + 无 `DOM` lib + 无 `jsx`。而 `ui/` 是浏览器代码（JSX、
+   * `fetch`、`<dialog>`）。更要命的是 **react 只装在 `packages/web/node_modules`** ——
+   * 从 `packages/plugin-ai-summary/ui/index.tsx` 出发做 Node 解析找不到 `react` 与 `@types/react`，
+   * 类型检查会直接报"找不到模块"。所以这里用 `paths` 把它们指到 web 的那份安装。
+   *
+   * 注意 `paths` 只是**类型解析**的权宜：构建期 `react` / `react/jsx-runtime` 仍是 external，
+   * 运行期由宿主页面的 import map 解析（见 `fixtures/vite.config.ts`）。
+   */
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "useDefineForClassFields": true,
+    "types": ["vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "react": ["./node_modules/@types/react"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"]
+    }
+  },
+  "include": [
+    "../../packages/plugin-ai-assistant/ui",
+    "../../packages/plugin-ai-summary/ui",
+    "../../packages/plugin-oidc/ui"
+  ]
+}

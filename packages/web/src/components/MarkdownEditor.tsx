@@ -35,7 +35,7 @@
  *    拖了 5 个文件，只有"失败的那一行"能说清是哪一个没上去。
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { EditorState, EditorSelection, Compartment, type Extension } from '@codemirror/state'
+import { EditorState, Compartment, type Extension } from '@codemirror/state'
 import {
   EditorView,
   keymap,
@@ -68,6 +68,7 @@ import { markdown, markdownLanguage, insertNewlineContinueMarkup, deleteMarkupBa
  */
 import { tags as t } from '@lezer/highlight'
 import { Button } from '../ui/Button'
+import { cn } from '../ui/cn'
 import { errorLine } from '../lib/errorText'
 import { useSlowHint } from '../lib/useSlowHint'
 import {
@@ -76,6 +77,20 @@ import {
   uploadPlaceholder,
   uploadSummaryText,
 } from '../lib/attachmentPlan'
+import { EditorToolbar, type BlockTierControl } from './editor/EditorToolbar'
+import { activeFormats, historyDepth, runFormatAction, runRedo, runUndo } from './editor/markdownCommands'
+import { liveRender } from './editor/liveRender'
+import {
+  BLOCK_TIER_OPTIONS,
+  parseSourceDoc,
+  blockAtOffset,
+  regionOfBlock,
+  setBlockTier,
+  setRegionTier,
+} from '../lib/editorBlocks'
+import { readStoredMode, storeMode, type EditorMode } from '../lib/editorModePlan'
+import { minimalEdit, type FormatAction } from '../lib/markdownActions'
+import type { BlockVisibility, PageVisibility } from '../api'
 
 const highlightStyle = HighlightStyle.define([
   { tag: t.heading1, fontSize: '1.5em', fontWeight: '700', color: 'var(--gw-ink)' },
@@ -142,58 +157,30 @@ const baseTheme = EditorView.theme({
 })
 
 /**
- * 加粗：把选区包进 `**`。
+ * 加粗（⌘/Ctrl+B）走**工具栏同一份实现**（`components/editor/markdownCommands.ts`）。
  *
- * 自己写而不是找现成命令：CodeMirror 没有内建的"切换加粗"（那是 Markdown 编辑器层面的
- * 业务动作）。做法与常见编辑器一致：
- * - 有选区 ⇒ 包住选区；若两侧已有 `**` 则**去掉**（再按一次取消，符合直觉）；
- * - 无选区 ⇒ 插入 `****` 并把光标放中间，用户直接打字即为粗体。
- *
- * 用 `changeByRange` 而不是拼接字符串：它由 CodeMirror 统一处理多光标/多选区，
- * 且返回的 `selection` 会被正确映射（否则多光标下选区会错位）。
+ * 这里刻意不留第二份"加粗"代码：原先它自成一个 `toggleBold`（当时只有快捷键一条路径），
+ * 现在工具栏按钮也要加粗 —— 两份实现必然漂移，而"按钮和快捷键做出来的东西不一样"
+ * 是最难被发现的一类 bug。共用后多光标行为也保持不变（`runFormatAction` 内部是
+ * `changeByRange`），且新增能力（斜体/链接/表格/权限菜单）与降级 textarea 一并共享。
  */
-function toggleBold(view: EditorView): boolean {
-  const { state } = view
-  const changes = state.changeByRange((range) => {
-    const before = state.sliceDoc(Math.max(0, range.from - 2), range.from)
-    const after = state.sliceDoc(range.to, Math.min(state.doc.length, range.to + 2))
-    // 情况一：选区外已有 `**…**` ⇒ 取消加粗
-    if (before === '**' && after === '**' && range.from !== range.to) {
-      return {
-        changes: [
-          { from: range.from - 2, to: range.from },
-          { from: range.to, to: range.to + 2 },
-        ],
-        range: EditorSelection.range(range.from - 2, range.to - 2),
-      }
-    }
-    // 情况二：选中的文本自身以 `**` 开头结尾 ⇒ 去掉标记
-    const text = state.sliceDoc(range.from, range.to)
-    if (range.from !== range.to && text.startsWith('**') && text.endsWith('**') && text.length >= 4) {
-      const inner = text.slice(2, -2)
-      return {
-        changes: { from: range.from, to: range.to, insert: inner },
-        range: EditorSelection.range(range.from, range.from + inner.length),
-      }
-    }
-    // 情况三：普通包裹
-    return {
-      changes: { from: range.from, to: range.to, insert: `**${text}**` },
-      range:
-        range.from === range.to
-          ? EditorSelection.range(range.from + 2, range.from + 2)
-          : EditorSelection.range(range.from, range.to + 4),
-    }
-  })
-  view.dispatch(changes, { scrollIntoView: true, userEvent: 'input' })
-  return true
-}
 
 export interface MarkdownEditorHandle {
   /** 在光标处插入（有选区时**替换**选区 —— 与 CodeMirror 的 `replaceSelection` 同语义） */
   insertAtCursor(text: string): void
   /** 只替换当前选区；无选区时不动作并返回 `false`（调用方据此提示而不是静默） */
   replaceSelection(text: string): boolean
+  /**
+   * **整篇替换**文档内容（AI 回退用：把草稿还原到某一轮之前）。
+   *
+   * 为什么必须是"整篇"而不是"再插一段"：回退的语义是**回到那个状态**，而两次 AI 写入
+   * 之间的草稿差异不是一段可插入的文本（模型可能删、可能改、可能重排）。用插入去模拟回退
+   * 只会让草稿越来越长、且永远回不到原样。
+   *
+   * 与 `insertAtCursor` 一样走 `userEvent: 'input'` 事务 ⇒ **⌘Z 一次即可撤销**，
+   * 即"回退"本身也是可撤销的（否则用户点错一次「回退」就再也回不来了）。
+   */
+  setDoc(text: string): void
 }
 
 export interface MarkdownEditorProps {
@@ -229,6 +216,27 @@ export interface MarkdownEditorProps {
    * 全部走 `userEvent: 'input'` 事务 ⇒ **⌘Z 一次即可撤销**（AI 产物绝不进"不可撤销"的路径）。
    */
   handleRef?: React.RefObject<MarkdownEditorHandle | null>
+  /**
+   * **块级阅读权限**的编辑能力（工具栏最右那个锁按钮）。
+   *
+   * `null`/不传 = 本场景不提供：第三方编辑器插件占用 `editor` 插槽时它拿不到正文模型，
+   * 没有 `manageVisibility` 权限的用户也不该看到这个入口（**不渲染**而不是渲染成灰按钮，
+   * 见仓库的"能力不存在就不要给一个点不动的按钮"约定）。
+   *
+   * 这里改的是**正文里的 gated 标记**（`<!--gated:org-->` 这类），不是新的后端端点：
+   * 服务端在保存时重新解析，故"改档位"与"改正文"是同一条保存路径、同一个版本历史。
+   * `pageVisibility` 只用于提示"块档位不能宽过页面档位"。
+   */
+  blockTiers?: { pageVisibility: PageVisibility | null } | null
+  /**
+   * 「授权给谁…」：把**光标所在的那一段**交给宿主去管理例外授予。
+   *
+   * 为什么由宿主执行而不是编辑器自己发请求：编辑器有"绝不发网络请求"的既有约定
+   * （它只负责编辑区，鉴权/缓存/错误文案都在宿主）。编辑器交出去的是
+   * `{ ordinal, excerpt }` —— `ordinal` 与服务端 `parseBlocks` 同序（有镜像守卫），
+   * 宿主据此换到服务端的块 id（见 `components/access/BlockGrantsDialog.tsx`）。
+   */
+  onManageBlockGrants?: (block: { ordinal: number; excerpt: string }) => void
 }
 
 /* ------------------------- 附件上传：可复用的纯函数 ------------------------- */
@@ -284,6 +292,8 @@ interface UploadSlot {
 export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
   const host = useRef<HTMLDivElement | null>(null)
   const view = useRef<EditorView | null>(null)
+  /** 工具栏"上传附件"按钮触发的隐藏文件选择器 */
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   /** 用 ref 持有回调：keymap 在创建时闭包捕获，若直接捕获 props 就会永远用第一版回调 */
   const onChangeRef = useRef(props.onChange)
   const onSaveRef = useRef(props.onSave)
@@ -303,7 +313,15 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
    * 不比对就上报会让宿主每敲一个字就重渲染一次工具条（还会打断输入法组合）。
    */
   const lastSelectionRef = useRef<string>('')
-  const editable = new Compartment()
+  /*
+   * Compartment 必须放在 **ref** 里，不能在组件体里 `new Compartment()`：
+   * 后者每次渲染都造一个新实例，而"重建配置"要用**同一个**实例才生效
+   * （`Compartment.reconfigure` 是按实例查表的）。放 body 里会让重配置静默失效 ——
+   * 这正是本文件此前 `editable` 的隐患（`disabled` 变化后编辑器仍可输入），一并修掉。
+   */
+  const editable = useRef(new Compartment())
+  /** 模式相关扩展（实时渲染 / 行号）在它里面，切模式=重配置，不重建编辑器 */
+  const modeSlot = useRef(new Compartment())
   /** 占位序号：同一次会话内单调递增，保证多文件同时上传时占位互不冲突 */
   const seqRef = useRef(0)
   /** 在飞的上传数量（驱动"仍在上传…"的慢提示） */
@@ -313,6 +331,140 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
   /** 失败待重试的文件（连同它们在正文里的失败说明，重试成功后按文本替换掉） */
   const [failures, setFailures] = useState<UploadSlot[]>([])
   const slow = useSlowHint(uploading > 0)
+
+  /* ------------------------- 工具栏：模式 / 状态 / 块权限 ------------------------- */
+
+  /**
+   * 编辑模式。**由编辑器自己持有**：它纯粹是"编辑区怎么画"，宿主的保存路径、
+   * 草稿、冲突检测完全不受影响；持久化在 localStorage（见 `lib/editorModePlan.ts`）。
+   */
+  const [mode, setMode] = useState<EditorMode>(() => readStoredMode())
+  /** 当前选区已处于哪些结构（工具栏 aria-pressed）。用 key 去重，避免每次按键都重渲染工具栏 */
+  const [active, setActive] = useState<ReadonlySet<FormatAction>>(() => new Set<FormatAction>())
+  const activeKeyRef = useRef('')
+  /**
+   * 撤销/重做深度（如实呈现"能不能撤销"）。
+   * 变量名**不能**叫 `history`：那会遮蔽 `@codemirror/commands` 的 `history()` 扩展
+   * （TypeScript 会报"这个表达式不可调用"，而真正的原因在几十行之外的扩展列表里）。
+   */
+  const [hist, setHist] = useState({ undo: 0, redo: 0 })
+  const historyKeyRef = useRef('0:0')
+  /** 光标所在块的权限状态（工具栏的锁按钮） */
+  const [tier, setTier] = useState<BlockTierControl | null>(null)
+  const tierKeyRef = useRef('')
+  /** 块权限改动的结果说明（成功/被拒绝的原因都走这里，绝不静默） */
+  const [tierNote, setTierNote] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
+  /**
+   * `blockTiers` 的 ref：`syncToolbar` 与 DOM handler 都建在空依赖的闭包里，
+   * 直接捕获 props 会永远读到第一版（"新页面保存后仍然没有权限入口"这类 bug 的来源）。
+   */
+  const tiersRef = useRef(props.blockTiers ?? null)
+  tiersRef.current = props.blockTiers ?? null
+
+  /**
+   * 把编辑器的实时状态同步给工具栏（选区结构 / 历史深度 / 当前块档位）。
+   *
+   * 每次 update 都算一遍，但**只在真的变化时** setState：否则每敲一个字都会重渲染
+   * 整个工具栏（十几个按钮 + Radix 菜单），输入法组合期间还会被打断。
+   */
+  const syncToolbar = useCallback((instance: EditorView): void => {
+    const act = activeFormats(instance)
+    const actKey = [...act].sort().join(',')
+    if (actKey !== activeKeyRef.current) {
+      activeKeyRef.current = actKey
+      setActive(act)
+    }
+    const depth = historyDepth(instance.state)
+    const depthKey = `${depth.undo}:${depth.redo}`
+    if (depthKey !== historyKeyRef.current) {
+      historyKeyRef.current = depthKey
+      setHist(depth)
+    }
+    // 没有权限编辑能力时不必解析正文（这一步是 O(文档长度)）
+    if (tiersRef.current === null) {
+      if (tierKeyRef.current !== '') {
+        tierKeyRef.current = ''
+        setTier(null)
+      }
+      return
+    }
+    const doc = parseSourceDoc(instance.state.doc.toString())
+    const block = blockAtOffset(doc, instance.state.selection.main.head)
+    const region = block === null ? null : regionOfBlock(doc, block.ordinal)
+    const next: BlockTierControl | null =
+      block === null
+        ? null
+        : {
+            current: block.marker ?? 'public',
+            regionBlocks: region?.blocks.length ?? 1,
+            pageVisibility: tiersRef.current.pageVisibility,
+          }
+    const nextKey =
+      next === null ? 'none' : `${next.current}:${next.regionBlocks}:${next.pageVisibility ?? ''}`
+    if (nextKey !== tierKeyRef.current) {
+      tierKeyRef.current = nextKey
+      setTier(next)
+    }
+  }, [])
+  const syncRef = useRef(syncToolbar)
+  syncRef.current = syncToolbar
+
+  /**
+   * 打开「授权给谁…」（交给宿主）。段落档位设成「需单独授权」之后，**只有这里**能指定
+   * 谁被允许读这一段 —— 缺了它那一档就是"设得出来、没人能看"的死档。
+   */
+  const manageGrants = useCallback((): void => {
+    const instance = view.current
+    if (instance === null) return
+    const doc = parseSourceDoc(instance.state.doc.toString())
+    const block = blockAtOffset(doc, instance.state.selection.main.head)
+    if (block === null) {
+      setTierNote({ tone: 'err', text: '把光标放到要授权的那一段里，再打开「授权给谁…」' })
+      return
+    }
+    // 摘要取首行并截断：对话框里用它让作者确认"要授权的就是这一段"
+    const firstLine = block.text.split('\n')[0] ?? ''
+    onManageGrantsRef.current?.({ ordinal: block.ordinal, excerpt: firstLine.slice(0, 160) })
+  }, [])
+  /** `onManageBlockGrants` 的 ref（空依赖的 DOM handler / 工具栏回调里读最新实现） */
+  const onManageGrantsRef = useRef(props.onManageBlockGrants)
+  onManageGrantsRef.current = props.onManageBlockGrants
+
+  /**
+   * 改当前块的档位。**改的是正文里的 gated 标记**：
+   * `lib/editorBlocks.ts` 负责重写并自检（块数/正文/档位三项对不上就放弃改动），
+   * 这里只把结果派发成一处最小改动 —— 于是它与手打标记走**完全同一条**保存路径。
+   */
+  const applyTier = useCallback((target: BlockVisibility, whole: boolean): void => {
+    const instance = view.current
+    if (instance === null) return
+    const text = instance.state.doc.toString()
+    const doc = parseSourceDoc(text)
+    const block = blockAtOffset(doc, instance.state.selection.main.head)
+    if (block === null) {
+      setTierNote({ tone: 'err', text: '把光标放到要改的那一段里，才能改它的阅读权限' })
+      return
+    }
+    const res = whole ? setRegionTier(text, block.ordinal, target) : setBlockTier(text, block.ordinal, target)
+    if (!res.ok) {
+      setTierNote({ tone: 'err', text: res.error })
+      return
+    }
+    const label = BLOCK_TIER_OPTIONS.find((o) => o.id === target)?.label ?? target
+    if (!res.changed) {
+      setTierNote({ tone: 'ok', text: `这一段已经是「${label}」，正文没有改动` })
+      return
+    }
+    const diff = minimalEdit(text, res.text)
+    if (diff !== null) {
+      // userEvent: 'input' ⇒ ⌘Z 一次撤销（与附件上传、AI 采纳同一约定）
+      instance.dispatch({ changes: diff, userEvent: 'input' })
+    }
+    setTierNote({
+      tone: 'ok',
+      text: `已把${whole ? '整个受限区段' : '这一段'}改为「${label}」——标记写进了正文，保存后对访客生效`,
+    })
+  }, [])
 
   onChangeRef.current = props.onChange
   onSaveRef.current = props.onSave
@@ -352,6 +504,20 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
         if (instance.state.selection.main.empty) return false
         insertIntoView(instance, text, null)
         return true
+      },
+      setDoc: (text: string) => {
+        const instance = view.current
+        if (instance === null) return
+        const doc = instance.state.doc
+        /* 内容已经相同就不派发事务：派发一次"没有变化"的替换会把光标弹到文首，
+           而用户看到的是一次莫名其妙的跳转。 */
+        if (doc.toString() === text) return
+        instance.dispatch({
+          changes: { from: 0, to: doc.length, insert: text },
+          selection: { anchor: Math.min(instance.state.selection.main.anchor, text.length) },
+          userEvent: 'input',
+          scrollIntoView: true,
+        })
       },
     }
     return () => {
@@ -460,14 +626,33 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
     startBatch(pending, instance, upload)
   }, [failures, startBatch])
 
+  /**
+   * 模式相关的扩展集合。**切模式 = 重配置这一个 compartment**，
+   * 编辑器实例、撤销栈、滚动位置、附件上传的占位都原样保留
+   * （重建编辑器会把这些全丢掉，而这正是"切个模式内容没了"的事故形态）。
+   */
+  const modeExtensions = useCallback((m: EditorMode): Extension => {
+    return [
+      // 行号只在源码模式显示（理由见创建 effect 里的注释）
+      ...(m === 'source' ? [lineNumbers(), highlightActiveLineGutter()] : []),
+      highlightActiveLine(),
+      // 实时渲染：只对"非活动块"做装饰，且都是 Decoration（不改文档）
+      ...(m === 'live' ? [liveRender({ hideMarks: true, renderImages: true, renderBlocks: true })] : []),
+    ]
+  }, [])
+
   useEffect(() => {
     const parent = host.current
     if (parent === null) return
 
     const extensions: Extension[] = [
-      lineNumbers(),
-      highlightActiveLineGutter(),
-      highlightActiveLine(),
+      /*
+        行号与"当前行高亮"放进 `modeSlot`：**实时渲染模式下不显示行号**。
+        理由是它们会撒谎：排版后的段落是一"行"，但软换行让它占了好几屏，
+        行号却只递增一次；作者会据此判断"文档有多长/我在第几行"，而那是错的。
+        源码模式下两者都保留（那才是行号真正有用的场景：定位、报错行）。
+      */
+      modeSlot.current.of(modeExtensions(mode)),
       history(),
       drawSelection(),
       dropCursor(),
@@ -493,7 +678,7 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
         不是会变化的运行期值。
       */
       EditorView.contentAttributes.of({ 'aria-label': props.ariaLabel }),
-      editable.of(EditorView.editable.of(!props.disabled)),
+      editable.current.of(EditorView.editable.of(!props.disabled)),
       keymap.of([
         // 保存：拦截浏览器默认（否则会弹"保存网页"）——真正落盘由父组件负责
         {
@@ -504,7 +689,10 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
             return true
           },
         },
-        { key: 'Mod-b', preventDefault: true, run: toggleBold },
+        // 格式快捷键与工具栏走**同一份实现**（`runFormatAction`），不存在"按钮和快捷键不一样"
+        { key: 'Mod-b', preventDefault: true, run: (v) => runFormatAction(v, 'bold') },
+        { key: 'Mod-i', preventDefault: true, run: (v) => runFormatAction(v, 'italic') },
+        { key: 'Mod-k', preventDefault: true, run: (v) => runFormatAction(v, 'link') },
         // 列表/引用里回车自动续行，退格跨过标记——Markdown 编辑最常用的两个动作
         { key: 'Enter', run: insertNewlineContinueMarkup },
         { key: 'Backspace', run: deleteMarkupBackward },
@@ -519,6 +707,8 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
         if (u.docChanged) onChangeRef.current(u.state.doc.toString())
         // 选区变化也要上报：宿主据此决定"改写选中"能不能点
         if (u.selectionSet || u.docChanged || u.focusChanged) reportSelection(u.view)
+        // 工具栏状态（结构高亮 / 撤销深度 / 当前块档位）随文档与选区变化重算
+        if (u.selectionSet || u.docChanged) syncRef.current(u.view)
       }),
       /*
         附件：粘贴 / 拖入文件。两个 handler 都**自己 preventDefault**（理由见文件头）：
@@ -555,6 +745,8 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
     view.current = instance
     // 首次上报：宿主可能在挂载前就渲染了工具条，不报一次会让"有选区/无选区"停在初始态
     reportSelection(instance)
+    // 工具栏的初始状态也要报一次（否则第一次点按钮前它显示的是"未处于任何结构"）
+    syncRef.current(instance)
     return () => {
       instance.destroy()
       view.current = null
@@ -575,16 +767,70 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
       // 外部整体替换不进入撤销栈的历史语义吗？——进入，用户应能撤销"恢复草稿"
       userEvent: 'input',
     })
+    // 宿主改了正文（草稿恢复、"权限"卡片改了块档位）⇒ 工具栏的当前块档位也可能变了
+    syncRef.current(instance)
   }, [props.value])
 
   useEffect(() => {
     const instance = view.current
     if (instance === null) return
-    instance.dispatch({ effects: editable.reconfigure(EditorView.editable.of(!props.disabled)) })
-  }, [props.disabled, editable])
+    instance.dispatch({ effects: editable.current.reconfigure(EditorView.editable.of(!props.disabled)) })
+  }, [props.disabled])
+
+  /*
+   * 切模式：重配置 `modeSlot`。**不重建编辑器**（撤销栈、滚动位置、未保存内容全保留），
+   * 也不碰正文 —— 模式只影响"怎么画"。
+   */
+  useEffect(() => {
+    const instance = view.current
+    if (instance === null) return
+    instance.dispatch({ effects: modeSlot.current.reconfigure(modeExtensions(mode)) })
+  }, [mode, modeExtensions])
 
   return (
     <div className="flex flex-col gap-1.5">
+      {/*
+        工具栏在编辑区**上方**（不是在底部）：它对应的动作发生在光标处，
+        而光标通常在视线上方；放底部会让"点按钮 → 找光标"变成一次来回。
+      */}
+      <EditorToolbar
+        mode={mode}
+        onModeChange={(next) => {
+          setMode(next)
+          // 记住选择：只影响"编辑区怎么画"，不影响正文/保存（见 editorModePlan.ts）
+          storeMode(next)
+        }}
+        active={active}
+        onAction={(action) => {
+          const instance = view.current
+          if (instance === null) return
+          runFormatAction(instance, action)
+          syncToolbar(instance)
+        }}
+        canUndo={hist.undo > 0}
+        canRedo={hist.redo > 0}
+        onUndo={() => {
+          const instance = view.current
+          if (instance === null) return
+          runUndo(instance)
+          syncToolbar(instance)
+        }}
+        onRedo={() => {
+          const instance = view.current
+          if (instance === null) return
+          runRedo(instance)
+          syncToolbar(instance)
+        }}
+        /*
+          块权限入口：只有宿主明确给了 `blockTiers` 才渲染（没有 manageVisibility 权限、
+          或编辑器插槽被第三方占用时不渲染 —— 能力不存在就不给一个点不动的按钮）。
+        */
+        tier={props.blockTiers == null ? null : tier}
+        onTierChange={applyTier}
+        onManageBlockGrants={props.onManageBlockGrants === undefined ? null : manageGrants}
+        onPickFiles={props.onUploadFiles === undefined ? null : () => fileInputRef.current?.click()}
+        disabled={props.disabled === true}
+      />
       <div
         ref={host}
         className="overflow-hidden rounded-md"
@@ -597,19 +843,55 @@ export default function MarkdownEditor(props: MarkdownEditorProps): ReactNode {
         */
       />
       {/*
-        上传状态行：`role="status"`（礼貌播报）而不是 `alert` —— 上传结果不该打断用户
+        附件选择器：工具栏的"上传附件"按钮点它。
+        为什么工具栏也要有一个入口：粘贴/拖入是**知道这个功能的人**才会做的动作，
+        而"点回形针"是所有人都会试的第一件事（隐藏的原生 input + 按钮触发，是无障碍的
+        标准做法：input 有可访问名称、按钮是真的按钮）。
+      */}
+      {props.onUploadFiles !== undefined && (
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          aria-label="选择要上传的附件"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? [])
+            // 清空 value：同一个文件连选两次也要能触发 change（否则第二次什么都不发生）
+            e.target.value = ''
+            if (files.length > 0) runUploadsRef.current(files, null)
+          }}
+        />
+      )}
+      {/*
+        状态行：`role="status"`（礼貌播报）而不是 `alert` —— 上传/权限改动的结果不该打断用户
         正在进行的输入；但它**必须**存在，否则键盘/读屏用户粘贴截图后完全不知道发生了什么
         （占位在文档里，可它是"上传中…"这几个字，成功与否只有这条状态说得出）。
-        `failures.length > 0` 时给出重试入口：File 还在内存里，重发不需要用户再选一次。
+        权限改动被拒绝时用 `alert`：那意味着"你以为收紧了，其实没有"，必须打断。
       */}
-      <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
-        <p role="status" className="m-0">
-          {uploading > 0 && slow ? '网络较慢，仍在进行…' : uploadNote}
-        </p>
-        {failures.length > 0 && (
-          <Button size="sm" variant="secondary" onClick={retryUploads}>
-            重试上传（{failures.length}）
-          </Button>
+      <div className="flex flex-col gap-1 text-xs text-muted">
+        <div className="flex flex-wrap items-center gap-2">
+          <p role="status" className="m-0">
+            {uploading > 0 && slow ? '网络较慢，仍在进行…' : uploadNote}
+          </p>
+          {failures.length > 0 && (
+            <Button size="sm" variant="secondary" onClick={retryUploads}>
+              重试上传（{failures.length}）
+            </Button>
+          )}
+        </div>
+        {tierNote !== null && (
+          <p
+            role={tierNote.tone === 'err' ? 'alert' : 'status'}
+            className={cn(
+              'm-0 rounded-md border px-2 py-1',
+              tierNote.tone === 'err'
+                ? 'border-danger-line bg-danger-bg text-danger-ink'
+                : 'border-line text-ink-soft',
+            )}
+          >
+            {tierNote.text}
+          </p>
         )}
       </div>
     </div>

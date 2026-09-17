@@ -58,6 +58,25 @@ function visibleTo(spec: string, audience: PreviewAudience): boolean {
 }
 
 /**
+ * 占位文案的**识别式**（服务端与本地预览生成的是同一句话，见下方 `flushGated`）。
+ *
+ * 用途只有一个，但很关键：**发现"手上的正文是投影结果"**。
+ * 投影会消费掉 `<!--gated:…-->` 标记、把受限段落换成这句话。若把这样一份正文当原文
+ * 编辑并保存，段落权限标记就**没了** —— 受限段落因此静默变成公开（服务端会照单全收，
+ * 因为从它的角度看，作者就是删掉了标记）。
+ *
+ * 三条真实来路：① 旧客户端写下的草稿（`localStorage` 里存的是当年那份投影正文）；
+ * ② 用户从别处粘贴了带占位的文本；③ 将来某条读路径被误用为编辑源。
+ * 拿不准时的口径是**提醒**而不是静默保存（见 `WikiEdit` 的保存拦截）。
+ */
+export const GATED_PLACEHOLDER_RE = /^>\s*🔒\s*此处有\s*\d+\s*段内容需(?:登录|更高权限)查看\s*$/m
+
+/** 正文里是否含服务端/预览生成的占位文案（⇒ 这不是原文） */
+export function looksProjected(markdown: string): boolean {
+  return GATED_PLACEHOLDER_RE.test(markdown)
+}
+
+/**
  * 按视角投影正文：把该视角看不到的 gated 区段替换为**显式占位**。
  *
  * 返回的是 Markdown（不是 HTML）—— 调用方照常走既有的 `renderMarkdownBody` 渲染，
