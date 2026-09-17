@@ -118,9 +118,24 @@ test('api.ts：12 个组织端点方法齐备，且 purgeInvitations 保持原�
   for (const line of expected) {
     assert.ok(apiSrc.code.includes(line), `api.ts 缺少方法声明：${line}`)
   }
-  // 既有的回收动作（P4）**保持不动**：本批只新增，不重排别人的端点
-  assert.ok(apiSrc.code.includes('purgeInvitations: () =>'), 'purgeInvitations 不得被删或改名')
-  assert.ok(apiSrc.code.includes("'/api/org/invitations/purge'"), 'purge 的路径不得被改')
+  /*
+   * 既有的回收动作（P4）**保持不动**：本批只新增，不重排别人的端点。
+   *
+   * ⚠️ 2026-09-17 更新：该方法的**归属**变了。「审计与运维」搬成插件 `@geewiki/ops` 之后，
+   * 宿主 `api.ts` 里那 8 个方法全部成了死代码（逐名 grep 外部引用为 0）并被删除，
+   * `purgeInvitations` 随之搬进 `packages/plugin-ops/ui/api.ts`。
+   *
+   * **端点路径不变**，所以这条不变量（"不得被删或改名"）仍然成立，只是要跟到新位置去查。
+   * 留一份在宿主里才是最坏的：同一份端点契约两个实现，而两者漂移是静默的。
+   */
+  assert.equal(
+    apiSrc.code.includes('purgeInvitations'),
+    false,
+    '宿主 api.ts 里不得再留 purgeInvitations —— 它现在的归属是 @geewiki/ops',
+  )
+  const opsApi = readFileSync(join(here, '..', '..', 'plugin-ops', 'ui', 'api.ts'), 'utf8')
+  assert.ok(opsApi.includes('purgeInvitations(): Promise<PurgeResponse>'), '插件里必须有 purgeInvitations')
+  assert.ok(opsApi.includes("'/api/org/invitations/purge'"), 'purge 的路径不得被改')
   // 类型写全（并导出）：四个视图类型 + 角色枚举
   for (const t of [
     'export type OrgRole =',

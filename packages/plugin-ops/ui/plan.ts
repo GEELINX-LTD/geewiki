@@ -328,14 +328,88 @@ export function formatTime(iso: string | null | undefined): string {
 }
 
 /**
- * 操作者标签。
+ * 一条组织成员（`GET /api/org/members`，`access: 'user'`）。
  *
- * ⚠️ 这里只能拿到 `actorId`（数字），**没有用户名** —— 端点的响应里就没有它。
- * 显示 `#12` 是如实呈现，不是偷懒；要做成"张三"得先让 auth 端点带上用户名。
- * 刻意**不**把 id 渲染成看起来像人名的东西（那会让运维以为已经解析过了）。
+ * ## 为什么用户目录走这个端点，而不是改 audit / sessions 的响应
+ *
+ * 两边的 `actorId` / `userId` 都只有数字，要显示人名有两条路：让 authz/auth 在
+ * 查询时 LEFT JOIN `users`，或者在前端拿一份成员表做映射。
+ *
+ * 选了**前端映射**，理由有三条，且都不是"图省事"：
+ * 1. 它只动一个包（本插件）。改后端要动 `@geewiki/authz` 与 `@geewiki/auth` 两个
+ *    包的响应契约 —— 而那两个端点还有别的消费者（组织管理页、脚本），契约一改，
+ *    "谁受影响"就不再是本插件的事。
+ * 2. 本页面**本来就要展示成员**：会话表、操作者列、将来按人筛，都指向同一份数据。
+ *    多取一次比多加两个字段更省事，也更不容易漂移。
+ * 3. 端点的 `access: 'user'` 意味着任何已登录的人都能读它 —— 而本页面要求
+ *    `administer`，权限上是严格更宽的那一侧，不会出现"页面能开、目录读不到"。
+ *
+ * ## 它**解决不了**的那一类（如实记录）
+ *
+ * 审计记录是**合规台账**，会长期存在；而成员表只反映**当下**。一个已经退出组织、
+ * 或被删除的用户，在这里永远解析不出来 —— 那时显示 `#12` 是**如实呈现**，
+ * 不是"没做"。真正的修法是在写入审计时就存下身份快照（`actorEmail` 冗余列），
+ * 那是一次 schema 迁移，不在本次范围。
  */
-export function actorLabel(actorId: number | null): string {
-  return actorId === null ? '（匿名）' : `#${actorId}`
+export interface MemberEntry {
+  readonly userId: number
+  readonly email: string
+  readonly displayName: string
+  readonly role: string
+  readonly joinedAt: string
+}
+
+export interface MembersResponse {
+  readonly ok: true
+  readonly members: readonly MemberEntry[]
+}
+
+/** 建索引：`userId → 成员`。列表接口返回的是数组，按 id 查是每行都要做的事 */
+export function buildUserIndex(members: readonly MemberEntry[]): ReadonlyMap<number, MemberEntry> {
+  const index = new Map<number, MemberEntry>()
+  for (const m of members) {
+    if (Number.isFinite(m.userId)) index.set(m.userId, m)
+  }
+  return index
+}
+
+/** 解析出来的一行"这是谁" */
+export interface UserLabel {
+  /** 主标签：显示名 → 邮箱 → `#id`（依次回退，绝不把 id 伪装成人名） */
+  readonly name: string
+  /** 次要标签（小字）：邮箱 · `#id`；解析不出来时说明**为什么** */
+  readonly detail: string
+  /** 是否解析到了具体的人。「匿名」与「查不到」都不是 resolved —— 但它们是**不同**的两件事 */
+  readonly resolved: boolean
+}
+
+/**
+ * 把 `actorId` / `userId` 解析成"这是谁"。
+ *
+ * 三种情况**必须可区分**，因为运维对它们要做的事不同：
+ *   · `null` ⇒ **匿名**（按设计：匿名请求受限页返回 404，故这里只可能是"没登录就试"）；
+ *   · 查得到 ⇒ 显示名/邮箱，并保留 `#id`（排障时要在日志里 grep 那个数字）；
+ *   · 查不到 ⇒ `#id` + **明说**"不在当前成员列表"。这条最容易做错：只显示 `#12`
+ *     与"没做解析"长得一模一样，而这正是本函数要消灭的状态。
+ */
+export function resolveUser(userId: number | null, index: ReadonlyMap<number, MemberEntry>): UserLabel {
+  if (userId === null) {
+    return { name: '（匿名）', detail: '无用户身份', resolved: false }
+  }
+  const member = index.get(userId)
+  if (member === undefined) {
+    return {
+      name: `#${userId}`,
+      detail: '不在当前成员列表（可能已退出或被删除）',
+      resolved: false,
+    }
+  }
+  const email = member.email.trim()
+  const display = member.displayName.trim()
+  const name = display !== '' ? display : email !== '' ? email : `#${userId}`
+  // 显示名与邮箱都摆出来：只给显示名的话，"同名的人"仍然分不出来（而邮箱是唯一的）
+  const detail = display !== '' && email !== '' ? `${email} · #${userId}` : `#${userId}`
+  return { name, detail, resolved: true }
 }
 
 /**

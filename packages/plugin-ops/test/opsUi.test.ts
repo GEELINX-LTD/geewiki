@@ -162,3 +162,26 @@ test('插件不得自带框架：react 是唯一的外部依赖（产物里不�
   assert.doesNotMatch(ui, /from 'react-dom/, '插件 UI 不得 import react-dom')
   assert.match(ui, /from 'react'/, '插件 UI 从 react 取 hooks（由宿主 import map 解析到同一个实例）')
 })
+
+/*
+ * ★ 「方便定位用户」：操作者/用户列必须解析成人，而不是只显示 `#12`。
+ *
+ * 这条守卫防的是一种**静默退化**：`fetchMembers()` 被删掉时，页面照常渲染，
+ * 只是每一行都退回 `#12` —— 而这正是改之前的样子，没有任何报错会提示"解析没生效"。
+ */
+test('★ 审计与会话两处都必须把 id 解析成人（否则退回 #12 且无任何报错）', () => {
+  assert.match(api, /fetchMembers\(/, 'api.ts 应导出成员目录端点')
+  assert.match(api, /'\/api\/org\/members'/, '目录端点路径')
+  assert.match(ui, /fetchMembers\(/, '界面必须真的取目录 —— 删掉它页面照常渲染，只是每行退回 #12')
+  assert.match(ui, /buildUserIndex\(/, '必须建索引（每行按 id 查）')
+
+  const cells = ui.match(/<UserCell /g) ?? []
+  assert.equal(cells.length, 2, `审计表与会话表各需要用一次 UserCell，实际 ${cells.length} 次`)
+  assert.match(ui, /userId=\{r\.actorId\}/, '审计的操作者列')
+  assert.match(ui, /userId=\{userId\}/, '会话的用户列')
+
+  // 反空洞：解析不出来时仍要给出 #id（排障要在日志里 grep 那个数字），且要说明原因
+  const plan = codeOnly(read('../ui/plan.ts'))
+  assert.match(plan, /#\$\{userId\}/, '解析不出来时仍须显示 #id')
+  assert.match(plan, /不在当前成员列表/, '查不到时必须说明原因，而不是只显示一个 #id')
+})

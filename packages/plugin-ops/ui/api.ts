@@ -19,6 +19,7 @@
  */
 import type {
   AccessExplainResponse,
+  MembersResponse,
   AuditFilters,
   AuditResponse,
   BlocksResyncResponse,
@@ -163,6 +164,17 @@ export function purgeGrants(): Promise<PurgeResponse> {
 
 export function purgeInvitations(): Promise<PurgeResponse> {
   return request<PurgeResponse>('POST', '/api/org/invitations/purge')
+}
+
+/**
+ * 组织成员目录（`@geewiki/org` 的 `GET /api/org/members`，`access: 'user'`）。
+ *
+ * 它**不是**审计/会话端点的一部分，而是本插件用来把 `actorId` / `userId` 解析成
+ * "这是谁"的那份数据 —— 理由与它解决不了的那一类，都写在 `plan.ts` 的
+ * `MemberEntry` 上方。
+ */
+export function fetchMembers(): Promise<MembersResponse> {
+  return request<MembersResponse>('GET', '/api/org/members')
 }
 
 /** 搜索索引核对（`@geewiki/search`）—— 此前界面上没有入口 */

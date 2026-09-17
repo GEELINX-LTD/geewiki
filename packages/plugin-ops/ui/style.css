@@ -419,3 +419,10 @@
   align-items: baseline;
   gap: 5px;
 }
+/* ---------- 用户单元格 ---------- */
+
+/* 主标签下方的次要信息（邮箱 · #id）。小一号且更淡：它是**补充**，不是主体 */
+.gw-ops-user-detail {
+  font-size: 11px;
+  color: var(--color-muted);
+}
