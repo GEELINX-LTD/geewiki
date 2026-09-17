@@ -73,15 +73,17 @@ export function InvitationsCard(): ReactNode {
    * 刚签发的**一次性令牌**。只存令牌与邮箱（不存整条邀请）：少存一份就少一处被顺手回显的机会。
    * 关闭（关闭按钮 / 重新签发）即置 `null`。
    */
-/**
+  /**
    * `email === null` ⇒ **通用码**（不绑定邮箱）。
-   * `link` 在**创建那一刻**就拼好（见 `submit`），于是渲染期不碰 `location` ——
-   * 该拼一次的东西拼一次，也让"复制的是链接"这件事只有一个真源。
+   * `link` 在**生成那一刻**就拼好（见 `submit` / `runRotate`），于是渲染期不碰
+   * `location` —— 该拼一次的东西拼一次，也让"复制的是链接"这件事只有一个真源。
+   * `rotated` 只影响提示语（"已签发" vs "已重新生成"），不参与任何判据。
    */
   const [created, setCreated] = useState<{
     token: string
     email: string | null
     link: string
+    rotated: boolean
   } | null>(null)
   const [copyHint, setCopyHint] = useState('')
 
@@ -156,7 +158,7 @@ export function InvitationsCard(): ReactNode {
        * 本文件从头到尾**只读** `location.origin`，绝不写 location / history —— 有守卫钉住。
        */
       const link = `${window.location.origin}/#/invite/${r.token}`
-      setCreated({ token: r.token, email: r.invitation.email, link })
+      setCreated({ token: r.token, email: r.invitation.email, link, rotated: false })
       setEmail('')
       await load()
     } catch (e: unknown) {
@@ -176,6 +178,57 @@ export function InvitationsCard(): ReactNode {
         : '当前环境不允许自动复制，请手动选中上面的链接后按 ⌘/Ctrl+C。',
     )
   }, [created])
+
+  /**
+   * 换发（重新生成邀请码）—— 这是"签发即失联"的出口。
+   *
+   * 令牌只在生成那一次响应里出现、库里只有 sha256，所以想再要一个**必须**让服务端
+   * 重新签发一个（它没法把旧令牌算回来，那需要明文存库）。
+   *
+   * 之所以要确认一次：换发会**立即作废上一个码**。如果管理员已经把上一个发出去了，
+   * 对方点开就是「邀请无效」—— 而这在管理员这边看不出任何异常。
+   */
+  const runRotate = useCallback(
+    async (inv: OrgInvitationView): Promise<void> => {
+      setBusy(true)
+      setErr(null)
+      setNotice('')
+      setCopyHint('')
+      try {
+        const r = await api.rotateInvitation(inv.id)
+        setCreated({
+          token: r.token,
+          email: r.email,
+          link: `${window.location.origin}/#/invite/${r.token}`,
+          rotated: true,
+        })
+        await load()
+      } catch (e: unknown) {
+        setErr(e)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [load],
+  )
+
+  const rotate = useCallback(
+    (inv: OrgInvitationView): void => {
+      confirm({
+        title: `重新生成${inv.email === null ? '这个通用邀请码' : `发给 ${inv.email} 的邀请码`}？`,
+        body: (
+          <p className="m-0 text-sm leading-relaxed text-ink-soft">
+            会**立即作废上一个邀请码**：如果它已经发出去了，对方将无法再用它加入。
+            新的邀请码同样只显示一次。这条邀请的组织角色与用户组不变。
+          </p>
+        ),
+        confirmLabel: '重新生成',
+        danger: false,
+        onConfirm: () => void runRotate(inv),
+      })
+    },
+    [confirm, runRotate],
+  )
 
   const revoke = useCallback(
     (inv: OrgInvitationView): void => {
@@ -326,9 +379,18 @@ export function InvitationsCard(): ReactNode {
         {created !== null && (
           <div className="mt-3 rounded-md border border-ok-line bg-ok-bg p-3">
             <p role="status" className="m-0 text-note text-ok-ink">
-              {created.email === null
-                ? '已签发一个通用邀请码（不限定邮箱）。'
-                : `已为 ${created.email} 签发邀请。`}
+              {/*
+                `rotated` 只改这一句提示语：签发与换发是两件不同的事，说清刚发生的是哪一件。
+                换发时还要点明"上一个已作废" —— 否则管理员会以为两个码都能用，
+                而旧码在对方那里是直接报「邀请无效」的。
+              */}
+              {created.rotated
+                ? created.email === null
+                  ? '已重新生成这个通用邀请码（上一个已作废）。'
+                  : `已重新生成发给 ${created.email} 的邀请码（上一个已作废）。`
+                : created.email === null
+                  ? '已签发一个通用邀请码（不限定邮箱）。'
+                  : `已为 ${created.email} 签发邀请。`}
             </p>
             <div className="mt-2 flex flex-wrap items-end gap-2">
               <div className="flex min-w-[18rem] flex-1 flex-col gap-1">
@@ -358,7 +420,8 @@ export function InvitationsCard(): ReactNode {
               </Button>
             </div>
             <p className="m-0 mt-2 text-xs leading-relaxed text-ink-soft">
-              这条链接只显示一次，关闭后无法再次查看 —— 请立即复制并发给受邀人。
+              这条链接只显示一次。关闭之后仍可以在下面那一行点「获取邀请码」**重新生成**一个
+              —— 那会作废这一个（库里只有令牌的哈希，取不回原文）。
             </p>
             <p className="m-0 mt-1 break-all font-mono text-xs leading-relaxed text-muted">
               邀请码原文：{created.token}
@@ -401,7 +464,7 @@ export function InvitationsCard(): ReactNode {
           ) : rows !== null && rows.length === 0 ? (
             <EmptyState
               title="还没有邀请"
-              hint="用上面的表单签发一条 —— 令牌只显示一次，签发后请立即复制并发给受邀人。"
+              hint="用上面的表单签发一条 —— 链接只显示一次，签发后请立即复制并发给受邀人（之后也能用「获取邀请码」重新生成）。"
             />
           ) : rows !== null ? (
             <div className="overflow-x-auto">
@@ -449,15 +512,33 @@ export function InvitationsCard(): ReactNode {
                           <Badge tone={STATE_TONE[state]}>{INVITATION_STATE_LABEL[state]}</Badge>
                         </td>
                         <td className="py-1.5">
-                          <Button
-                            variant="danger"
-                            size="sm"
-                            icon={<Trash2 className="size-3.5" />}
-                            disabled={busy}
-                            onClick={() => revoke(inv)}
-                          >
-                            撤销
-                          </Button>
+                          <div className="flex flex-wrap gap-2">
+                            {/*
+                              只有"还能用"的邀请才给换发入口：已接受的换发会被服务端 409 拒掉
+                              —— 换发它等于让**第二个人**也能凭同一条邀请进来；已过期的同理
+                              （换发不代替续期）。不渲染这两个必然失败的按钮。
+                            */}
+                            {state === 'pending' && (
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                icon={<RefreshCw className="size-3.5" />}
+                                disabled={busy}
+                                onClick={() => rotate(inv)}
+                              >
+                                获取邀请码
+                              </Button>
+                            )}
+                            <Button
+                              variant="danger"
+                              size="sm"
+                              icon={<Trash2 className="size-3.5" />}
+                              disabled={busy}
+                              onClick={() => revoke(inv)}
+                            >
+                              撤销
+                            </Button>
+                          </div>
                         </td>
                       </tr>
                     )
@@ -471,7 +552,9 @@ export function InvitationsCard(): ReactNode {
         </div>
 
         <p className="m-0 mt-3 text-xs leading-relaxed text-muted">
-          服务端只回最多 200 条邀请，且**不回 token 字段** —— 令牌只在签发那一次出现。
+          服务端只回最多 200 条邀请，且**不回 token 字段** —— 库里只有令牌的 sha256，
+          明文只在「签发」与「获取邀请码（换发）」那两次响应里出现。因此想再拿一个可用的码，
+          是**重新生成一个新的**（旧的作废），而不是"把旧的显示出来"。
           已过期但未接受的邀请可以用「审计与运维」里的回收动作清理；已接受的是入伙记录，不会被回收。
         </p>
       </CardBody>

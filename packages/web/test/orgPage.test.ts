@@ -161,8 +161,8 @@ test('★ 邀请卡片：令牌只在创建成功的分支里渲染（写入点 
   const code = invites.code
   // 反空洞：先证明三条都抽到了
   assert.ok(
-    code.includes('setCreated({ token: r.token, email: r.invitation.email, link })'),
-    '应能看到令牌的写入点（只存令牌、邮箱与拼好的链接）',
+    code.includes('setCreated({ token: r.token, email: r.invitation.email, link, rotated: false })'),
+    '应能看到令牌的写入点（只存令牌、邮箱、拼好的链接与"这是签发还是换发"）',
   )
   assert.ok(code.includes('setCreated(null)'), '应能看到令牌的清空点（关闭 / 重新签发）')
   assert.ok(
@@ -195,7 +195,7 @@ test('★ 邀请卡片：令牌只在创建成功的分支里渲染（写入点 
   assert.ok(code.includes('e.currentTarget.select()'), '聚焦即全选，便于手动复制')
   assert.ok(code.includes('aria-label="邀请链接（只显示一次）"'), '令牌输入框的可访问名称按约定')
   assert.ok(
-    code.includes('这条链接只显示一次，关闭后无法再次查看 —— 请立即复制并发给受邀人。'),
+    code.includes('这条链接只显示一次。关闭之后仍可以在下面那一行点「获取邀请码」'),
     '必须有一句"只显示一次"的提示（否则用户关掉就永久失去它）',
   )
 })
@@ -532,4 +532,48 @@ test('SSR：无 administer 的成员**拿不到管理界面**（直接访问 #/o
     assert.ok(!html.includes(label), `无权时不得挂载「${label}」对应的卡片`)
   }
   assert.ok(!html.includes('管理 ▾') && !html.includes('审计与运维'), 'member 也不该看到运维台面入口')
+})
+
+/* ==================== ★ 邀请码换发（"签发即失联"的出口） ==================== */
+
+test('★ 邀请码管理：待用的邀请必须有「获取邀请码」入口，且换发要确认', () => {
+  const code = invites.code
+  /*
+   * 背景：原始令牌只在生成的**那一次**响应里出现，库里只有 sha256（与会话 cookie 同一纪律）。
+   * 于是"签发即失联"—— 管理员关掉提示框之后就再也拿不到那个码。
+   * 换发端点就是那个出口：随时能再要一个**新**的。
+   */
+  assert.match(code, /api\.rotateInvitation\(/, '必须真的调用换发端点（否则"管理"只是一张只读列表）')
+  assert.match(
+    code,
+    // 窗口给宽：这段 JSX 缩进很深（每行 ~30 空格），窄窗口会把「有入口」误判成「没有」
+    /state === 'pending' &&[\s\S]{0,500}?获取邀请码/,
+    '只有"还能用"的邀请才给换发入口 —— 已接受/已过期的换发会被服务端 409 拒掉，不该渲染必然失败的按钮',
+  )
+  // 换发会作废上一个码：必须在确认框里说清，否则管理员会把两个码都发出去
+  const ro = /const rotate = useCallback\(([\s\S]*?)\n  \)/.exec(code)
+  assert.ok(ro, '未能抽出 rotate 的函数体（判据失效即红）')
+  assert.match(ro[1] as string, /立即作废上一个邀请码/, '确认框必须点明"会作废上一个"')
+  assert.match(ro[1] as string, /onConfirm/, '换发必须经确认再执行')
+})
+
+test('★ 换发的提示语必须与签发区分开（否则"刚发生的是哪件事"要靠猜）', () => {
+  const code = invites.code
+  assert.match(code, /rotated: true/, '换发要把"这是换发"记下来')
+  assert.match(code, /已重新生成/, '换发成功后要说"已重新生成"')
+  assert.match(code, /上一个已作废/, '换发成功后要点明上一个已作废 —— 否则用户以为两个码都能用')
+})
+
+test('★ 库里不存明文：卡片里没有任何"把旧令牌取回来"的路径', () => {
+  /*
+   * 换发是"生成一个新的"，不是"把旧的显示出来"。后者需要把令牌明文存库，
+   * 而那会让一份数据库泄露直接变成可开号的凭据。
+   * 判据：卡片只经 `created`（来自签发/换发的响应）拿到令牌，列表数据里没有任何令牌字段。
+   */
+  assert.doesNotMatch(
+    invites.code,
+    /inv\.token|invitation\.token|\.token_hash/,
+    '列表数据里不得有令牌字段 —— 令牌只能来自签发/换发那一次响应',
+  )
+  assert.match(apiSrc.code, /rotateInvitation:/, 'api.ts 要有换发方法')
 })
