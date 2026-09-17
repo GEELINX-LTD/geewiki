@@ -7,7 +7,7 @@
  * - 激活顺序遵循依赖拓扑（被依赖者先激活）。
  * - 广义冲突组：同组内全局仅允许激活一个插件。
  */
-import type { GeeWikiManifest } from '@geewiki/core'
+import type { GeeWikiManifest, PluginHealth } from '@geewiki/core'
 
 /** 已注册插件（registry 条目：插件模块 + Manifest + 迁移目录解析器） */
 export interface RegisteredPlugin {
@@ -18,6 +18,19 @@ export interface RegisteredPlugin {
     name: string
     apply: (ctx: any, config?: any) => unknown // eslint-disable-line @typescript-eslint/no-explicit-any -- cordis 插件形态多样，registry 统一收纳
     Config?: unknown
+    /**
+     * ★ F12：可选的**健康探针**。
+     *
+     * 为什么挂在模块上、而不是再开一个服务：插件模块对象本来就被管理器持有
+     * （`entry.module`），而健康检查是**拉取式**的、由 REST 请求触发 ——
+     * 于是它天然不需要任何"注册期可见性"，也就绕开了 `slot-plugin.ts` 文件头记录的
+     * 那个陷阱（在插件 apply 期 `ctx.get` 拿不到尚未结算的服务）。
+     * 再开一个 `health-service` 只会**为了对称**而引入一处必然踩坑的注册时序。
+     *
+     * 契约与超时语义见 `pluginHealth()`：探针抛错/超时由宿主判定，与插件自报的
+     * `ok:false` 严格区分（前者是"没问到"，后者是"问到且它说坏了"）。
+     */
+    health?: () => PluginHealth | Promise<PluginHealth>
   }
   /**
    * 迁移脚本目录：**按方言**解析后的绝对路径表（激活前由迁移控制器执行；缺省则插件自管）。

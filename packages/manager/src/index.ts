@@ -23,21 +23,37 @@
  * 按依赖拓扑依次激活；REST 路由经 @geewiki/http 的路由服务挂载。
  */
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { basename, dirname } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join, resolve } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import type { Context } from 'cordis'
 import {
   CACHE_PURGE_EVENT,
+  PLUGIN_ACTIVATED_EVENT,
+  PLUGIN_DEACTIVATED_EVENT,
   asAsync,
   closeAfterResponse,
+  isBuiltinSlotName,
+  SLOT_PROPS_SCHEMA,
   normalizeRuntime,
   type AnyDatabaseAdapter,
   type ConfigSchema,
   type FiberLike,
   type HttpRouterService,
+  type PluginLifecycleEvent,
   type RouteHandlerContext,
+  type SlotDeclaration,
   type SlotService,
+  isPluginPermission,
+  PLUGIN_PERMISSIONS,
+  sortPermissions,
+  type PluginPermission,
+  type PluginHealthReport,
+  type PluginHealth,
+  DEFAULT_DATA_DIR,
+  DEFAULT_DB_FILENAME,
+  DEFAULT_LOCALE,
+  isLocaleCode,
 } from '@geewiki/core'
 export type { RegisteredPlugin } from './deps.js'
 export {
@@ -69,12 +85,29 @@ import {
   type RegisteredPlugin,
 } from './deps.js'
 import { decideWatchdog } from './watchdog.js'
-import { SlotRegistry, resolveSlots, type SlotAssignment } from './slots.js'
+import { SlotRegistry, resolveSlots, undeclaredSlots, type SlotAssignment } from './slots.js'
+import {
+  collectRouteDecls,
+  effectiveRoutesByOwner,
+  resolveRouteDecls,
+  type ResolvedRoute,
+  type RouteConflict,
+} from './routes.js'
+import {
+  CapabilityRegistry,
+  collectCapabilityDecls,
+  resolveCapabilityDecls,
+  unresolvedCapabilities,
+  type CapabilityConflict,
+  type ResolvedCapability,
+} from './capabilities.js'
 import { SLOT_SERVICE_NAME } from './slot-plugin.js'
+import { CAPABILITY_SERVICE_NAME } from './capability-plugin.js'
 
 export { SlotRegistry, resolveSlots, SLOT_SERVICE_NAME }
 export type { SlotAssignment }
 export { slotPlugin, type SlotPluginConfig } from './slot-plugin.js'
+export { capabilityPlugin, type CapabilityPluginConfig } from './capability-plugin.js'
 import { buildPluginUiTable, statFileSync, type PluginUiTable } from './plugin-ui.js'
 export {
   buildPluginUiTable,
@@ -97,9 +130,21 @@ import {
   isSchemaInstance,
   pruneUnknownFields,
   sanitizeSchemaPayload,
+  secretFieldNames,
   validateConfig,
   type ConfigSchemaPayload,
 } from './config-schema.js'
+import { readSecretFile, setSecret, writeSecretFile, type SecretStore } from './secrets.js'
+import { BACKUP_DIR_PREFIX, createBackup, describeBackup, readBackupManifest } from './backup.js'
+import { verifyAllIntegrity, type IntegrityReport } from './plugin-install.js'
+import {
+  availableLocales,
+  collectLocaleDecls,
+  loadCatalogsFor,
+  type CatalogIssue,
+  type LocaleDecl,
+  type ResolvedCatalogs,
+} from './i18n.js'
 
 /* ====================== 崩溃标记（架构 §5.3 自愈） ====================== */
 
@@ -155,10 +200,25 @@ export interface ManagerConfig {
    */
   crashMarkerFile?: string
   /**
+   * **密钥文件路径**（`role: 'secret'` 字段的落盘位置，见 `secrets.ts`）。
+   *
+   * 缺省 = 与基础层清单同目录的 `secrets.json`（即 `config/secrets.json`，已被 `.gitignore` 忽略）。
+   * 组合根可显式指定（例如把配置目录与数据目录分开挂载时）。
+   */
+  secretsFile?: string
+  /**
    * 外部插件发现阶段的问题（组合根 `buildRegistry` 扫描 plugins/ 得到）：
    * 只读透出到 `GET /api/plugins` 的 `issues` 字段，让"目录里躺着但没被加载"的插件可见。
    */
   discoveryIssues?: DiscoveryIssue[]
+  /**
+   * ★ F17：外部插件目录的绝对路径（用于**完整性校验**）。
+   *
+   * 为什么由组合根传进来、而不是管理器自己推：插件目录的解析规则（`options > GEEWIKI_PLUGINS_DIR >
+   * 仓库根下 plugins/`）在组合根里已经有一份**唯一实现**，这里再推一次就是第二份判据。
+   * 缺省 `undefined` ⇒ 完整性接口明确回"未配置"，而不是去猜一个目录然后报告"没有插件"。
+   */
+  pluginsDir?: string
   /**
    * **内置插件 UI 资产的兜底根**（绝对路径）：用于解析插件 UI 产物的**第二候选根**
    * `<本目录>/plugins-ui/<插件名>`（第一候选根是外部插件自带的 `<插件目录>/dist`）。
@@ -180,6 +240,41 @@ export interface ManagerConfig {
   pluginUiDist?: string | null
 }
 
+/**
+ * ★ F10：读取并**校验**一个插件的权限声明。
+ *
+ * 未知取值被**拒绝并告警**，而不是静默收下 —— 这一点是刻意的：静默接受任意字符串会让
+ * `fs:raed`、`FS:read`、`filesystem` 这类拼写/命名错误**看起来像"已经声明过了"**，
+ * 于是声明表里出现一堆永远不会被任何消费方认出的项，而作者以为自己做对了。
+ * 与"能力名必须含 `/`"是同一类设计（把拼写错误变成可见的，而不是静默降级）。
+ *
+ * `undefined`（没写这个字段）是**合法**的：绝大多数插件不需要跨界能力，
+ * 强制每个插件都写一个空数组只会制造噪声。它返回空数组，与"写了 []"同义。
+ */
+function readPluginPermissions(owner: string, raw: unknown): PluginPermission[] {
+  if (raw === undefined) return []
+  if (!Array.isArray(raw)) {
+    console.warn(
+      `[manager:permissions] 插件 ${owner} 的 geewiki.permissions 不是数组，已忽略；` +
+        `合法取值：${PLUGIN_PERMISSIONS.join(', ')}`,
+    )
+    return []
+  }
+  const out: PluginPermission[] = []
+  for (const v of raw) {
+    if (typeof v === 'string' && isPluginPermission(v)) {
+      if (!out.includes(v)) out.push(v)
+      continue
+    }
+    console.warn(
+      `[manager:permissions] 插件 ${owner} 声明了未知权限 ${JSON.stringify(v)}，已忽略；` +
+        `合法取值：${PLUGIN_PERMISSIONS.join(', ')}`,
+    )
+  }
+  // 按危险度升序输出：管理台与日志都直接用它，顺序即"从轻到重"
+  return sortPermissions(out) as PluginPermission[]
+}
+
 export interface PluginSnapshot {
   name: string
   version: string
@@ -192,6 +287,16 @@ export interface PluginSnapshot {
   description?: string
   state: 'active' | 'inactive' | 'error'
   layer: Layer | null
+  /**
+   * **进程内临时停用**（本批新增）：插件来自基础清单、但被管理台在当前进程内停掉了。
+   *
+   * 与"未启用"的区别只在**重启后会不会回来**：临时停用不写任何清单文件，正常重启
+   * 仍按基础清单加载（用户口径："立即停止，若没有另行持久化，重启后仍启用"）；
+   * 想让它永久消失，走"应用并持久化"（会把条目从基础清单里删掉）。
+   *
+   * `state` 保持 `inactive` 不变（它描述的是运行态），本字段才是"为什么没在跑"。
+   */
+  runtimeDisabled: boolean
   hotReloadable: boolean
   provides?: string
   requires: string[]
@@ -204,6 +309,14 @@ export interface PluginSnapshot {
   source: 'builtin' | 'external'
   /** 是否声明了 schemastery configSchema（管理台据此决定渲染表单还是 JSON 编辑框） */
   configurable: boolean
+  /**
+   * ★ F10：插件声明的**跨界能力**（文件系统 / 环境变量 / 外网 / 进程 / 密钥）。
+   *
+   * 恒为数组（可能为空）：管理台据此渲染"装它之前该知道什么"。宿主**不做强制**
+   * （同进程同权限），所以这里是**信息**而不是**闸门** —— 但它必须能被执行到，
+   * 否则声明就只是源码里的注释（见 `readPluginPermissions` 的未知项告警）。
+   */
+  permissions: PluginPermission[]
 }
 
 export interface PluginGraphNode {
@@ -211,6 +324,8 @@ export interface PluginGraphNode {
   label: string
   layer: Layer | null
   state: 'active' | 'inactive' | 'error'
+  /** 进程内临时停用（见 {@link PluginSnapshot.runtimeDisabled}）；依赖图据此上第三种颜色 */
+  runtimeDisabled: boolean
   hotReloadable: boolean
   conflictGroup?: string
 }
@@ -232,6 +347,30 @@ export class ManagerError extends Error {
 }
 
 /* ============================ 清单文件 IO ============================ */
+
+/**
+ * 构造插件生命周期事件的负载（F7）。
+ *
+ * 抽成纯函数是为了让两个发射点（激活 / 停用）**共用同一份字段逻辑**；
+ * 但 `ctx.emit(常量, …)` 那一步刻意留在各自的调用点——见 {@link GeeWikiManager.emitPluginActivated}
+ * 的说明（抽掉会让 `platformEvents.test.ts` 的"每个事件都有发射点"守卫失去作用）。
+ */
+function pluginLifecyclePayload(
+  name: string,
+  entry: RegisteredPlugin,
+  error?: string,
+): PluginLifecycleEvent {
+  return {
+    name,
+    /*
+     * 清单里 `provides` 是**单个字符串**（一个插件最多声明一个能力 token），
+     * 而事件契约上统一成数组：订阅者判"我要的那个服务来了没有"时用 `includes`，
+     * 比 `===` 更不容易在将来（若放宽为多个 token）写错。
+     */
+    provides: entry.manifest.geewiki.provides === undefined ? [] : [entry.manifest.geewiki.provides],
+    ...(error === undefined ? {} : { error }),
+  }
+}
 
 function readList(file: string): PluginListFile {
   if (!existsSync(file)) return { enabled: [] }
@@ -286,9 +425,15 @@ interface ManagedPlugin {
 
 export class GeeWikiManager {
   readonly ctx: Context
-  private readonly config: Required<Omit<ManagerConfig, 'registry' | 'crashMarkerFile'>> & {
+  private readonly config: Required<Omit<ManagerConfig, 'registry' | 'crashMarkerFile' | 'pluginsDir'>> & {
     registry: RegisteredPlugin[]
     crashMarkerFile?: string
+    /**
+     * ★ F17：外部插件目录。`null` = 未配置 —— 完整性校验据此**明确回"未配置"**，
+     * 而不是猜一个目录然后报告"没有插件"（那会让"没装插件"与"看错地方了"长得一模一样）。
+     * `Required<>` 会把可选字段变成 `string`，故与 `crashMarkerFile` 一样在此显式放宽。
+     */
+    pluginsDir: string | null
   }
   private readonly plugins = new Map<string, ManagedPlugin>()
   /** 激活顺序（dispose 时逆序卸载） */
@@ -304,6 +449,18 @@ export class GeeWikiManager {
    * 端到端已覆盖。兜底的存在是为了不把"没装 slot 插件"变成管理器无法启动。
    */
   private readonly slots: SlotRegistry
+  /**
+   * ★ F9 能力注册表。
+   *
+   * 与 `slots` 同样是"**优先用独立兄弟插件已暴露的那一份**（唯一真源），拿不到则自建兜底"。
+   *
+   * ⚠️ 这里**不能**写成 `ctx.provide('capability-service', …)`：实测证明，
+   * 在管理器的 `apply` 里 provide 的服务，对它 boot 出来的子插件**不可见**（`ctx.get`
+   * 返回 `undefined` 且静默），于是每个插件的能力注册都会被悄悄跳过 ——
+   * 表现是一道永远 403 的闸门和一份干净得可疑的日志。提供者必须是排在管理器之前的
+   * 独立插件（见 `capability-plugin.ts` 文件头，与 `slot-plugin.ts` 同一结论）。
+   */
+  private readonly capabilities: CapabilityRegistry
   private base: PluginListFile = { enabled: [] }
   private session: PluginListFile = { enabled: [] }
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
@@ -320,6 +477,18 @@ export class GeeWikiManager {
    */
   private readonly overlayFailed = new Set<string>()
 
+  /**
+   * **进程内临时停用的插件名**（本批新增）：基础清单里的插件被管理台就地停掉时登记在这里。
+   *
+   * 三条不变量，缺一条这个功能就会变成"静默改配置"：
+   *   1. **不落盘**——任何清单文件都不写它，故正常重启后插件照基础清单回来（这正是"临时"）；
+   *   2. **激活即清除**——清除点放在 {@link activateCore} 成功处而不是 enable() 里，
+   *      这样 boot / enable / 递归拉依赖 / 冲突组替换 全都自动覆盖，不会留下"既在跑又被标记停用"；
+   *   3. **持久化即删除**——{@link persistSession} 把条目从基础清单移除后才清空登记，
+   *      于是"应用并持久化"之后重启也不会再加载它。
+   */
+  private readonly runtimeDisabled = new Set<string>()
+
   constructor(ctx: Context, config: ManagerConfig) {
     this.ctx = ctx
     this.config = {
@@ -331,17 +500,190 @@ export class GeeWikiManager {
       meltdownThreshold: config.meltdownThreshold ?? 3,
       crashMarkerFile: config.crashMarkerFile,
       discoveryIssues: config.discoveryIssues ?? [],
+      pluginsDir: config.pluginsDir ?? null,
       webDist: config.webDist ?? null,
       // 内置插件 UI 根：缺省回落 webDist（与拆分前行为一致）
       pluginUiDist: config.pluginUiDist ?? config.webDist ?? null,
+      // 密钥文件：缺省与基础层清单同目录（config/secrets.json，已被 .gitignore 忽略）
+      secretsFile: config.secretsFile ?? join(dirname(config.baseFile), 'secrets.json'),
     }
     // 插槽注册表：优先用 `@geewiki/slot` 已暴露的那一份（唯一真源）；
     // 拿不到则自建兜底（见字段注释——此时只有 manifest 声明式贡献可用）。
     const provided = ctx.get(SLOT_SERVICE_NAME) as SlotRegistry | undefined
     this.slots = provided ?? new SlotRegistry()
+    // 同 `slots`：优先用 `@geewiki/capability` 已暴露的那一份，拿不到则自建兜底
+    this.capabilities = (ctx.get(CAPABILITY_SERVICE_NAME) as CapabilityRegistry | undefined) ?? new CapabilityRegistry()
   }
 
   /* ------------------------- 查询（供 REST） ------------------------- */
+
+  /**
+   * ★ F20：产出一个备份 —— `data/` + `config/` 的**一致性**快照。
+   *
+   * ## 为什么数据库必须走 `VACUUM INTO`，而不是拷文件
+   * 默认后端是 SQLite 且开着 WAL：运行中的库由「主文件 + `-wal` + `-shm`」共同构成，
+   * 朴素拷贝会得到**撕裂快照**（cp 期间还有提交在写），或者把旧的 `-wal` 一起带走、
+   * 让 SQLite 下次打开时**重放不属于该快照的帧**。
+   * `VACUUM INTO` 由引擎自己保证一致性、对运行中的库安全，且产出**自包含、不带边车**
+   * （实测：源目录有 `s.db`/`s.db-wal`/`s.db-shm`，快照只有一个 `snap.db`）。
+   *
+   * ## 为什么快照能力是注入的
+   * pnpm 严格隔离下 `better-sqlite3` 只从 `@geewiki/db-sqlite` 可解析，管理器 import 不到；
+   * 而管理器**已经**握着 `db` 服务，`db.run('VACUUM INTO ?', [dest])` 实测可用（带绑定参数）。
+   * 于是备份**不需要任何新依赖**，也不需要放宽包边界。
+   *
+   * ## 非 SQLite 部署：如实说"没包含"，而不是假装完整
+   * PG 部署下不产出数据库文件，清单里 `database.included=false` 并写明要改用 `pg_dump`。
+   * 一个"看起来完整、恢复后缺数据"的备份，比一个明说不含数据库的备份危险得多。
+   */
+  async createBackup(
+    opts: { outDir?: string; repoRoot?: string; now?: Date } = {},
+  ): Promise<import('./backup.js').BackupReport> {
+    const repoRoot = resolve(opts.repoRoot ?? process.cwd())
+    const outDir = opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')
+    // 迁移控制器处已有同款取法（`this.ctx.get('db') as AnyDatabaseAdapter | undefined`）
+    const db = this.ctx.get('db') as AnyDatabaseAdapter | undefined
+    const dialect = db?.dialect ?? 'sqlite'
+    const snapshot = opts.now === undefined ? {} : { now: opts.now }
+    const databaseRelPath = join(DEFAULT_DATA_DIR, DEFAULT_DB_FILENAME)
+    if (db !== undefined && dialect === 'sqlite') {
+      return createBackup({
+        repoRoot,
+        outDir,
+        databaseRelPath,
+        ...snapshot,
+        snapshotDatabase: async (dest: string) => {
+          // 目标文件必须不存在：`VACUUM INTO` 拒绝覆盖已存在的文件（这正好是我们的意图）
+          db.run('VACUUM INTO ?', [dest])
+        },
+      })
+    }
+    return createBackup({
+      repoRoot,
+      outDir,
+      databaseRelPath,
+      ...snapshot,
+      databaseNote:
+        db === undefined
+          ? '本快照不含数据库：当前没有可用的 db 服务（未激活数据库插件？）。'
+          : `本快照不含数据库：当前后端方言是 ${dialect}，它不是 SQLite。` +
+            'PostgreSQL 部署请在该库上用 pg_dump 单独备份 —— 本命令不冒充它。',
+    })
+  }
+
+  /** 已存在的备份目录（按时间倒序），供 REST/CLI 展示 */
+  listBackups(opts: { outDir?: string; repoRoot?: string } = {}): {
+    dir: string
+    createdAt: string
+    files: number
+    bytes: number
+    databaseIncluded: boolean
+  }[] {
+    const repoRoot = resolve(opts.repoRoot ?? process.cwd())
+    const outDir = opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')
+    if (!existsSync(outDir)) return []
+    const out: ReturnType<GeeWikiManager['listBackups']> = []
+    for (const name of readdirSync(outDir)) {
+      if (!name.startsWith(BACKUP_DIR_PREFIX)) continue
+      const dir = join(outDir, name)
+      // 单个坏清单不能让整个列表 500：跳过并在下面靠"列表里没有它"体现出来
+      let manifest: ReturnType<typeof readBackupManifest>
+      try {
+        manifest = readBackupManifest(dir)
+      } catch {
+        continue
+      }
+      out.push({
+        dir,
+        createdAt: manifest.createdAt,
+        files: manifest.files.length,
+        bytes: manifest.files.reduce((s, f) => s + f.bytes, 0),
+        databaseIncluded: manifest.database.included,
+      })
+    }
+    return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  }
+
+  /**
+   * ★ F12：**插件健康探针**的聚合（可被 REST 请求触发）。
+   *
+   * ## 三条判据都是刻意的
+   * 1. **只探测 `active` 的插件**：未激活的插件没有"健康"可言（`state` 字段已经说明
+   *    一切），去调它的探针会把"没在跑"报成"坏了"。
+   * 2. **超时由宿主强制**（缺省 2s）：探针是插件代码，一个 `await` 卡死的探针会让
+   *    健康端点整体挂住 —— 于是"某个插件不健康"升级成"健康检查不可用"，
+   *    而后者恰恰是运维最需要它的时候。超时结论放 `timedOut`，**不**混进 `ok:false`。
+   * 3. **`ok:false` 与 `error` 严格分开**：前者是"插件说它坏了"（要去看它的 `detail`），
+   *    后者是"我们没能问到它"（要去看宿主日志）。混在一起会让运维做错方向的动作。
+   *
+   * 探针**缺失不是不健康**：绝大多数插件没有可探测的状态，`health` 字段留空即可。
+   * 把"没探针"报成 `ok:true` 是撒谎（我们并没有验证过），报成 `ok:false` 是误报。
+   */
+  async pluginHealth(timeoutMs = 2000): Promise<PluginHealthReport[]> {
+    const reports: PluginHealthReport[] = []
+    for (const entry of this.config.registry) {
+      const name = entry.name
+      const p = this.plugins.get(name)
+      const state: PluginHealthReport['state'] = p?.active ? 'active' : p?.error ? 'error' : 'inactive'
+      const probe = entry.module.health
+      if (state !== 'active' || typeof probe !== 'function') {
+        reports.push({ name, state })
+        continue
+      }
+      const started = Date.now()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const result = await Promise.race([
+          Promise.resolve().then(() => probe()),
+          new Promise<'__timeout__'>((resolve) => {
+            /*
+             * ⚠️ 这个定时器**必须**保持被引用状态 —— 不加 `unref()`。
+             *
+             * 加过的后果实测过：`unref()` 让定时器不再阻止事件循环退出，于是在
+             * "除了这个探针没有别的待处理工作"的场景（单测、空闲实例）下，事件循环
+             * 直接结束、定时器永远不触发 ⇒ `Promise.race` **永不 settle** ⇒
+             * 健康端点挂住，而且现象是"测试进程报 Promise 一直 pending"这种极难定位的形态。
+             * 换句话说：超时保护本身不能依赖任何外部工作来驱动。
+             */
+            timer = setTimeout(() => resolve('__timeout__'), timeoutMs)
+          }),
+        ])
+        const durationMs = Date.now() - started
+        if (result === '__timeout__') {
+          reports.push({ name, state, timedOut: true, durationMs })
+          continue
+        }
+        /*
+         * ★ **形态校验**：探针返回的东西必须是 `{ ok: boolean, ... }`。
+         *
+         * 这是本设施唯一会骗人的地方：把"没看懂"当成"没问题"。一个返回 `undefined`
+         * 或 `{}` 的探针（写错了、忘了 return、被 TS 的 any 放过去）如果不校验，
+         * 就会以"有 health 字段"的形态出现在报告里，消费方很容易把它读成健康。
+         * 这里报 `error`，与"插件自报 ok:false"和"超时"三者互不混淆。
+         */
+        if (typeof result !== 'object' || result === null || typeof (result as PluginHealth).ok !== 'boolean') {
+          reports.push({
+            name,
+            state,
+            error: `探针返回值形态非法（应为 { ok: boolean }，实际 ${JSON.stringify(result) ?? String(result)}）`,
+            durationMs,
+          })
+          continue
+        }
+        reports.push({ name, state, health: result, durationMs })
+      } catch (err) {
+        reports.push({
+          name,
+          state,
+          error: err instanceof Error ? err.message : String(err),
+          durationMs: Date.now() - started,
+        })
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    }
+    return reports
+  }
 
   /** 全部注册插件的运行快照（含未激活） */
   snapshot(): PluginSnapshot[] {
@@ -366,7 +708,21 @@ export class GeeWikiManager {
       webDist: this.config.pluginUiDist,
       statFile: statFileSync,
       slotAssignments: this.slotAssignments(),
+      // F2：路由声明必须进入口表 —— 它是"要不要推迟加载该插件产物"的判据之一
+      // （只贡献按需插槽 + 一个页面的插件若被推迟，点导航项会看到空白页且不报错）。
+      routesByOwner: effectiveRoutesByOwner(this.routeResolution().routes),
     })
+  }
+
+  /**
+   * 插件页面路由的**声明裁决**（F2）。
+   *
+   * 与 {@link slotAssignments} 同一条教训：裁决只做一次、所有消费方读同一份结果。
+   * 入口表、REST 诊断、（未来）服务端渲染都走这里；各处自行判一遍必然走向
+   * "表里说 A 生效、界面渲染 B"。
+   */
+  routeResolution(): { routes: ResolvedRoute[]; conflicts: RouteConflict[] } {
+    return resolveRouteDecls(collectRouteDecls(this.config.registry), this.activationOrder)
   }
 
   /**
@@ -378,7 +734,23 @@ export class GeeWikiManager {
    * 极难排查的分裂——与 `resolvePluginUiHit` 的"唯一判定"是同一条教训。
    */
   slotAssignments(): SlotAssignment[] {
-    return resolveSlots(this.slots.list(), this.activationOrder)
+    /*
+     * 必须把**声明表**一起传进去（A1）：插件自定义扩展点的基数不是从名字推出来的，
+     * 只在 `declarations()` 里。漏传的后果很隐蔽——`single` 声明被当成默认 `multi`，
+     * 于是一个本该"最早激活者胜出"的扩展点会同时渲染两个贡献者，且**不报任何冲突**
+     * （因为裁决时压根不知道它是单占用）。
+     */
+    return resolveSlots(this.slots.list(), this.activationOrder, this.slots.declarations())
+  }
+
+  /**
+   * 插件自定义扩展点的**声明**表（`slot.define()` 的产物；A1 起可由插件自行开放扩展点）。
+   *
+   * 与 {@link slotAssignments} 分开暴露的原因：这张表回答"**谁开了哪些扩展点**"，
+   * 而裁决结果回答"**每个扩展点谁生效**"。管理台/排障两者都要，且受众不同。
+   */
+  slotDeclarations(): readonly (SlotDeclaration & { readonly slot: string })[] {
+    return this.slots.declarations()
   }
 
   /**
@@ -389,6 +761,21 @@ export class GeeWikiManager {
    */
   slotService(): SlotService {
     return this.slots
+  }
+
+  /**
+   * ★ F9：能力声明的裁决结果（`resolveCapabilityDecls` 的产物）。
+   *
+   * 与 `routeResolution()` 同构：**从活状态现算**，不做快照——插件激活/停用会改变
+   * 激活顺序，而"同名能力谁生效"正是由激活顺序裁决的。
+   */
+  capabilityResolution(): { capabilities: ResolvedCapability[]; conflicts: CapabilityConflict[] } {
+    return resolveCapabilityDecls(collectCapabilityDecls(this.config.registry), this.activationOrder)
+  }
+
+  /** ★ F9：能力注册表实例（manager 持有并 `ctx.provide('capability-service')`） */
+  capabilityService(): CapabilityRegistry {
+    return this.capabilities
   }
 
   private snapshotOf(name: string): PluginSnapshot {
@@ -404,6 +791,7 @@ export class GeeWikiManager {
       description: m.geewiki.description,
       state: p?.active ? 'active' : p?.error ? 'error' : 'inactive',
       layer: p?.layer ?? null,
+      runtimeDisabled: this.runtimeDisabled.has(name),
       hotReloadable: m.geewiki.runtime?.supportsHotReload === true,
       provides: m.geewiki.provides,
       requires: directDependencies(this.config.registry, name),
@@ -413,6 +801,7 @@ export class GeeWikiManager {
       error: p?.error ?? undefined,
       source: entry.source ?? 'builtin',
       configurable: this.configSchemaOf(entry) !== undefined,
+      permissions: readPluginPermissions(name, m.geewiki.permissions),
     }
   }
 
@@ -426,6 +815,7 @@ export class GeeWikiManager {
         label: entry.name,
         layer: p?.layer ?? null,
         state: p?.active ? 'active' : p?.error ? 'error' : 'inactive',
+        runtimeDisabled: this.runtimeDisabled.has(entry.name),
         hotReloadable: m.geewiki.runtime?.supportsHotReload === true,
         conflictGroup: m.geewiki.conflictGroup,
       }
@@ -445,9 +835,73 @@ export class GeeWikiManager {
     return [...this.config.discoveryIssues]
   }
 
+  /**
+   * ★ F15：插件**文案目录声明**（惰性缓存）。
+   *
+   * 缓存的是"哪个插件声明了哪个语言的哪个文件"（注册表在启动后基本不变），
+   * 而**文件内容每次现读**：译文是可以热改的，缓存内容会让"改了译文但界面不变"
+   * 表现为一个需要重启的谜题。
+   */
+  private localeDeclsCache?: { decls: LocaleDecl[]; issues: CatalogIssue[] }
+
+  private localeDecls(): { decls: LocaleDecl[]; issues: CatalogIssue[] } {
+    this.localeDeclsCache ??= collectLocaleDecls(this.config.registry)
+    return this.localeDeclsCache
+  }
+
+  /** ★ F15：可选语言集合与默认语言（供前端初始化与语言切换器） */
+  i18nAvailable(): { default: string; locales: string[]; issues: CatalogIssue[] } {
+    const { decls, issues } = this.localeDecls()
+    return { default: DEFAULT_LOCALE, locales: availableLocales(decls), issues }
+  }
+
+  /**
+   * ★ F15：某个语言下应当下发的插件文案。
+   *
+   * 返回**整条回退链**的 catalog（见 `manager/src/i18n.ts` 的解释）：
+   * 回退逻辑只在 core 的 `fallbackChain` 里实现一次，前端不重复一份。
+   */
+  i18nCatalogs(locale: string): ResolvedCatalogs & { declIssues: CatalogIssue[] } {
+    const { decls, issues } = this.localeDecls()
+    return { ...loadCatalogsFor(decls, locale), declIssues: issues }
+  }
+
+  /**
+   * ★ F17：**外部插件完整性体检**（相对各自的安装基线）。
+   *
+   * 刻意不做进 `snapshot()`：那是一个会被前端高频轮询的端点（插件探测、UI 入口表都读它），
+   * 而完整性校验要对每个插件的每个文件算 sha256 —— 放进热路径等于给每次轮询加一次全量磁盘读。
+   * 校验是**按需**动作，故走独立的 admin 端点/CLI。
+   *
+   * 未配置 `pluginsDir` 时返回 `[]` 并附带说明，**不猜目录**：猜错会让"没有插件"与
+   * "看错地方了"这两种完全不同的情况长得一模一样。
+   */
+  verifyPluginIntegrity(): { pluginsDir: string | null; reports: IntegrityReport[]; note?: string } {
+    const dir = this.config.pluginsDir
+    if (dir === null) {
+      return {
+        pluginsDir: null,
+        reports: [],
+        note: '未配置插件目录（pluginsDir）：无法校验。请在组合根传入，或设置 GEEWIKI_PLUGINS_DIR。',
+      }
+    }
+    return { pluginsDir: dir, reports: verifyAllIntegrity(dir) }
+  }
+
   /** 双层清单内容（含启动时各插件的激活错误） */
-  sessionState(): { base: PluginListFile; session: PluginListFile; bootErrors: string[] } {
-    return { base: this.base, session: this.session, bootErrors: this.bootErrors }
+  sessionState(): {
+    base: PluginListFile
+    session: PluginListFile
+    bootErrors: string[]
+    /** 进程内临时停用的插件名（重启即恢复；顺序按登记先后，便于界面上排） */
+    runtimeDisabled: string[]
+  } {
+    return {
+      base: this.base,
+      session: this.session,
+      bootErrors: this.bootErrors,
+      runtimeDisabled: [...this.runtimeDisabled],
+    }
   }
 
   /* ----------------------- 配置（架构 §5.7） ----------------------- */
@@ -486,6 +940,13 @@ export class GeeWikiManager {
     activeLayer: Layer | null
     config: Record<string, unknown>
     schema: ConfigSchemaPayload | null
+    /**
+     * 声明为 `role: 'secret'` 的字段**是否已有值**（只报有无，绝不返回值）。
+     *
+     * `config` 里对应的字段恒为空串：这是"保存后不再回显"的落点 ——
+     * 管理台据此把输入框显示为「已配置（留空表示不修改）」，用户要改只能填一个新值。
+     */
+    secrets: Record<string, boolean>
   } {
     const entry = this.registryOf(name)
     const schema = this.configSchemaOf(entry)
@@ -502,6 +963,7 @@ export class GeeWikiManager {
       activeLayer: managed?.layer ?? null,
       config: config ?? {},
       schema: schema ? sanitizeSchemaPayload(schema) : null,
+      secrets: this.secretPresenceOf(name),
     }
   }
 
@@ -521,6 +983,15 @@ export class GeeWikiManager {
   async updateConfig(
     name: string,
     raw: unknown,
+    opts: {
+      /**
+       * 要**显式清除**的密钥字段（§ `role: 'secret'`）。
+       *
+       * 单独开一个口子而不是用"空串 = 清除"：表单回显的密钥恒为空串，
+       * 若把它当清除，用户每改一次别的字段就会顺手删掉密钥。
+       */
+      clearSecrets?: readonly string[]
+    } = {},
   ): Promise<{ config: Record<string, unknown>; hotUpdated: boolean; requiresRestart: boolean }> {
     const entry = this.registryOf(name)
     const schema = this.configSchemaOf(entry)
@@ -543,6 +1014,9 @@ export class GeeWikiManager {
       config = raw as Record<string, unknown>
     }
 
+    // 密钥：值写进密钥文件，配置里**不留**该字段（见 absorbSecrets / hydrateSecrets）
+    config = this.absorbSecrets(name, config, opts.clearSecrets ?? [])
+
     const managed = this.plugins.get(name)
     const previous = managed?.config
     const layer = this.layerOf(name)
@@ -556,7 +1030,7 @@ export class GeeWikiManager {
     }
 
     try {
-      await fiber.update(config)
+      await fiber.update(this.hydrateSecrets(name, config))
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
       // 回滚磁盘：恢复旧配置（无旧配置则移除该条目的 config 字段）
@@ -569,7 +1043,7 @@ export class GeeWikiManager {
       // 回滚进程内：cordis 在 update 失败后 fiber.config 已是新值，需显式再 update 回旧值
       let rolledBack = false
       try {
-        await fiber.update(previous ?? {})
+        await fiber.update(this.hydrateSecrets(name, previous ?? {}))
         rolledBack = true
       } catch (rollbackErr) {
         console.error(`[manager] 配置回滚（进程内）失败 ${name}:`, rollbackErr)
@@ -645,6 +1119,86 @@ export class GeeWikiManager {
     if (existing) existing.config = config
     else file.enabled.push({ name, config })
     writeList(layer === 'session' ? this.config.sessionFile : this.config.baseFile, file)
+  }
+
+  /* ------------------------- 写一次、不可回读的密钥 ------------------------- */
+
+  /**
+   * 该插件声明的密钥字段名（schema `role: 'secret'`）。无 schema / 无该角色 → 空数组，
+   * 调用方据此走"零开销的原路径"（不读密钥文件、不做任何拷贝）。
+   */
+  private secretFieldsOf(name: string): string[] {
+    const entry = this.config.registry.find((p) => p.name === name)
+    if (!entry) return []
+    const schema = this.configSchemaOf(entry)
+    if (!schema) return []
+    return secretFieldNames(schema)
+  }
+
+  /**
+   * **吸收**入参里的密钥值并返回"可入库的配置"（密钥字段已被摘掉）。
+   *
+   * 三条语义（与前端表单的文案一一对应）：
+   * - 字段是**非空字符串** → 写进密钥文件（替换旧值）；
+   * - 字段是**空/缺失** → 不修改（保留文件里的旧值）——这是"保存后不再回显"的必然结果：
+   *   表单拿到的就是空串，若把它当成"清除"，那么每次改其它字段都会顺手删掉密钥；
+   * - 字段名出现在 `clear` 里 → 清除（显式动作，与"留空"区分开）。
+   *
+   * 返回值**必须**用于落盘（`persistConfig`）——密钥值绝不能出现在 `plugins.*.json` 里。
+   */
+  private absorbSecrets(name: string, config: Record<string, unknown>, clear: readonly string[]): Record<string, unknown> {
+    const fields = this.secretFieldsOf(name)
+    if (fields.length === 0) return config
+    const out: Record<string, unknown> = { ...config }
+    const file = this.config.secretsFile
+    const store: SecretStore = readSecretFile(file)
+    let dirty = false
+    for (const field of fields) {
+      const incoming = out[field]
+      delete out[field] // 无论何种情况都不入库：密钥只存在于密钥文件与"交给插件的那一份"
+      if (clear.includes(field)) {
+        if (setSecret(store, name, field, null)) dirty = true
+        continue
+      }
+      if (typeof incoming === 'string' && incoming.trim() !== '') {
+        if (setSecret(store, name, field, incoming)) dirty = true
+      }
+    }
+    if (dirty) writeSecretFile(file, store)
+    return out
+  }
+
+  /**
+   * 把密钥文件里的值**填回**交给插件的那一份配置（只在 `ctx.plugin` / `fiber.update`
+   * 的边界上调用）。
+   *
+   * 为什么不让密钥一直待在 `managed.config` 里：那份对象会被 `addToSession` /
+   * `persistSession` / `snapshotOf` 反复消费，只要有一处漏了脱敏就会写进入库文件。
+   * 让它在**内存记录里根本不存在**，是唯一不需要靠"记得脱敏"来保证的形态。
+   */
+  private hydrateSecrets(name: string, config: Record<string, unknown>): Record<string, unknown> {
+    const fields = this.secretFieldsOf(name)
+    if (fields.length === 0) return config
+    const stored = readSecretFile(this.config.secretsFile)[name]
+    if (!stored) return config
+    let out = config
+    for (const field of fields) {
+      const value = stored[field]
+      if (value === undefined) continue
+      if (out === config) out = { ...config }
+      out[field] = value
+    }
+    return out
+  }
+
+  /** 哪些密钥字段已有值（**只报有无，不报值**；`GET /config` 用它驱动"已配置"提示） */
+  private secretPresenceOf(name: string): Record<string, boolean> {
+    const fields = this.secretFieldsOf(name)
+    if (fields.length === 0) return {}
+    const stored = readSecretFile(this.config.secretsFile)[name] ?? {}
+    const out: Record<string, boolean> = {}
+    for (const field of fields) out[field] = (stored[field] ?? '') !== ''
+    return out
   }
 
   /**
@@ -829,7 +1383,17 @@ export class GeeWikiManager {
       }
       return this.snapshotOf(name)
     }
-    if (m.runtime?.supportsHotReload !== true) {
+    /*
+     * "恢复"与"新启用"必须分开，而且**判定要放在热插拔守卫之前**：
+     *   · 被**临时停用**的基础层插件仍在基础清单里，重新启用它是"回到本进程本来就有的状态"，
+     *     不是热插拔——所以不该被 `hot_reload_not_supported` 挡住。
+     *   · 反例（沙箱实测）：`@geewiki/org` 不支持热插拔，但**没有活跃依赖方**，于是能被临时停用，
+     *     却启不回来 ⇒ "停了只能重启才能起来"，把临时停用变成了单向陷阱。
+     *   · 该守卫原本要防的是"把一个从未在本进程跑过的冷插件热装上来"，恢复路径不属此列。
+     * 判据用登记 + 基础清单条目双重确认：登记本身就意味着该插件来自基础清单。
+     */
+    const restoringBase = this.runtimeDisabled.has(name) && this.base.enabled.some((e) => e.name === name)
+    if (!restoringBase && m.runtime?.supportsHotReload !== true) {
       throw new ManagerError(
         'hot_reload_not_supported',
         `${name} 未声明 runtime.supportsHotReload: true，仅支持持久化安装 + 进程重启（冷操作）`,
@@ -844,14 +1408,22 @@ export class GeeWikiManager {
         { with: preConflict },
       )
     }
-    const violations = checkHotChain(this.config.registry, this.activeNames(), name)
-    if (violations.length > 0) {
-      throw new ManagerError(
-        'hot_dependency_not_supported',
-        `依赖链中存在不支持热加载的未激活依赖: ${violations.join('; ')}`,
-        { path: violations },
-      )
+    /*
+     * 依赖链守卫同理：它要拒的是"热启用时链上有冷依赖"，而恢复链上的冷依赖**本身也是恢复**
+     * （同样在基础清单里、同样只是被临时停掉），由递归帧各自判定——真正不可恢复的冷依赖
+     * 会在那一帧的上面那条守卫里被拒（`restoringBase` 为 false），保护并未失效。
+     */
+    if (!restoringBase) {
+      const violations = checkHotChain(this.config.registry, this.activeNames(), name)
+      if (violations.length > 0) {
+        throw new ManagerError(
+          'hot_dependency_not_supported',
+          `依赖链中存在不支持热加载的未激活依赖: ${violations.join('; ')}`,
+          { path: violations },
+        )
+      }
     }
+
     // 事务性启用：先递归启用未激活依赖（同样走会话层热路径）。
     // 任一环节失败时的回滚由 enable 的**单一回滚点**统一负责（共用 activated 数组），
     // 本帧不再自行回滚——避免深度 ≥2 时孙依赖无人记账（W2）。
@@ -863,13 +1435,15 @@ export class GeeWikiManager {
         await this.enableInner(dep, undefined, activated, skipDeps)
       }
     }
-    await this.activateCore(name, effectiveConfig, 'session')
+    await this.activateCore(name, effectiveConfig, restoringBase ? 'base' : 'session')
     // 自登记：激活成功的那一帧自己记账（目标自身激活失败时不登记）
     activated.push(name)
     this.lastEnabledName = name
     this.lastEnabledAt = Date.now()
-    // 落盘用"生效配置"（activateCore 已按 schema 填默认值/裁剪未知字段）
-    this.addToSession(name, this.plugins.get(name)?.config ?? effectiveConfig)
+    // 落盘用"生效配置"（activateCore 已按 schema 填默认值/裁剪未知字段）。
+    // 恢复基础层插件不落盘：它的条目本来就在基础清单里，写入会话层等于复制一份
+    //（那会造出"基础层 + 会话层同名条目"的叠加态，并把层降级成 session、界面显示成"临时启用"）。
+    if (!restoringBase) this.addToSession(name, this.plugins.get(name)?.config ?? effectiveConfig)
     return this.snapshotOf(name)
   }
 
@@ -1059,26 +1633,55 @@ export class GeeWikiManager {
   }
 
   /** 会话层停用（disable）：仅限 Session 层插件；有活动依赖者时阻止卸载 */
+  /**
+   * 停用插件（支持两种层，重启后的命运不同）：
+   *
+   *   · **会话层**（本来就不是随启动加载的）：卸载 + 从会话清单移除。重启后仍不会加载，
+   *     因为它从来不在基础清单里——这不需要额外登记。
+   *   · **基础层**（随启动加载）：卸载 + 记入 {@link runtimeDisabled}（**不写任何文件**）。
+   *     重启后照基础清单回来，这就是用户要的"临时停用"。想永久停用走"应用并持久化"。
+   *
+   * 两者共用同一条依赖方守卫：有活跃依赖方就拒绝（否则会把别人一起弄坏）。守卫在两种层
+   * 上都必须先于卸载执行——先卸了再报错就已经把依赖方弄坏了。
+   */
   async disable(name: string): Promise<void> {
     const p = this.plugins.get(name)
     if (!p?.active) throw new ManagerError('not_active', `插件未激活: ${name}`)
-    if (p.layer !== 'session') {
-      throw new ManagerError(
-        'base_layer',
-        `${name} 属于基础层（冷操作），请编辑基础层清单 ${basename(this.config.baseFile)} 后重启进程`,
-      )
-    }
     const dependents = collectDependents(this.config.registry, this.activeNames(), name)
     if (dependents.length > 0) {
       throw new ManagerError('has_dependents', `存在依赖方，禁止卸载: ${dependents.join(', ')}`, { dependents })
     }
+    /*
+     * 层必须在卸载**之前**取：`deactivateCore → unloadPlugin` 会把 `managed.layer` 置为 null，
+     * 卸载后再读只会拿到 null，于是会话层插件会走错分支（被登记成"临时停用基础层插件"，
+     * 会话清单里的条目也永远清不掉）。
+     */
+    const layer = p.layer
     await this.deactivateCore(name)
-    this.removeFromSession(name)
+    if (layer === 'session') {
+      this.removeFromSession(name)
+      return
+    }
+    // 基础层：只在本进程里记住它被停了（不落盘 ⇒ 重启照基础清单回来）
+    this.runtimeDisabled.add(name)
+    console.log(`[manager] 插件 ${name} 已在本进程内临时停用（基础清单未改动，重启后仍会加载）`)
   }
 
   /** 应用并持久化：Session 层"活动"条目合并进 Base，清空会话（构想 5.3 的"应用并持久化"）。
    * 激活失败（error 态/未装配）的条目不提升——避免坏配置被持久化后每次启动报错。 */
-  persistSession(): { promoted: string[] } {
+  persistSession(): { promoted: string[]; disabled: string[] } {
+    /*
+     * 临时停用一并持久化：把条目从基础清单里删掉，**然后**才清空登记（不变量 ③）。
+     * 顺序不能反——先清登记再落盘，中途写盘失败就会留下"标记没了、清单也没改"的
+     * 假持久化：界面显示已持久化，重启后插件却又回来了。
+     */
+    const disabled = [...this.runtimeDisabled].filter(
+      (name) => this.plugins.get(name)?.active !== true && this.base.enabled.some((e) => e.name === name),
+    )
+    if (disabled.length > 0) {
+      const drop = new Set(disabled)
+      this.base.enabled = this.base.enabled.filter((e) => !drop.has(e.name))
+    }
     const promoted: string[] = []
     for (const entry of this.session.enabled) {
       const p = this.plugins.get(entry.name)
@@ -1097,7 +1700,16 @@ export class GeeWikiManager {
     this.session = { enabled: [] }
     writeList(this.config.baseFile, this.base)
     writeList(this.config.sessionFile, this.session)
-    return { promoted }
+    // 落盘成功之后才撤登记：上面的 filter 已经保证只删"确实没在跑"的条目
+    for (const name of disabled) {
+      this.runtimeDisabled.delete(name)
+      const mp = this.plugins.get(name)
+      if (mp) mp.layer = null
+    }
+    if (disabled.length > 0) {
+      console.log(`[manager] 临时停用已持久化：基础清单移除 ${disabled.join(', ')}`)
+    }
+    return { promoted, disabled }
   }
 
   /* ------------------------- 内部实现 ------------------------- */
@@ -1130,6 +1742,65 @@ export class GeeWikiManager {
     const before = this.session.enabled.length
     this.session.enabled = this.session.enabled.filter((e) => !drop.has(e.name))
     if (this.session.enabled.length !== before) writeList(this.config.sessionFile, this.session)
+  }
+
+  /**
+   * ★ F14：带超时的插件加载。
+   *
+   * 为什么必须有（本项是审计 §3.2「可靠性」里唯一**没有**任何缓解措施的中风险项）：
+   * `apply()` 是插件自己的代码。一个死循环、或一个永不 settle 的 `await`，
+   * 会让 `ctx.plugin()` **永远不返回**——而激活跑在**进程启动路径**上，
+   * 于是故障形态是「进程既没起来、也没报错、也不退出」，日志停在上一个插件。
+   * 除了超时，没有任何别的机制能把这个状态变成一条可读的错误。
+   *
+   * 超时后的处置**分两步，缺一不可**：
+   * 1. 立刻抛 `load_timeout`（与 `load_failed` 走同一条单点回滚路径）；
+   * 2. **接住那个已经没人等的 promise**：若它最终成功了，就主动 `dispose()` 掉那个 fiber。
+   *    不做第 2 步会得到比超时更糟的东西——一个**幽灵插件**：管理器认为它没激活，
+   *    它却已经把服务/路由/插槽装进了容器，且再无句柄可回收。
+   *
+   * 定时器**刻意不 `unref()`**：本仓库刚在 F12 踩过这个坑——`unref()` 之后空闲场景下
+   * 事件循环直接结束，`Promise.race` 永不 settle，超时反而**永不触发**。
+   * 正确做法是在正常路径上显式 `clearTimeout`（见 `finally`）。
+   */
+  private async loadPluginModule(
+    name: string,
+    entry: RegisteredPlugin,
+    effectiveConfig: Record<string, unknown>,
+  ): Promise<FiberLike> {
+    const { applyTimeout } = normalizeRuntime(entry.manifest.geewiki.runtime)
+    const pending = this.ctx.plugin(entry.module, this.hydrateSecrets(name, effectiveConfig))
+    // `<= 0` = 显式关闭超时（逃生口，与 drainTimeout 的 `<= 0` 语义方向一致）
+    if (applyTimeout <= 0) return await pending
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new ManagerError('load_timeout', `加载超时 ${name}: apply() 在 ${applyTimeout}s 内未结算`, {
+            timeoutSeconds: applyTimeout,
+          }),
+        )
+      }, applyTimeout * 1000)
+    })
+
+    try {
+      return await Promise.race([pending, timeout])
+    } catch (err) {
+      if (err instanceof ManagerError && err.code === 'load_timeout') {
+        // 幽灵插件回收：成功则 dispose，失败则吞掉（原始错误已由超时错误代表，
+        // 这里再抛会变成一条没人认领的 unhandledRejection）
+        void pending.then(
+          (late) => {
+            void late.dispose().catch(() => {})
+          },
+          () => {},
+        )
+      }
+      throw err
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 
   /**
@@ -1197,13 +1868,21 @@ export class GeeWikiManager {
       }
       effectiveConfig = pruneUnknownFields(schema, validation.value) as Record<string, unknown>
     }
+    // 密钥：入参里的值落进密钥文件，交给插件的那一份再把已存的值填回去。
+    // `managed.config` 记的是**没有密钥**的那一份（落盘与会话清单都消费它）。
+    effectiveConfig = this.absorbSecrets(name, effectiveConfig, [])
 
     // cordis 动态加载：await 等激活完成（含 async apply）；激活失败经 _error 抛出
     let fiber: FiberLike
     try {
-      fiber = await this.ctx.plugin(entry.module, effectiveConfig)
+      fiber = await this.loadPluginModule(name, entry, effectiveConfig)
     } catch (err) {
       managed.error = (err as Error).message
+      /*
+       * ★ F14：已经**结构化**的错误（如 `load_timeout`）原样上抛，不再包成 `load_failed`。
+       * 否则超时会被这个 catch 抹掉 code，REST 层只能按 400 回，运维看不到"是超时"。
+       */
+      if (err instanceof ManagerError) throw err
       throw new ManagerError('load_failed', `加载失败 ${name}: ${(err as Error).message}`)
     }
     managed.fiber = fiber
@@ -1211,10 +1890,54 @@ export class GeeWikiManager {
     managed.layer = layer
     managed.error = null
     managed.config = effectiveConfig
+    // 激活即撤掉"临时停用"登记（不变量 ②）：否则会出现"既在跑、又被标记为临时停用"的自相矛盾
+    this.runtimeDisabled.delete(name)
     this.activationOrder.push(name)
+    /*
+     * ★ F10：激活时把权限声明**打出来**。
+     *
+     * 为什么在激活而不是在快照查询里：快照是查询路径（管理台轮询会把它刷屏），
+     * 而"装了什么、它要碰什么"是**每次激活一次**的事实，正好对应运维读日志的场景。
+     * 无声明时**一行都不打** —— 否则 20 个内置插件会刷出 20 行"权限: （无）"，
+     * 把真正有声明的那几行淹掉。
+     */
+    const declaredPermissions = readPluginPermissions(name, entry.manifest.geewiki.permissions)
+    if (declaredPermissions.length > 0) {
+      console.log(`[manager] 插件 ${name} 声明的跨界能力: ${declaredPermissions.join(', ')}`)
+    }
     // 插槽声明登记：**放在激活成功之后**（apply 抛错时不该留下归属记录，
     // 否则插件起来了才算数这条不变式会被破坏）。声明式来源标记为 'manifest'。
     this.registerManifestSlots(name, entry)
+    // 路由声明**不需要**在这里登记：它与插槽不同，是"纯声明"——没有需要按 owner 回收的
+    // 运行期状态，入口表每次现算（见 routeResolution()）。在这里多发一个事件反而会让
+    // "声明表"与"激活集合"建立一份多余的同步关系。
+    this.emitPluginActivated(name, entry)
+  }
+
+  /**
+   * 广播「插件已激活」（F7）。
+   *
+   * ## 为什么需要这个事件（而不只是日志）
+   * 它是 "**`provide` 可见性陷阱**"的正规解除点：一个插件 `apply` 未结算时 `provide` 的服务
+   * 对它期间创建的子插件不可见（`ctx.get` 返回 `undefined` 并**静默跳过**）。在此之前，
+   * 依赖方唯一的办法是"排在自己前面"这种脆弱的顺序约定。订阅 `PLUGIN_ACTIVATED_EVENT`
+   * 则可以在服务真正可用之后再做延迟绑定。
+   *
+   * ## 为什么 `ctx.emit` 写在这里而不是抽进一个通用辅助函数
+   * 抽掉之后，`PLUGIN_ACTIVATED_EVENT` 就不在"发射点"上了——
+   * 而 `packages/manager/test/platformEvents.test.ts` 正是靠"常量出现在 `ctx.emit(…)` 的第一个实参"
+   * 来防"声明了却没人发"的**谎报 token**。为了一个 3 行的 helper 让那条守卫失去作用不划算。
+   *
+   * 纪律（与其它平台事件一致）：同步 emit、**吞掉订阅者异常**——这里跑在插件启停路径上，
+   * 让某个订阅者的 bug 把一次成功的激活上报成失败是最坏结果（插件已加载、状态已改，
+   * 调用方却重试 ⇒ 重复激活）。
+   */
+  private emitPluginActivated(name: string, entry: RegisteredPlugin): void {
+    try {
+      this.ctx.emit(PLUGIN_ACTIVATED_EVENT, pluginLifecyclePayload(name, entry))
+    } catch (err) {
+      console.warn(`[manager] ${PLUGIN_ACTIVATED_EVENT} 的订阅者抛错（已忽略，插件启停本身照常）:`, err)
+    }
   }
 
   /**
@@ -1263,6 +1986,8 @@ export class GeeWikiManager {
       }
       effective = pruneUnknownFields(schema, validation.value) as Record<string, unknown>
     }
+    // 会话层覆盖也走同一套：清单文件里本来就没有密钥，这里只把已存的密钥补进运行时那一份
+    effective = this.absorbSecrets(name, effective, [])
     const previous = managed.config
     if (isDeepStrictEqual(effective, previous)) {
       // 覆盖值与基础层生效值相同（enable 写会话条目时通常就是这样）：跳过，
@@ -1270,11 +1995,11 @@ export class GeeWikiManager {
       return
     }
     try {
-      await fiber.update(effective)
+      await fiber.update(this.hydrateSecrets(name, effective))
     } catch (err) {
       this.overlayFailed.add(name)
       try {
-        await fiber.update(previous ?? {})
+        await fiber.update(this.hydrateSecrets(name, previous ?? {}))
         console.error(`[manager] 插件 ${name} 会话层配置叠加失败，已回滚为基础层配置`)
       } catch (rollbackErr) {
         console.error(`[manager] 插件 ${name} 会话层配置叠加回滚失败:`, rollbackErr)
@@ -1297,6 +2022,21 @@ export class GeeWikiManager {
     }
     const idx = this.activationOrder.indexOf(name)
     if (idx >= 0) this.activationOrder.splice(idx, 1)
+    /*
+     * F7：停用完成事件。放在**所有回收动作之后**（贡献注销、长连接回收、排空都已结算）——
+     * 订阅者收到它时去查该插件的状态，看到的必须是"确实已经停了"，
+     * 否则会读到半停用的中间态（例如插槽贡献还在、服务已经没了）。
+     */
+    this.emitPluginDeactivated(name, managed.entry, error?.message)
+  }
+
+  /** 广播「插件已停用」（F7）。**放在所有回收动作之后**——见调用点的说明。 */
+  private emitPluginDeactivated(name: string, entry: RegisteredPlugin, error?: string): void {
+    try {
+      this.ctx.emit(PLUGIN_DEACTIVATED_EVENT, pluginLifecyclePayload(name, entry, error))
+    } catch (err) {
+      console.warn(`[manager] ${PLUGIN_DEACTIVATED_EVENT} 的订阅者抛错（已忽略，插件启停本身照常）:`, err)
+    }
   }
 
   /**
@@ -1536,7 +2276,9 @@ function fail(h: RouteHandlerContext, err: unknown): void {
         ? 404
         : err.code === 'payload_too_large'
           ? 413
-          : err.code === 'replace_rollback_failed'
+          : err.code === 'load_timeout'
+            ? 504 // ★ F14：服务端等待插件 apply 结算超时——不是客户端的请求有问题
+            : err.code === 'replace_rollback_failed'
             ? 500 // 回滚也未成功：状态不确定，需人工介入（非客户端错误）
             : err.code === 'conflict_group' ||
               err.code === 'hot_reload_not_supported' ||
@@ -1617,8 +2359,12 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
       plugins: mayReadPluginConfig(h) ? snapshots : snapshots.map(withoutPluginConfig),
       issues: manager.discoveryIssues(),
     })
+  }, { access: 'public', owner: '@geewiki/manager' })
+  router.register('GET', '/api/plugins/graph', (h) => ok(h, { graph: manager.graph() }), {
+    access: 'public',
+    // ★ F12：登记方 —— 内置插件在此**示范**怎么声明（插件可自行决定是否归因）
+    owner: '@geewiki/manager',
   })
-  router.register('GET', '/api/plugins/graph', (h) => ok(h, { graph: manager.graph() }))
   // 插槽裁决结果与冲突诊断。
   //
   // 为什么单独开一个只读端点而不是只塞进入口表：入口表是**给前端驱动加载**的，
@@ -1626,11 +2372,163 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
   // （入口表走 revision + 304，这里必须每次现算），混在一起会让排障必须绕过缓存。
   router.register('GET', '/api/plugins/slots', (h) => {
     const assignments = manager.slotAssignments()
+    const declarations = manager.slotDeclarations()
+    const routeResolution = manager.routeResolution()
+    const capabilityResolution = manager.capabilityResolution()
     ok(h, {
       slots: assignments,
       conflicts: assignments.filter((a) => a.suppressed.length > 0),
+      // A1：谁开了哪些插件自定义扩展点（基数由声明决定，未声明默认 multi）
+      declarations,
+      /*
+       * 有贡献者、但**无人 `define()` 声明过**的自定义扩展点（诊断）。
+       *
+       * 这**不是错误**（未声明按 `multi` 处理，功能正常），但必须可见——它通常意味着两件事之一：
+       * ① 贡献方已经迁到自定义扩展点、声明方还没调 `define()`（缺基数声明，单占用会失效）；
+       * ② **拼错了命名空间**：`pulgin-a/toolbar` 与 `plugin-a/toolbar` 会各自成为一个扩展点，
+       *    两个贡献者永远碰不到一起，而界面上**什么都不会报**（各自渲染进一个空出口）。
+       * ②正是"开放键空间"引入的新失败模式，故必须带上这条补偿（判据见 `undeclaredSlots`）。
+       */
+      undeclared: undeclaredSlots(assignments, declarations),
+      // F2：路由声明的裁决结果与冲突（同一端点，因为两者是同一件事的两面：
+      // "插件能往哪儿插" 与 "插件能不能有自己的页面"）
+      routes: routeResolution.routes,
+      routeConflicts: routeResolution.conflicts,
+      // F9：能力声明的裁决与冲突（同一端点，理由同上：都是"插件能宣称什么"）
+      capabilities: capabilityResolution.capabilities,
+      capabilityConflicts: capabilityResolution.conflicts,
+      capabilityDeclarations: manager.capabilityService().declarations(),
+      /*
+       * 声明了却没有注册求解器的能力（诊断）。
+       *
+       * 这**不是错误**（该能力恒 false，不影响别的功能），但必须可见：它意味着
+       * 某个插件声明的能力**永远算不出 true**，于是依赖它的导航项/路由完全不出现、
+       * 且没有任何报错。判据与插槽的 `undeclared` 同构（见本端点上方那段注释）。
+       */
+      unresolvedCapabilities: unresolvedCapabilities(
+        capabilityResolution.capabilities.map((c) => c.decl.name),
+        manager.capabilityService().registered(),
+      ),
+      /*
+       * ★ 优化点 8：内置插槽的 props 描述表。
+       *
+       * 与上面几项不同，这一项**不是**运行期裁决结果，而是**契约的自助入口**：
+       * 外部插件是裸 JS，作者没有 `EditorSlotProps` 这类类型可查。放在这个端点是因为
+       * 它是"插槽"这个主题的既有落点（受众相同：写插件 UI 的人 + 排障的人）。
+       *
+       * 一致性不靠纪律：`packages/core/test/slot-props-schema.test.ts` 会按每一项自己声明的
+       * `contract` 锚点去源码里比对接口的顶层字段名与可选性，两侧任一方向漂移即红。
+       */
+      props: SLOT_PROPS_SCHEMA,
     })
+  }, { access: 'public', owner: '@geewiki/manager' })
+  /*
+   * ★ F12：**插件健康检查**端点。
+   *
+   * 为什么单独一个端点而不是塞进 `GET /api/plugins`：两者的**时效与代价**完全不同 ——
+   * 快照是纯内存读，而这里要**执行插件代码**（每个 active 插件一次探针，逐个带超时）。
+   * 混在一起会让"列一下插件"变成一个会阻塞数秒的请求。
+   *
+   * 顺带回传 `routeOwners`（按登记方聚合的请求计数）：两者都是**运行期遥测**
+   * （与上面那个"插件宣称了什么"的静态诊断端点受众相同、数据性质不同），
+   * 放在一起可以让一次排障请求拿全。
+   */
+  router.register(
+    'GET',
+    '/api/plugins/health',
+    async (h) => {
+      const plugins = await manager.pluginHealth()
+      // 本函数已经持有 router 本身（`registerRoutes(router, manager)`），无需 ctx.get
+      // 失败关闭：第三方实现可以不提供 ownerStats ⇒ 报空数组，而不是编一个 0
+      // （0 会被读成"没有请求"，那是在撒谎）
+      const routeOwners = router.ownerStats?.() ?? []
+      ok(h, {
+        plugins,
+        routeOwners,
+        // 明确告诉消费方"摘要只覆盖自报不健康的与探测失败的"，避免把 ok:true 读成"全都验证过了"
+        summary: {
+          active: plugins.filter((p) => p.state === 'active').length,
+          unhealthy: plugins.filter((p) => p.health?.ok === false).length,
+          failed: plugins.filter((p) => p.timedOut === true || p.error !== undefined).length,
+          unprobed: plugins.filter((p) => p.state === 'active' && p.health === undefined && p.error === undefined && p.timedOut !== true).length,
+        },
+      })
+    },
+    { access: 'admin', owner: '@geewiki/manager' },
+  )
+  /*
+   * ★ F20：备份。**只有服务器进程**能产出一致的数据库快照（它握着 `db` 服务），
+   * 所以备份是服务端能力；而**恢复刻意不做成路由** —— 恢复要在服务器正拿着库和附件
+   * 读写的时候替换文件，等价于"边跑边换引擎"，只能停机用 CLI 做。
+   *
+   * 访问等级 `admin`：备份产物含 `config/secrets.json`（明文密钥），且读写的是宿主机文件，
+   * 属于本项目里仅次于"热卸载数据库插件"的高危操作。
+   */
+  router.register(
+    'POST',
+    '/api/backup',
+    async (h) => {
+      try {
+        const report = await manager.createBackup()
+        ok(h, {
+          dir: report.dir,
+          files: report.manifest.files.length,
+          bytes: report.totalBytes,
+          database: report.manifest.database,
+          secretsIncluded: report.manifest.secretsIncluded,
+          describe: describeBackup(report.manifest),
+        })
+      } catch (err) {
+        fail(h, err)
+      }
+    },
+    { access: 'admin', owner: '@geewiki/manager' },
+  )
+  router.register('GET', '/api/backup', (h) => ok(h, { backups: manager.listBackups() }), {
+    access: 'admin',
+    owner: '@geewiki/manager',
   })
+  /*
+   * ★ F17：外部插件**完整性体检**。刻意不做进 `GET /api/plugins`：那是前端会轮询的热端点，
+   * 而校验要对每个插件的每个文件算 sha256。这里按需触发。
+   *
+   * `unsigned`（没有安装基线）与 `ok` 必须在响应里保持可区分 —— 把"无法判断"报成"通过"
+   * 正是这类设施最容易退化成"看起来在防护、实际什么都没防"的方式。
+   */
+  router.register('GET', '/api/plugins/integrity', (h) => ok(h, manager.verifyPluginIntegrity()), {
+    access: 'admin',
+    owner: '@geewiki/manager',
+  })
+  /*
+   * ★ F15：i18n。**刻意是 `public`**：界面文案要在**登录之前**就能用（登录页自己也有文案），
+   * 而这里下发的只有插件贡献的界面文本，没有密钥、没有正文、没有主体信息。
+   * 若将来有人在 catalog 里放敏感性内容，这条访问等级就要重新审视 —— 故在此写明理由。
+   */
+  router.register('GET', '/api/i18n', (h) => ok(h, manager.i18nAvailable()), {
+    access: 'public',
+    owner: '@geewiki/manager',
+  })
+  router.register(
+    'GET',
+    '/api/i18n/:locale',
+    (h) => {
+      const locale = h.params['locale'] ?? ''
+      // 语言标记会参与回退链计算与语言码比较；非法输入直接 400，不要让它流进解析逻辑
+      if (!isLocaleCode(locale)) {
+        h.json(400, { ok: false, error: 'invalid_locale', message: `语言标记不合法: ${JSON.stringify(locale)}` })
+        return
+      }
+      const resolved = manager.i18nCatalogs(locale)
+      ok(h, {
+        locale,
+        default: DEFAULT_LOCALE,
+        chain: resolved.chain,
+        catalogs: resolved.catalogs,
+        issues: [...resolved.declIssues, ...resolved.issues],
+      })
+    },
+    { access: 'public', owner: '@geewiki/manager' },
+  )
   // 插件 UI 入口表（前端插槽用）：由注册表 × 激活集合 × 产物 stat 现算。
   // 注册位置说明：本路由是 3 段（/api/plugins/ui），与既有 GET /api/plugins/graph 同形；
   // 4 段路由（如 /api/plugins/:name/config）不受影响——某插件恰好叫 "ui" 时仅裸 3 段路径被占用。
@@ -1653,10 +2551,10 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     } catch (err) {
       fail(h, err)
     }
-  })
+  }, { access: 'public' })
   // 刻意保持 public：P0 的契约是"读端点行为与改动前完全一致"（设计文档 §8.1 P0 行），
   // 读路径裁剪统一留给 P2。这里**不是"暂缓收紧"，而是收紧会直接弄坏管理台首屏**：
-  // AdminPage 用 Promise.all([api.plugins(), api.session(), api.slots().catch(() => null)]) 取数，
+  // 插件页（packages/web/src/pages/GraphPage.tsx）用 Promise.all 取 plugins/session/slots/graph，
   // 三个里只有 api.session() 没有 .catch()，它一旦 401/503 就整体 reject ⇒ 插件列表根本不渲染。
   // （packages/web 在 P0 不得改动，前端测试又全部 mock 掉了 api 模块，故此回归不会有测试变红。）
   router.register('GET', '/api/session', (h) => {
@@ -1703,7 +2601,12 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
       if (!name) throw new ManagerError('not_found', '缺少插件名')
       const body = await readJsonBody(h)
       if (!('config' in body)) throw new ManagerError('bad_request', '请求体缺少 config 字段')
-      const result = await manager.updateConfig(name, body['config'])
+      // `clearSecrets` 是可选的动作字段（不在 config 里，免得被 schema 裁剪掉）：
+      // 用于"显式清除已配置的密钥"，与"留空 = 不修改"区分开
+      const clearSecrets = Array.isArray(body['clearSecrets'])
+        ? body['clearSecrets'].filter((v): v is string => typeof v === 'string')
+        : []
+      const result = await manager.updateConfig(name, body['config'], { clearSecrets })
       ok(h, result)
     } catch (err) {
       fail(h, err)

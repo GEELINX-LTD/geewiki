@@ -26,7 +26,12 @@
 import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { PLUGIN_UI_FILE_SEGMENT, type GeeWikiManifest, type SlotName } from '@geewiki/core'
+import {
+  isPluginUiEntryPath,
+  type GeeWikiManifest,
+  type PluginRouteDecl,
+  type SlotName,
+} from '@geewiki/core'
 import type { RegisteredPlugin } from './deps.js'
 import { conflictsOf, effectiveSlotsByOwner, type SlotAssignment, type SlotConflict } from './slots.js'
 
@@ -67,6 +72,15 @@ export interface PluginUiTableEntry {
    *    **本次新增该字段不会改变任何既有部署的 revision**，不会平白触发一次全量重取。
    */
   slots?: SlotName[]
+  /**
+   * 该插件**生效的**页面路由声明（F2 新增）。同样空值时省略该键（理由同上）。
+   *
+   * 为什么路由要进入口表而不是只在客户端 bundle 里注册：入口表是**加载决策**的唯一依据，
+   * 而"这个插件的产物里有没有页面"必须参与"要不要推迟加载"的判定——
+   * 只贡献按需插槽 + 一个页面的插件若被整个推迟，用户点它的导航项会看到空白页**且不报错**。
+   * 前端据此把它标为不可推迟（`isLazyOnlyEntry` 返回 false）。
+   */
+  routes?: readonly PluginRouteDecl[]
 }
 
 /** 未能进入入口表的原因（`GET /api/plugins/ui` 的 `skipped`） */
@@ -153,15 +167,19 @@ export function pluginUiNameFromSegments(segments: readonly string[]): string | 
 /**
  * 解析插件清单声明的 UI 入口（`geewiki.client`）。
  * 未声明 → undefined；`client: {}` → 缺省 `entry: 'client.js'`；
- * 文件名不满足 {@link PLUGIN_UI_FILE_SEGMENT}（含 `/`、以 `.` 开头、含空白等）→
+ * 路径不满足 {@link isPluginUiEntryPath}（`..`、绝对路径、空段、以 `.` 开头、含空白等）→
  * **整体视为未声明**（返回 undefined，不抛错——一个坏声明不该让宿主启动失败）。
+ *
+ * ★ F13：判据从"必须单段"放宽为"单段**或**分层路径"。放宽的部分是**限制**，
+ * 不是**防护**：`..` / 绝对路径 / 空段都由 `PLUGIN_UI_ASSET_PATH` 的逐段规则挡住，
+ * 而真正的路径防护在静态资源层（段比较 + realpath）。
  */
 export function pluginUiEntryOf(manifest: GeeWikiManifest | undefined): { entry: string; css?: string } | undefined {
   const client = manifest?.geewiki.client
   if (!client) return undefined
   const entry = client.entry ?? 'client.js'
-  if (!PLUGIN_UI_FILE_SEGMENT.test(entry)) return undefined
-  if (client.css !== undefined && !PLUGIN_UI_FILE_SEGMENT.test(client.css)) return undefined
+  if (!isPluginUiEntryPath(entry)) return undefined
+  if (client.css !== undefined && !isPluginUiEntryPath(client.css)) return undefined
   return client.css === undefined ? { entry } : { entry, css: client.css }
 }
 
@@ -229,6 +247,11 @@ export interface BuildPluginUiTableOptions {
   dirExists?: UiDirExists
   /** 插槽裁决结果（`resolveSlots` 的产物）。缺省视为"无人贡献插槽"，行为与改动前完全一致。 */
   slotAssignments?: readonly SlotAssignment[]
+  /**
+   * 每个 owner **生效的**路由声明（`effectiveRoutesByOwner` 的产物）。
+   * 缺省视为"没有插件声明路由"，行为与改动前完全一致（`routes` 键不出现 ⇒ revision 不变）。
+   */
+  routesByOwner?: ReadonlyMap<string, readonly PluginRouteDecl[]>
 }
 
 /**
@@ -280,12 +303,14 @@ export function buildPluginUiTable(opts: BuildPluginUiTableOptions): PluginUiTab
       continue
     }
     const slots = slotsByOwner.get(name)
+    const routes = opts.routesByOwner?.get(name)
     found[name] = {
       entry: declared.entry,
       ...(declared.css === undefined ? {} : { css: declared.css }),
       rev: revOf(hit),
       // 空数组时省略键：见 PluginUiTableEntry.slots 的说明（保持既有部署 revision 不变）
       ...(slots === undefined || slots.length === 0 ? {} : { slots }),
+      ...(routes === undefined || routes.length === 0 ? {} : { routes }),
     }
   }
   // 按键排序后再序列化：revision 只反映内容，不反映注册表顺序

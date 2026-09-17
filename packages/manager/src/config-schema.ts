@@ -13,6 +13,7 @@
  * 前端只按 refs 图渲染、不做反序列化。
  */
 import type { ConfigSchema } from '@geewiki/core'
+import { SECRET_ROLE } from './secrets.js'
 
 /** 序列化载荷中的单个 schema 节点 */
 export interface ConfigSchemaNode {
@@ -95,6 +96,33 @@ interface SchemaLike {
   dict?: Record<string, SchemaLike>
   inner?: SchemaLike
   list?: SchemaLike[]
+  /**
+   * 节点的元信息（`role` / `description` / `default` …）；仅用于识别 `role: 'secret'`。
+   * 用 `unknown` 而非具体形状：schemastery 的 `Meta<any>` 没有字符串索引签名，
+   * 写成 `Record<string, unknown>` 会让整个 `SchemaLike` 转换被视为不安全的收窄。
+   */
+  meta?: unknown
+}
+
+/**
+ * 声明为 `role: 'secret'` 的**顶层**字段名（写一次、不可回读）。
+ *
+ * 语义（由 `Manager` 落实，见 `secrets.ts` 的文件头）：
+ * 值落盘到独立的密钥文件、**不写进 `plugins.*.json`**、任何 HTTP 响应都不回显，
+ * 留空表示"不修改"，要改只能填一个新值。
+ *
+ * 只识别顶层字段是**有意的收窄**：密钥藏进数组/嵌套对象既没有真实用例，
+ * 又会让"留空 = 不修改"这条语义变得无法判断（空数组 ≠ 未填写）。
+ */
+export function secretFieldNames(schema: ConfigSchema): string[] {
+  const dict = (schema as SchemaLike).dict
+  if (!dict) return []
+  const out: string[] = []
+  for (const [key, node] of Object.entries(dict)) {
+    const role = (node.meta as { role?: unknown } | undefined)?.role
+    if (role === SECRET_ROLE) out.push(key)
+  }
+  return out
 }
 
 /**

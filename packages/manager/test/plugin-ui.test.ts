@@ -78,18 +78,28 @@ test('pluginUiEntryOf：未声明 client → undefined；client:{} → 缺省 cl
   )
 })
 
-test('pluginUiEntryOf：文件名不合法（目录/隐藏/空白/穿越）整体视为未声明', () => {
-  for (const bad of ['a/b.js', '../evil.js', '.env', 'x y.js', '', 'a\\b.js']) {
+test('pluginUiEntryOf：路径不合法（隐藏/空白/穿越/空段）整体视为未声明', () => {
+  /*
+   * ★ F13：`'a/b.js'` **已从本列表移除** —— 分层路径现在是合法的入口形态
+   * （原先"必须单段"是纯限制，没有安全理由；静态层早就支持子目录）。
+   * 放宽的是限制，防护清单原样保留：隐藏名、空白、反斜杠、上跳、空段。
+   */
+  for (const bad of ['../evil.js', '.env', 'x y.js', '', 'a\\b.js', 'a//b.js', '/abs.js', 'a/../b.js']) {
     assert.equal(
       pluginUiEntryOf(manifestOf('@t/a', { entry: bad })),
       undefined,
-      `入口名 ${JSON.stringify(bad)} 应被剔除`,
+      `入口路径 ${JSON.stringify(bad)} 应被剔除`,
     )
   }
   // 样式非法同样整体剔除（宁可当作没有 UI，也不下发半截声明）
   assert.equal(pluginUiEntryOf(manifestOf('@t/a', { entry: 'client.js', css: '../x.css' })), undefined)
   // 合法边界：以字母/数字开头，其后允许 . _ -
   assert.deepEqual(pluginUiEntryOf(manifestOf('@t/a', { entry: 'client-a1_b2.js' })), { entry: 'client-a1_b2.js' })
+  // ★ F13：分层入口与分层样式都合法，且**原样**保留（前端要按这个路径去取）
+  assert.deepEqual(pluginUiEntryOf(manifestOf('@t/a', { entry: 'ui/index.js', css: 'styles/a.css' })), {
+    entry: 'ui/index.js',
+    css: 'styles/a.css',
+  })
 })
 
 /* ---------------------- 插件名与路径段 ---------------------- */
@@ -432,4 +442,40 @@ test('slotConflicts：只在真有多方声明时出现，且**不计入** revis
     sameWithoutConflictFlag.revision,
     'slotConflicts 不应计入 revision（否则仅多一条告警也会触发前端重取 bundle）',
   )
+})
+
+/* ---------------------- F2：路由字段（routes） ---------------------- */
+
+test('routes：无声明时整个键被省略 —— 保证既有部署的 revision 逐字节不变', () => {
+  const stat = fakeStat({ '/p/a/dist/client.js': [1, 2] })
+  const registry = [pluginOf('@t/a', { dir: '/p/a', client: {} })]
+  const base = { registry, activeNames: new Set(['@t/a']), webDist: '/w', statFile: stat, dirExists: anyDirExists }
+
+  const withoutRoutes = buildPluginUiTable(base)
+  const withEmptyMap = buildPluginUiTable({ ...base, routesByOwner: new Map() })
+
+  assert.equal('routes' in (withoutRoutes.plugins['@t/a'] as object), false, '无声明时不应出现 routes 键')
+  assert.equal(withoutRoutes.revision, withEmptyMap.revision, '空路由表不得改变 revision')
+})
+
+test('routes：声明者的 routes 计入 revision（否则 304 会隐藏"插件多了一个页面"）', () => {
+  const stat = fakeStat({ '/p/a/dist/client.js': [1, 2] })
+  const registry = [pluginOf('@t/a', { dir: '/p/a', client: {} })]
+  const base = { registry, activeNames: new Set(['@t/a']), webDist: '/w', statFile: stat, dirExists: anyDirExists }
+
+  const before = buildPluginUiTable(base)
+  const after = buildPluginUiTable({
+    ...base,
+    routesByOwner: new Map([['@t/a', [{ id: 'board', label: '看板', group: 'main' as const }]]]),
+  })
+
+  assert.deepEqual(after.plugins['@t/a']?.routes?.map((r) => r.id), ['board'])
+  assert.notEqual(before.revision, after.revision, '新增页面必须改变 revision，否则前端会一直拿 304')
+
+  // 只改 nav 元信息（id 不变）同样必须计入：导航标签变了而 revision 不变 ⇒ 界面永远显示旧标签
+  const relabeled = buildPluginUiTable({
+    ...base,
+    routesByOwner: new Map([['@t/a', [{ id: 'board', label: '数据看板', group: 'main' as const }]]]),
+  })
+  assert.notEqual(after.revision, relabeled.revision, '导航元信息变化同样要计入 revision')
 })
