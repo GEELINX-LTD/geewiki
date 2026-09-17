@@ -36,8 +36,31 @@ export default defineConfig({
     /*
       这里曾写 `chunkSizeWarningLimit: 800` —— 那是**掩盖**警告而不是解决问题：
       当时主包 832 kB（gzip 266 kB），把阈值抬到 800 kB 之后构建不再提示，但匿名读者
-      依然要下载整包。本批把 `@xyflow/react`（依赖图）拆成独立 chunk 后主包明显回落，
-      故删掉这行、恢复 Vite 默认阈值作为**真实告警**（超过就是又一次依赖进错包）。
+      依然要下载整包。把 `@xyflow/react`（依赖图）拆成独立 chunk 后主包回落到 709 kB，
+      故删掉这行、恢复 Vite 默认阈值继续当**真实告警**。
+
+      ## ★ 709 kB 的实测构成（别把它当成"又有依赖进错包"）
+      原文写着"超过就是又一次依赖进错包"——**这条诊断已经实测证伪**，留着会让人去追
+      一个不存在的错包。当前主 chunk 的构成（用下面的办法量的）：
+
+        · 本项目源码 112 个模块，以及 react / react-dom / scheduler
+        · radix 的若干原语（dialog / dropdown / tooltip 及其传递依赖）
+        · marked + dompurify（`hostSdk.renderMarkdown` 需要，首屏即用）
+        · lucide-react **84 个图标模块**
+        · **不含** `@xyflow/react`、`@codemirror/*`、`@lezer/*` —— 它们分别在
+          `GraphPage-*.js`(239 kB) 与 `MarkdownEditor-*.js`(564 kB) 两个懒加载 chunk 里
+
+      即：主包偏大是**这个 app shell 的真实体量**（React 19 + 组件库 + 一个 Markdown
+      渲染器 + 一个富应用的壳），不是放错位置。真要再压，得动**首屏加载面**
+      （把壳里某几块也改成懒加载），那是产品决定，且会多出请求与闪烁风险。
+
+      ## 怎么重新量（改这条注释前请先量）
+      ```bash
+      cd packages/web && npx vite build --sourcemap
+      # 主 chunk 的 .map 里 sources 列表 = 该 chunk 实际包含的模块，按包分组即可
+      ```
+      注意：**别用 esbuild 的 metafile 做这件事** —— 不加 `--splitting` 时它会把动态
+      `import()` 全部内联，量出来的是一个 1.5 MB 的假主包（实测踩过）。
     */
   },
   base: '/',
