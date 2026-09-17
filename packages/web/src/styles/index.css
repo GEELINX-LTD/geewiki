@@ -39,3 +39,4 @@
 @import '../styles.css' layer(legacy);
 @import './focus.css';
 @import './markdown.css';
+@import './xyflow.css';

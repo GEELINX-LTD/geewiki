@@ -146,8 +146,20 @@ const baseTheme = EditorView.theme({
   },
   '.cm-activeLine': { backgroundColor: 'var(--gw-surface-hover)' },
   '.cm-activeLineGutter': { backgroundColor: 'var(--gw-surface-hover)', color: 'var(--gw-ink-soft)' },
-  '.cm-selectionBackground, ::selection': { backgroundColor: 'var(--gw-accent-soft)' },
-  '&.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--gw-accent-soft)' },
+  /*
+   * ★ 选区用**中间调**的 `--gw-accent-soft-line`，不是 `--gw-accent-soft`。
+   *
+   * 后者是给"淡色底"（chip / 提示块）设计的 token：浅色模式 `#eff6ff`、深色模式 `#10203a`，
+   * 与编辑区表面的**亮度几乎一致** ⇒ 选中一片文字在屏幕上**看不出来**（用户报的
+   * 「选中文本不会表现出来」）。选区要的是"与底色明确可分辨"，而不是"含蓄的强调底"。
+   *
+   * `--gw-accent-soft-line` 在两种模式下都是中间调（浅色 `--gw-blue-200` /
+   * 深色 `--gw-dk-blue-line`），故不需要为深色模式再写一份。
+   */
+  '.cm-selectionBackground, ::selection': { backgroundColor: 'var(--gw-accent-soft-line)' },
+  '&.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--gw-accent-soft-line)' },
+  // 高亮"与选区相同的其它匹配"（`highlightSelectionMatches`）——比选区更轻一档，故意不同
+  '.cm-selectionMatch': { backgroundColor: 'var(--gw-accent-soft)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--gw-accent)' },
   '.cm-placeholder': { color: 'var(--gw-ink-muted)', fontStyle: 'normal' },
   '.cm-scroller': { overflow: 'auto', fontFamily: 'var(--gw-font-mono)' },
