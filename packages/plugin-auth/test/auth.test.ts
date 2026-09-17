@@ -279,11 +279,19 @@ test('auth-service：apply 后 ctx.get 拿得到；各端点的 access 等级符
     assert.equal(typeof h.svc().resolveSession, 'function')
     assert.equal(h.svc().hasCredentialSource(), false, '空库：还没有可登录的账号')
 
-    // 等级：登录/初始化/状态是 public（否则引导与登录无法进行），me/password 是 user
-    assert.equal(h.accessOf('GET', '/api/auth/state'), undefined, '未声明 = public')
-    assert.equal(h.accessOf('POST', '/api/auth/setup'), undefined)
-    assert.equal(h.accessOf('POST', '/api/auth/login'), undefined)
-    assert.equal(h.accessOf('POST', '/api/auth/logout'), undefined)
+    /*
+     * 等级：登录/初始化/状态/登出是 public（否则引导与登录无法进行），me/password 是 user。
+     *
+     * ★ F11：这里**从 `undefined` 改成了 `'public'`**。
+     * 改造前断言的是"未声明 ⇒ 默认 public" —— 而那正是审计报告 §3.1 点名的问题：
+     * 省略第 4 参与写 `{ access: 'public' }` 运行期等价，但"谁决定了它公开"完全不同，
+     * 评审时也看不出来。现在每个端点都显式声明，这条断言于是钉住的是
+     * "作者写下的决定"，而不是"默认值兜住了"。
+     */
+    assert.equal(h.accessOf('GET', '/api/auth/state'), 'public', '须显式声明 public，不得依赖默认值')
+    assert.equal(h.accessOf('POST', '/api/auth/setup'), 'public', '初始化入口必须公开（首次部署没有账号）')
+    assert.equal(h.accessOf('POST', '/api/auth/login'), 'public')
+    assert.equal(h.accessOf('POST', '/api/auth/logout'), 'public')
     assert.equal(h.accessOf('GET', '/api/auth/me'), 'user')
     assert.equal(h.accessOf('POST', '/api/auth/password'), 'user')
 

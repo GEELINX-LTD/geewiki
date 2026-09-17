@@ -71,7 +71,7 @@ export const EchoPlugin = {
       })
     }
 
-    const unregister = router.register('GET', '/api/echo', handle)
+    const unregister = router.register('GET', '/api/echo', handle, { access: 'public' })
     console.log('[@geewiki/echo] 已激活: GET /api/echo')
     return () => {
       unregister()

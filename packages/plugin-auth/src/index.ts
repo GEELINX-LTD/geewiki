@@ -42,16 +42,24 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
 import {
+  USER_LOGIN_EVENT,
   asAsync,
   auditIpHash,
   writeAuditLog,
   type AnyDatabaseAdapter,
+  type AuthService,
+  type AuthUser,
   type DatabaseAdapterAsync,
   type GeeWikiManifest,
   type HttpRouterService,
+  type OidcAuthOutcome,
   type Principal,
   type RequestVerdict,
   type RouteHandlerContext,
+  type UserLoginEvent,
+  builtinCapabilitiesOf,
+  type CapabilityService,
+  type CapabilitySet,
 } from '@geewiki/core'
 import { dummyVerify, hashPassword, verifyPassword, type StoredCredential } from './password.js'
 import {
@@ -148,92 +156,21 @@ export const AuthConfigSchema = Schema.object({
 
 /* ======================= auth-service 服务契约 ======================= */
 
-/** 对外可见的用户信息（**不含**任何凭据字段） */
-export interface AuthUser {
-  id: number
-  email: string
-  displayName: string
-  orgId: number
-  /**
-   * 组织角色，**唯一来源是 `org_members` 表**（见 `resolveOrgRole`）。
-   * `null` = guest（**没有**组织角色，不是最低档角色）—— 设计文档 §2.1。
-   * 它**只用于能力判定**，不参与"能看哪条内容"的判定（§2.0 两条正交的轴）。
-   */
-  orgRole: 'owner' | 'admin' | 'member' | 'viewer' | null
-  emailVerified: boolean
-  createdAt: string
-  lastSeenAt: string | null
-}
-
-/**
- * `authenticateOidc` 的裁决结果（设计文档 §7.2 那张表）。
+/*
+ * ★ F3：契约已**下沉到 `@geewiki/core`**（真源 `packages/core/src/services.ts`）。
  *
- * 每个分支都对应一个明确的 HTTP 语义，由**调用方**（`@geewiki/oidc` 的回跳路由）翻译：
- * 本包不认识 HTTP，保持可测。
+ * 这里只做**转出**，保证既有 `import { AuthService } from '@geewiki/auth'` 不破。
+ * 但**新的消费方与替换实现请直接从 `@geewiki/core` 取** —— 替换身份实现的插件
+ * 不该为了拿接口类型而依赖它要替换的那个包（语义倒挂，F3 消掉的正是它）。
  */
-export type OidcAuthOutcome =
-  /** 身份已绑定（或按策略新建并绑定）⇒ 已建会话；`setCookie` 可直接写进响应头 */
-  | { kind: 'login'; user: AuthUser; setCookie: string; expiresAt: string }
-  /**
-   * `(issuer,sub)` 未绑定，但该 email 已有本地账号 ⇒ **绝不自动合并**。
-   * `ticket` 是 bearer 凭据，**只能经 HttpOnly cookie 交付**，不得出现在 URL / 响应体里。
-   */
-  | { kind: 'link_required'; ticket: string; email: string; expiresAt: string }
-  /** `invite_only` 且无未消费邀请 */
-  | { kind: 'no_invitation'; email: string | null }
-  /** 其它拒绝（`off` / 域名不允许 / 账号停用 / 声明不合法） */
-  | { kind: 'denied'; reason: string; email: string | null }
-
-export interface AuthService {
-  /**
-   * 是否存在**任何可用的凭据来源**（存在可登录账号，或将来接入的 OIDC 通道）。
-   *
-   * **必须同步返回**：消费方是 `judgeAccess`（纯函数），用于区分
-   * 503 `bootstrap_required`（根本没东西可登录）与 401 `unauthorized`（请去登录）。
-   * 实现是进程内缓存的布尔值（激活时查一次，setup / 口令变更后就地更新）。
-   */
-  hasCredentialSource(): boolean
-  /** 解析原始会话令牌（cookie 值）→ 用户；无效 / 过期 / 已吊销 / 账号停用一律 `undefined` */
-  resolveSession(rawToken: string): Promise<AuthUser | undefined>
-  /**
-   * 注册一个 OIDC provider（由 `@geewiki/oidc` 调用）。返回注销函数。
-   *
-   * 同 id 重复注册**抛错**而非静默覆盖 —— 两个 adapter 抢同一个 id 是需要被看见的配置冲突
-   * （与 `llm-service` 的路由注册表同一裁决）。
-   */
-  registerOidcProvider(provider: OidcProvider): () => void
-  /** 当前已注册的 provider 快照（供 `capabilities` 下发；已停用的返回空数组） */
-  listOidcProviders(): readonly OidcProviderInfo[]
-  /**
-   * 用**已验证**的 OIDC 身份声明完成登录 / 建号 / 判定需要绑定。
-   *
-   * 调用方必须先完成全部密码学校验（签名、`iss`、`aud`、`exp`、`nonce`）——
-   * 本方法**不做任何 token 校验**，它只负责账号策略与数据库。
-   */
-  authenticateOidc(claims: OidcClaims, req: IncomingMessage): Promise<OidcAuthOutcome>
-  /**
-   * ★ P2：由**受信插件**创建本地账号（当前调用方只有 @geewiki/org 的邀请流程）。
-   *
-   * **本方法不做任何鉴权** —— 它假定调用方已经验证过"这个人确实该有账号"
-   * （org 用的是一个 256 位熵、未过期、未消费、且邮箱匹配的邀请令牌）。
-   * 因此**绝不要**把它直接接到任何 HTTP 端点上。
-   *
-   * 好处是口令哈希、邮箱唯一性、`credentialSource` 的维护都留在身份域内，
-   * 不会被复制到第二个插件里（复制出来的那份将来必然漏掉算法升级）。
-   */
-  createLocalUser(input: {
-    email: string
-    displayName: string
-    password: string
-  }): Promise<
-    { ok: true; userId: number } | { ok: false; error: 'email_taken' | 'invalid_email' | 'invalid_password' }
-  >
-}
+export type { AuthService, AuthUser, OidcAuthOutcome } from '@geewiki/core'
 
 export const manifest: GeeWikiManifest = {
   name: '@geewiki/auth',
   version: '0.1.0',
   geewiki: {
+    // ★ F10：跨界能力声明（宿主不强制，用于评审与可观测）
+    permissions: ['env'],
     displayName: '身份与登录',
     description: '本地账号密码登录、会话管理与首次初始化向导',
     provides: 'auth-service',
@@ -422,44 +359,33 @@ async function resolveGroupIds(
   return rows.map((r) => Number(r.group_id))
 }
 
-/** 下发给前端的**能力**集合（与"能看什么"完全正交，见设计文档 §2.0） */
-export interface AuthCapabilities {
-  editContent: boolean
-  administer: boolean
-  manageVisibility: boolean
-}
+/*
+ * ★ F9：**能力集合的真源已上移到 `@geewiki/core`**。
+ *
+ * 原先这里有一个本地的 `AuthCapabilities`（三个布尔字段），`web/src/api.ts` 里还有
+ * 一模一样的第二份，`web/src/lib/navPlan.ts` 里还有第三份名字清单。三份真源意味着
+ * "加一个能力"要改三处，而漏改一处**不会编译报错**——它只会让那个入口永远不出现。
+ *
+ * 现在：
+ * - **能力名**在 `core/src/domain.ts`（内置三个 + 插件用 `a/b` 命名空间声明）；
+ * - **取值规则**在 `core/src/services.ts` 的 `builtinCapabilitiesOf()`（本文件原先的
+ *   `capabilitiesOf()` 就是它——规则本身没变，只是搬到了替换 auth 的插件也能拿到的地方）；
+ * - **插件贡献的值**由 `capability-service` 注册的求解器给出。
+ */
 
 /**
- * 由组织角色推导能力集合。
+ * 某主体的能力快照：内置（角色推导） ∪ 插件注册的求解器。
  *
- * **只用于前端隐藏入口 —— 服务端判定一律独立进行**：前端隐藏不是安全措施
- * （设计文档 §9 R10 反模式第 5 条），这些布尔值被改掉也不会多出任何权限。
+ * **逐请求现取能力服务**，不在激活期存快照：提供者可能晚于本插件激活，
+ * 也可能被热替换，而 `ctx.get` 拿不到时是**静默**返回 `undefined` 的——
+ * 存快照会把"服务晚到"永久固化成"插件能力永远算不出来"。
  *
- * 角色语义（§2.1）：
- * - `owner` / `admin`：管理成员、组、邀请、插件；改任何条目的可见性。
- * - `member`：建改内容；对自己有编辑权的条目改可见性与授予例外。
- * - `viewer`：**只读**（能看组织内可见条目，不能写）。
- * - `null`（= guest，未入伙）：什么都不能做，只能看被显式授予的内容。
- *
- * `manageVisibility` 给的是"**是否可能拥有**"的上界；**逐条目的**判定由
- * policy-service 的 `PageAccess.canManageVisibility` 给出（本文件不认识条目）。
+ * 拿不到服务时**退回纯内置**：这是保守的一侧（插件能力缺失 ⇒ 前端藏起对应入口），
+ * 而不是"全都给"。
  */
-function capabilitiesOf(principal: Principal | undefined): AuthCapabilities {
-  if (principal?.kind === 'break-glass') {
-    // 应急通道的意义是"身份系统本身出问题时还能进场"，能力上界等同 owner。
-    // 它的每次使用都由 server 层写 `access.break_glass` 留痕（设计文档 D7）。
-    return { editContent: true, administer: true, manageVisibility: true }
-  }
-  if (principal?.kind !== 'user') {
-    return { editContent: false, administer: false, manageVisibility: false }
-  }
-  const role = principal.orgRole
-  const isAdmin = role === 'owner' || role === 'admin'
-  return {
-    editContent: isAdmin || role === 'member',
-    administer: isAdmin,
-    manageVisibility: isAdmin || role === 'member',
-  }
+function capabilitySnapshot(ctx: Context, principal: Principal | undefined): CapabilitySet {
+  const svc = ctx.get('capability-service') as CapabilityService | undefined
+  return svc ? svc.snapshot(principal) : builtinCapabilitiesOf(principal)
 }
 
 /* ============================ 插件本体 ============================ */
@@ -772,12 +698,30 @@ export const AuthPlugin = {
     const loginAs = async (
       userId: number,
       req: IncomingMessage,
+      method: 'password' | 'oidc' = 'password',
     ): Promise<{ user: AuthUser; setCookie: string; expiresAt: string }> => {
       await db.run('UPDATE users SET last_seen_at = ? WHERE id = ?', [new Date().toISOString(), userId])
       const session = await createSession(userId, req)
       const user = await loadUser(userId)
       // 会话已建但账号读不到 = 并发删号。抛出去让调用方 500，而不是发一个指向空账号的 cookie。
       if (!user) throw new Error('@geewiki/auth: 会话已建立但账号不可读（并发删除？）')
+      /*
+       * F7 平台事件：登录成功（**SSO 侧**）。
+       *
+       * `loginAs` 被 SSO 的两条子路径共用（已绑定账号 / 首次建号），在这里发一次即可；
+       * **本地口令路径不走 `loginAs`**（它在 `POST /api/auth/login` 里内联建会话），
+       * 那边单独发同一个事件——两处都必须发，漏一处就是"某种登录方式不触发订阅者"，
+       * 而那种缺口极难被发现。`method` 字段正是用来让订阅者区分两者的。
+       *
+       * 负载刻意**不含会话标识**：本事件是**广播**，所有订阅者都会收到；
+       * 会话 id 属于"能关联到具体一次登录"的敏感标识，需要它的场景（审计关联）
+       * 已经落在 `audit()` 里，不必再广播一份。
+       */
+      try {
+        ctx.emit(USER_LOGIN_EVENT, { userId, method } satisfies UserLoginEvent)
+      } catch (err) {
+        console.warn(`[@geewiki/auth] ${USER_LOGIN_EVENT} 的订阅者抛错（已忽略，登录本身照常成功）:`, err)
+      }
       return {
         user,
         setCookie: sessionCookie(session.rawToken, {
@@ -848,7 +792,7 @@ export const AuthPlugin = {
           new Date().toISOString(),
           b.iid,
         ])
-        const out = await loginAs(userId, req)
+        const out = await loginAs(userId, req, 'oidc')
         audit({
           action: 'login.ok',
           targetKind: 'user',
@@ -940,7 +884,7 @@ export const AuthPlugin = {
         })
         // 首个 SSO 账号同样是"可登录账号" ⇒ 探针必须即时更新（否则写端点会一直 503）
         await refreshCredentialSource()
-        const out = await loginAs(created, req)
+        const out = await loginAs(created, req, 'oidc')
         audit({
           action: 'user.create',
           targetKind: 'user',
@@ -1018,11 +962,11 @@ export const AuthPlugin = {
            * 能力下发：**只用于前端隐藏入口**，服务端判定一律独立进行
            * （前端隐藏不是安全措施，见设计文档 §9 R10 反模式第 5 条）。
            */
-          capabilities: capabilitiesOf(h.principal),
+          capabilities: capabilitySnapshot(ctx, h.principal),
           /** OIDC 通道（P1.5）：未启用 `@geewiki/oidc` 时 `available:false`，前端不渲染 SSO 按钮 */
           oidc: oidcCapability(),
         })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- POST /api/auth/setup（public；仅首次可用） ---------- */
@@ -1120,7 +1064,7 @@ export const AuthPlugin = {
         })
         h.res.setHeader('set-cookie', sessionCookie(session.rawToken, { maxAgeSeconds: session.maxAgeSeconds, secure: secureCookie }))
         h.json(201, { ok: true, user, expiresAt: session.expiresAt })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- POST /api/auth/login（public） ---------- */
@@ -1207,8 +1151,20 @@ export const AuthPlugin = {
           actorIpHash: auditIpHash(clientIp(h.req)),
         })
         h.res.setHeader('set-cookie', sessionCookie(session.rawToken, { maxAgeSeconds: session.maxAgeSeconds, secure: secureCookie }))
+        /*
+         * F7 平台事件：登录成功（**本地口令路径**）。
+         *
+         * 这条路径**不走 `loginAs`**（它内联建会话），所以事件必须在这里单独发一次。
+         * 两处都发是刻意的：只发 SSO 那一处，症状是"用口令登录的人不触发订阅者"——
+         * 而写订阅者的插件作者通常只用口令测试，于是这个缺口会一直潜伏到某个用户报障。
+         */
+        try {
+          ctx.emit(USER_LOGIN_EVENT, { userId, method: 'password' } satisfies UserLoginEvent)
+        } catch (err) {
+          console.warn(`[@geewiki/auth] ${USER_LOGIN_EVENT} 的订阅者抛错（已忽略，登录本身照常成功）:`, err)
+        }
         h.json(200, { ok: true, user: await loadUser(userId), expiresAt: session.expiresAt })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- POST /api/auth/logout（public） ---------- */
@@ -1234,7 +1190,7 @@ export const AuthPlugin = {
         }
         h.res.setHeader('set-cookie', clearedSessionCookie({ secure: secureCookie }))
         h.json(200, { ok: true })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- GET /api/auth/me（user） ---------- */
@@ -1262,7 +1218,7 @@ export const AuthPlugin = {
              * 能力下发：**只用于前端隐藏入口**，服务端判定一律独立进行
              * （前端隐藏不是安全措施，见设计文档 §9 R10 反模式第 5 条）。
              */
-            capabilities: capabilitiesOf(h.principal),
+            capabilities: capabilitySnapshot(ctx, h.principal),
           })
         },
         { access: 'user' },

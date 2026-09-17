@@ -15,8 +15,6 @@
  * 方法集与上述四个端点一一对应，两者**共用同一份内部实现**（listPages/getPage/
  * savePage/deletePage），故同一入参下结果逐字段一致。
  */
-import { createReadStream } from 'node:fs'
-import { stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
@@ -25,16 +23,33 @@ import {
   asAsync,
   auditIpHash,
   closeAfterResponse,
+  ATTACHMENT_UPLOADED_EVENT,
   DEFAULT_DATA_DIR,
+  PAGE_CREATED_EVENT,
+  PAGE_DELETED_EVENT,
+  PAGE_SAVED_EVENT,
   resolveProjectPath,
   writeAuditLog,
   type AnyDatabaseAdapter,
+  type AttachmentUploadedEvent,
   type DatabaseExecutor,
   type GeeWikiManifest,
   type HttpRouterService,
+  type PageDeletedEvent,
+  type PageSavedEvent,
   type Principal,
+  type ResyncReport,
   type RouteHandlerContext,
+  type WikiBacklink,
+  type WikiNavOrder,
+  type WikiOutlink,
+  type WikiPageDetail,
+  type WikiPageSummary,
+  type WikiSaveInput,
+  type WikiSaveResult,
+  type WikiService,
 } from '@geewiki/core'
+import { AttachmentServiceError, type AttachmentService } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
 import {
   ATTACHMENT_EXT_WHITELIST,
@@ -44,9 +59,8 @@ import {
   effectiveMime,
   formatDisposition,
   normalizeExt,
-  resolveAttachmentPath,
 } from './attachments.js'
-import { AttachmentStoreError, ensureAttachmentDirs, isUniqueViolation, storeStream } from './attachment-store.js'
+import { AttachmentStoreError, createFsAttachmentService, isUniqueViolation } from './attachment-store.js'
 import {
   BlockParseError,
   BlockSyncError,
@@ -136,6 +150,11 @@ export interface WikiConfig {
   attachmentAllowedExt?: string[]
   /** 是否允许 SVG 内联展示（默认 false；同源内联 SVG 可执行脚本） */
   attachmentInlineSvg?: boolean
+  /**
+   * 附件**字节存储**由谁提供（★ F4）。`'builtin'`（默认）= 本插件自带的本地实现；
+   * `'none'` = 不注册内置实现，改用别处提供的 `attachment-service`。
+   */
+  attachmentProvider?: 'builtin' | 'none'
 }
 
 /**
@@ -175,102 +194,47 @@ export const WikiConfigSchema = Schema.object({
   attachmentInlineSvg: Schema.boolean()
     .default(false)
     .description('是否允许 SVG 内联展示（默认关闭：同源内联 SVG 可执行脚本 = 存储型 XSS，除非另配 CSP）'),
+  /*
+   * ★ F4：附件**字节存储**由谁提供。
+   *
+   * 默认 `'builtin'` = 本插件自带的本地文件系统实现（内容寻址，向后兼容）。
+   * 设为 `'none'` 时本插件**不再注册**内置实现，改为使用 `ctx.get('attachment-service')`
+   * 拿到的那个 —— 于是"换 S3/WebDAV"不需要改 wiki 源码，只需要：
+   *   1. 一个插件 `ctx.provide('attachment-service', …)`（实现 `@geewiki/core` 的 `AttachmentService`）；
+   *   2. 本项设为 `'none'`。
+   *
+   * **为什么不自动探测"别人提供了没有"**：cordis 服务在提供者的 `apply()` 结算前对
+   * 其它插件不可见（`ctx.get` 返回 undefined 且**静默**），自动探测会在激活顺序变化时
+   * 悄悄退回内置实现或悄悄拿不到服务。显式配置让这件事在配置里可见。
+   */
+  attachmentProvider: Schema.union([
+    Schema.const('builtin').description('使用本插件自带的本地实现（默认）'),
+    Schema.const('none').description('不自带：改用别处提供的 attachment-service'),
+  ])
+    .default('builtin')
+    .description('附件字节存储由谁提供'),
 })
 
 /* ======================= wiki-service 服务契约 ======================= */
 
-/** 页面摘要（对应 GET /api/pages 的单项） */
-export interface WikiPageSummary {
-  slug: string
-  title: string
-  updated_at: string
-  /** 版本号 = 历史快照数 + 1（与端点同口径） */
-  version: number
-}
-
-/** 页面详情（对应 GET /api/pages/:slug 的响应体） */
-export interface WikiPageDetail {
-  slug: string
-  title: string
-  content: string
-  created_at: string
-  updated_at: string
-  version: number
-  /**
-   * 最近版本历史（条数受 config.recentVersions 限制，按 id 倒序）。
-   *
-   * ★ `author`（0019）：**做出这次改动的人**，不是"快照内容的作者"。
-   * 快照存的是**改动前**的正文（`savePage` 的既有约定："先快照旧的，再改"），
-   * 而 `saved_by` 与 `saved_at` 记的是同一次动作 ⇒ 把「什么时候 + 谁 + 这次改了哪几行」
-   * 对齐成一条改动。落成一句话：**第 i 条快照的作者 = 把它覆盖掉的那个人**。
-   *
-   * `author: null` 的三种来源（读侧一律显示「未记录」，**不编造**）：
-   *   1. 0019 之前写入的历史行（`saved_by` 列还不存在）；
-   *   2. 经 `wiki-service.save()` 跨插件代调用、没有可归属主体的写入；
-   *   3. 该用户已被删除 —— 0019 刻意**不加外键**（历史资产必须留存，见迁移注释），
-   *      所以 id 可能指向一个查不到的账号，LEFT JOIN 会回 NULL。
-   *
-   * `title` 是**该快照当时的标题**。为什么标题也在 `content` 列旁边：`savePage` 允许
-   * 只改标题（正文不变时走 `unchanged` 分支不写历史，但标题+正文同时改会写一条），
-   * 时间线上要能看出"这次连标题一起改了" —— 只给正文的 diff 会漏掉这一半。
-   */
-  versions: {
-    id: number
-    saved_at: string
-    title: string | null
-    author: { id: number; displayName: string | null } | null
-  }[]
-  /**
-   * ★ P2：当前主体对这条目的**能力**，供前端条件化渲染按钮。
-   *
-   * **前端隐藏只是体验，不是安全** —— 服务端在写路径上另有强制（§9 R10 反模式 5）。
-   * 之所以要下发：否则界面会对每个访客都显示"编辑/删除"，点下去才 401/403，
-   * 那是把权限做成了猜谜。
-   */
-  capabilities: { canEdit: boolean; canDelete: boolean; canManageVisibility: boolean }
-  /**
-   * ★ P2：可见性档位。**只在有管理权时下发** —— 它是"谁能看"的结构信息，
-   * 普通读者不需要它，管理面板才需要回填。
-   */
-  visibility?: 'private' | 'org' | 'public'
-  inherit?: boolean
-  published?: boolean
-}
-
-export interface WikiSaveInput {
-  title: string
-  content: string
-}
-
-/**
- * 一次 `blocks.tier` 扇出重算的**结果**：把"没重算"与"重算失败"分开。
+/*
+ * ★ F3：契约已**下沉到 `@geewiki/core`**（真源 `packages/core/src/services.ts`）。
  *
- * 为什么需要这一层：`resynced === 0` 本身是**歧义**的 —— 它既可能是"该页没有子孙"
- * （完全正常），也可能是"扇出抛错、一个都没算"（**内容泄漏级**：祖先收紧没传导到
- * 子孙的 `tier`，于是读路径 404 而检索仍命中并吐出正文片段）。调用方拿到一个裸数字
- * 时无法区分这两者，而它们的处置完全不同。
- *
- * 单一真源：写入路径的响应（`WikiSaveResult.indexTiersResync`）、档位变更端点、
- * 以及 `POST /api/admin/blocks/resync` 的逐页结果都用这一个类型。
+ * 这里只做**转出**，保证既有 `import { WikiService } from '@geewiki/wiki'` 不破。
+ * 但**新的消费方与替换实现请直接从 `@geewiki/core` 取** —— 替换 wiki 实现的插件
+ * 不该为了拿接口类型而依赖它要替换的那个包（语义倒挂，F3 消掉的正是它）。
  */
-export interface ResyncReport {
-  /** 被重算的**块**数（0 且 `failed === false` = 该页没有子孙 / 没有块） */
-  resynced: number
-  /** 是否**整个扇出抛错**（true 时 `resynced` 必然为 0，且必须处置） */
-  failed: boolean
-  error?: string
-}
-
-export interface WikiSaveResult {
-  outcome: 'created' | 'updated' | 'unchanged'
-  version: number
-  /**
-   * 仅 `outcome === 'created'` 时可能出现：新建的页可能**成为已有页的祖先**（slug 前缀），
-   * 于是那些子孙的有效档位被收紧，必须重算它们的 `blocks.tier`（否则检索仍按旧档位 ⇒
-   * 读路径 404 而检索命中，属内容泄漏级）。
-   */
-  indexTiersResync?: ResyncReport
-}
+export type {
+  ResyncReport,
+  WikiBacklink,
+  WikiNavOrder,
+  WikiOutlink,
+  WikiPageDetail,
+  WikiPageSummary,
+  WikiSaveInput,
+  WikiSaveResult,
+  WikiService,
+} from '@geewiki/core'
 
 /**
  * `GET /api/pages/:slug/versions` 的查询行（内部类型，不下发）。
@@ -293,83 +257,12 @@ interface VersionListRow {
   acl_json: string | null
 }
 
-/** 反向链接项：**引用**了某页的页面（对应 GET /api/pages/:slug/backlinks 的单项） */
-export interface WikiBacklink {
-  slug: string
-  title: string
-}
-
-/**
- * 正向链接项：某页正文里**指向**的目标。
- *
- * `title` 为 `null` 表示目标页面**尚不存在**（先写引用、后建页面是正常用法，
- * 与 wiki 的"红链"语义一致），这正是本表 `target_slug` 不加外键的原因。
- */
-export interface WikiOutlink {
-  /**
-   * `true`=目标存在且可见；`false`=目标不存在（红链，可创建）；
-   * `'hidden'`=**存在但你看不到** —— 前端不得把它渲染成"不存在"，
-   * 否则用户会去创建一个已存在的页面（脏数据 + 错误引导）。
-   */
-  exists?: boolean | 'hidden'
-  slug: string
-  title: string | null
-}
-
-/**
- * `wiki-service` 服务契约（本插件经 `ctx.provide('wiki-service', svc)` 提供）。
- *
- * 存在的意义：让消费方**不必**直接 `SELECT` 本插件的 `pages` / `page_versions` 表——
- * 那会把表结构变成跨包隐式契约，并绕开本插件的"幂等保存 + 版本快照"语义
- * （保存时先快照旧正文；标题与正文都未变化时不写历史、不动 updated_at）。
- *
- * **为什么必须有它**：manifest 的 `geewiki.provides` 只是依赖图 token，**不会**创建
- * cordis 服务。此前本插件声明了 `provides: 'wiki-service'` 却从未 `ctx.provide`，
- * 于是任何按 `requires: ['wiki-service']` 依赖本插件的消费方 `ctx.get('wiki-service')`
- * 都会拿到 `undefined`（同类症状极难定位：调用方看到的只是"永远拿不到数据"）。
- *
- * **方法集与四个 REST 端点一一对应**（不引入端点之外的新语义）：
- *   list()   ↔ GET    /api/pages
- *   get()    ↔ GET    /api/pages/:slug
- *   save()   ↔ PUT    /api/pages/:slug
- *   remove() ↔ DELETE /api/pages/:slug
- *   backlinks() ↔ GET /api/pages/:slug/backlinks
- *   links()     ↔ GET /api/pages/:slug/links
- *
- * 入参非法时抛错（而非静默返回空值）：`message` 以 `<code>: ` 开头，`code` 与端点的
- * 400/413 错误码同源（`invalid_slug` / `invalid_title` / `content_too_large`）。
- *
- * **方法全部返回 Promise（自本批起）**：本插件同时支持同步适配器（better-sqlite3）与
- * 异步适配器（pg），后者本质上是异步的，故唯一的共同形态是异步。
- * 契约变更的代价为零：全仓 grep 确认**没有任何 `ctx.get('wiki-service')` 消费者**
- * （只有提及它的注释），故不存在需要同步迁移的调用方。
- */
-export interface WikiService {
-  /*
-   * ★ P2：**所有读方法都显式要求 `principal`**（设计文档 §9 R2）。
-   *
-   * 本服务是 cordis 全局单例，不持有请求上下文。若把主体做成可选参数，
-   * 任何"忘了传"的调用点都会静默退化成"不过滤"—— 那是把一次编码疏忽变成全量泄漏。
-   * 加必填参数让它在**编译期**就炸，而不是在运行时悄悄放行。
-   */
-  /** 页面摘要列表（按 updated_at 倒序，与端点同序）；只含该主体可见的条目 */
-  list(principal: Principal): Promise<WikiPageSummary[]>
-  /** 页面详情；**不存在或无权**均返回 `undefined`（对应端点 404，不泄露存在性） */
-  get(slug: string, principal: Principal): Promise<WikiPageDetail | undefined>
-  /** 新建或更新（幂等 upsert）：标题与正文均未变化时 outcome='unchanged' 且不写历史 */
-  save(slug: string, input: WikiSaveInput): Promise<WikiSaveResult>
-  /** 删除页面及其全部版本历史；返回是否确实删除（false 对应端点 404） */
-  remove(slug: string): Promise<boolean>
-  /** 引用了该页的页面（按标题、slug 稳定排序）；页面不存在时返回 `undefined`（对应端点 404）。已按主体可见性过滤 */
-  backlinks(slug: string, principal: Principal): Promise<WikiBacklink[] | undefined>
-  /** 该页正文指向的目标；`undefined` 对应 404。不可见的目标带 `exists:'hidden'`，**不得**当作"不存在" */
-  links(slug: string, principal: Principal): Promise<WikiOutlink[] | undefined>
-}
-
 export const manifest: GeeWikiManifest = {
   name: '@geewiki/wiki',
   version: '0.1.0',
   geewiki: {
+    // ★ F10：跨界能力声明（宿主不强制，用于评审与可观测）
+    permissions: ['fs:read', 'fs:write', 'env'],
     displayName: '知识库页面',
     description: '创建、编辑与删除页面，并保留每次保存的历史版本',
     provides: 'wiki-service',
@@ -590,6 +483,72 @@ function parseSaveBody(body: unknown): WikiSaveInput {
   return normalizeSaveFields(b.title, b.content)
 }
 
+/**
+ * 页面的**直接父级** slug（顶层页面为 `null`）。
+ *
+ * 层级完全由 slug 决定（本仓没有 `parent_id` 列，见 `navTree.ts` 的同一约定）：
+ * `a/b/c` 的父级是 `a/b`。拖动排序只在同一父级内进行，判据就是它——
+ * 这也是"拖动不会改变页面身份"的实现方式（slug 是 URL 里那个身份）。
+ */
+export function parentOf(slug: string): string | null {
+  const i = slug.lastIndexOf('/')
+  return i < 0 ? null : slug.slice(0, i)
+}
+
+/** `setNavOrder` 的拒绝原因（HTTP 层据 `reason` 翻成 400 与可读消息）。 */
+export class NavOrderError extends Error {
+  constructor(
+    readonly reason: 'empty' | 'duplicate' | 'not_a_sibling',
+    readonly slug?: string,
+  ) {
+    super(`nav_order_rejected: ${reason}${slug === undefined ? '' : ` (${slug})`}`)
+    this.name = 'NavOrderError'
+  }
+}
+
+/** `POST /api/pages/:slug/hidden` 的请求体（白名单：只认 `hidden` 一个字段） */
+function parseNavHiddenBody(body: unknown): boolean {
+  const b = (body ?? {}) as Record<string, unknown>
+  if (typeof b !== 'object' || Array.isArray(b)) {
+    throw new Error('invalid_body: 请求体须为 JSON 对象')
+  }
+  const unknown = Object.keys(b).filter((k) => k !== 'hidden')
+  if (unknown.length > 0) {
+    throw new Error(`invalid_body: 未知字段: ${unknown.join(', ')}`)
+  }
+  if (typeof b['hidden'] !== 'boolean') {
+    throw new Error('invalid_body: hidden 必须是布尔值')
+  }
+  return b['hidden']
+}
+
+/**
+ * `POST /api/pages/order` 的请求体。
+ *
+ * `parent` 可为 null（= 顶层）；`items` 是这一层的**完整新顺序**，
+ * 每一项可以是页面 slug，也可以是**没有页面的分组路径**（层级由 slug 决定，
+ * `guide` 本身可能不是页面，但同样需要位次）。
+ */
+function parseNavOrderBody(body: unknown): { parent: string | null; items: string[] } {
+  const b = (body ?? {}) as Record<string, unknown>
+  if (typeof b !== 'object' || Array.isArray(b)) {
+    throw new Error('invalid_body: 请求体须为 JSON 对象')
+  }
+  const unknown = Object.keys(b).filter((k) => k !== 'parent' && k !== 'items')
+  if (unknown.length > 0) {
+    throw new Error(`invalid_body: 未知字段: ${unknown.join(', ')}`)
+  }
+  const parent = b['parent'] ?? null
+  if (parent !== null && typeof parent !== 'string') {
+    throw new Error('invalid_body: parent 必须是字符串或 null')
+  }
+  const raw = b['items']
+  if (!Array.isArray(raw) || raw.some((x) => typeof x !== 'string')) {
+    throw new Error('invalid_body: items 必须是字符串数组')
+  }
+  return { parent: parent as string | null, items: raw as string[] }
+}
+
 export const WikiPlugin = {
   name: '@geewiki/wiki',
   /** cordis 约定：声明 Config 后由 cordis 负责校验与默认值填充 */
@@ -701,19 +660,67 @@ export const WikiPlugin = {
     const attachmentInlineSvg = config.attachmentInlineSvg === true
 
     /**
+     * ★ F4：附件**字节存储**（`attachment-service`）。
+     *
+     * 默认由本插件注册内置的本地实现；`attachmentProvider: 'none'` 时**不注册**，
+     * 改用别处提供的那个（见 `WikiConfigSchema` 该项的注释）。
+     *
+     * 消费一律走 `attachmentService()` **逐请求现取**，而不是在这里存一个快照：
+     * 提供者可能晚于本插件激活、也可能被热替换（`ctx.get` 返回 undefined 是**静默**的，
+     * 存快照会把"服务晚到"永久固化成"附件永远 503"）。
+     */
+    const builtinAttachment: AttachmentService | undefined =
+      config.attachmentProvider === 'builtin'
+        ? createFsAttachmentService({ dataDir: attachmentDataRoot, tmpDir: attachmentTmpDir })
+        : undefined
+    const attachmentUnprovide = builtinAttachment
+      ? ctx.provide('attachment-service', builtinAttachment)
+      : undefined
+    const attachmentService = (): AttachmentService => {
+      const svc = ctx.get('attachment-service') as AttachmentService | undefined
+      if (!svc) {
+        throw new AttachmentServiceError(
+          'storage_unavailable',
+          // 消息必须报**实际生效的配置值**，不要断言一个我们没核对过的原因：
+          // 这里一度硬编码成"本插件配置为 attachmentProvider:none"，而它其实常常是
+          // builtin（见下方激活期探针的注释）——操作者会被引去检查一个本来就对的配置项。
+          `attachment-service 不可用：本插件 attachmentProvider=${String(config.attachmentProvider)}，` +
+            '且当前没有任何插件提供该服务',
+        )
+      }
+      return svc
+    }
+
+    /**
      * 激活期探针：**建一次目录**，把"附件目录不可写"这件事在启动时就暴露出来。
      *
-     * 但**失败只告警、不阻止激活**：只读挂载 / 权限没配好的场景下，若在这里抛错，
+     * ★ 探针**必须打在本插件刚建出来的那个对象上**（`builtinAttachment`），
+     * **不能走 `attachmentService()`**：cordis 里插件在**自己的 `apply` 结算之前**
+     * `ctx.get` 不到自己刚 `provide` 出去的服务（返回 undefined，且**静默**）。
+     * 这一条曾经写错，后果有两个，且都在**默认可用的路径**上：
+     *   1. 每次启动都打一条**假警报**（"上传将返回 503 storage_unavailable"），
+     *      并把它归因到一个取值本来就是 `builtin` 的配置项；
+     *   2. 探针**真正的用途**——检查附件目录是否可写——**从未执行过**：
+     *      它在 `ready()` 之前就抛了。于是"数据目录只读"这个它专程要报的场景
+     *      反而不会被报出来，只会打同一条误导性的消息。
+     * 请求期不受影响（那时服务已可见，实测：`GET /api/attachments/<不存在>` 返回 **404** 而非 503），
+     * 所以它**不是**功能故障，而是**观测故障**：一条永远响、且指向错误方向的警报。
+     *
+     * 失败仍**只告警、不阻止激活**：只读挂载 / 权限没配好的场景下，若在这里抛错，
      * 整个 wiki 插件（含页面读写）会一起起不来 —— 那是把"附件用不了"升级成"整站用不了"。
      * 正文与版本历史与附件目录毫无关系，它们没有理由陪葬。
      */
-    void ensureAttachmentDirs(attachmentDataRoot, attachmentTmpDir).catch((err: unknown) => {
-      console.warn(
-        `[@geewiki/wiki] 附件目录不可用（${attachmentDataRoot}）：上传将返回 503 storage_unavailable。` +
-          '页面与版本历史不受影响。原因:',
-        err,
-      )
-    })
+    if (builtinAttachment) {
+      void builtinAttachment.ready().catch((err: unknown) => {
+        console.warn(
+          `[@geewiki/wiki] 附件目录不可用（${attachmentDataRoot}）：上传将返回 503 storage_unavailable。` +
+            '页面与版本历史不受影响。原因:',
+          err,
+        )
+      })
+    }
+    // `attachmentProvider: 'none'` 时不探测：字节存储归别的插件，它的目录由它自己负责，
+    // 本插件在这里既看不到、也无权替它下结论。
 
     /**
      * 页面摘要列表（按 updated_at 倒序；version = 历史快照数 + 1）。
@@ -808,12 +815,33 @@ export const WikiPlugin = {
       }
     }
 
+    /**
+     * 读全部"同级顺序"（供 `GET /api/pages` 一起下发）。
+     *
+     * 刻意**不进 `WikiService` 契约**：它没有独立端点，只是列表响应的一半
+     * （契约那条"方法集与端点一一对应"的纪律因此不被破坏）。
+     */
+    const listNavOrder = async (): Promise<WikiNavOrder[]> => {
+      const rows = await adb.query<{ parent: string; item: string; position: number | string }>(
+        'SELECT parent, item, position FROM page_nav_order ORDER BY parent ASC, position ASC',
+      )
+      const byParent = new Map<string, string[]>()
+      for (const r of rows) {
+        const list = byParent.get(r.parent)
+        if (list === undefined) byParent.set(r.parent, [r.item])
+        else list.push(r.item)
+      }
+      return [...byParent.entries()].map(([parent, items]) => ({ parent, items }))
+    }
+
     const listPages = async (principal: Principal): Promise<WikiPageSummary[]> => {
       // 先拿"这个主体看得见的集合"，再用它过滤 —— 过滤发生在**服务端**，
       // 且复用策略层的唯一出口（不自己写第二套可见性规则）
       const visible = new Set(await policy().visibleSlugs(principal))
       return (
-        await adb.query<PageRow & { version_count: number | string | null }>(
+        await adb.query<
+          PageRow & { version_count: number | string | null; nav_hidden: number | string | null }
+        >(
           /*
             版本数一次算完，不再逐行跑相关子查询。
             原先是 `(SELECT COUNT(*) FROM page_versions v WHERE v.page_id = p.id)`：
@@ -823,10 +851,18 @@ export const WikiPlugin = {
             `LEFT JOIN`（不是 INNER）保证"一次都没存过版本的页面"仍然出现在结果里 ——
             此时计数是 NULL，下面按 0 处理，语义与旧的子查询一致（COUNT 恒为 0 而不会是 NULL）。
           */
-          `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at, v.n AS version_count
+          /*
+            再 LEFT JOIN 一份 `page_nav_state`：侧栏与「全部页面」共用这一份列表，
+            "在侧栏隐藏"与"自定义顺序"必须随列表一起下发（否则前端要再发一次请求，
+            且两处数据会短暂不一致）。用 `ON n.slug = p.slug` 而不是 `p.id`：
+            导航状态按 slug 存（slug 是页面的**身份**，且本表由迁移独立创建）。
+          */
+          `SELECT p.id, p.slug, p.title, p.created_at, p.updated_at, v.n AS version_count,
+                  n.hidden AS nav_hidden
              FROM pages p
              LEFT JOIN (SELECT page_id, COUNT(*) AS n FROM page_versions GROUP BY page_id) v
                     ON v.page_id = p.id
+             LEFT JOIN page_nav_state n ON n.slug = p.slug
             ORDER BY p.updated_at DESC, p.id DESC`,
         )
       )
@@ -843,11 +879,30 @@ export const WikiPlugin = {
             `?? 0` 兜住 LEFT JOIN 未命中时的 NULL。
           */
           version: Number(r.version_count ?? 0) + 1,
+          /*
+            两个字段都显式兜底：
+              · `nav_hidden` 在 LEFT JOIN 未命中时是 NULL ⇒ 0（未隐藏）；
+              · `nav_order`  在未命中时是 NULL ⇒ null（"没排过"，与 0 是两件事：
+                0 表示"排在第 0 位"，不能被当成"没排过"）。
+            与上面 `version` 同一条理由用 `Number()`：PG 会把 INTEGER 按数字返回，
+            但 COUNT(*) 那类是字符串；这里统一强转，避免两种驱动下类型漂移。
+          */
+          nav_hidden: Number(r.nav_hidden ?? 0) === 1,
         }))
     }
 
     /** 页面详情（正文 + 最近 recentLimit 条版本历史）；不存在**或无权**一律返回 undefined */
-    const getPage = async (slug: string, principal: Principal): Promise<WikiPageDetail | undefined> => {
+    /**
+     * 取页面详情。
+     *
+     * `rawContent`（`?content=raw`）返回**含 gated 标记的原文**，只允许能编辑这一页的人拿到
+     * —— 理由见路由处的长注释：投影后的正文对读者是对的、对编辑者是**错的**。
+     */
+    const getPage = async (
+      slug: string,
+      principal: Principal,
+      opts?: { rawContent?: boolean },
+    ): Promise<WikiPageDetail | undefined> => {
       /*
        * **判定先于取数**：`level='none'` 直接返回 undefined，调用方翻译成 404。
        *
@@ -866,7 +921,31 @@ export const WikiPlugin = {
        * "想办法删掉"正是最容易漏的形式 —— 那时原文已经进了对象，任何一条提前 return
        * 都会把它带出去。
        */
-      const projectedContent = await projectPageContentFor(adb, {
+      /*
+       * ★ 原文模式：**跳过投影**，把库里的正文原样交给调用方。
+       *
+       * 这是编辑路径的必需品，不是便利：投影会把 `<!--gated:org-->` 这类标记吃掉，
+       * 而编辑者随后要**带着标记**保存回库。若编辑者拿到的是投影结果，一次最普通的
+       * "改一个字再保存"就会把标记写没 —— 受限段落因此**静默变成公开**（实测复现：
+       * 公开页 + `<!--gated:org-->` 段，编辑者改一个标点后匿名访客即可读到该段）。
+       *
+       * 授权上不新增暴露面：能编辑这一页的人本来就能从版本快照端点
+       * （`GET /api/pages/:slug/versions/:id`，同样要求 `canEdit`）读到含标记的原文。
+       *
+       * ★ **`canEdit` 在这里判，不再只靠路由层判**（守卫见 `test/rawContentGuard.test.ts`）。
+       * 路由层那份检查只覆盖"经 HTTP 进来的调用"，而本方法是 cordis 全局单例上的一个
+       * 普通方法，跨插件调用（`packages/plugin-ai-kb/src/index.ts` 的 `read_page`、
+       * `packages/plugin-ai-pages/src/index.ts` 的 `page.update`）根本不经过路由。
+       * 把判据留一半在外面，就等于给"绕过它"留了一条不必故意就能走上去的路。
+       *
+       * 够不着时**退回投影口径**而不是抛错：本方法的既有语义是"不存在与无权同一个答案"，
+       * 抛错会把"你能不能编辑"变成一个可探测的信号；而 `contentMode` 让拿到投影的调用方
+       * **知道自己拿的是投影**，这不做静默兜底。
+       */
+      const wantRaw = opts?.rawContent === true && access.canEdit
+      const projectedContent = wantRaw
+        ? { text: page.content, gatedCount: 0 }
+        : await projectPageContentFor(adb, {
         pageId: page.id,
         content: page.content,
         principal,
@@ -876,7 +955,7 @@ export const WikiPlugin = {
          * 恰好会以"某次请求多显示一段"的形式出现，最难复现）。
          */
         grantedBlockIds: await grantedBlockIdsOf(principal),
-      })
+          })
       /*
        * 版本列表连同**作者**一起取（0019）。
        *
@@ -917,7 +996,10 @@ export const WikiPlugin = {
         title: page.title,
         // ★ P3a：**投影后的**正文，不是 `page.content`。受限块在这里已经被替换成占位，
         // 原文从未进入这个对象 ⇒ 也就不可能出现在任何响应分支里。
+        // （例外只有显式的原文模式 `?content=raw`，见上面的 `wantRaw` 分支。）
         content: projectedContent.text,
+        // 响应自述正文口径：拿到 `'raw'` 的调用方**不得**把它当读者可见的内容渲染
+        ...(wantRaw ? { contentMode: 'raw' as const } : {}),
         created_at: page.created_at,
         updated_at: page.updated_at,
         // **必须 Number() 强转**：`pg` 把 `COUNT(*)`（bigint）作为**字符串**返回以避免精度丢失，
@@ -1286,7 +1368,14 @@ export const WikiPlugin = {
            * 而**经产品新建的条目一律显式写 `'org'`**（组织内可见）—— 这是本产品的常态。
            * 若这里图省事省略该列，新建的页面会默认为私有，与用户预期相反；
            * 而若把 DDL 默认改成 'org'，则导入脚本/第三方插件的插入路径会意外公开内容。
+           *
+           * `input.visibility / published` 只在这条**创建**分支生效（服务路径专属，
+           * 取值已在 `svc.save` 校验）：系统写方可以以非默认档位建档，缺省仍是 'org'。
+           * `published_at` 在此一并落列——创建为 public 却不发布等于对所有人不可见
+           * （发布闸门只约束 public 档），不能让调用方分两步做这件原子的事。
            */
+          const vis = input.visibility ?? 'org'
+          const publishedAt = input.published === true ? now : null
           const ins = await tx.run(
             /*
              * ★ `RETURNING id` 不是可选的：SQLite 有隐式 rowid，**PostgreSQL 没有** ——
@@ -1294,9 +1383,9 @@ export const WikiPlugin = {
              * `page_id = 0` 撞外键，**每一个新建页面的请求都 500**（实测）。
              * 见 `packages/db-postgres/src/index.ts:237-238`。
              */
-            `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, acl_revision, content_hash)
-             VALUES (?, ?, ?, ?, ?, 'org', 1, 0, ?) RETURNING id`,
-            [slug, input.title, input.content, now, now, sha256Hex(input.content)],
+            `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, published_at, acl_revision, content_hash)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, ?) RETURNING id`,
+            [slug, input.title, input.content, now, now, vis, publishedAt, sha256Hex(input.content)],
           )
           const pageId = Number(ins.lastInsertRowid)
           /*
@@ -1304,12 +1393,13 @@ export const WikiPlugin = {
            *
            * `self` 是必需的：这一行还在本事务里没提交，而策略层走另一条连接读 pages
            * （PG 下看不到未提交的行），不传就会被误判成"页面不存在" ⇒ tier 全是 NULL。
-           * 传进去的正是刚写下的那一行的可见性三列。
+           * 传进去的正是刚写下的那一行的可见性三列（档位/发布都可能来自 input，
+           * 这里必须跟着上面走，否则块 tier 按错误的档位算——检索与读路径当场漂移）。
            */
           const level = await pageLevelOf(slug, {
-            visibility: 'org',
+            visibility: vis,
             inherit: 1,
-            published_at: null,
+            published_at: publishedAt,
           })
           await syncBlocksForPage(tx as unknown as Parameters<typeof syncBlocksForPage>[0], {
             pageId,
@@ -1413,6 +1503,42 @@ export const WikiPlugin = {
        * 而 `assert.deepEqual` 与 `deepStrictEqual` **都会**把这个键算作差异
        * （表现是 expected/actual 打印出来一模一样却断言失败，极难看出原因）。
        */
+      /*
+       * ★ 保存后广播 {@link PAGE_SAVED_EVENT}（需求 ③ 的触发点：摘要要跟着正文走）。
+       *
+       * **位置在事务提交之后、`return` 之前**：事务内广播会让订阅者读到一个尚未提交的
+       * 状态（PG 的 MVCC 下它们在另一条连接上根本看不到这次写入 ⇒ 生成的摘要是旧正文的）。
+       *
+       * **`unchanged` 不广播**：内容与标题都没变，没有"新版本"可供摘要跟进；
+       * 广播它只会让每次点保存都触发一次要花钱的重算。
+       *
+       * **用 `emit`（同步、不等待）而不是 `parallel`**：见 core 里该常量的注释——
+       * 保存的成败与快慢**不得**取决于一个模型调用有多慢。这一层再兜一次 try/catch：
+       * core 的契约要求订阅者自己吞异常，但"契约要求"与"真的吞了"是两件事，
+       * 而订阅者漏吞的后果是**一次已经成功的保存返回 500**（调用方重试 ⇒ 写两遍），
+       * 那是这里能造成的最坏结果，不值得用"他们应该守规矩"去赌。
+       */
+      if (outcome !== 'unchanged') {
+        try {
+          const payload = {
+            slug,
+            title: input.title,
+            updatedAt: now,
+            outcome,
+            actorId: actorId ?? null,
+          } satisfies PageSavedEvent
+          ctx.emit(PAGE_SAVED_EVENT, payload)
+          /*
+           * F7：`PAGE_CREATED_EVENT` 是 `PAGE_SAVED_EVENT` 的**更窄形态**——
+           * 只在"这一次保存真的创建了新页面"时发射，供只关心"新页面出现"的订阅者使用
+           * （否则它们得自己从 `outcome` 里筛，容易漏筛，且筛错的表现是"新建页面时多跑一次重活"）。
+           * 两个事件同源、同一份负载形状，订阅者按需二选一即可，**不要同时订阅**（会收到两遍）。
+           */
+          if (outcome === 'created') ctx.emit(PAGE_CREATED_EVENT, payload)
+        } catch (err) {
+          console.warn(`[@geewiki/wiki] ${PAGE_SAVED_EVENT} 的订阅者抛错（已忽略，保存本身照常成功）:`, err)
+        }
+      }
       return indexTiersResync === undefined
         ? { outcome, version: versionNo }
         : { outcome, version: versionNo, indexTiersResync }
@@ -1453,6 +1579,7 @@ export const WikiPlugin = {
      */
     const deletePage = async (
       slug: string,
+      actorId: number | null = null,
     ): Promise<
       | false
       | { title: string; versions: number; bytes: number; createdAt: string; contentHash: string | null }
@@ -1511,6 +1638,20 @@ export const WikiPlugin = {
         return summary
       })
       if (deleted) await resyncDescendantsReporting(slug)
+      /*
+       * F7 平台事件：页面删除。
+       *
+       * 与 `PAGE_SAVED_EVENT` 同一条纪律（见 core 的契约注释）：**同步 `emit`、不等订阅者**，
+       * 且这里额外吞掉订阅者的异常——删除是"数据真的没了"的不可逆动作，
+       * 绝不能因为某个订阅者抛错就让调用方以为删除失败（它会重试，而重试只会得到 404）。
+       */
+      if (deleted) {
+        try {
+          ctx.emit(PAGE_DELETED_EVENT, { slug, actorId } satisfies PageDeletedEvent)
+        } catch (err) {
+          console.warn(`[@geewiki/wiki] ${PAGE_DELETED_EVENT} 的订阅者抛错（已忽略，删除本身照常成功）:`, err)
+        }
+      }
       return deleted
     }
 
@@ -1528,14 +1669,42 @@ export const WikiPlugin = {
         assertLive()
         return listPages(principal)
       },
-      get: async (slug, principal) => {
+      /*
+       * ★ `opts` **必须原样转发**。这里漏过一次（P4 尾的可见性护栏）：接口上加了
+       * `rawContent`、`getPage` 里也实现了它，唯独这个包装层只转两个参数 ——
+       * 于是**跨插件调用方**（`read_page` / `page.update`）永远拿到投影正文，
+       * 而经 HTTP 进来的编辑者拿到的是原文。两条路径行为不一致，且**不报错**：
+       * 表现是 AI 一改就把受限段落的标记抹掉（`plugin-wiki/src/index.ts:894` 记的那条缺陷
+       * 从另一条路上原样回来）。守卫见 `test/rawContentGuard.test.ts`。
+       */
+      get: async (slug, principal, opts) => {
         assertLive()
-        return getPage(slug, principal)
+        return getPage(slug, principal, opts)
       },
       save: async (slug, input) => {
         assertLive()
         assertValidSlug(slug)
-        return savePage(slug, normalizeSaveFields(input?.title, input?.content))
+        const fields = normalizeSaveFields(input?.title, input?.content)
+        /*
+         * 两个可选字段（`visibility` / `published`）**只在这条服务路径上透传**：
+         * HTTP 侧 `parseSaveBody` 的白名单不含它们（未知字段 400），所以"用户能改
+         * 自己页面的档位"不会从这条路发生。运行期仍校验取值——跨插件调用方是
+         * 结构化类型的 JS 世界，类型收窄挡不住脏值，而脏值会以"未知档位"的形态
+         * 进入 `pages.visibility`（策略层对未知档位失败关闭：比当场抛错难查得多）。
+         */
+        if (input?.visibility !== undefined) {
+          if (input.visibility !== 'private' && input.visibility !== 'org' && input.visibility !== 'public') {
+            throw new Error(`invalid_visibility: 可见性档位只能是 private / org / public（收到 ${String(input.visibility)}）`)
+          }
+          fields.visibility = input.visibility
+        }
+        if (input?.published !== undefined) {
+          if (typeof input.published !== 'boolean') {
+            throw new Error(`invalid_published: published 须为布尔值（收到 ${String(input.published)}）`)
+          }
+          fields.published = input.published
+        }
+        return savePage(slug, fields)
       },
       remove: async (slug) => {
         assertLive()
@@ -1555,6 +1724,80 @@ export const WikiPlugin = {
         assertLive()
         return (await pageExists(slug)) ? listOutlinks(slug, principal) : undefined
       },
+      exists: async (slug) => {
+        assertLive()
+        assertValidSlug(slug)
+        return pageExists(slug)
+      },
+      resyncTiers: async (slugs) => {
+        assertLive()
+        for (const slug of slugs) assertValidSlug(slug)
+        // 与 `resyncDescendantTiers` 同款循环，只是范围由调用方给出（不做前缀扇出）。
+        // 档位一律现问策略层（pageLevelOf），本包不推导任何规则——包括不知道"为什么要刷"。
+        return adb.transaction(async (tx) => {
+          let touched = 0
+          for (const slug of slugs) {
+            const row = (await tx.query<{ id: number }>('SELECT id FROM pages WHERE slug = ?', [slug]))[0]
+            if (!row) continue
+            touched += await applyTierToPageBlocks(tx, row.id, await pageLevelOf(slug))
+          }
+          return touched
+        })
+      },
+      setNavHidden: async (slug, hidden) => {
+        assertLive()
+        assertValidSlug(slug)
+        /*
+         * 页面不存在就**不写**：否则会留下一条悬挂的导航状态行，而该 slug 之后若被新建，
+         * 新页面会"继承"一条没人做过的隐藏设置——这类错查起来极难（症状出现在另一天）。
+         * 存在性用 `pageExists`（服务内 helper）而不是 `resolvePage`：后者对无权者一律 none，
+         * 那是"不泄露存在性"的纪律，不能用来判"页面在不在"。
+         */
+        if (!(await pageExists(slug))) return false
+        await adb.run(
+          /*
+            `ON CONFLICT` 在 SQLite(≥3.24) 与 PostgreSQL 通用（与 `builtin_docs_state` 同一写法）。
+            顺序在另一张表（`page_nav_order`，按父级存一整串）——隐藏与排序是两件事，
+            这里绝不能顺手把顺序清掉。
+          */
+          `INSERT INTO page_nav_state (slug, hidden, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT (slug) DO UPDATE SET hidden = excluded.hidden, updated_at = excluded.updated_at`,
+          [slug, hidden ? 1 : 0, new Date().toISOString()],
+        )
+        return true
+      },
+      setNavOrder: async (parent, items) => {
+        assertLive()
+        const normParent = parent ?? ''
+        if (items.length === 0) throw new NavOrderError('empty')
+        const seen = new Set<string>()
+        for (const item of items) {
+          assertValidSlug(item)
+          if (seen.has(item)) throw new NavOrderError('duplicate', item)
+          seen.add(item)
+          /*
+           * 同层级是硬约束：跨层级排序会变成"移动页面"，而移动意味着改 slug（改 URL）。
+           * 这一条对"页面"与"没有页面的分组"是**同一条规则**——分组路径的形状与 slug 一致。
+           */
+          if ((parentOf(item) ?? '') !== normParent) throw new NavOrderError('not_a_sibling', item)
+        }
+        return adb.transaction(async (tx) => {
+          /*
+           * 整组重写：先删这个父级的全部位次，再按提交顺序写回。
+           * 为什么不"只改动过的那一条"：拖动表达的是"我看重这个顺序"，整组写才能保证
+           * 没有两条同位、没有新旧混排，且重放安全（同样输入得到同样结果）。
+           */
+          await tx.run('DELETE FROM page_nav_order WHERE parent = ?', [normParent])
+          for (let i = 0; i < items.length; i += 1) {
+            await tx.run('INSERT INTO page_nav_order (parent, item, position) VALUES (?, ?, ?)', [
+              normParent,
+              items[i] as string,
+              i,
+            ])
+          }
+          return items.length
+        })
+      },
     }
 
     /* ---------- GET /api/pages：列表 ---------- */
@@ -1569,8 +1812,96 @@ export const WikiPlugin = {
      */
     cleanups.push(
       router.register('GET', '/api/pages', async (h) => {
-        h.json(200, { pages: await listPages(requirePrincipal(h)) })
-      }),
+        /*
+         * 一次请求同时给"页面摘要"和"同级顺序"：侧栏与「全部页面」共用这一份数据，
+         * 分两次请求会出现"顺序是旧的、隐藏是新的"这类中间态。
+         * `nav_order` 里可能有**没有页面的分组路径**（它们不在 `pages` 里）——这是有意的。
+         */
+        h.json(200, { pages: await listPages(requirePrincipal(h)), nav_order: await listNavOrder() })
+      }, { access: 'public' }),
+    )
+
+    /* ---------- POST /api/pages/:slug/hidden：在左侧边栏隐藏 / 取消隐藏 ---------- */
+    /*
+     * 用 `POST` 而不是 `PATCH`：本仓的 router 只注册过 GET/PUT/POST/DELETE 四种方法，
+     * 不引入一个新方法可以少一处需要单独验证的东西；语义上是"设置某个开关"，
+     * 幂等由服务端的 upsert 保证（同一请求重放得到同一结果）。
+     *
+     * 门控复用 `requireCap(…, 'canEdit')`：与 PUT/DELETE 完全同口径（无主体 401、
+     * 非法 slug 400、"看不见"直接 404 不泄露存在性、看得见但不够格 403）。
+     * 判据只有一个出口 —— policy-service，本文件不自己查 visibility。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/:slug/hidden', async (h) => {
+        const slug = h.params.slug ?? ''
+        const guard = await requireCap(h, slug, 'canEdit')
+        if (!guard) return
+        let hidden: boolean
+        try {
+          hidden = parseNavHiddenBody(await readBody(h))
+        } catch (err) {
+          h.json(400, { ok: false, error: 'invalid_body', message: (err as Error).message })
+          return
+        }
+        const stored = await svc.setNavHidden(slug, hidden)
+        if (!stored) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+          return
+        }
+        h.json(200, { ok: true, slug, hidden })
+      }, { access: 'public' }),
+    )
+
+    /* ---------- POST /api/pages/order：同一层级内重排（拖动排序落库） ---------- */
+    /*
+     * `parent` 为 `null` 表示顶层。**不校验 slugs 是否覆盖该层级的全部页面**：
+     * 前端只提交它拖动的可编辑子集，服务端把未提交的兄弟留在原位置（它们的 sort_key
+     * 没被写，排序时按"没排过"回退段名字典序）。要求"必须提交全部"会把只读页面
+     * （别人建的、你不能编辑的）也逼进请求里，反而制造一个必须先有全量权限才能排序的陷阱。
+     */
+    cleanups.push(
+      router.register('POST', '/api/pages/order', async (h) => {
+        if (!h.principal) {
+          h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息，无法排序' })
+          return
+        }
+        let body: { parent: string | null; items: string[] }
+        try {
+          body = parseNavOrderBody(await readBody(h))
+        } catch (err) {
+          h.json(400, { ok: false, error: 'invalid_body', message: (err as Error).message })
+          return
+        }
+        /*
+         * **每一个页面项**都要自己可编辑：排序改变的是所有人看到的导航，
+         * 不能凭"其中某一篇我有权限"就动整组。逐个走 `requireCap`（它自己会写出 401/400/404/403）
+         * 而不是在这里再写一遍判定 —— 判定只有 policy-service 一个出口。
+         *
+         * ⚠️ **分组项要跳过这道门**：`guide` 这类路径可能根本没有页面，
+         * `resolvePage` 对它只会给出"不存在"⇒ 404，而分组本来就没有可判定的对象。
+         * 它对内容的暴露面是零（只是一层目录的位置），因此分组项只要求"已登录"
+         * （上面已判）。真正需要护住的是页面项——那才是不该被别人随意挪动的东西。
+         */
+        for (const item of body.items) {
+          if (!(await pageExists(item))) continue
+          const guard = await requireCap(h, item, 'canEdit')
+          if (!guard) return
+        }
+        try {
+          const written = await svc.setNavOrder(body.parent, body.items)
+          h.json(200, { ok: true, parent: body.parent, items: body.items, written })
+        } catch (err) {
+          if (err instanceof NavOrderError) {
+            h.json(400, {
+              ok: false,
+              error: `invalid_order_${err.reason}`,
+              message: `排序被拒绝（${err.reason}${err.slug === undefined ? '' : `: ${err.slug}`}）`,
+            })
+            return
+          }
+          throw err
+        }
+      }, { access: 'public' }),
     )
 
     /* ---------- GET /api/pages/:slug：详情 + 最近版本历史 ---------- */
@@ -1579,7 +1910,41 @@ export const WikiPlugin = {
         // 路由段存在即为字符串；`?? ''` 仅为类型收窄（无匹配行 → 404，与既有行为一致）
         const slug = h.params.slug ?? ''
         const p = requirePrincipal(h)
-        const page = await getPage(slug, p)
+        /*
+         * `?content=raw`：给**编辑者**的原文（含 `<!--gated:…-->` 标记）。
+         *
+         * 权限：必须是 `canEdit`。**显式 403 而不是 404** —— 只读用户可能读得到这一页，
+         * 对他说"页面不存在"是撒谎（本仓库对 404 的既有口径只在"读不到"时使用）。
+         * 非法取值（`?content=projected` 之外的任何值）也显式 400，不静默按投影处理：
+         * 静默会让调用方以为拿到了原文，而那正是本参数要避免的事故。
+         */
+        const contentParam = h.url.searchParams.get('content')
+        if (contentParam !== null && contentParam !== '' && contentParam !== 'raw') {
+          h.json(400, {
+            ok: false,
+            error: 'invalid_content_mode',
+            message: 'content 只接受 raw（原文，含 gated 标记）',
+          })
+          return
+        }
+        const wantRaw = contentParam === 'raw'
+        if (wantRaw) {
+          const access = await policy().resolvePage(p, slug)
+          if (access.level === 'none') {
+            if (await pageExists(slug)) recordAccessDenied(h, slug, 'no_read_access', p)
+            h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+            return
+          }
+          if (!access.canEdit) {
+            h.json(403, {
+              ok: false,
+              error: 'raw_requires_edit',
+              message: '原文（含权限标记）只对可编辑这条目的主体下发',
+            })
+            return
+          }
+        }
+        const page = await getPage(slug, p, { rawContent: wantRaw })
         if (!page) {
           /*
            * ★ P4：对外仍是 404（不泄露存在性），但**内部区分**两种情形 ——
@@ -1591,7 +1956,7 @@ export const WikiPlugin = {
           return
         }
         h.json(200, page)
-      }),
+      }, { access: 'public' }),
     )
 
     /*
@@ -2004,7 +2369,7 @@ export const WikiPlugin = {
           blocks: version.blocks_json === null ? null : (JSON.parse(version.blocks_json) as unknown),
           acl: version.acl_json === null ? null : (JSON.parse(version.acl_json) as unknown),
         })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- POST /api/pages/:slug/versions/:id/restore：恢复某个版本（★ P3c） ---------- */
@@ -2387,6 +2752,19 @@ export const WikiPlugin = {
      * 读端点（列表/详情/版本/反链/出链）**保持 public**，行为与 P0 之前完全一致——
      * 按可见性裁剪读取是 P2 的事（需要在服务端逐对象判定，见设计文档 §5）。
      * 注意：`access` 是**粗粒度**闸门，它只保证"不是匿名"，不区分"谁能改哪一条"。
+     *
+     * ★ **逐对象授权（内置文档批补上）**：上面那段话在 P0–P3 一直是真的——save/delete 是
+     * 仅有的两个**不问 `policy-service` 就写库**的端点（附件、授予、可见性、版本恢复全都问）。
+     * 后果不止"内置文档只读挡不住它们"：任何登录主体（含 break-glass）都能改写/删除
+     * **任何人**的页面，包括只有 admin 够得着的 private 页——写侧与读侧的判据不一致。
+     * 修法与其余写端点完全同口径：**判据来自 `policy-service` 这一个出口**（`requireCap`），
+     * 不在路由里查 visibility、不为内置文档另设守卫。`canEdit` 由策略层按页判定，
+     * 内置文档的只读覆盖因此自动生效——wiki 依旧不知道有内置文档这回事。
+     *
+     * **新建不受逐对象判定约束**（slug 尚不存在，`resolvePage` 对它只有"不存在⇒none"，
+     * 拿 none 当"不能建"会把产品的基本动作杀光）：建档权仍是 `access: 'user'` 本身，
+     * 与既有行为一致。存在性用 `pageExists` 判（服务内 helper），
+     * **不用 `resolvePage` 的存在性**——它对无权者一律 none，正是"不泄露存在性"的那条纪律。
      */
     cleanups.push(
       router.register('PUT', '/api/pages/:slug', async (h) => {
@@ -2418,6 +2796,14 @@ export const WikiPlugin = {
           h.json(400, { ok: false, error: 'invalid_body', message })
           return
         }
+        /*
+         * ★ 逐对象授权（内置文档批）：**已存在的页**必须 `canEdit`；新建（slug 还不存在）
+         * 不走这道门——建档权就是 `access: 'user'` 本身，与既有行为一致（裁决见本路由文件头）。
+         * 判存在用 `pageExists`（服务内查询），**不得**用 `resolvePage` 的存在性：
+         * 它对无权者一律返回 none，拿"看不见"当"不存在"会让 admin 也建不了同名页之前先误伤，
+         * 反过来"看不见但存在"时放行创建又会撞 UNIQUE。
+         */
+        if ((await pageExists(slug)) && (await requireCap(h, slug, 'canEdit')) === null) return
         let result: WikiSaveResult
         try {
           /*
@@ -2536,7 +2922,14 @@ export const WikiPlugin = {
     cleanups.push(
       router.register('DELETE', '/api/pages/:slug', async (h) => {
         const slug = h.params.slug ?? ''
-        const removed = await deletePage(slug)
+        /*
+         * ★ 逐对象授权（内置文档批）：删除必须 `canDelete`。此前 DELETE 不问策略层，
+         * 任何登录主体都能删**任何人**的页面（含只有 admin 够得着的 private 页）。
+         * 不存在的页走 `resolvePage` ⇒ none ⇒ 404，与原本"删不到才 404"同一状态码，
+         * 行为对用户不变、对越权者关门。
+         */
+        if ((await requireCap(h, slug, 'canDelete')) === null) return
+        const removed = await deletePage(slug, h.principal?.userId ?? null)
         if (removed === false) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return
@@ -2824,11 +3217,52 @@ export const WikiPlugin = {
      * 管理权限守卫：解析主体、判定可见性与 `canManageVisibility`、取回 page id。
      * 返回 `null` 表示已写出响应（调用方直接 return）。
      */
+    /**
+     * 写端点的**逐对象授权**（与 `requireManage` 完全同口径；PUT/DELETE 补挂的原因
+     * 写在 PUT 路由头上那段——此前这两个端点是仅有的"不问策略层就写库"的入口）。
+     *
+     * `cap` 直接取 `PageAccess` 上的能力字段（`canEdit` / `canDelete`）：**能力由策略层
+     * 一处定义，路由只查询、不计算**——内置文档的只读覆盖（authz 对记账页强制
+     * `canEdit/canDelete=false`）因此在这两个端点上自动生效，wiki 不需要知道有这回事。
+     * 404/403 的分法与 `requireManage` 相同：`level==='none'` 一律 404（不泄露存在性），
+     * 看得见但不够格才 403。
+     */
+    const requireCap = async (
+      h: RouteHandlerContext,
+      slug: string,
+      cap: 'canEdit' | 'canDelete',
+    ): Promise<{ principal: Principal } | null> => {
+      const principal = h.principal
+      if (!principal) {
+        h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息，无法判定写权限' })
+        return null
+      }
+      if (!isValidSlug(slug)) {
+        h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+        return null
+      }
+      // 策略层是判定单点：不在这里自己查 visibility（那会成为第二个真源）
+      const access = await policy().resolvePage(principal, slug)
+      if (access.level === 'none') {
+        h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
+        return null
+      }
+      if (!access[cap]) {
+        h.json(403, {
+          ok: false,
+          error: 'forbidden',
+          message: cap === 'canEdit' ? '没有编辑该条目的权限' : '没有删除该条目的权限',
+          details: { reason: access.reason },
+        })
+        return null
+      }
+      return { principal }
+    }
+
     const requireManage = async (
       h: RouteHandlerContext,
       slug: string,
-    ): Promise<{ principal: Principal } | null> => {
-      const principal = h.principal
+    ): Promise<{ principal: Principal } | null> => {      const principal = h.principal
       if (!principal) {
         h.json(401, { ok: false, error: 'unauthorized', message: '缺少主体信息，无法判定可管理性' })
         return null
@@ -4021,7 +4455,7 @@ export const WikiPlugin = {
          * ★ **先看 `Content-Length`，缺失或超限就 413 且一个字节都不读。**
          *
          * 为什么"缺失"也要拒：没有长度就意味着只能边收边判 —— 那时已经被迫读了一大段
-         * 才可能发现超限（虽然 `storeStream` 仍会封顶，但前置拒绝是**零成本**的那一层）。
+         * 才可能发现超限（虽然存储层仍会封顶，但前置拒绝是**零成本**的那一层）。
          * 为什么必须在读流之前：`h.req` 是同一个 socket 上的可读流，一旦开始读，要么把
          * 它收完（可能几个 GB），要么中断连接 —— 而中断连接前我们已经无法回一个干净的
          * 413 响应体。`closeAfterResponse` 负责"请求体没读完也要让连接正确收尾"。
@@ -4068,12 +4502,10 @@ export const WikiPlugin = {
           return
         }
 
-        /* 流式哈希 + 落盘（内容寻址；超限在 storeStream 内再次封顶并中断） */
+        /* 流式哈希 + 落盘（内容寻址；超限在存储层内再次封顶并中断） */
         let stored: { sha256: string; byteSize: number; dedup: boolean }
         try {
-          stored = await storeStream(h.req, {
-            dataDir: attachmentDataRoot,
-            tmpDir: attachmentTmpDir,
+          stored = await attachmentService().put(h.req, {
             maxBytes: attachmentMaxBytes,
             ext,
             /*
@@ -4168,6 +4600,29 @@ export const WikiPlugin = {
             actorIpHash: auditIpHash(h.req.socket?.remoteAddress ?? null),
             after: { page: page.slug, sha256: stored.sha256, ext, byte_size: stored.byteSize, mime },
           }).catch((err: unknown) => console.error('[@geewiki/wiki] 附件上传审计写入失败:', err))
+          /*
+           * F7 平台事件：附件上传完成。
+           *
+           * 与审计**同一条件**（只在 `created` 时发，不在 `dedup` 幂等重放时发）：
+           * 否则"用户刷新一次重放同一个 PUT"会让每个订阅者（缩略图、扫描、索引）
+           * 再跑一遍，而内容是同一份——那既浪费又可能产生重复的派生记录。
+           * 这与 `PAGE_SAVED_EVENT` 不含 `'unchanged'` 是同一条裁决。
+           */
+          try {
+            ctx.emit(ATTACHMENT_UPLOADED_EVENT, {
+              id: String(outcome.id),
+              slug: page.slug,
+              name: originalName,
+              size: stored.byteSize,
+              mime,
+              actorId: p.userId ?? null,
+            } satisfies AttachmentUploadedEvent)
+          } catch (err) {
+            console.warn(
+              `[@geewiki/wiki] ${ATTACHMENT_UPLOADED_EVENT} 的订阅者抛错（已忽略，上传本身照常成功）:`,
+              err,
+            )
+          }
         }
         /*
          * 状态码统一 201：本端点是**幂等 PUT**，重放同一个请求得到同形状的响应，
@@ -4314,16 +4769,14 @@ export const WikiPlugin = {
             return
           }
         }
-        /* ④ 到这里才碰文件：先 stat（"元数据在、文件不在"是可诊断的状态，不是 500） */
-        const absPath = resolveAttachmentPath(attachmentDataRoot, row.sha256, row.ext)
-        let size: number
-        try {
-          size = (await stat(absPath)).size
-        } catch {
-          console.error(`[@geewiki/wiki] 附件元数据存在但文件缺失: id=${row.id} ${absPath}`)
+        /* ④ 到这里才碰存储：取对象句柄（"元数据在、字节不在"是可诊断的状态，不是 500） */
+        const blob = await attachmentService().get(row.sha256, row.ext)
+        if (!blob) {
+          console.error(`[@geewiki/wiki] 附件元数据存在但文件缺失: id=${row.id} sha256=${row.sha256}${row.ext}`)
           h.json(404, { ok: false, error: 'blob_missing', message: '附件文件缺失（元数据存在）' })
           return
         }
+        const size = blob.size
         if (size !== Number(row.byte_size)) {
           // 不拦（仍按实际字节伺服），但必须留痕：路径即哈希，尺寸不符意味着内容被替换过
           console.warn(
@@ -4395,7 +4848,7 @@ export const WikiPlugin = {
           'content-length': size,
         })
         await new Promise<void>((resolve) => {
-          const stream = createReadStream(absPath)
+          const stream = blob.open()
           stream.on('error', (err) => {
             // 响应头已发出：改不了状态码，只能断开连接（让客户端看到截断，而不是一个 200 空体）
             console.error(`[@geewiki/wiki] 附件读取失败: id=${row.id}`, err)
@@ -4410,7 +4863,7 @@ export const WikiPlugin = {
           stream.pipe(h.res)
           stream.on('end', () => resolve())
         })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- GET /api/pages/:slug/attachments：该页附件清单（管理面） ---------- */
@@ -4479,7 +4932,7 @@ export const WikiPlugin = {
             createdAt: r.created_at,
           })),
         })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- DELETE /api/attachments/:id：删元数据（磁盘文件留给 GC） ---------- */
@@ -4629,7 +5082,7 @@ export const WikiPlugin = {
           return
         }
         h.json(200, { ok: true, slug, backlinks: await listBacklinks(slug, p) })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- GET /api/pages/:slug/links：本页指向了谁（出链） ---------- */
@@ -4647,7 +5100,7 @@ export const WikiPlugin = {
           return
         }
         h.json(200, { ok: true, slug, links: await listOutlinks(slug, p) })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- GET /api/admin/blocks/verify：块与正文的双写一致性探针 ---------- */
@@ -5004,7 +5457,8 @@ export const WikiPlugin = {
       cleanups.forEach((fn) => fn())
       cleanups.length = 0
       unprovide()
-      console.log('[@geewiki/wiki] 已卸载: REST 路由全部摘除，wiki-service 已注销')
+      attachmentUnprovide?.()
+      console.log('[@geewiki/wiki] 已卸载: REST 路由全部摘除，wiki-service / attachment-service 已注销')
     }
   },
 }

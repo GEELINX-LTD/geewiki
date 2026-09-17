@@ -29,7 +29,14 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from 'cordis'
 import { Context as CordisContext } from 'cordis'
 import type { DatabaseAdapter, HttpRouterService, RouteHandler, RouteHandlerContext, RunResult } from '@geewiki/core'
-import { anonymousPrincipal, asAsync, MIGRATION_TABLE, type Principal } from '@geewiki/core'
+import {
+  anonymousPrincipal,
+  asAsync,
+  MIGRATION_TABLE,
+  PAGE_SAVED_EVENT,
+  type PageSavedEvent,
+  type Principal,
+} from '@geewiki/core'
 import { AuthzPlugin } from '@geewiki/authz'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
@@ -346,7 +353,13 @@ async function makeHarness(
     body?: unknown,
     principal: Principal = MEMBER,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
-    const handler = routes.get(`${method} ${path}`)
+    /*
+     * 路径可以带查询串（形如 `/api/pages/:slug?content=raw`）：**路由查表用路径部分**，
+     * 查询串进 `h.url`。为什么需要：原文模式（`?content=raw`）是同一路由的另一种正文口径，
+     * 没有它就只能为"带参数的同一路由"另造一条路由名，那是把契约写歪。
+     */
+    const [routeKey = path] = path.split('?')
+    const handler = routes.get(`${method} ${routeKey}`)
     assert.ok(handler, `应已注册路由 ${method} ${path}`)
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
     const req = Readable.from(chunks) as unknown as IncomingMessage
@@ -481,12 +494,15 @@ test('wiki-service：save 新建 → 读取 → 列表；内容未变时 outcome
     )
 
     // 列表：摘要字段与排序（单条时只校验字段形状）
+    // 导航批（2026-09-16）起摘要多了 `nav_hidden`：这里显式写进期望值，
+    // 让"列表会下发隐藏状态"这件事本身也被钉住（同级的**顺序**不走摘要，见 GET /api/pages 的 nav_order）
     assert.deepEqual((await svc.list(MEMBER)), [
       {
         slug: 'getting-started',
         title: '入门',
         updated_at: updated?.updated_at,
         version: 2,
+        nav_hidden: false,
       },
     ])
 
@@ -1596,5 +1612,191 @@ test('P3c：恢复祖先的档位必须重算子孙的 blocks.tier（否则读�
     )
   } finally {
     h.dispose()
+  }
+})
+
+
+/* ------------------ ★ 原文模式：编辑路径的正文口径（本批） ------------------ */
+
+/**
+ * 回归守卫：**投影后的正文不能当原文用**。
+ *
+ * 背景（实测复现过的事故）：默认详情接口返回的是**按读者投影**后的正文 ——
+ * `<!--gated:org-->` 这类标记被消费掉、受限段落对看不到的人变成占位。编辑页此前用的就是
+ * 这份正文，于是"打开编辑页 → 改一个标点 → 保存"会把标记写没，受限段落**静默变成公开**
+ * （复现路径：公开页 + org 受限段，保存后匿名访客能读到该段全文）。
+ *
+ * 故本批新增 `?content=raw`：把库里的原文交给**可编辑者**。这里钉住四件事：
+ *   1. 默认口径仍然是投影（读者的正文里没有标记）—— 不能因为修编辑路径而改变读路径；
+ *   2. 可编辑者拿得到原文（含标记），且响应自述 `contentMode === 'raw'`；
+ *   3. 可读但不可编辑者拿不到原文，且是**显式 403**（不是 404：对他说"页面不存在"是撒谎）；
+ *   4. 非法取值显式 400，不静默按投影处理（静默会让调用方以为拿到了原文）。
+ */
+test('★ 原文模式：?content=raw 只给可编辑者，默认口径仍是投影（投影事故的回归守卫）', async () => {
+  const h = await makeHarness()
+  try {
+    const content = '公开A\n\n<!--gated:org-->\n机密B ORGRAW7788\n<!--/gated-->\n\n结尾'
+    const put = await h.call('PUT', '/api/pages/:slug', { slug: 'raw1' }, { title: 'R', content }, OWNER)
+    assert.equal(put.status, 200)
+
+    // 1. 默认口径：投影后的正文（标记被消费）
+    const proj = await h.call('GET', '/api/pages/:slug', { slug: 'raw1' }, undefined, OWNER)
+    assert.equal(proj.status, 200)
+    assert.equal(
+      String(proj.body['content']).includes('<!--gated'),
+      false,
+      '默认口径必须是投影后的正文（读者的正文里不该出现标记）',
+    )
+    assert.equal(proj.body['contentMode'], undefined, '默认口径不应自称 raw')
+
+    // 2. 可编辑者拿得到原文
+    const raw = await h.call('GET', '/api/pages/:slug?content=raw', { slug: 'raw1' }, undefined, OWNER)
+    assert.equal(raw.status, 200)
+    assert.equal(raw.body['contentMode'], 'raw', '响应必须自述正文口径')
+    assert.ok(String(raw.body['content']).includes('<!--gated:org-->'), '原文必须含标记')
+    assert.ok(String(raw.body['content']).includes('ORGRAW7788'), '原文必须含受限段正文')
+
+    /*
+     * 3. 可读但不可编辑者：显式 403（不是 404，也不是静默降级成投影）。
+     *
+     * 这样的主体在模型里是**真实存在**的一类：`viewer` 例外授予给出 `level: 'full'`
+     * 但 `canEdit: false`（见 plugin-authz 的 `decideNormally`：`canEdit: grant === 'editor'`）。
+     * 组织成员**不能**拿来当反例 —— 他们对 `org` 档条目本来就有编辑权（`canEdit: true`）。
+     */
+    const granted = await h.call(
+      'POST',
+      '/api/pages/:slug/grants',
+      { slug: 'raw1' },
+      { subjectKind: 'user', subjectId: '2', role: 'viewer' },
+      OWNER,
+    )
+    assert.equal(granted.status, 200, `前置：给用户 2 一条 viewer 授予（实际 ${granted.status}）`)
+    const viewerRead = await h.call('GET', '/api/pages/:slug', { slug: 'raw1' }, undefined, APPLICANT)
+    assert.equal(viewerRead.status, 200, '前置：viewer 授予下读得到这一页')
+    const viewerCaps = viewerRead.body['capabilities'] as Record<string, unknown> | undefined
+    assert.equal(viewerCaps?.['canEdit'], false, '前置：viewer 授予没有编辑权')
+    const denied = await h.call('GET', '/api/pages/:slug?content=raw', { slug: 'raw1' }, undefined, APPLICANT)
+    assert.equal(denied.status, 403, '可读但不可编辑者请求原文必须被拒')
+    assert.equal(denied.body['error'], 'raw_requires_edit')
+    assert.equal(denied.body['content'], undefined, '拒绝时不得带出任何正文')
+
+    // 4. 非法取值：400（不静默按投影处理）
+    const bad = await h.call('GET', '/api/pages/:slug?content=projected', { slug: 'raw1' }, undefined, OWNER)
+    assert.equal(bad.status, 400)
+    assert.equal(bad.body['error'], 'invalid_content_mode')
+  } finally {
+    h.unload()
+  }
+})
+
+
+/* ============================== PAGE_SAVED_EVENT ============================== */
+
+/*
+ * 保存事件是"摘要跟着正文走"（需求 ③）的**唯一触发点**。它有三条契约，
+ * 每一条失效的方式都是静默的：
+ *  ① 内容没变时**不**广播 —— 否则每点一次保存都要花一次模型调用；
+ *  ② 负载里**没有正文** —— 它是广播，所有订阅者（包括本不该看到这一页的插件）都收得到；
+ *  ③ 订阅者抛错**不得**让保存失败 —— 一次已经写进库的保存返回 500，调用方重试就写两遍。
+ *
+ * 这里必须用**真实 cordis**（`ctx.emit` / `ctx.on` 是真实事件总线）：
+ * 上面那套替身 ctx 连 `.on` 都没有——第一次写这几条用例时就撞上了这一点。
+ */
+async function makeEventHarness(): Promise<{
+  root: Context
+  adapter: NodeSqliteAdapter
+  svc: WikiService
+  dispose(): Promise<void>
+}> {
+  const dir = mkdtempSync(join(tmpdir(), 'gw-wiki-evt-'))
+  const adapter = new NodeSqliteAdapter(join(dir, 'test.db'), SCHEMA_SQL_PATHS.map((p) => readFileSync(p, 'utf8')).join('\n'))
+  const routes = new Map<string, RouteHandler>()
+  const routerService: HttpRouterService = {
+    register: (method, path, handler) => {
+      routes.set(`${method} ${path}`, handler)
+      return () => routes.delete(`${method} ${path}`)
+    },
+    stats: () => ({ total: 0, ok: 0, fail: 0, consecutiveFailures: 0, lastMs: 0, avgMs: 0 }),
+    inflight: () => 0,
+    pending: () => 0,
+    drain: () => Promise.resolve(true),
+  }
+  const root = new CordisContext()
+  root.provide('db', adapter)
+  root.provide('http', routerService)
+  const authzFork = root.plugin(AuthzPlugin)
+  await authzFork
+  const fork = root.plugin(WikiPlugin, { recentVersions: 5 })
+  await fork
+  return {
+    root,
+    adapter,
+    svc: root.get('wiki-service') as WikiService,
+    async dispose() {
+      await fork.dispose()
+      await authzFork.dispose()
+      adapter.close()
+      rmSync(dir, { recursive: true, force: true })
+    },
+  }
+}
+
+test('PAGE_SAVED_EVENT：真的写入时广播，内容未变时不广播', async () => {
+  const h = await makeEventHarness()
+  try {
+    const seen: PageSavedEvent[] = []
+    h.root.on(PAGE_SAVED_EVENT, (e: unknown) => seen.push(e as PageSavedEvent))
+
+    await h.svc.save('evt', { title: '事件', content: '第一版' })
+    assert.equal(seen.length, 1, '新建必须广播一次')
+    assert.equal(seen[0]?.slug, 'evt')
+    assert.equal(seen[0]?.outcome, 'created')
+    assert.equal(seen[0]?.title, '事件')
+    assert.equal(typeof seen[0]?.updatedAt, 'string', '负载必须带保存后的 updated_at（订阅者据此判版本）')
+    assert.equal(seen[0]?.actorId, null, '经服务调用没有可归属的用户 ⇒ null，而不是编一个 id')
+
+    // 一模一样地再存一次 ⇒ unchanged ⇒ 不广播（否则每次点保存都花钱重算摘要）
+    await h.svc.save('evt', { title: '事件', content: '第一版' })
+    assert.equal(seen.length, 1, 'unchanged 不得广播')
+
+    await h.svc.save('evt', { title: '事件', content: '第二版' })
+    assert.equal(seen.length, 2)
+    assert.equal(seen[1]?.outcome, 'updated')
+  } finally {
+    await h.dispose()
+  }
+})
+
+test('PAGE_SAVED_EVENT：负载里**不得**带正文', async () => {
+  const h = await makeEventHarness()
+  try {
+    let payload: Record<string, unknown> | null = null
+    h.root.on(PAGE_SAVED_EVENT, (e: unknown) => {
+      payload = e as Record<string, unknown>
+    })
+    await h.svc.save('evt-body', { title: '事件', content: '机密正文' })
+    assert.notEqual(payload, null)
+    assert.deepEqual(
+      Object.keys(payload as unknown as Record<string, unknown>).sort(),
+      ['actorId', 'outcome', 'slug', 'title', 'updatedAt'],
+      '负载的键是契约的一部分：多一个 content 就等于把正文广播给所有订阅者',
+    )
+  } finally {
+    await h.dispose()
+  }
+})
+
+test('PAGE_SAVED_EVENT：订阅者抛错**不得**让保存失败', async () => {
+  const h = await makeEventHarness()
+  try {
+    h.root.on(PAGE_SAVED_EVENT, () => {
+      throw new Error('订阅者故意抛错')
+    })
+    // 不抛、且内容真的写进去了（不是"看起来成功但回滚了"）
+    await h.svc.save('evt-boom', { title: '事件', content: '正文' })
+    const page = await h.svc.get('evt-boom', MEMBER)
+    assert.equal(page?.content, '正文')
+  } finally {
+    await h.dispose()
   }
 })

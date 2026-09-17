@@ -1,0 +1,25 @@
+{
+  "name": "@geewiki/builtin-docs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 内置文档：首次部署生成描述本项目的只读文章（架构/功能/Markdown 演示/特殊结构），版本键控自动同步，可隐藏",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@geewiki/authz": "workspace:*",
+    "@geewiki/db-sqlite": "workspace:*",
+    "@geewiki/wiki": "workspace:*",
+    "@types/node": "^22.0.0"
+  }
+}

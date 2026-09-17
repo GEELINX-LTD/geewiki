@@ -9,7 +9,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "build:ui": "pnpm --filter @geewiki/web build:plugin-ui"
   },
   "dependencies": {
     "@geewiki/auth": "workspace:*",

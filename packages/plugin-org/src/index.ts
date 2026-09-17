@@ -349,13 +349,30 @@ export const OrgPlugin = {
       ),
     )
 
-    /* ==================== GET /api/org/members（admin） ==================== */
+    /*
+     * ==================== GET /api/org/members（**任何登录用户**） ====================
+     *
+     * ★ 本批放宽：原为 `admin`，现为 `{ access: 'user' }` —— 已认证即可读。
+     *
+     * 为什么放宽（一个真实的功能阻塞）：改页面/段落权限只要求 `manageVisibility`，而**组织成员
+     * 也有**这个能力；但"授权给谁"必须知道对方的 id，而 id 的名单此前只有管理员拿得到
+     * ⇒ 出现"有权授权、却只能凭记忆猜一个数字 id"的人。作者的原话是"授权时，所谓的 id 是什么"，
+     * 那正是这个缺口的症状。故：**能看到名单，才谈得上按名单授权**。
+     *
+     * 放宽了什么（明说，不静默）：登录用户现在能看到成员列表，其中含 `email`、`displayName`、
+     * `role`（组织角色）与 `joinedAt`。邮箱是**刻意保留**的：重名时它是唯一能区分"授权给谁"的
+     * 信息，去掉它会让选择框变成猜谜。**邀请（含邮箱与被邀请人状态）仍然只有管理员可见**
+     * （`GET /api/org/invitations` 未改），因为那里面还有尚未加入的人与邀请状态。
+     */
     cleanups.push(
       router.register(
         'GET',
         '/api/org/members',
         async (h) => {
-          if (!requireAdmin(h)) return
+          /*
+           * 不再要求 admin：路由的 `{ access: 'user' }` 已保证"已认证"，
+           * 而本端点的用途是"让我选一个授权对象"—— 凡是能走到授权界面的人都该看得到。
+           */
           const rows = await db.query<{
             user_id: number
             email: string
@@ -381,7 +398,7 @@ export const OrgPlugin = {
             })),
           })
         },
-        { access: 'admin' },
+        { access: 'user' },
       ),
     )
 
@@ -552,13 +569,19 @@ export const OrgPlugin = {
       ),
     )
 
-    /* ==================== GET /api/org/groups（admin） ==================== */
+    /*
+     * ==================== GET /api/org/groups（**任何登录用户**） ====================
+     *
+     * 与成员名单同一口径、同一理由（见上面 members 的注释）：用户组本身**不是秘密** ——
+     * 它是授权对象；看不见组名就没法按组授权。组的**增删与成员调整**仍需管理员
+     * （本文件其余 `/api/org/groups*` 路由的 `access: 'admin'` 未改）。
+     */
     cleanups.push(
       router.register(
         'GET',
         '/api/org/groups',
         async (h) => {
-          if (!requireAdmin(h)) return
+          // 不再要求 admin（理由见上面的路由注释）：组是**授权对象**，看不见就选不了
           const groups = await db.query<{ id: number; name: string; created_at: string }>(
             'SELECT id, name, created_at FROM groups WHERE org_id = ? ORDER BY name',
             [DEFAULT_ORG_ID],
@@ -585,7 +608,7 @@ export const OrgPlugin = {
             })),
           })
         },
-        { access: 'admin' },
+        { access: 'user' },
       ),
     )
 

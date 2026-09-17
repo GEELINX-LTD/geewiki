@@ -10,26 +10,11 @@
  */
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
-/* ======================= 身份声明 ======================= */
-
-/**
- * 从 ID token 里**验证通过后**提取的身份声明。
- *
- * `issuer` 必须是**已规范化**的值（见 {@link normalizeIssuer}）—— 生产方（`@geewiki/oidc`）
- * 负责规范化，消费方（本包）不再重复规范化时才比较，避免两处规则漂移。
+/*
+ * ★ F3：`OidcClaims` / `OidcProvider` / `OidcProviderInfo` 已**下沉到 `@geewiki/core`**
+ * （真源 `packages/core/src/services.ts`）。此处转出，保证既有 import 不破。
  */
-export interface OidcClaims {
-  /** 已规范化的 issuer（`new URL(issuer).href`） */
-  issuer: string
-  /** OIDC `sub`：IdP 内稳定且唯一的用户标识 */
-  subject: string
-  /** IdP 声明的邮箱（可能为空） */
-  email: string | null
-  /** IdP 对邮箱的**声明**（不是我们独立验证的事实，故不用于自动绑定） */
-  emailVerified: boolean
-  /** IdP 声明的显示名（可空） */
-  displayName: string | null
-}
+export type { OidcClaims, OidcProvider, OidcProviderInfo } from '@geewiki/core'
 
 /**
  * 规范化 `issuer`：`https://idp.example.com` 与 `https://idp.example.com/` 必须视为**同一个**。
@@ -146,36 +131,3 @@ export function verifyLinkTicket(
   }
 }
 
-/* ======================= provider 注册表 ======================= */
-
-/**
- * 一个 OIDC provider 的**描述**（由 `@geewiki/oidc` 注册进 `auth-service`）。
- *
- * 本包只持有描述，**不碰 OIDC 协议本身**（发现文档、JWKS、PKCE 都在 `@geewiki/oidc`）——
- * 形态对齐 `llm-service` 的路由注册表：契约层持有注册表，adapter 提供实现。
- *
- * 三个方法都**必须同步**：`capabilities` 在 `GET /api/auth/state` 里下发，
- * 而那是每个访客冷启动都会打的热路径，不能在那里做网络 IO。可用性由 provider
- * 自己缓存（并在后台按需刷新）。
- */
-export interface OidcProvider {
-  /** 注册表键（重复注册时 `registerOidcProvider` 抛错，不静默覆盖） */
-  id: string
-  /** 前端 SSO 按钮的展示名 */
-  label: string
-  /** 前端导航到的入口路径（由 provider 自己注册的路由提供，形如 `/api/auth/oidc/start`） */
-  startPath: string
-  /** 当前是否可用（IdP 可达 + 配置完整） */
-  available(): boolean
-  /** 不可用原因：`'unreachable' | 'unconfigured'` 等；可用时返回 `null` */
-  reason(): string | null
-}
-
-/** 下发到前端的 provider 快照（不带函数，可直接 JSON 序列化） */
-export interface OidcProviderInfo {
-  id: string
-  label: string
-  startPath: string
-  available: boolean
-  reason: string | null
-}

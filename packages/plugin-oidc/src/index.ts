@@ -109,9 +109,13 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/oidc',
   version: '0.1.0',
   geewiki: {
+    // ★ F10：跨界能力声明（宿主不强制，用于评审与可观测）
+    permissions: ['env', 'net'],
     displayName: '企业 SSO（OIDC）',
     description: '接入 OIDC 身份源（授权码 + PKCE），与本地账号密码并存；未启用时零影响',
-    // 无 provides：它只往 auth-service 注册一条 provider 与两条路由，不对外提供新服务
+    // 无 provides：它只往 auth-service 注册一条 provider 与两条路由，不对外提供新服务。
+    // 但**界面归它**：账号页的 `<SlotOutlet name="account-identities" />` 由本插件的
+    // client.js 填充 —— 反过来说，没装本插件时用户不会看到一个讲企业 SSO、却无处可点的空态。
     provides: undefined,
     // 按**服务 token**依赖：auth-service（策略与账号）、http-service（挂路由）、
     // database-provider（协议环节的失败审计要写 audit_log）
@@ -125,6 +129,18 @@ export const manifest: GeeWikiManifest = {
       drainTimeout: 5,
     },
     configSchema: OidcConfigSchema,
+    /*
+     * 客户端产物与插槽（照 `@geewiki/ai-assistant` 的写法）。
+     *
+     * `slots` 必须显式声明：宿主 `registerSlot` 有一道越权拦截 —— 清单的 `slots` 没列出该
+     * 插槽名时，插件的注册被**静默忽略**（不报错，表现是"界面凭空消失"）。而这块界面
+     * 只可能来自"能提供外部身份"的插件，正好是清单该声明的东西。
+     *
+     * `entry` / `css` 的文件名必须与 `packages/web/fixtures/vite.config.ts` 的
+     * `fileName: () => 'client.js'` + `cssFileName: 'client'` 逐字对应：对不上同样是静默不加载。
+     */
+    client: { entry: 'client.js', css: 'client.css' },
+    slots: ['account-identities'],
   },
 }
 

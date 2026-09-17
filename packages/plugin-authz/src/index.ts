@@ -324,6 +324,37 @@ export const AuthzPlugin = {
 
     const isAdminRole = (p: Principal): boolean => p.orgRole === 'owner' || p.orgRole === 'admin'
 
+    /* ------------------------- 内置文档覆盖（可选消费面） ------------------------- */
+
+    /**
+     * `builtin-docs-service` 的**最小结构需求**（结构化类型，刻意不 import
+     * `@geewiki/builtin-docs`，也不把它写进 requires）：内置文档是**可选插件**，
+     * 硬依赖会让"没启用文档"变成"authz 起不来"。与 wiki/search 对 policy-service
+     * 的反向消费同一条先例：只消费结果，不 import 实现。
+     */
+    interface BuiltinDocsPolicyLike {
+      /** 该 slug 是否内置文档插件**建过**的页（记账表为权威，撞名未接管的不算） */
+      isManagedPage(slug: string): boolean
+      /** 当前的隐藏开关 */
+      isHidden(): boolean
+    }
+
+    /**
+     * 懒取内置文档判据服务：**每次调用都现取**，不缓存。
+     *
+     * 为什么必须现取：`hidden` 配置的热更新与插件重装都表现为"重新 activate ⇒
+     * provide 一个**新对象**"，缓存旧引用会把"关掉即隐藏"退化成"重启才隐藏"。
+     * 代价只是每次判定多一次服务表查找。缺席（未启用该插件）⇒ `undefined` ⇒ 无覆盖，
+     * 这是设计好的常态，不是异常。
+     */
+    const builtinDocs = (): BuiltinDocsPolicyLike | undefined => {
+      try {
+        return ctx.get('builtin-docs-service') as BuiltinDocsPolicyLike | undefined
+      } catch {
+        return undefined
+      }
+    }
+
     /** 不带应急覆盖的"本来会怎样" —— 规则 O1 的审计判据就是拿它与最终结果比（§2.3 边界 1） */
     const decideNormally = (
       rank: number,
@@ -359,18 +390,40 @@ export const AuthzPlugin = {
       publishedAt: string | null,
       grant: string | undefined,
     ): { access: PageAccess; overrode: boolean } => {
+      /*
+       * ★ 内置文档覆盖（`@geewiki/builtin-docs`）：两条规则都**收敛在这一个出口**——
+       * resolvePage / resolvePages / visibleSlugs 三条路径全走 buildAccess，
+       * 于是 HTTP 写路由、AI 写工具（先问 canEdit）、前端按钮（capabilities）、
+       * 列表与检索（visibleSlugs）拿到的都是同一份结论，没有第二条路可以绕。
+       */
+      const bd = builtinDocs()
+      const managed = bd !== undefined && bd.isManagedPage(slug)
+      const hidden = managed && bd!.isHidden()
       const normal = decideNormally(rank, publishedAt, grant, p)
       let level = normal.level
       let reason = normal.reason
       let overrode = false
-      if (level === 'none' && isAdminRole(p)) {
+      if (hidden) {
+        /*
+         * 隐藏的内置文档：对**所有主体**（含 owner/admin）判 `level === 'none'` ⇒
+         * 列表、检索、阅读一律视同不存在。隐藏优先于 O1 与显式授予——
+         * 让后两者把它抬回来，"隐藏"就成了泄漏；管理员取消隐藏走配置开关，
+         * 不需要隔着隐藏层偷看。不留覆盖审计：这不是"越权看到了"，
+         * 是一个产品开关的形态。
+         */
+        level = 'none'
+        reason = 'default-deny'
+      } else if (level === 'none' && isAdminRole(p)) {
         // ★ 规则 O1：owner/admin 恒可看一切。**只在"本来会被拒"时才算覆盖** ——
         // 否则管理员的日常浏览会把审计表刷爆，真实信号被噪声淹没（§2.3 边界 1）。
         level = 'full'
         reason = p.orgRole === 'owner' ? 'owner' : 'admin'
         overrode = true
       }
-      const canEdit = level === 'full' && (normal.canEdit || isAdminRole(p))
+      // 内置文档只读：编辑/删除/改可见性对**任何主体**恒 false（含 owner/admin、
+      // 含显式 editor 授予——授予只买得到"读"，买不到"改"）。判据权威是内置文档的
+      // 记账表（isManagedPage），不是代码目录：slug 撞名而未被接管的页面不受影响。
+      const canEdit = managed ? false : level === 'full' && (normal.canEdit || isAdminRole(p))
       const access: PageAccess = {
         slug,
         level,
@@ -455,6 +508,17 @@ export const AuthzPlugin = {
        * （见 GET /api/admin/search/verify）。
        */
       async effectiveIndexLevel(slug: string, self?: PageVisRow): Promise<0 | 1 | null> {
+        /*
+         * ★ 内置文档覆盖（与 buildAccess 同一份判据、同一个服务现取）：隐藏的记账页
+         * 返回 `null` = "没有任何通用主体读得到" ⇒ 块 `tier` 算成 NULL ⇒ **检索命中层
+         * 也看不见它**。`blocks.tier` 是物化派生列（search 的命中谓词只看 tier，不再求
+         * visibleSlugs 交集，见 plugin-search 的注释），所以隐藏开关翻动时由
+         * `@geewiki/builtin-docs` 主动重同步记账页的 tier（`WikiService.resyncTiers`）；
+         * 本函数负责的是另一半——**重算出来的结果必须正确**。
+         * `self`（创建事务内的未提交行）也罩不住隐藏：先查覆盖再谈 self。
+         */
+        const bdHidden = builtinDocs()
+        if (bdHidden !== undefined && bdHidden.isManagedPage(slug) && bdHidden.isHidden()) return null
         const index = await loadVisibilityIndex()
         if (self) {
           // 只覆盖自身那一行（调用方刚 INSERT、还没提交，另一条连接看不到）。
@@ -641,7 +705,7 @@ export const AuthzPlugin = {
           setHeader.call(h.res, 'cache-control', 'public, max-age=3600')
         }
         h.res.end('User-agent: *\nDisallow: /\n')
-      })
+      }, { access: 'public' })
 
       /*
        * `sitemap.xml` 的定位在 D4 下变了：**不给爬虫，给运维做泄漏核对**
@@ -666,7 +730,7 @@ export const AuthzPlugin = {
          */
         const urls = slugs.map((s) => `  <url><loc>/p/${esc(s)}</loc></url>`).join('\n')
         h.res.end(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset>\n${urls}\n</urlset>\n`)
-      })
+      }, { access: 'public' })
 
       router.register('GET', '/portal', async (h: RouteHandlerContext) => {
         // 匿名主体：门户展出的必须与"未登录访客看得到的内容"逐字一致
@@ -692,7 +756,7 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
 </html>
 `,
         )
-      })
+      }, { access: 'public' })
 
       /*
        * ---------- GET /api/admin/audit：审计查询（★ P4） ----------

@@ -21,7 +21,24 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import { asAsync, isAsyncAdapter, writeAuditLog, type DatabaseAdapter, type GeeWikiManifest, type HttpRouterService, type Principal, type RouteHandlerContext } from '@geewiki/core'
+import {
+  SEARCH_PERFORMED_EVENT,
+  asAsync,
+  isAsyncAdapter,
+  writeAuditLog,
+  type ContentView,
+  type DatabaseAdapter,
+  type GeeWikiManifest,
+  type HttpRouterService,
+  type Principal,
+  type RouteHandlerContext,
+  type SearchBlockRef,
+  type SearchHit,
+  type SearchMode,
+  type SearchPerformedEvent,
+  type SearchResult,
+  type SearchService,
+} from '@geewiki/core'
 
 /* ============================== 配置 ============================== */
 
@@ -78,54 +95,21 @@ export const manifest: GeeWikiManifest = {
 
 /* ============================ 服务契约 ============================ */
 
-/**
- * 检索命中的一条结果（与 `GET /api/search` 响应里 `hits[]` 的元素**逐字段一致**）。
- * 抽成具名类型是为了让它成为跨包契约：AI/RAG 插件消费 `search-service` 时依赖这里。
+/*
+ * ★ F3：契约已**下沉到 `@geewiki/core`**（真源 `packages/core/src/services.ts`）。
+ *
+ * 这里只做**转出**，保证既有 `import { SearchService } from '@geewiki/plugin-search'` 不破。
+ * 但**新的消费方与替换实现请直接从 `@geewiki/core` 取** —— 替换检索实现的插件
+ * 不该为了拿接口类型而依赖它要替换的那个包（语义倒挂，F3 消掉的正是它）。
  */
-/** 命中的块（★ P3a：命中定位与高亮的唯一来源）。 */
-export interface SearchBlockRef {
-  ordinal: number
-  kind: string
-  text: string
-}
-
-export interface SearchHit {
-  slug: string
-  title: string
-  snippet: string
-  /**
-   * ★ P3a：本页**当前主体可见**的块（按 `ordinal` 升序）。
-   *
-   * 为什么要有它：块级模型下"这一页为什么命中"必须落在**具体的块**上 —— 高亮片段
-   * 也正是从这些块的文本里取的（见 {@link snippetFor}）。**这里只可能出现可见块**：
-   * 不可见的块既不出现在数组里，其文本也从不经过 SQL 返回给本层。
-   */
-  blocks: readonly SearchBlockRef[]
-  /**
-   * ★ P3a：本页**被裁剪掉**（当前主体看不到）的块数。**不含任何内容，只是计数。**
-   *
-   * **对匿名主体恒为 0**（设计文档 §4.5 第 3 条）：匿名下若 `gatedCount > 0`，就等于
-   * 确认"这里存在你看不到的内容"，那是存在性泄漏。故匿名一律拿到 0，与"这页确实没有
-   * 受限块"不可区分。
-   */
-  gatedCount: number
-  /**
-   * 相关度：FTS 路为 BM25 取负后的值（**越大越相关**），LIKE 路恒为 0。
-   *
-   * **只在同一次查询的结果内部可比**：它不是归一化分数（值域无界），量级随语料规模与
-   * 查询词变化，跨查询比大小无意义；两种 mode 的 score 也不可比。
-   */
-  score: number
-  updated_at: string
-}
-
-/** 一次检索的结果：`mode` 回传实际走的那条路径（观测与测试用） */
-export interface SearchResult {
-  mode: 'fts' | 'like'
-  /** 全量命中数，**不受 limit 影响** */
-  total: number
-  hits: readonly SearchHit[]
-}
+export type {
+  ContentView,
+  SearchBlockRef,
+  SearchHit,
+  SearchMode,
+  SearchResult,
+  SearchService,
+} from '@geewiki/core'
 
 /**
  * `policy-service` 的**最小结构需求**（结构化类型，刻意不 import `@geewiki/authz`）。
@@ -151,76 +135,6 @@ interface PolicyServiceLike {
    * 会让"受限块计数"恒为 0、探针与 `gatedCount` 双双失真。详见该函数的注释。
    */
   grantedBlockIds(principal: Principal): Promise<readonly number[]>
-}
-
-/**
- * ★ P3a：一页正文的**可见块投影**（`contents()` 的返回值，设计文档 §4.5）。
- *
- * 为什么不直接返回字符串：RAG 需要**块级引用定位**（`sources` 帧按 `ordinal` 指向具体块），
- * 而那必须来自**同一次**投影结果 —— 二次查询会让"答案提到了、sources 里没有"成为可能。
- */
-export interface ContentView {
-  /** 该主体可见块的拼接文本（块间 `'\n\n'`） */
-  text: string
-  /** 可见块，按 `ordinal` 升序 —— 供 `sources` 帧与引用定位 */
-  blocks: readonly SearchBlockRef[]
-  /** 被裁剪掉的块数（**不含内容**，仅计数）。**对匿名主体恒为 0**（同 {@link SearchHit.gatedCount}） */
-  gatedCount: number
-  /**
-   * 可见块里 `tier` 的最大值（域 `{0,1}`）。
-   * **仅诊断用**：它**不反映** `granted` 档的可见块（那些块 `tier` 为 `NULL`）。
-   * 判定一律走 `policy-service`，**不得**据本字段做任何放行/拒绝。
-   */
-  maxVisibleTier: number
-}
-
-/**
- * `search-service` 服务契约（本插件经 `ctx.provide('search-service', svc)` 提供）。
- *
- * 存在的意义：让消费方（AI/RAG 插件）**不必**知道检索插件内部怎么建索引、
- * 也不必直接 `SELECT` wiki 的 `pages` 表（那会把表结构变成跨包隐式契约）。
- *
- * ★ P2：**两个方法都显式要求 `principal` 且改为异步**（设计文档 §9 R2）。
- * 为什么必须显式传主体：cordis 服务是进程级单例，把主体藏在服务内部等于让
- * "忘了传"变成"按上一个人的权限返回"。故 principal 是**必填首参**——
- * 漏传在编译期即报错，运行期再兜一道（见 {@link assertPrincipal}）。
- *
- * 为什么从同步改成异步：可见性判定要走 `policy-service`（`visibleSlugs` 是异步的，
- * 它可能要查祖先链）。这是 P2 的**破坏性契约变更**，消费方（`@geewiki/ai`）已同步跟进。
- */
-export interface SearchService {
-  /**
-   * 全文检索。与 `GET /api/search` 是**同一份实现**（端点只是把它包成 HTTP），
-   * 故两者在同主体、同 q、同 limit 下结果逐字段一致。
-   *
-   * **结果已在 SQL 层按主体裁剪**：`total`、`hits`、`snippet` 全部只覆盖当前主体
-   * 可见（`full` 档）的条目。**绝不是"先取全量再后过滤"** —— 那样 `total`、
-   * 高亮与分页语义会一起泄漏（设计文档 §5.6 明令禁止）。
-   *
-   * @param principal 主体（匿名用 `anonymousPrincipal()`，不可省略）
-   * @param q    查询串（调用方无需 trim，内部会 trim；trim 后为空则返回空结果）
-   * @param opts limit 为本次返回条数上限（1..100，非法值抛错——与端点的 400 语义对应）；
-   *             mode 为查询语义：`'phrase'`（默认）= 整串字面短语（搜索框语义），
-   *             `'terms'` = 切成词元后 OR（**问句检索**语义，RAG 用）。
-   */
-  search(
-    principal: Principal,
-    q: string,
-    opts?: { limit?: number; mode?: SearchMode },
-  ): Promise<SearchResult>
-
-  /**
-   * 按 slug 批量取**可见块投影**，供 RAG 拼上下文。
-   * 只包含**真实存在且当前主体可见（`full` 档）**的 slug（查不到/无权看的键不出现）；
-   * 空数组直接返回空 Map。**值里只有可见块** —— 不可见块的文本从不进入返回结构。
-   *
-   * ⚠️ 这是 RAG 的**正文入口**，也是 §5.6 点名的第三条泄漏旁路：调用方若绕过它
-   * 直接读 `pages` / `blocks` 表，权限就白做了。裁剪在本方法内部完成（唯一出口）。
-   *
-   * ★ P3a：返回值由 `ReadonlyMap<string, string>` 改为 `ReadonlyMap<string, ContentView>`
-   * （**破坏性契约变更**）—— RAG 的 `sources` 帧需要块级引用定位，而它必须来自同一次投影。
-   */
-  contents(principal: Principal, slugs: readonly string[]): Promise<ReadonlyMap<string, ContentView>>
 }
 
 /**
@@ -259,7 +173,7 @@ const MAX_LIMIT = 100
 /**
  * 查询串长度上限（服务层护栏）。
  *
- * 与 `@geewiki/ai` 的 `MAX_QUERY_LENGTH = 500` **刻意保持一致**：REST 端点与 AI 插件
+ * 与 `@geewiki/ai-qa` 的 `MAX_QUERY_LENGTH = 500` **刻意保持一致**：REST 端点与问答插件
  * 对"多长的问句算合理"应有同一口径，否则从两个入口进来的同一句话会有不同结果。
  * 这里不复用对方的常量：search 是下层（ai 依赖 search-service），下层不能反向依赖上层，
  * 故两处各自持有该数值并在注释里互相指认。
@@ -379,9 +293,6 @@ export function buildTermQuery(q: string): string[] {
   return terms
 }
 
-/** 一次检索的查询语义：`phrase` = 整串字面短语（默认，向后兼容）；`terms` = 词元 OR（问句检索） */
-export type SearchMode = 'phrase' | 'terms'
-
 /**
  * 自实现高亮片段（不用 FTS5 的 `snippet()`：trigram 下它上限约 64 token ≈ 中文 64 字，
  * 太短且会把片段切得很碎）。
@@ -496,6 +407,35 @@ export const SearchPlugin = {
     }
 
     /**
+     * F7：在**单一实现**外面包一层，只为了广播 `SEARCH_PERFORMED_EVENT`。
+     *
+     * 为什么包在这里而不是各端点里：`searchImpl` 是 REST 与跨插件 `search-service.search()`
+     * 的**唯一**入口（见下方说明），在这里发一次就两条路都覆盖到；
+     * 分开写迟早出现"插件内检索不触发统计"这种只在跨插件调用时才显现的缺口。
+     *
+     * 负载**不放结果集**：事件是广播，订阅者若把它当缓存用，就会拿到别人查询的结果
+     * （而检索结果是**按主体过滤**的——那等于绕过可见性判定）。
+     */
+    const search = async (
+      principal: Principal,
+      rawQuery: string,
+      opts?: { limit?: number; mode?: SearchMode },
+    ): Promise<SearchResult> => {
+      const result = await searchImpl(principal, rawQuery, opts)
+      try {
+        ctx.emit(SEARCH_PERFORMED_EVENT, {
+          query: rawQuery ?? '',
+          hits: result.total,
+          actorId: principal.userId ?? null,
+        } satisfies SearchPerformedEvent)
+      } catch (err) {
+        // 订阅者的 bug 不得让一次成功的检索失败（契约见 core 的事件说明）
+        console.warn(`[@geewiki/search] ${SEARCH_PERFORMED_EVENT} 的订阅者抛错（已忽略，检索本身照常）:`, err)
+      }
+      return result
+    }
+
+    /**
      * **检索的单一实现**：`GET /api/search` 与 `search-service.search()` 都走这里。
      * 端点只负责把 HTTP 参数解析成 `(q, limit)` 并把结果包成响应体——
      * 若两处各写一份 SQL，迟早会出现"REST 与插件内检索结果不一致"的漂移。
@@ -505,7 +445,7 @@ export const SearchPlugin = {
      * `contents()` 共用同一对谓词。**绝不先取全量再在 JS 里过滤** —— 那样 `total`、
      * 片段与分页语义会一起泄漏（设计文档 §5.6 明令禁止）。
      */
-    const search = async (
+    const searchImpl = async (
       principal: Principal,
       rawQuery: string,
       opts?: { limit?: number; mode?: SearchMode },
@@ -778,7 +718,7 @@ export const SearchPlugin = {
         // 长度上限：必须在调用 search() **之前**拦下并给出 400——search() 对超长查询抛
         // RangeError，而路由层对同步抛错统一转成 **500**（见 server 的 dispatch catch），
         // 那是"服务器故障"的语义，与"调用方传得太长"不符。
-        // 错误码 `too_long` 与 @geewiki/ai 的 `/api/ai/ask` 保持一致口径。
+        // 错误码 `too_long` 与 @geewiki/ai-qa 的 `/api/ai/ask` 保持一致口径。
         if (q.length > MAX_QUERY_LENGTH) {
           h.json(400, {
             ok: false,
@@ -845,7 +785,7 @@ export const SearchPlugin = {
           total: result.total,
           hits: result.hits,
         })
-      }),
+      }, { access: 'public' }),
     )
 
     /* ---------- GET /api/admin/search/verify：块索引一致性探针 ---------- */

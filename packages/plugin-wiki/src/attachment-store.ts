@@ -21,31 +21,25 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
-import { createWriteStream } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
 import { mkdir, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { Readable } from 'node:stream'
-import { attachmentRelPath, assertExtAllowed } from './attachments.js'
+import { AttachmentServiceError, type AttachmentService, type StoredAttachment, type StoredBlob } from '@geewiki/core'
+import { assertExtAllowed, attachmentRelPath, resolveAttachmentPath } from './attachments.js'
 
 /**
- * 附件存储层的错误。`code` 即端点要回的错误码（沿用仓库"消息前缀即错误码"的约定）：
+ * 附件存储层的错误 —— **类本体已上移到 `@geewiki/core`**（F4 契约下沉）。
  *
- * - `payload_too_large` ⇒ 413（调用方的输入问题）
- * - `length_mismatch` ⇒ **400**（实收字节数与声明的 `Content-Length` 不符：上传被截断/半途而废）
- * - `storage_unavailable` ⇒ **503**（不是 500）。这一点是刻意的：磁盘只读/写满/无权限是
- *   **运维状态**，不是本服务故障。报 500 会让每个失败请求都计入 `stats().consecutiveFailures`，
- *   连续失败达到阈值就可能触发看门狗熔断 —— 于是"磁盘满了"被升级成"整站被熔断"。
- *   503 的表达更准确：**依赖不可用，服务本身是活的**。
+ * 为什么错误类也必须搬走：它**是契约的一部分**。若留在本包，一个 S3/WebDAV 实现
+ * 要么依赖 `@geewiki/plugin-wiki`（语义倒挂），要么自己造一个同名类 —— 而后者会让端点的
+ * `err instanceof AttachmentServiceError` **静默失配**，于是存储层报的 413 / 400 / 503
+ * 全部退化成 500，并计进 `stats().consecutiveFailures`（磁盘满 → 整站被看门狗熔断）。
+ * 现在两侧引用的是**同一个类对象**，`instanceof` 与 `code` 分类天然一致。
+ *
+ * 旧名保持可用（既有 import 不破）。
  */
-export class AttachmentStoreError extends Error {
-  constructor(
-    readonly code: 'payload_too_large' | 'length_mismatch' | 'storage_unavailable',
-    message: string,
-  ) {
-    super(`${code}: ${message}`)
-    this.name = 'AttachmentStoreError'
-  }
-}
+export { AttachmentServiceError as AttachmentStoreError }
 
 /** 磁盘/文件系统的"运维状态"类错误码：消息里据此措辞（见 {@link asStoreError}）。 */
 const STORAGE_ERRNO = new Set(['EROFS', 'ENOSPC', 'EACCES', 'EPERM', 'EDQUOT'])
@@ -57,7 +51,7 @@ export function isStorageErrno(err: unknown): boolean {
 }
 
 /**
- * 把存储层的任意失败翻译成 {@link AttachmentStoreError}。
+ * 把存储层的任意失败翻译成 {@link AttachmentServiceError}。
  *
  * ★ **默认全部按 `storage_unavailable` 处理，而不是只认一份 errno 白名单。**
  * 两个理由，第二条是实测的：
@@ -72,11 +66,11 @@ export function isStorageErrno(err: unknown): boolean {
  *    最想避免的形态。
  */
 function asStoreError(err: unknown, context: string): Error {
-  if (err instanceof AttachmentStoreError) return err
+  if (err instanceof AttachmentServiceError) return err
   const code = (err as NodeJS.ErrnoException | null)?.code
   const detail = typeof code === 'string' ? `（${code}${isStorageErrno(err) ? '，已知的存储故障码' : ''}）` : ''
   const reason = err instanceof Error ? err.message : String(err)
-  return new AttachmentStoreError('storage_unavailable', `附件存储不可用${detail}：${context} —— ${reason}`)
+  return new AttachmentServiceError('storage_unavailable', `附件存储不可用${detail}：${context} —— ${reason}`)
 }
 
 /** 创建附件与临时目录（幂等）。激活期的探针与每次上传都走它。 */
@@ -107,14 +101,13 @@ function isUniqueViolation(err: unknown): boolean {
 /** 导出以便端点识别"并发下另一个同内容请求刚插入"这一种冲突（见 attachments 端点）。 */
 export { isUniqueViolation }
 
-export interface StoreStreamResult {
-  /** 内容哈希（hex，64 位）。**原始文件名不参与**：去重与路径都只看它。 */
-  sha256: string
-  /** 实际写入的字节数（来自流，不是 `Content-Length`）。 */
-  byteSize: number
-  /** `true` = 该内容此前已在磁盘上（本次只是删掉了临时文件，没有产生第二份）。 */
-  dedup: boolean
-}
+/**
+ * 一次落盘的结果 —— **即 core 契约的 `StoredAttachment`**（同名同形，不另立一份）。
+ *
+ * 之所以不再本地定义：这个形状是**跨包契约的一部分**（`attachment-service.put()` 的返回值），
+ * 本地再来一份就会在字段增删时静默漂移 —— 而"多一个字段"正是替换实现最容易漏的地方。
+ */
+export type StoreStreamResult = StoredAttachment
 
 /**
  * 把 `src` 流式写入内容寻址路径。
@@ -186,7 +179,7 @@ export async function storeStream(
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
       byteSize += buf.length
       if (byteSize > o.maxBytes) {
-        throw new AttachmentStoreError(
+        throw new AttachmentServiceError(
           'payload_too_large',
           `附件超过上限（${o.maxBytes} 字节）`,
         )
@@ -233,7 +226,7 @@ export async function storeStream(
      * · 反例（真会不一致的情形只有一种）：**请求体被中途掐断**。那正是我们要拒的东西。
      */
     if (o.expectedBytes !== undefined && byteSize !== o.expectedBytes) {
-      throw new AttachmentStoreError(
+      throw new AttachmentServiceError(
         'length_mismatch',
         `实收 ${byteSize} 字节，与声明的长度 ${o.expectedBytes} 不符：上传被截断，落盘会产生一份"自洽但残缺"的新内容`,
       )
@@ -269,4 +262,46 @@ export async function storeStream(
     throw asStoreError(err, `落到 ${rel} 失败`)
   }
   return { sha256, byteSize, dedup: false }
+}
+
+/* ============================ 内置本地实现 ============================ */
+
+/**
+ * **内置的本地实现**（文件系统 + sha256 内容寻址），即 `attachment-service` 的默认 provider。
+ *
+ * 它是契约的第一个实现，但**不是特权实现**：`@geewiki/core` 的 `AttachmentService` 就是
+ * 全部要求 —— 一个 S3/WebDAV 插件提供同样的 token 即可顶替，wiki 侧一行不改
+ * （wiki 的 `attachmentProvider: 'none'` 会让内置实现不再注册）。
+ *
+ * `get()` 用 `stat` 而不是"直接开流"：**"元数据在、文件不在"是一个必须可诊断的状态**
+ * （端点据此回 404 `blob_missing` 并打日志），而不是让调用方去猜一个 ENOENT 流错误。
+ * 这也是把它做成 `StoredBlob{size, open()}` 而不是直接返回 `Readable` 的原因 ——
+ * 字节数（响应头要用）与打开流必须在**同一次**探测里拿到，否则两者之间文件可能就没了。
+ */
+export function createFsAttachmentService(o: { dataDir: string; tmpDir: string }): AttachmentService {
+  return {
+    ready: () => ensureAttachmentDirs(o.dataDir, o.tmpDir),
+    put: (src, p) =>
+      storeStream(src, {
+        dataDir: o.dataDir,
+        tmpDir: o.tmpDir,
+        maxBytes: p.maxBytes,
+        ext: p.ext,
+        expectedBytes: p.expectedBytes,
+      }),
+    async get(sha256: string, ext: string): Promise<StoredBlob | undefined> {
+      const abs = resolveAttachmentPath(o.dataDir, sha256, ext)
+      let size: number
+      try {
+        size = (await stat(abs)).size
+      } catch {
+        return undefined
+      }
+      return { size, open: () => createReadStream(abs) }
+    },
+    async remove(sha256: string, ext: string): Promise<void> {
+      // 不存在视为成功（幂等）：GC 与"删元数据"两条路径都可能跑到前面去
+      await rm(resolveAttachmentPath(o.dataDir, sha256, ext), { force: true })
+    },
+  }
 }
