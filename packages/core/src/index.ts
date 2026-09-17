@@ -140,8 +140,8 @@ export const PLUGIN_ROUTE_ID = /^[a-z][a-z0-9-]*$/
  */
 export const RESERVED_ROUTE_IDS: readonly string[] = [
   'wiki',
-  'plugins', // 旧链接，在路由解析处改写成 graph
-  'graph',
+  'plugins', // 「插件管理」页（原 id 为 graph，本轮转正）
+  'graph', // 旧 id：仍须保留 —— 它在路由解析处被改写成 plugins，且不得被插件声明占用
   'access', // 旧的权限治理路由（现为占位重定向页）
   'audit',
   'org',

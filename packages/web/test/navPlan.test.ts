@@ -122,8 +122,9 @@ function adminNavBlock(): string {
 test('App：确有效果物 —— ADMIN_NAV 数组体能被抽取出来（防正则写坏导致 0===0）', () => {
   const block = adminNavBlock()
   assert.ok(block.length > 40, `应能抽取出 ADMIN_NAV 的数组体（实际 ${block.length} 字符）`)
-  // 合并后管理面只剩依赖图一项（原「插件管理」的表格已并入该页），故这里钉的是它
-  assert.ok(block.includes("id: 'graph'"), 'ADMIN_NAV 里应含依赖图（插件管理的唯一入口）')
+  // 合并后管理面只剩这一项（原「插件管理」的表格已并入该页）；
+  // 它**后来还改了 id**：显示名与路由 id 一起从「依赖图」/`graph` 改为「插件管理」/`plugins`
+  assert.ok(block.includes("id: 'plugins'"), 'ADMIN_NAV 里应含插件管理（其唯一入口，id 为 plugins）')
 })
 
 test('App：ADMIN_NAV 的**每一项**都必须声明 requires: administer', () => {
