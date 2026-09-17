@@ -50,8 +50,8 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import './style.css'
 import {
-  actorLabel,
   AUDIT_PAGE_SIZE,
+  buildUserIndex,
   blocksVerifyVerdict,
   cacheVerdict,
   changedFields,
@@ -61,6 +61,7 @@ import {
   formatTime,
   hasAuditFilters,
   pageCount,
+  resolveUser,
   searchVerifyVerdict,
   sectionById,
   SECTIONS,
@@ -70,6 +71,7 @@ import {
   type BlocksResyncResponse,
   type BlocksVerifyResponse,
   type CachePlanResponse,
+  type MemberEntry,
   type SearchVerifyResponse,
   type SessionEntry,
   type SitemapAuditResponse,
@@ -81,6 +83,7 @@ import {
   fetchAccessExplain,
   fetchAudit,
   fetchCachePlan,
+  fetchMembers,
   fetchSessions,
   fetchSitemapAudit,
   purgeGrants,
@@ -122,6 +125,29 @@ interface PluginUiHost {
 function Badge(props: { readonly level?: 'ok' | 'warn' | 'bad'; readonly children: ReactNode }): ReactNode {
   const cls = props.level === undefined ? 'gw-ops-badge' : `gw-ops-badge gw-ops-badge-${props.level}`
   return <span className={cls}>{props.children}</span>
+}
+
+/**
+ * 「这是谁」单元格。
+ *
+ * 为什么不是一行 `#12`：`#12` 无法定位到具体的人（要跳去另一个页面自己查），
+ * 而审计/会话表的全部价值就是"谁做了什么"。现在显示 **显示名 + 邮箱 · #id** 两行 ——
+ * 显示名给人读，邮箱唯一定位（同名的人靠它分开），`#id` 留给排障时在日志里 grep。
+ *
+ * 解析不出来时（已退出/被删除）**明说原因**，而不是只显示 `#12`：
+ * 后者与"根本没做解析"长得一模一样，而这正是本次要消灭的状态。
+ */
+function UserCell(props: {
+  readonly userId: number | null
+  readonly users: ReadonlyMap<number, MemberEntry>
+}): ReactNode {
+  const label = resolveUser(props.userId, props.users)
+  return (
+    <>
+      <div className={label.resolved ? undefined : 'gw-ops-mono'}>{label.name}</div>
+      <div className="gw-ops-user-detail">{label.detail}</div>
+    </>
+  )
 }
 
 /** 结论块：把端点的裸 JSON 变成"要不要处理" */
@@ -191,6 +217,7 @@ function ConfirmBar(props: {
  */
 function AuditSection(props: {
   readonly view: 'security' | 'acl'
+  readonly users: ReadonlyMap<number, MemberEntry>
   readonly reloadToken: number
   readonly busy: string
   readonly run: (key: string, fn: () => Promise<string>) => Promise<void>
@@ -347,7 +374,9 @@ function AuditSection(props: {
                         <td className="gw-ops-mono">
                           {r.targetKind}:{r.targetId}
                         </td>
-                        <td className="gw-ops-mono">{actorLabel(r.actorId)}</td>
+                        <td>
+                          <UserCell userId={r.actorId} users={props.users} />
+                        </td>
                         <td>
                           {diff.length === 0 ? (
                             <span className="gw-ops-dim">—</span>
@@ -405,6 +434,7 @@ function AuditSection(props: {
 /* ============================== 分区三：会话 ============================== */
 
 function SessionsSection(props: {
+  readonly users: ReadonlyMap<number, MemberEntry>
   readonly reloadToken: number
   readonly run: (key: string, fn: () => Promise<string>) => Promise<void>
   readonly confirm: (r: ConfirmRequest) => void
@@ -471,7 +501,9 @@ function SessionsSection(props: {
                   const activeCount = userId === null ? 0 : activeOf(userId)
                   return (
                   <tr key={s.id}>
-                    <td className="gw-ops-mono">{actorLabel(userId)}</td>
+                    <td>
+                      <UserCell userId={userId} users={props.users} />
+                    </td>
                     <td>
                       <Badge level={s.revokedAt === null && s.status === 'active' ? 'ok' : undefined}>
                         {s.status}
@@ -931,6 +963,14 @@ export function OpsRoute(props: PluginRouteProps): ReactNode {
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
   /** 刷新令牌：点「刷新」时自增，当前分区据此重取（分区组件内部各自持有数据） */
   const [reloadToken, setReloadToken] = useState(0)
+  /**
+   * 用户目录：`userId → 成员`，用来把 `#12` 解析成"这是谁"。
+   *
+   * 取不到时**不挡路**（审计与会话数据本身仍然有用），但也不静默吞掉 ——
+   * 走 `onError` 弹一条横幅，否则每行都会显示"不在当前成员列表"，
+   * 而那个说法在"目录没加载出来"时是**错的**。
+   */
+  const [users, setUsers] = useState<ReadonlyMap<number, MemberEntry>>(() => new Map())
 
   const onError = useCallback((e: unknown) => {
     setErr(describeOpsError(e))
@@ -949,6 +989,20 @@ export function OpsRoute(props: PluginRouteProps): ReactNode {
       setBusy('')
     }
   }, [])
+
+  useEffect(() => {
+    let alive = true
+    fetchMembers()
+      .then((r) => {
+        if (alive) setUsers(buildUserIndex(r.members))
+      })
+      .catch((e: unknown) => {
+        if (alive) setErr({ title: '成员列表加载失败', hint: `${describeOpsError(e).title} —— 操作者列只能显示 #id` })
+      })
+    return () => {
+      alive = false
+    }
+  }, [reloadToken])
 
   const requestConfirm = useCallback((r: ConfirmRequest) => {
     /*
@@ -1022,6 +1076,7 @@ export function OpsRoute(props: PluginRouteProps): ReactNode {
       {section === 'security' && (
         <AuditSection
           view="security"
+          users={users}
           reloadToken={reloadToken}
           busy={busy}
           run={run}
@@ -1029,10 +1084,18 @@ export function OpsRoute(props: PluginRouteProps): ReactNode {
         />
       )}
       {section === 'acl' && (
-        <AuditSection view="acl" reloadToken={reloadToken} busy={busy} run={run} onError={onError} />
+        <AuditSection
+          view="acl"
+          users={users}
+          reloadToken={reloadToken}
+          busy={busy}
+          run={run}
+          onError={onError}
+        />
       )}
       {section === 'sessions' && (
         <SessionsSection
+          users={users}
           reloadToken={reloadToken}
           run={run}
           confirm={requestConfirm}

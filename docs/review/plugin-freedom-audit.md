@@ -696,11 +696,14 @@ pnpm run install-plugin --verify [--json]
 #### 验证读数（取数方式一并给出）
 
 - `pnpm run typecheck`：27 个项目 + `scripts/` + `plugin-ops`，`grep -c 'error TS'` = **0**，exit 0
-  （日志 `data/verify/tc-ops2.log`）。
-- `pnpm run test`：**2206 例 / 2206 通过 / 0 失败**，exit 0（日志 `data/verify/test-ops2.log`）。
-  本轮新增 `packages/plugin-ops/test/opsPlan.test.ts`（23 例，纯判据）+ `opsUi.test.ts`（11 例，
+  （日志 `data/verify/tc-users2.log`）。
+- `pnpm run test`：**2210 例 / 2210 通过 / 0 失败**，exit 0（日志 `data/verify/test-users2.log`）。
+  本轮新增 `packages/plugin-ops/test/opsPlan.test.ts`（26 例，纯判据）+ `opsUi.test.ts`（12 例，
   源码级不变量）+ `packages/web/test/opsOwnership.test.ts`（4 例，归属）；`opsPage.test.ts` 已删
   （它钉的页面不在宿主里了）。
+- 搬迁时被**测试抓到的两处真实后果**（都已修）：① `orgPage.test.ts` 里钉
+  `purgeInvitations` 的那条断言 —— 该方法的归属变了，已改成"宿主里不得再有一份 + 插件里有"；
+  ② 宿主 `api.ts` 的 8 个方法 + 7 个类型成了死代码（逐名 grep 外部引用为 0），已整块删除。
 - **运行期实测**（`curl` 真实服务）：`GET /api/plugins/ui` 的 `plugins["@geewiki/ops"]` =
   `{entry:"client.js", css:"client.css", rev:"f32aa3f2", routes:[{id:"audit", label:"审计与运维",
   requires:"administer", group:"admin"}]}`；`GET /api/plugins/slots` 的 `routes` =
@@ -708,15 +711,46 @@ pnpm run install-plugin --verify [--json]
   `/plugins-ui/@geewiki/ops/{client.js,client.css}` 均 200。
 - **渲染实测**（headless Chrome 挂真实组件 + 打桩 fetch，五个分区各渲染一份）：
   五分区全部 `渲染=ok`，`table` 3 张、`[role=tab]` 25 个（5 分区 × 5 标签）、
-  变更明细 `private → org` 真的画出来了、分页文案 `第 1 / 3 页` 与 `共 120 条` 正确。
-  产物 `client.js` 39.95 kB / gzip 9.51 kB、`client.css` 5.27 kB。
+  变更明细 `private → org` 真的画出来了、分页文案 `第 1 / 3 页` 与 `共 120 条` 正确；用户列解析为 `张三` / `zhang@example.com · #1`（无显示名时退回邮箱 `li@example.com` / `#2`），查不到的 id 显示 `#404` + 「不在当前成员列表（可能已退出或被删除）」，匿名显示「（匿名）」+「无用户身份」—— 三种「解析不出来」互相可区分。
+  产物 `client.js` **41.35 kB / gzip 9.90 kB**、`client.css` **5.33 kB**（加入用户目录后的最终读数）。
+
+#### 用户定位（追加一问：「方便定位用户」）
+
+原状：操作者/用户列只有 `#12` —— 端点的响应里只有 `actorId` / `userId`，没有用户名。
+改法是**前端映射**，而不是改两个插件的响应契约：
+
+- 新增 `fetchMembers()` → `GET /api/org/members`（`@geewiki/org`，`access: 'user'`，
+  返回 `{userId, email, displayName, role}`），在 `OpsRoute` 里取一次、建
+  `buildUserIndex()` 索引，审计表与会话表共用。
+- `resolveUser(userId, index)` 产出**两行**：主标签 = 显示名 → 邮箱 → `#id` 依次回退；
+  次要小字 = `邮箱 · #id`。**邮箱必须一起显示** —— 只给显示名的话，"同名的人"仍分不出来；
+  `#id` 也必须留着，排障时要在日志里 grep 那个数字。
+- **三种"解析不出来"必须可区分**：`null` ⇒ `（匿名）/ 无用户身份`；查得到 ⇒ 人；
+  查不到 ⇒ `#id` + **明说**"不在当前成员列表（可能已退出或被删除）"。
+  最后一种最容易做错：只显示 `#12` 与"根本没做解析"长得一模一样，而那正是要消灭的状态。
+- 目录**取不到时不挡路**（审计/会话数据本身仍有用），但走 `onError` 弹横幅 ——
+  否则每行都显示"不在当前成员列表"，而那个说法在"目录没加载出来"时是**错的**。
+
+为什么不改后端：那要同时动 `@geewiki/authz`（audit）与 `@geewiki/auth`（sessions）两个包的
+响应契约，而那两个端点还有别的消费者；本页面本来就要展示成员，多取一次比多加两个字段更省事。
+**它解决不了的那一类**：审计是长期台账，而成员表只反映当下 —— 已退出/被删除的用户永远解析
+不出来，那时显示 `#id` 是如实呈现。真正的修法是写入审计时存身份快照（`actorEmail` 冗余列），
+那是一次 schema 迁移，不在本轮。
+
+**顺带清掉的死代码**：搬迁之后，宿主 `packages/web/src/api.ts` 里的 8 个方法
+（`auditLog` / `sessions` / `revokeSession` / `purgeGrants` / `purgeInvitations` /
+`accessExplain` / `sitemapAudit` / `cachePlan`）与 7 个类型（`AuditEntry` / `AuditResponse` /
+`SessionEntry` / `SessionsResponse` / `AccessExplainResponse` / `SitemapAuditResponse` /
+`CachePlanResponse`）**外部引用数全为 0**（逐名 grep 确认）—— 留着就是"同一份端点契约两个实现"，
+而两者漂移是静默的。已整块删除。
 
 #### 未做（如实记录）
 
-- **端点的响应里没有用户名**（只有 `actorId`），所以操作者列显示 `#12`。要显示人名得先让
-  auth 的会话/审计响应带上用户名 —— 那是端点契约变更，不在本轮。
 - 落成插件后 `@geewiki/ops` **可以被停用**。这是「万物皆插件」的应有之义，但也意味着
-  "停用之后就没地方看审计了"。台账式的兜底（例如停用需要更强的确认）留作显式决定。
+  "停用之后就没地方看审计了"。（用户明确表示这一条不用管。）
+- 审计端点**没有按操作者筛选**的参数（只有 `view/action/targetKind/targetId/since/until/limit/offset`），
+  故"看某个人做过什么"目前只能翻页找。那是一次后端契约变更，留作显式决定。
+
 
 ---
 

@@ -9,8 +9,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  actorLabel,
   AUDIT_PAGE_SIZE,
+  buildUserIndex,
   auditQuery,
   blocksVerifyVerdict,
   cacheVerdict,
@@ -19,12 +19,14 @@ import {
   formatTime,
   hasAuditFilters,
   pageCount,
+  resolveUser,
   searchVerifyVerdict,
   sectionById,
   shortValue,
   sitemapVerdict,
   type BlocksVerifyResponse,
   type CachePlanResponse,
+  type MemberEntry,
   type SearchVerifyResponse,
   type SitemapAuditResponse,
 } from '../ui/plan.js'
@@ -109,9 +111,49 @@ test('formatTime：空值与非法值都显示「—」而不是 Invalid Date �
   assert.notEqual(formatTime('2026-09-17T10:00:00Z'), '—')
 })
 
-test('actorLabel：没有用户名就如实显示 id，绝不伪装成人名', () => {
-  assert.equal(actorLabel(null), '（匿名）')
-  assert.equal(actorLabel(12), '#12')
+const member = (over: Partial<MemberEntry> = {}): MemberEntry => ({
+  userId: 12,
+  email: 'zhang@example.com',
+  displayName: '张三',
+  role: 'member',
+  joinedAt: '2026-01-01T00:00:00Z',
+  ...over,
+})
+
+test('resolveUser：解析得出时给显示名，并把邮箱与 #id 一起摆出来', () => {
+  const label = resolveUser(12, buildUserIndex([member()]))
+  assert.equal(label.name, '张三')
+  assert.equal(label.detail, 'zhang@example.com · #12', '邮箱唯一定位（同名的人靠它分开），#id 留给日志 grep')
+  assert.equal(label.resolved, true)
+})
+
+test('resolveUser：没有显示名时退回邮箱，绝不把 id 伪装成人名', () => {
+  const label = resolveUser(12, buildUserIndex([member({ displayName: '' })]))
+  assert.equal(label.name, 'zhang@example.com')
+  assert.equal(label.detail, '#12')
+})
+
+test('resolveUser：匿名与"查不到"必须可区分（两者要做的事不同）', () => {
+  const anon = resolveUser(null, buildUserIndex([member()]))
+  assert.equal(anon.name, '（匿名）')
+  assert.equal(anon.resolved, false)
+
+  const missing = resolveUser(99, buildUserIndex([member()]))
+  assert.equal(missing.name, '#99')
+  assert.equal(missing.resolved, false)
+  assert.match(
+    missing.detail,
+    /不在当前成员列表/,
+    '查不到时必须**明说原因** —— 只显示 #99 与"根本没做解析"长得一模一样，而后者正是本次要消灭的状态',
+  )
+  assert.notEqual(anon.detail, missing.detail, '两种"解析不出来"的原因是不同的事实，文案不得混用')
+})
+
+test('buildUserIndex：按 id 建索引，非有限 id 跳过（不塞进一个查不到的空条目）', () => {
+  const index = buildUserIndex([member({ userId: 1 }), member({ userId: 2 }), member({ userId: Number.NaN })])
+  assert.equal(index.size, 2)
+  assert.equal(index.get(1)?.userId, 1)
+  assert.equal(index.get(2)?.userId, 2)
 })
 
 test('sectionById：非法/缺失的分区 id 落到默认分区（深链被改坏时不白屏）', () => {
