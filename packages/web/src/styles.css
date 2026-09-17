@@ -205,7 +205,15 @@ h2 + .empty { padding: calc(var(--spacing) * 2); }
   `display: block` 是让 `overflow-x` 在表格上真正生效的前提（`display: table` 的盒子不产生
   滚动容器），列的排布仍由内部的匿名表格盒按内容计算，故既有观感不变。
 */
-.md-body table { border-collapse: collapse; margin: 0.6em 0; display: block; max-width: 100%; overflow-x: auto; }
+/*
+  ★ 滚动容器是**包裹层**，不是表格自己。
+  这里曾是 `.md-body table { display: block; overflow-x: auto }`，注释还写着"既有观感不变"
+  ——**那句是错的**：`display: block` 让 `<thead>` 与 `<tbody>` 各自成为独立的匿名表格盒，
+  表头与数据行于是渲染成两个互不相连的框、列也不再对齐（一张表看起来像两张）。
+  包裹层由 `markdownRender.ts` 的 `wrapTables()` 注入，覆盖阅读页与编辑器实时渲染两条路径。
+*/
+.md-body table { border-collapse: collapse; margin: 0.6em 0; }
+.gw-table-scroll { max-width: 100%; overflow-x: auto; }
 .md-body th, .md-body td { border: 1px solid var(--gw-line); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 3); }
 .md-body hr { border: 0; border-top: 1px solid var(--gw-line); margin: 1.4em 0; }
 /*

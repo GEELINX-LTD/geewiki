@@ -61,6 +61,7 @@ import {
   type LiveBlockKind,
 } from '../../lib/liveRenderPlan'
 import { mdToHtml } from '../../lib/sanitize'
+import { wrapTables } from '../../lib/markdownRender'
 
 /** 需要抹掉字面量的标记节点（标记是语法，不是内容） */
 const HIDDEN_MARKS = new Set([
@@ -171,6 +172,9 @@ class RenderedBlockWidget extends WidgetType {
     // 说清"这里为什么不能直接打字"：点一下就会变回源码
     wrap.title = '点击这里改源码'
     wrap.innerHTML = mdToHtml(this.source)
+    // 与阅读页同一条修法：表格自己不能 `display: block`（那会把一张表拆成两个框），
+    // 滚动交给包裹层。渲染块直接写 innerHTML，故这里要显式调一次。
+    wrapTables(wrap)
     return wrap
   }
 

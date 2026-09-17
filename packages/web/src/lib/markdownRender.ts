@@ -221,6 +221,32 @@ export function buildBlockedAttachment(
  *                       未知时（历史快照预览等）传 `null`/不传 ⇒ 占位块不给申请入口，
  *                       但**仍然**如实说明"无权访问或被删除"。
  */
+/** 表格滚动容器的类名（样式在 `styles.css`；两处注入方共用同一个名字） */
+export const TABLE_SCROLL_CLASS = 'gw-table-scroll'
+
+/**
+ * ★ 把每张表格包进一个滚动容器。
+ *
+ * ## 为什么必须包一层，而不能直接给 `<table>` 设 `display: block; overflow-x: auto`
+ * 那正是此前的做法，而它**破坏了表格本身**：`display: block` 会让 `<thead>` 与
+ * `<tbody>` 各自成为**独立的匿名表格盒** ⇒ 表头与数据行渲染成两个互不相连的框、
+ * 列也不再对齐（用户报的「编辑器中的表格渲染有问题」，附图中一张表变成了两个）。
+ * 滚动必须发生在**包裹层**上，表格自己保持 `display: table` 才可能是一张表。
+ *
+ * 两处调用方：阅读页（`renderMarkdownBody`）与编辑器的实时渲染块（`liveRender.ts`）——
+ * 后者直接 `innerHTML = mdToHtml(...)`，不走本函数，故必须显式调用这个helper。
+ */
+export function wrapTables(holder: ParentNode): void {
+  for (const table of [...holder.querySelectorAll('table')]) {
+    // 幂等：已经包过就跳过（`renderMarkdownBody` 可能被同一段 HTML 反复处理）
+    if (table.parentElement?.classList.contains(TABLE_SCROLL_CLASS) === true) continue
+    const wrap = document.createElement('div')
+    wrap.className = TABLE_SCROLL_CLASS
+    table.replaceWith(wrap)
+    wrap.append(table)
+  }
+}
+
 export function renderMarkdownBody(
   markdown: string,
   opts: {
@@ -265,6 +291,9 @@ export function renderMarkdownBody(
    * DOMPurify 可能把属性/节点整段摘掉，我们就白标了。
    */
   decorateAttachmentMedia(holder, { applySlug: opts.attachmentSlug ?? null })
+
+  // 表格包滚动容器（理由见 wrapTables 的文件注释——这条曾经错在给表格自己设 display:block）
+  wrapTables(holder)
 
   const headingEls = [...holder.querySelectorAll('h2, h3')].filter(
     (el) => el.closest(SKIP_SELECTOR) === null,
