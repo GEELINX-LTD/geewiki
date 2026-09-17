@@ -14,11 +14,22 @@
  *    走完整导航，IdP 回跳才能落回本站；用 fetch 会因为跨站与 cookie 语义而失败。
  *    按钮**只在 `capabilities.oidc.available` 为真时出现** —— 未启用 OIDC 插件时
  *    `/api/auth/oidc/*` 根本不存在，渲染一个点了 404 的按钮比不渲染更糟。
+ * 5. **SSO 不可用时【什么都不渲染】—— 包括"它为什么不可用"**。这里曾经有一条
+ *    「SSO 不可用：已配置的单点登录当前无法连接（unreachable）」的告警，已删除。
+ *    理由三条，缺一条都不足以删除它：
+ *      a. **登录页面向的是匿名访客**。"你的 IdP 连不上"对他没有任何可操作性 ——
+ *         他既不能修，也不知道那是什么；它只是把一次困惑换成了另一次困惑。
+ *      b. **它向未认证的人暴露了内部配置状态**（"本站配了 SSO"本身就是一条信息），
+ *         而这与账号页已经确立的原则冲突：那块界面已归还给提供者插件，
+ *         "宿主连'外面有 SSO 这回事'都不再提"。
+ *      c. **真正需要这条信息的人有别的入口**：管理员看 `GET /api/plugins` 的插件状态与
+ *         `@geewiki/oidc` 自己的探测结论；点 SSO 入口也会拿到 503 `oidc_unavailable`
+ *         并带上原因。告警留在**可操作的人能看到的地方**，而不是留在匿名页面上。
+ *    守卫见 `packages/web/test/loginSso.test.ts`（源码级钉住"不可用分支不得再出现"）。
  */
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { KeyRound, ShieldCheck } from 'lucide-react'
 import {
-  Badge,
   Button,
   buttonClassName,
   Card,
@@ -230,13 +241,6 @@ export function LoginPage(): ReactNode {
             </a>
           </CardBody>
         </Card>
-      )}
-
-      {oidc?.available === false && oidc.reason !== 'disabled' && (
-        <p className="m-0 flex items-center gap-2 text-xs text-muted">
-          <Badge tone="warn">SSO 不可用</Badge>
-          已配置的单点登录当前无法连接（{oidc.reason}），本地账号登录不受影响。
-        </p>
       )}
 
       {/*
