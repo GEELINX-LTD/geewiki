@@ -502,7 +502,16 @@ export const RESERVED_ROUTE_IDS: readonly string[] = [
   'plugins', // 「插件管理」页（原 id 为 graph，本轮转正）
   'graph', // 旧 id：仍须保留 —— 它在路由解析处被改写成 plugins，且不得被插件声明占用
   'access', // 旧的权限治理路由（现为占位重定向页）
-  'audit',
+  /*
+   * `audit` 曾在这里（宿主页面 `packages/web/src/pages/OpsPage.tsx` 占用它）。
+   * 2026-09-17 起「审计与运维」搬成了插件 `@geewiki/ops`，由它自己的清单声明
+   * `routes: [{ id: 'audit', … }]` —— 于是这个 id **必须**从保留清单里移出，
+   * 否则插件那条声明会被 `resolveRouteDecls` 按"保留 id"整条拒绝，
+   * 症状是导航项与页面一起消失、且没有任何报错。
+   *
+   * 留着它不删的代价更隐蔽：宿主与插件会**同时**声称拥有 `audit`，而"谁赢"
+   * 取决于两处代码的顺序而不是声明 —— 那正是这一轮要消灭的东西。
+   */
   'org',
   'login',
   'setup',

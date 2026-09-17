@@ -65,6 +65,7 @@ import { AuthzPlugin, manifest as authzManifest } from '@geewiki/authz'
 import { BuiltinDocsPlugin, DOCS_MIGRATIONS_DIR, manifest as builtinDocsManifest } from '@geewiki/builtin-docs'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
+import { OpsPlugin, manifest as opsManifest } from '@geewiki/ops'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
 import { OidcPlugin, manifest as oidcManifest } from '@geewiki/oidc'
 import { OpenAiPlugin, manifest as openAiManifest } from '@geewiki/openai'
@@ -1593,6 +1594,21 @@ export function defaultRegistry(
       name: '@geewiki/editor-plain',
       manifest: editorPlainManifest,
       module: EditorPlainPlugin,
+      source: 'builtin',
+    },
+    // 「审计与运维」台面（2026-09-17 从宿主页面 `packages/web/src/pages/OpsPage.tsx` 搬来）。
+    //
+    // 它**不提供任何服务、不注册任何服务端路由** —— 台面上那 8 个端点分属 auth / authz / org，
+    // 本插件只贡献一个前端页面（清单里的 `routes: [{ id: 'audit', … }]`）。
+    // 这与 `@geewiki/editor-plain` 同形：服务端只有一个空 `apply`，故 supportsHotReload 为真。
+    //
+    // ⚠️ 搬迁时**两边必须同时改**：这里登记 + 基础层清单启用 + `audit` 从 RESERVED_ROUTE_IDS 移出。
+    // 只改一边的两种后果都是静默的（要么声明被按"保留 id"整条拒绝，要么宿主旧分支永远赢），
+    // 故 `packages/web/test/opsOwnership.test.ts` 把这三种残留逐条钉住。
+    {
+      name: '@geewiki/ops',
+      manifest: opsManifest as GeeWikiManifest,
+      module: OpsPlugin,
       source: 'builtin',
     },
     // LLM 契约插件：提供 llm-service（route→provider 注册表 + 终止保证 + 无 key 降级），

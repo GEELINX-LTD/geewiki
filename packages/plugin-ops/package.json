@@ -1,0 +1,22 @@
+{
+  "name": "@geewiki/ops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 内置插件：审计与运维台面（越权告警、权限变更、会话管理、反向展开、运维动作），经 F2 页面路由接入宿主",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "build:ui": "pnpm --filter @geewiki/web build:plugin-ui"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

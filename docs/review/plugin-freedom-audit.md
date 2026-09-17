@@ -637,6 +637,89 @@ pnpm run install-plugin --verify [--json]
 
 ---
 
+### 「审计与运维」从宿主页面搬成插件 `@geewiki/ops`（已落地；F2 页面路由的**第一个真实使用者**）
+
+用户反馈「当前的审计与运维功能性和表现形式上都很差」，并先问了一句「这个审计与运维是由插件实现的吗」。
+查下来答案是**一半一半**，而这条分界线恰好就是问题本身：
+
+- **表现形式 = 宿主页面**：`packages/web/src/pages/OpsPage.tsx`（536 行），路由 id `audit` 写死在
+  `App.tsx` 的 `ADMIN_NAV` 与 `core` 的 `RESERVED_ROUTE_IDS` 里；
+- **功能 = 全部来自插件**：页面调的 8 个端点分属 `@geewiki/auth`（会话列表/吊销）、
+  `@geewiki/authz`（审计查询/授权回收/反向展开/sitemap 核对/清缓存指引）、
+  `@geewiki/org`（邀请回收）。
+
+于是"功能性差"的**硬证据**是：插件侧早已实现好的四个能力，界面上**零入口**（grep 确认前端没有任何引用）——
+
+| 端点 | 归属插件 |
+| --- | --- |
+| `GET /api/admin/search/verify` | `@geewiki/search` |
+| `GET /api/admin/blocks/verify` | `@geewiki/wiki` |
+| `POST /api/admin/blocks/resync` | `@geewiki/wiki` |
+| `POST /api/admin/users/:userId/sessions/revoke` | `@geewiki/auth` |
+
+还有两处"数据拿到了但没显示"：`AuditEntry.before` / `.after`（`api.ts:1504-1505`）——
+**权限变更"到底改了什么"的答案**，界面一个字没渲染；以及 `SessionEntry` 的
+`createdAt` / `userAgent` / `ipHash`。另外 `api.auditLog` 支持
+`action / targetKind / targetId / since / until / limit / offset`，界面只用了 `view` +
+写死的 `limit: 50` —— 过滤、时间范围、分页一个都没用上。
+
+#### 落地位置
+
+- **新包 `packages/plugin-ops/`**：`src/index.ts`（清单声明 `routes: [{ id: 'audit', label: '审计与运维',
+  requires: 'administer', group: 'admin' }]`，服务端只有一个空 `apply`，`provides` 刻意留空）、
+  `ui/index.tsx`（页面，五个分区）、`ui/api.ts`（自带 fetch + `x-gw-csrf: '1'`）、
+  `ui/plan.ts`（纯判据层，零 import、可在 node 直测）、`ui/style.css`（`.gw-ops-*`，只用宿主
+  `--color-*` 语义变量、一个回退值都不写）。
+- **宿主侧三处必须同时删**（只删一边的后果都是**静默**的，故由
+  `packages/web/test/opsOwnership.test.ts` 逐条钉住）：`ADMIN_NAV` 的入口、
+  `App.tsx` 的 `active === 'audit'` 分派分支、`RESERVED_ROUTE_IDS` 里的 `'audit'`
+  （留着它 ⇒ 插件那条声明会被 `resolveRouteDecls` 按"保留 id"**整条拒绝**）。
+- **组合根登记**：`packages/server/src/index.ts` 加 import + 注册表条目；
+  `config/plugins.base.json` 在 `@geewiki/authz` **之后**启用（它 `requires` auth/org/authz，
+  而基础层清单的顺序就是激活顺序）。
+- **构建**：`build:plugin-ui` 加一段；`tsconfig.plugin-ui.json` 的 `include` 加 `plugin-ops/ui`。
+
+#### 关键取舍
+
+- **插件 UI 一律自带 CSS**：宿主 Tailwind 只扫 `packages/web/src`，而**外部插件**（`plugins/<name>/`）
+  根本不在仓库那个位置 —— 依赖宿主工具类不可移植。故 `style.css` 用 `.gw-ops-*` 前缀 +
+  宿主 `--color-*` 语义变量（与 `@geewiki/ai-assistant` 同一做法）。
+- **不需要任何新的宿主能力**：`registerRoute` 早已在宿主 SDK 里（`hostSdk.ts:144`，SDK `0.9.0`），
+  CSRF 只是一个静态头 `x-gw-csrf: '1'`。
+- **危险操作改成"就地确认条"而不是模态**：模态会盖住被操作的那一行，而本页的破坏性动作
+  全是针对具体对象的。
+- **`busy` 从全局单键改为按动作的键**：此前任何一个动作在跑，页面上**所有**按钮都禁用
+  （一次全库重算会冻住整页）。
+- **`view: 'all'` 仍然禁用**：两类审计必须各自取数（服务端白名单是真源），前端取 `all`
+  再分类等于把那套白名单抄第二份。
+
+#### 验证读数（取数方式一并给出）
+
+- `pnpm run typecheck`：27 个项目 + `scripts/` + `plugin-ops`，`grep -c 'error TS'` = **0**，exit 0
+  （日志 `data/verify/tc-ops2.log`）。
+- `pnpm run test`：**2206 例 / 2206 通过 / 0 失败**，exit 0（日志 `data/verify/test-ops2.log`）。
+  本轮新增 `packages/plugin-ops/test/opsPlan.test.ts`（23 例，纯判据）+ `opsUi.test.ts`（11 例，
+  源码级不变量）+ `packages/web/test/opsOwnership.test.ts`（4 例，归属）；`opsPage.test.ts` 已删
+  （它钉的页面不在宿主里了）。
+- **运行期实测**（`curl` 真实服务）：`GET /api/plugins/ui` 的 `plugins["@geewiki/ops"]` =
+  `{entry:"client.js", css:"client.css", rev:"f32aa3f2", routes:[{id:"audit", label:"审计与运维",
+  requires:"administer", group:"admin"}]}`；`GET /api/plugins/slots` 的 `routes` =
+  `[{owner:"@geewiki/ops", route:{id:"audit",…}}]`、`routeConflicts: []`；
+  `/plugins-ui/@geewiki/ops/{client.js,client.css}` 均 200。
+- **渲染实测**（headless Chrome 挂真实组件 + 打桩 fetch，五个分区各渲染一份）：
+  五分区全部 `渲染=ok`，`table` 3 张、`[role=tab]` 25 个（5 分区 × 5 标签）、
+  变更明细 `private → org` 真的画出来了、分页文案 `第 1 / 3 页` 与 `共 120 条` 正确。
+  产物 `client.js` 39.95 kB / gzip 9.51 kB、`client.css` 5.27 kB。
+
+#### 未做（如实记录）
+
+- **端点的响应里没有用户名**（只有 `actorId`），所以操作者列显示 `#12`。要显示人名得先让
+  auth 的会话/审计响应带上用户名 —— 那是端点契约变更，不在本轮。
+- 落成插件后 `@geewiki/ops` **可以被停用**。这是「万物皆插件」的应有之义，但也意味着
+  "停用之后就没地方看审计了"。台账式的兜底（例如停用需要更强的确认）留作显式决定。
+
+---
+
 ## 1. 健康度实测（客观读数）
 
 ### 1.0 最新读数（F1–F21 全部落地 + 优化点 1/2/3/4/6/7/8）

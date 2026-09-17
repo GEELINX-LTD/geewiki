@@ -16,6 +16,9 @@
       "name": "@geewiki/authz"
     },
     {
+      "name": "@geewiki/ops"
+    },
+    {
       "name": "@geewiki/wiki"
     },
     {
