@@ -174,6 +174,8 @@ export const manifest = {
   name: '@geewiki/db-sqlite',
   version: '0.1.0',
   geewiki: {
+    // ★ F10：跨界能力声明（宿主不强制，用于评审与可观测）
+    permissions: ['fs:read', 'fs:write', 'env'],
     displayName: 'SQLite 数据库',
     description: '把页面与版本历史保存在本地 SQLite 文件里，无需另装数据库服务',
     provides: 'database-provider',

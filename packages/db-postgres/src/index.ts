@@ -363,6 +363,8 @@ export const manifest: GeeWikiManifest = {
   name: '@geewiki/postgres',
   version: '0.1.0',
   geewiki: {
+    // ★ F10：跨界能力声明（宿主不强制，用于评审与可观测）
+    permissions: ['fs:read', 'env', 'net'],
     displayName: 'PostgreSQL 数据库',
     description: '把页面与版本历史保存在 PostgreSQL 服务里，适合多人协作与集中运维',
     provides: 'database-provider',

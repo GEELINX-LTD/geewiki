@@ -39,15 +39,30 @@ import {
   type Principal,
   type RequestHook,
   type RequestVerdict,
+  type CapabilityName,
+  type HttpRouteInfo,
+  type RouteOwnerStats,
+  type HttpRouterService as HttpRouterServiceType,
   type RouteAccess,
   type RouteAccessOptions,
+  unauditedRoutes,
   type RouteHandler,
   type RouteHandlerContext,
 } from '@geewiki/core'
 import { DB_SQLITE_MIGRATIONS_DIR, SqliteDbPlugin, manifest as dbSqliteManifest } from '@geewiki/db-sqlite'
-import { AiPlugin, manifest as aiManifest } from '@geewiki/ai'
+import { AiAdminPlugin, manifest as aiAdminManifest } from '@geewiki/ai-admin'
+import { AiAssistantPlugin, manifest as aiAssistantManifest } from '@geewiki/ai-assistant'
+import { AiWritingPlugin, manifest as aiWritingManifest } from '@geewiki/ai-writing'
+import { AiKbPlugin, manifest as aiKbManifest } from '@geewiki/ai-kb'
+import { AiWebSearchPlugin, manifest as aiWebSearchManifest } from '@geewiki/ai-web-search'
+import { AiSummaryPlugin, SUMMARY_MIGRATIONS_DIR, manifest as aiSummaryManifest } from '@geewiki/ai-summary'
+import { AiNavPlugin, manifest as aiNavManifest } from '@geewiki/ai-nav'
+import { AiPagesPlugin, manifest as aiPagesManifest } from '@geewiki/ai-pages'
+import { AiToolsPlugin, manifest as aiToolsManifest } from '@geewiki/ai-tools'
+import { AiJournalPlugin, JOURNAL_MIGRATIONS_DIR, manifest as aiJournalManifest } from '@geewiki/ai-journal'
 import { AuthPlugin, manifest as authManifest } from '@geewiki/auth'
 import { AuthzPlugin, manifest as authzManifest } from '@geewiki/authz'
+import { BuiltinDocsPlugin, DOCS_MIGRATIONS_DIR, manifest as builtinDocsManifest } from '@geewiki/builtin-docs'
 import { EchoPlugin, manifest as echoManifest } from '@geewiki/echo'
 import { EditorPlainPlugin, manifest as editorPlainManifest } from '@geewiki/editor-plain'
 import { LlmPlugin, manifest as llmManifest } from '@geewiki/llm'
@@ -65,6 +80,7 @@ import {
   removeCrashMarker,
   resolveMigrationsDirs,
   slotPlugin,
+  capabilityPlugin,
   writeCrashMarker,
   type DiscoveryIssue,
   type RegisteredPlugin,
@@ -90,6 +106,8 @@ export const httpManifest: GeeWikiManifest = {
     description: '提供网页访问与 REST 接口，并托管前端静态资源',
     provides: 'http-service',
     requires: [],
+    // ★ F10：监听端口 + 托管静态资源 + 读环境变量（端口/主机/静态根都从 env 来）
+    permissions: ['fs:read', 'fs:write', 'env', 'net'],
     runtime: {
       supportsHotReload: false, // 核心通信层：冷操作，仅支持持久化安装 + 进程重启
       drainTimeout: 5,
@@ -99,11 +117,24 @@ export const httpManifest: GeeWikiManifest = {
 
 interface RouteEntry {
   method: string
+  /** 注册时的原始路径（诊断/审计要用它，`segments` 是匹配用的派生形态） */
+  path: string
   /** 路径段：':xxx' 开头为参数段 */
   segments: string[]
   handler: RouteHandler
   /** 粗粒度访问等级（默认 `'public'`；见 @geewiki/core 的 RouteAccess） */
   access: RouteAccess
+  /** ★ F9：该路由还要求的能力（`access` 通过后仍需满足）；缺省表示不额外要求 */
+  capability?: CapabilityName
+  /** ★ F12：登记方（可观测性用；见 `RouteAccessOptions.owner`）。缺省 = 不归因 */
+  owner?: string
+  /**
+   * ★ F11：调用方是否**显式**给了 `access`。
+   *
+   * 与 `access` 分开存，因为两者信息量不同：`access: 'public'` 可能是"作者写了 public"，
+   * 也可能是"作者什么都没写、吃了默认值"。审计要区分的就是这两者（见 `HttpRouteInfo`）。
+   */
+  explicit: boolean
 }
 
 /**
@@ -225,6 +256,57 @@ export interface RouterIdentityDeps {
    * stdout 那一行**保留**作为冗余（容器日志被采集时它是第一手证据）。
    */
   onBreakGlassUse?: (req: IncomingMessage) => void
+  /**
+   * ★ F9：能力探针 —— 问"这个主体具不具备这个能力"。
+   *
+   * 与 `credentialSourceProbe` 同一套路：由组合根接上，server **不 import 任何能力实现**。
+   * 必须是**同步**的（消费方在请求热路径上被同步调用）；由 `capability-service` 的
+   * `snapshot()` 提供，而它本身被设计成同步纯函数（见 core 的 `CapabilityResolver`）。
+   *
+   * 缺省（未接线）时：**带 `capability` 的路由一律拒绝**（失败关闭）——
+   * 未接线意味着"没人能判定"，此时放行等于把闸门直接拆掉。
+   */
+  capabilityProbe?: (name: CapabilityName, principal: Principal) => boolean
+}
+
+/** ★ F11：严格模式的开关环境变量。设为 `1` 时，存在未显式声明访问等级的路由即**拒绝启动**。 */
+export const STRICT_ROUTE_ACCESS_ENV = 'GEEWIKI_STRICT_ROUTE_ACCESS'
+
+/**
+ * ★ F11：启动期**全路由访问等级审计**。
+ *
+ * ## 审计的是"有没有人做过这个决定"，不是"公开对不对"
+ * `register()` 的第 4 参可省，省略即 `access: 'public'`（匿名可调）。于是全仓几十个调用点
+ * 全靠作者自觉 —— 而"**忘了写**"与"**故意公开**"在源码里长得一模一样：两种情况的 `access`
+ * 都是 `'public'`，运行期也毫无痕迹。评审看不见风险，出事也追不到"这是谁定的"。
+ *
+ * 所以这里点名的是 `explicit === false` 的那些，也就是"**没人明确负责**的公开"。
+ * 公开本身不是问题（登录、健康检查、匿名可读的接口都该公开），**没被声明过**才是。
+ *
+ * ## 两种模式
+ * - 默认：把清单聚合成**一条**告警（不是每条一行 —— 噪声会把告警训练成背景音）。
+ * - `GEEWIKI_STRICT_ROUTE_ACCESS=1`：**拒绝启动**。给"不受信插件/合规环境"用：
+ *   一个带着默认 public 上线的新端点会让进程直接起不来，而不是悄悄暴露。
+ *
+ * `router.routes` 是可选方法（第三方实现可以不提供），拿不到就静默跳过 ——
+ * 审计是增强，不该让不提供它的实现无法工作。
+ */
+export function auditRouteAccess(router: HttpRouterServiceType, env: NodeJS.ProcessEnv = process.env): void {
+  const routes = router.routes?.()
+  if (routes === undefined) return
+  const unaudited = unauditedRoutes(routes)
+  if (unaudited.length === 0) return
+  const list = unaudited.map((r) => `    ${r.method.padEnd(6)} ${r.path}`).join('\n')
+  const head = `[geewiki] ${unaudited.length}/${routes.length} 条路由未显式声明访问等级，正按默认 'public'（匿名可调）运行：`
+  const tail =
+    `  这些路由的公开是"默认值"而不是"决定"。给它们的 register() 补上第 4 参` +
+    `（例如 { access: 'public' }）即视为已评审的决定；收紧为 'user'/'admin' 则更安全。`
+  if (env[STRICT_ROUTE_ACCESS_ENV] === '1') {
+    throw new Error(
+      `${head}\n${list}\n\n[${STRICT_ROUTE_ACCESS_ENV}=1] 严格模式拒绝启动。${tail}`,
+    )
+  }
+  console.warn(`${head}\n${list}\n${tail}`)
 }
 
 /**
@@ -287,7 +369,10 @@ function verdictDenial(raw: unknown): AccessDenial | null {
 }
 
 class HttpRouter implements HttpRouterService {
-  private readonly routes: RouteEntry[] = []
+  /** 已注册路由表。字段名刻意与 `routes()` 方法区分：后者是给审计用的**快照**。 */
+  private readonly routeTable: RouteEntry[] = []
+  /** ★ F12：owner → 命中其路由的请求数（进程内累计，不落盘、重启即清零） */
+  private readonly ownerRequests = new Map<string, number>()
   /**
    * 请求前置钩子（按注册顺序串行执行）。
    *
@@ -341,18 +426,25 @@ class HttpRouter implements HttpRouterService {
   ): () => void {
     const entry: RouteEntry = {
       method,
+      path,
       segments: path.split('/').filter(Boolean),
       handler,
       // 默认 public：只传 3 个实参的既有调用点（以及全部现存插件）行为完全不变
       access: opts?.access ?? 'public',
+      // ★ F11：记下"这是显式声明的还是吃了默认值"
+      explicit: opts?.access !== undefined,
+      // ★ F9：缺省即"不额外要求能力"——既有调用点行为完全不变
+      ...(opts?.capability === undefined ? {} : { capability: opts.capability }),
+      // ★ F12：缺省即"不归因"——既有调用点行为完全不变
+      ...(opts?.owner === undefined ? {} : { owner: opts.owner }),
     }
-    this.routes.push(entry)
+    this.routeTable.push(entry)
     let removed = false
     return () => {
       if (removed) return
       removed = true
-      const idx = this.routes.indexOf(entry)
-      if (idx >= 0) this.routes.splice(idx, 1)
+      const idx = this.routeTable.indexOf(entry)
+      if (idx >= 0) this.routeTable.splice(idx, 1)
     }
   }
 
@@ -366,6 +458,46 @@ class HttpRouter implements HttpRouterService {
       const idx = this.hooks.indexOf(hook)
       if (idx >= 0) this.hooks.splice(idx, 1)
     }
+  }
+
+  /**
+   * ★ F11：已注册路由的只读快照（**不含处理器**）。
+   *
+   * 顺序 = 注册顺序（即"谁先激活谁在前"），不做排序：审计与排障时"注册顺序"
+   * 本身是有用信息（它反映了依赖图的解析结果）。
+   */
+  routes(): readonly HttpRouteInfo[] {
+    return this.routeTable.map((r) => ({
+      method: r.method,
+      path: r.path,
+      access: r.access,
+      explicit: r.explicit,
+      ...(r.capability === undefined ? {} : { capability: r.capability }),
+      ...(r.owner === undefined ? {} : { owner: r.owner }),
+    }))
+  }
+
+  /**
+   * ★ F12：按登记方聚合的请求计数。
+   *
+   * 计数在**闸门之前**发生（见 `gateThenInvoke`）：被 401/403 拒绝的请求同样计入 ——
+   * "某个插件的端点正被大量匿名请求打"恰恰是最该被看见的形态之一，
+   * 只统计成功请求会把它藏起来。
+   */
+  ownerStats(): readonly RouteOwnerStats[] {
+    const routeCount = new Map<string, number>()
+    for (const r of this.routeTable) {
+      if (r.owner === undefined) continue
+      routeCount.set(r.owner, (routeCount.get(r.owner) ?? 0) + 1)
+    }
+    const owners = new Set<string>([...routeCount.keys(), ...this.ownerRequests.keys()])
+    return [...owners]
+      .sort((a, b) => a.localeCompare(b))
+      .map((owner) => ({
+        owner,
+        routes: routeCount.get(owner) ?? 0,
+        requests: this.ownerRequests.get(owner) ?? 0,
+      }))
   }
 
   stats(): HttpRouterStats {
@@ -621,7 +753,7 @@ class HttpRouter implements HttpRouterService {
         return s // 非法编码序列按原样参与匹配（最终落入 404）
       }
     })
-    for (const route of this.routes) {
+    for (const route of this.routeTable) {
       if (route.method !== method || route.segments.length !== segments.length) continue
       const params: Record<string, string> = {}
       let matched = true
@@ -766,7 +898,12 @@ class HttpRouter implements HttpRouterService {
     pathname: string,
   ): void {
     const credentialSource = envAdminToken() !== null || this.identity.credentialSourceProbe?.() === true
-    const denial = judgeAccess(route.access, h.principal ?? anonymousPrincipal(), credentialSource)
+    const principal = h.principal ?? anonymousPrincipal()
+    // ★ F12：计数放在**闸门之前** —— 被拒的请求同样要可见（"端点正被大量匿名请求打"最该被看到）
+    if (route.owner !== undefined) {
+      this.ownerRequests.set(route.owner, (this.ownerRequests.get(route.owner) ?? 0) + 1)
+    }
+    const denial = judgeAccess(route.access, principal, credentialSource)
     if (denial) {
       /*
        * ★ 同上（T6 / X3）：网关层的拒绝（401 `unauthorized` / 403 `forbidden`）也必须是
@@ -786,6 +923,32 @@ class HttpRouter implements HttpRouterService {
       })
       this.exitHandler(state)
       return
+    }
+    /*
+     * ★ F9：**能力闸门**（第二层，`access` 通过之后才轮到它）。
+     *
+     * 为什么与 `access` 分开而不是塞进 `RouteAccess` 联合里：两者回答的是不同问题，
+     * 且**判定归属不同** —— `access` 的规则（匿名/已登录/管理员）由宿主拥有，
+     * `capability` 的规则由**注册它的插件**拥有。混成一个联合会让人以为
+     * "写个字符串就行"，而实际语义是"某个插件承诺会算这个值"。
+     *
+     * **失败关闭**：探针没接线（`undefined`）时一律拒绝。未接线意味着"没人能判定"，
+     * 此时放行等于把闸门直接拆掉 —— 而 `capability` 是插件显式要求的，不是默认行为。
+     */
+    if (route.capability !== undefined) {
+      const granted = this.identity.capabilityProbe?.(route.capability, principal) === true
+      if (!granted) {
+        h.res.setHeader('cache-control', 'no-store')
+        h.res.setHeader('x-content-type-options', 'nosniff')
+        h.json(403, {
+          ok: false,
+          error: 'capability_required',
+          message: `需要能力 ${route.capability}`,
+          details: { access: route.access, capability: route.capability },
+        })
+        this.exitHandler(state)
+        return
+      }
     }
     this.invokeHandler(route.handler, h, state, method, pathname)
   }
@@ -1141,6 +1304,21 @@ export const HttpPlugin = {
         const auth = ctx.get('auth-service') as { hasCredentialSource?: () => boolean } | undefined
         return auth?.hasCredentialSource?.() === true
       },
+      /*
+       * ★ F9：能力探针。与 `credentialSourceProbe` 同样**逐请求现取**服务 ——
+       * `capability-service` 由 manager 提供，而它可能晚于本插件激活（也有热替换路径），
+       * 构造期快照必然是 undefined。
+       *
+       * 拿不到服务 ⇒ 返回 `false`（失败关闭）⇒ 带 `capability` 的路由拒绝。
+       * 方向是刻意的：服务不可用时应表现为"入口暂时不可用"，而不是"闸门消失"。
+       */
+      capabilityProbe: (name, principal) => {
+        const svc = ctx.get('capability-service') as
+          | { snapshot: (p: typeof principal) => Record<string, boolean> }
+          | undefined
+        if (!svc) return false
+        return svc.snapshot(principal)[name] === true
+      },
       onBreakGlassUse: (req) => {
         const rawDb = ctx.get('db') as AnyDatabaseAdapter | undefined
         if (!rawDb) return
@@ -1417,11 +1595,12 @@ export function defaultRegistry(
       module: EditorPlainPlugin,
       source: 'builtin',
     },
-    // LLM 契约插件：提供 llm-service（route→provider 注册表 + 终止保证 + 无 key 降级）。
-    // **不声明 requires**：它自身零依赖，没有 provider 时也能装载并给出可迭代的降级流；
+    // LLM 契约插件：提供 llm-service（route→provider 注册表 + 终止保证 + 无 key 降级），
+    // **并且是"模型接入"的唯一配置面**（服务商/端点/密钥/模型/上下文长度/最长输出/思考强度）。
+    // requires 只点名 http-service（配置表单的服务商下拉走 `GET /api/llm/providers`）；
     // **不进 conflictGroup**：它是注册表而非某个厂商的实现，多家 provider 应共存。
-    // 与 @geewiki/echo 同形态：**只登记、不写进默认基础层清单**，即"已注册但未启用"，
-    // 由使用者在管理台按需热启用（需要 LLM 的插件应在自己的 requires 里点名它）。
+    // **本批起写进默认基础层清单**：出厂即让用户在「插件管理 → 模型接入」里填一次就能接上模型
+    // （不填密钥时问答与辅助写作**明确报不可用**——`retrieval-only` 抽取式摘要那条冒充答案的路已随本批删除，见 `docs/design/ai-plugin-split.md`）；需要 LLM 的插件仍应在 requires 里点名它。
     { name: '@geewiki/llm', manifest: llmManifest as GeeWikiManifest, module: LlmPlugin, source: 'builtin' },
     // 全文检索：索引表由插件自带迁移建立（按方言声明——只有 SQLite 有 FTS5；
     // 该插件在其它方言下会在 apply 里显式拒绝，见其源码的能力守卫）。
@@ -1445,24 +1624,177 @@ export function defaultRegistry(
       migrationsDirs: builtinMigrations(wikiManifest as GeeWikiManifest, { sqlite: WIKI_MIGRATIONS_DIR }),
       source: 'builtin',
     },
-    // AI 问答（检索增强问答的检索-only 形态）：提供 ai-service。
-    // requires 点名 search-service 与 llm-service 两个**服务**（不是插件名），故管理器会保证
-    // 检索与模型契约层先激活；**没有模型也能用**——无 provider 时降级为检索结果 + 抽取式摘要，
-    // 这正是产品承诺"没有 API key 时也完整可用"的落点。
-    // 与 @geewiki/echo / @geewiki/llm 同形态：**只登记、不写进默认基础层清单**（已注册未启用），
-    // 由使用者在管理台按需热启用；是否默认启用见 docs 的部署建议。
-    { name: '@geewiki/ai', manifest: aiManifest as GeeWikiManifest, module: AiPlugin, source: 'builtin' },
+    // 内置文档：把"关于本项目自身"的文章（架构/功能/Markdown/特殊结构）作为**真实
+    // wiki 页面**在首次部署时生成。三条设计红线见 `packages/plugin-builtin-docs/src/index.ts`
+    // 文件头；**只读与隐藏的判据不在本包也不在 wiki，在 policy-service**（授权判据
+    // 唯一出口，`buildAccess` 每次判定现取 `builtin-docs-service`）——所以这里没有
+    // "锁页"逻辑，wiki 也不知道有这回事。requires 只有 database-provider 与
+    // wiki-service：**没有端点、没有前端**，文档的读写走 wiki 自己的路由。
+    {
+      name: '@geewiki/builtin-docs',
+      manifest: builtinDocsManifest as GeeWikiManifest,
+      module: BuiltinDocsPlugin,
+      // 迁移是方言中立的键值表（builtin_docs_state），manifest 的 './migrations' 对所有
+      // dialect 生效；此处同样给一份 sqlite 回退（registry 与 manifest 双真源钉住的纪律）。
+      migrationsDirs: builtinMigrations(builtinDocsManifest as GeeWikiManifest, { sqlite: DOCS_MIGRATIONS_DIR }),
+      source: 'builtin',
+    },
+    // AI 工具总线（L0）：提供 ai-tool-service，**纯注册表、不含任何具体工具**。
+    // 它必须能被最先激活——工具提供者（ai-kb 等）按 `requires: ['ai-tool-service']`
+    // 依赖它，而依赖边由 deps.ts 解析并保证激活顺序。
+    // 为什么不塞进会话核心：见 packages/plugin-ai-tools/src/index.ts 文件头（三条理由，
+    // 第一条就是插槽那批的实测教训——提供者必须先结算，否则子插件 ctx.get() 拿到 undefined
+    // 并**静默跳过**自己的贡献）。
+    {
+      name: '@geewiki/ai-tools',
+      manifest: aiToolsManifest as GeeWikiManifest,
+      module: AiToolsPlugin,
+      source: 'builtin',
+    },
+    // AI 变更日志（P4，L0 平台能力）：提供 ai-journal-service。
+    // 记下 AI 的每一次写操作（工具 + 目标 + 改变前后的文本快照），并按"轮"回退。
+    //
+    // 为什么它是**独立插件**而不是塞进 ai-tools 或 ai-assistant：写操作横跨多个域
+    // （页面正文、编辑器草稿、插件启停、插件配置），而"哪个域怎么改回去"必须由**各域自己**
+    // 提供撤销执行体（`registerUndoer`）——journal 一旦认识业务域，它就变成第二个 wiki，
+    // 两份判据必然漂移（本仓为这条付过代价：正文里看不到、附件却能下载）。
+    //
+    // requires 只有 http-service 与 database-provider，**不依赖 llm / ai-tools**：
+    // 它是被工具调用的下游，反过来依赖调用方会成环。
+    {
+      name: '@geewiki/ai-journal',
+      manifest: aiJournalManifest as GeeWikiManifest,
+      module: AiJournalPlugin,
+      // 只登记 sqlite：这条迁移用了 AUTOINCREMENT 与部分索引（`WHERE undone_at IS NULL`），
+      // 是 SQLite 方言。给它编一份 PG 目录等于凭空多一个没人验过的真源。
+      // 整条 AI 链路本来就是 SQLite-only（`@geewiki/search` 在非 sqlite 方言下直接抛错）。
+      migrationsDirs: builtinMigrations(aiJournalManifest as GeeWikiManifest, { sqlite: JOURNAL_MIGRATIONS_DIR }),
+      source: 'builtin',
+    },
+    // AI 知识库工具（L2 工具提供者）：把 list_pages / search_kb / read_page 三条工具
+    // 注册进工具总线。**不含检索算法、不碰数据库**——只包装 search-service 与 wiki-service
+    // 这两个已经按主体裁剪过的服务。三者都是只读工具（无 mutating 标记），
+    // 故不受 P4 的 mutation journal 与自锁护栏约束。
+    {
+      name: '@geewiki/ai-kb',
+      manifest: aiKbManifest as GeeWikiManifest,
+      module: AiKbPlugin,
+      source: 'builtin',
+    },
+    // AI 联网搜索（L2 工具提供者）：把 `web_search` 注册进工具总线，默认经 AnySearch 检索。
+    //
+    // 它不做权限判定、不碰数据库、不落任何状态——**唯一的行为就是一次出站 HTTP**，
+    // 故没有迁移目录。与 ai-kb 的三条工具并列：那三条查站内，这一条查站外，
+    // 差别在**每个结果声明的依据不同**（`grounding: 'kb'` vs `'web'`），
+    // 界面据此给出不同措辞的标注（见 packages/plugin-ai-tools/src/types.ts 的 AiToolGrounding）。
+    //
+    // 未配置 API 密钥时走 AnySearch 的**匿名额度**（按来源 IP 计），所以"能装就能用"，
+    // 不把密钥作为启用前提：密钥只是把额度从匿名提到账号（每天 1000 次）。
+    {
+      name: '@geewiki/ai-web-search',
+      manifest: aiWebSearchManifest as GeeWikiManifest,
+      module: AiWebSearchPlugin,
+      source: 'builtin',
+    },
+    // AI 摘要（P6，需求 ③④）：跟着正文自动生成每页摘要、按摘要检索，并贡献
+    // `article-summary` 插槽的那张折叠卡。
+    //
+    // 它是**第一个订阅 PAGE_SAVED_EVENT 的插件**——那条事件的契约（同步广播、不等待、
+    // 订阅者自己吞异常）就是为它这类"保存后顺手做点别的"的消费者定的。
+    // 六条 requires 里两条值得说明：
+    // - `wiki-service`：读正文只能经它（带主体）。摘要**不碰数据库里的正文列**，
+    //   否则就等于开出一条绕过可见性投影的读路径——而那正是 P4 尾刚补上的那条红线。
+    // - `policy-service`：要问"这一页对谁可见"（`effectiveIndexLevel`）才知道该按哪一档
+    //   投影来写摘要。拿不到判据就不该激活：那不是"少个功能"，是**摘要内容可能超出该页的可见范围**。
+    {
+      name: '@geewiki/ai-summary',
+      manifest: aiSummaryManifest as GeeWikiManifest,
+      module: AiSummaryPlugin,
+      // 只登记 sqlite：`page_summaries` 用了 `ON DELETE CASCADE` 与 SQLite 的
+      // ON CONFLICT(page_id) 写法（PG 也支持后者，但这份迁移从未在 PG 上跑过）。
+      // 编一份没人验过的 PG 目录比不编更糟——`@geewiki/search` 的先例是**显式拒绝**。
+      migrationsDirs: builtinMigrations(aiSummaryManifest as GeeWikiManifest, { sqlite: SUMMARY_MIGRATIONS_DIR }),
+      source: 'builtin',
+    },
+    // AI 页面写工具（P4）：贡献 page.update —— **本仓第一条 mutating 工具**。
+    // 它是"变更日志真的有人往里记"的那一半：没有写工具，journal 永远是一张空表。
+    //
+    // 四条 requires 都是必需的，其中两条是刻意的：
+    // - `policy-service`：`wiki-service.save()` **不带主体**（授权发生在 HTTP 处理器里），
+    //   所以工具必须自己向策略层要一次 `canEdit`。拿不到判据就不该能激活——
+    //   否则"没有权限判据"会退化成"没有权限检查"。
+    // - `ai-journal-service`：**记不下来就别改**（决策 3）。日志缺席时这条工具不注册，
+    //   而不是照改然后留下一批不可回退的改动。
+    {
+      name: '@geewiki/ai-pages',
+      manifest: aiPagesManifest as GeeWikiManifest,
+      module: AiPagesPlugin,
+      source: 'builtin',
+    },
+    // AI 编辑框工具（P3）：贡献 editor.read_doc / read_selection / insert_text /
+    // replace_selection 四条 **side:'client'** 描述符。**它原先叫 @geewiki/ai-assist**，
+    // 自带续写/改写/润色/摘要四个按钮与 `editor-toolbar` 插槽的前端；决策 18 把那套 UI
+    // 连同 POST /api/ai/assist 端点整份删除（同一件事有两条界面路径时，两条都会漂移）。
+    //
+    // 现在它是**纯贡献者**：不 provide 服务、没有 HTTP 端点、没有前端产物，只声明四条工具名。
+    // 执行体在浏览器（宿主 `lib/editorTools.ts` 登记）——工具本来就是"服务端说它存在、
+    // 浏览器说它怎么跑"两半，故 requires 只有 ai-tool-service。
+    {
+      name: '@geewiki/ai-writing',
+      manifest: aiWritingManifest as GeeWikiManifest,
+      module: AiWritingPlugin,
+      source: 'builtin',
+    },
+    // AI 页面跳转工具（P5）：贡献 open_page / scroll_to 两条 **side:'client'** 描述符，
+    // 处理器由宿主在 `packages/web/src/lib/navTools.ts` 登记（同 ai-writing 的"两半"形态）。
+    // 它们回答需求 ② 的后半句「也能自行找其他页」——`search_kb` 只能给出 slug，用户还停在原地。
+    // **不是 mutating**：跳转与滚动改的不是数据，刷新即回原位，也不需要"撤销"
+    // （标了会让回退 UI 上多出两条点了没反应的条目）。
+    // AI 管理台工具（P5）：让助手在**护栏**约束下启停插件、读写插件配置。
+    // 它是 `checkSelfLock` 的第一个真实消费者——P4 的注释里就写着"启停工具本身要到 P5
+    // 才存在，届时 targetsOf(args) 由那个工具交出目标名"。
+    //
+    // requires 里**刻意没有 manager**：管理器是引导期直接 app.plugin() 装载的，
+    // 不在注册表里、也就没有 provides 可供依赖解析匹配；声明它只会让本插件因
+    // "依赖无法解析"而激活失败。真正的取用发生在执行期（那时 'manager' 早已 provide）。
+    {
+      name: '@geewiki/ai-admin',
+      manifest: aiAdminManifest as GeeWikiManifest,
+      module: AiAdminPlugin,
+      source: 'builtin',
+    },
+    {
+      name: '@geewiki/ai-nav',
+      manifest: aiNavManifest as GeeWikiManifest,
+      module: AiNavPlugin,
+      source: 'builtin',
+    },
+    // AI 助手会话核心（L1）：agent loop + 系统提示 + 预算，**本身不含任何检索逻辑**——
+    // 它只按名字调用工具总线里的工具（ai-kb 的三条即由此进来）。
+    // requires 点名三个**服务 token**：http（端点）、llm（模型）、ai-tool-service（工具总线）。
+    // 工具总线缺席时它会退化成普通聊天，但那是**降级**而非设计形态，故仍声明依赖，
+    // 让卸载 ai-tools 时被依赖图拦住，而不是留下一个"看起来还在、其实查不了"的助手。
+    // 自带 `app-dock` 插槽的前端（底部常驻输入条），且该插槽必须归按需加载——
+    // 否则匿名读者也会下载整套对话 bundle（见设计文档 §3.4.1 第 ② 条）。
+    {
+      name: '@geewiki/ai-assistant',
+      manifest: aiAssistantManifest as GeeWikiManifest,
+      module: AiAssistantPlugin,
+      source: 'builtin',
+    },
     // OpenAI 兼容 adapter（第一个真实 provider）：只往 llm-service 注册一条路由，故**无 provides**；
     // requires 点名 llm-service（服务 token，不是插件名），由管理器保证注册表先就绪。
-    // conflictGroup 'llm-provider'：与将来的其它厂商 adapter 同组互斥——这正是该冲突组的用途。
-    // 与 @geewiki/llm / @geewiki/ai 同形态：**只登记、不写进默认基础层清单**（已注册未启用）——
-    // 它需要外部提供凭据才有意义，且与其它 provider 互斥，属于"按需显式启用"的插件。
+    // **本批起无自己的配置**（configSchema 是零字段 schema）：端点/密钥/模型/上下文长度都在
+    // @geewiki/llm 的统一配置里；也**撤掉了 conflictGroup 'llm-provider'**——多个适配器现在是
+    // 并列的可选服务商（由 provider 字段单选），同时启用是正常需求而非冲突。
+    // **本批起写进默认基础层清单**：没有密钥时它只是注册一条不可用的路由（问答照旧降级），
+    // 而默认启用意味着用户在「模型接入」里选服务商时下拉里已经有它。
     { name: '@geewiki/openai', manifest: openAiManifest as GeeWikiManifest, module: OpenAiPlugin, source: 'builtin' },
     // OIDC / 企业 SSO adapter：只往 auth-service 注册一条 provider 并把 /api/auth/oidc/* 两条
     // 路由挂上，故**无 provides**；requires 点名 auth-service（账号策略与 provider 注册表都在那里）、
     // http-service、database-provider（协议环节的失败要落 audit_log）。
     // conflictGroup 'oidc-provider'：与将来的第二个 IdP adapter 同组互斥。
-    // 与 @geewiki/llm / @geewiki/ai / @geewiki/openai 同形态：**只登记、不写进默认基础层清单**
+    // 与 @geewiki/echo / @geewiki/editor-plain 同形态：**只登记、不写进默认基础层清单**
     // （已注册但未启用）—— 它需要外部 IdP 才有意义。未启用时 /api/auth/oidc/* 根本不存在（404），
     // 本地密码通道完全不受影响（这是"无外部依赖 / 离线可用"承诺的落点）。
     { name: '@geewiki/oidc', manifest: oidcManifest as GeeWikiManifest, module: OidcPlugin, source: 'builtin' },
@@ -1557,18 +1889,36 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
   // 服务即对管理器及其 boot 出来的插件可见（与 db-sqlite / http 作为兄弟插件同理）。
   await app.plugin(slotPlugin)
 
+  // ★ F9：能力服务插件**同样必须先于管理器装载**（理由与上一段逐字相同，实测同源）：
+  // 若由管理器在自己 apply 里 provide，插件 apply 期的 `ctx.get('capability-service')`
+  // 是 undefined，它的能力注册会被**静默跳过** —— 那是一道永远 403 的闸门 + 干净得可疑的日志。
+  await app.plugin(capabilityPlugin)
+
   const managerFiber = await app.plugin(PluginManagerPlugin, {
     registry: built.registry,
     // 发现期问题（跳过的插件目录等）透出到 GET /api/plugins 的 issues 字段
     discoveryIssues: built.issues,
+    // ★ F17：插件目录的解析规则在这里有唯一实现，故由组合根传给管理器（供完整性校验用）
+    pluginsDir: pluginsRoot,
     // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
     baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
     sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
+    // `role: 'secret'` 字段（如模型 API 密钥）的落盘位置：与清单同目录，已被 .gitignore 忽略，
+    // 绝不写进入库的 plugins.*.json（见 packages/manager/src/secrets.ts 的文件头）
+    secretsFile: resolveProjectPath(join(configDir, 'secrets.json'), import.meta.url),
     crashMarkerFile,
     // 入口表的第二候选根（<pluginUiDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
     webDist,
     pluginUiDist,
   })
+
+  /*
+   * ★ F11：**全路由审计**必须在管理器结算之后跑 —— 路由是在各插件的 `apply` 里注册的，
+   * 而插件由管理器在这一步之前 boot 出来。放在更早的位置会审计到一张空表，
+   * 于是"审计通过"与"什么都没审计"变得无法区分（这正是审计类代码最容易变成摆设的方式）。
+   */
+  const routerForAudit = app.get('http') as HttpRouterServiceType | undefined
+  if (routerForAudit) auditRouteAccess(routerForAudit)
 
   return {
     app,

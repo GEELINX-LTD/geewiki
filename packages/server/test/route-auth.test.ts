@@ -81,7 +81,70 @@ function probePlugin(): RegisteredPlugin {
       handlerCalls++
       h.json(200, { ok: true })
     }, { access: 'user' })
+
+    /* ★ F9：能力闸门。同一处理器、三种声明，用来断言"读的是能力表"而不是某种内建规则 */
+    router.register('GET', '/api/t/cap-granted', (h: RouteHandlerContext) => {
+      handlerCalls++
+      h.json(200, { ok: true, scope: 'cap-granted' })
+    }, { capability: 'test/granted' })
+    router.register('GET', '/api/t/cap-denied', (h: RouteHandlerContext) => {
+      handlerCalls++
+      h.json(200, { ok: true, scope: 'cap-denied' })
+    }, { capability: 'test/denied' })
+    // access 与 capability 是**两层**：匿名的 401 必须先于能力的 403 出现
+    router.register('GET', '/api/t/cap-user', (h: RouteHandlerContext) => {
+      handlerCalls++
+      h.json(200, { ok: true, scope: 'cap-user' })
+    }, { access: 'user', capability: 'test/granted' })
   })
+}
+
+/**
+ * ★ F9：用**真实路径**注册两个能力 —— 经 manager 提供的 `capability-service` 注册求解器，
+ * 而不是在测试里再造一个服务提供者。
+ *
+ * 为什么不造假服务：`capability-service` 由 manager 自己 `ctx.provide`，再造一个会
+ * 直接撞上 cordis 的"服务重复注册"错误（实测）。更重要的是：走真实注册路径才能顺带
+ * 覆盖"插件怎么把自己的能力接进闸门"这件事 —— 那正是 F9 要交付的能力。
+ *
+ * 两个能力刻意取相反的值，用来断言闸门读的是**能力表**而非某种内建规则。
+ */
+function capabilityPlugin(): RegisteredPlugin {
+  const name = '@t/capability'
+  const manifest: GeeWikiManifest = {
+    name,
+    version: '1.0.0',
+    geewiki: {
+      requires: ['http-service'],
+      // ★ F9 清单声明：让 manager 的诊断端点能看见"谁引入了哪些能力"。
+      // 声明与求解器是两件事 —— 少了下面 apply 里的 provide，该能力会恒为 false，
+      // 而这个字段存在的意义正是让那种情况**可见**（见 manager 的 unresolvedCapabilities）。
+      capabilities: [
+        { name: 'test/granted', label: '测试：放行' },
+        { name: 'test/denied', label: '测试：拒绝' },
+      ],
+      runtime: { supportsHotReload: true, drainTimeout: 5 },
+    },
+  }
+  return {
+    name,
+    manifest,
+    module: {
+      name,
+      apply(ctx: Context) {
+        const svc = ctx.get('capability-service') as
+          | { provide(owner: string, n: string, r: (p: Principal) => boolean): () => void }
+          | undefined
+        assert.ok(svc, 'manager 应已 provide capability-service（F9）')
+        const undoGranted = svc.provide(name, 'test/granted', () => true)
+        const undoDenied = svc.provide(name, 'test/denied', () => false)
+        return () => {
+          undoGranted()
+          undoDenied()
+        }
+      },
+    },
+  }
 }
 
 async function startHarness(): Promise<Harness> {
@@ -91,7 +154,12 @@ async function startHarness(): Promise<Harness> {
   const capture = testPlugin('@t/auth-capture', (_ctx, r) => {
     router = r
   })
-  const registry: RegisteredPlugin[] = [httpRegistryEntry(null, { port, host: '127.0.0.1' }), capture, probePlugin()]
+  const registry: RegisteredPlugin[] = [
+    httpRegistryEntry(null, { port, host: '127.0.0.1' }),
+    capabilityPlugin(),
+    capture,
+    probePlugin(),
+  ]
   writeFileSync(
     join(dir, 'plugins.base.json'),
     `${JSON.stringify({ enabled: registry.map((e) => ({ name: e.name })) }, null, 2)}\n`,
@@ -424,4 +492,46 @@ test('注册钩子后：路由匹配与静态层交接的行为逐字不变', as
   } finally {
     off()
   }
+})
+
+/* --------------------- ★ F9：能力闸门（第二层，access 之后） --------------------- */
+
+test('★ F9 能力闸门：具备能力放行，不具备 ⇒ 403 capability_required 且处理器未执行', async () => {
+  const h = await server()
+  await withEnvToken(ADMIN_TOKEN, async () => {
+    handlerCalls = 0
+    const granted = await fetch(base(h, '/api/t/cap-granted'), { headers: adminHeaders() })
+    assert.equal(granted.status, 200, '能力表中为 true ⇒ 放行')
+
+    const denied = await fetch(base(h, '/api/t/cap-denied'), { headers: adminHeaders() })
+    assert.equal(denied.status, 403, '能力表中为 false ⇒ 403（即使 access 已通过）')
+    const body = (await denied.json()) as { ok: boolean; error: string; details?: { capability?: string } }
+    assert.equal(body.ok, false)
+    assert.equal(body.error, 'capability_required')
+    assert.equal(body.details?.capability, 'test/denied', '错误信封应带上被拒的能力名，便于定位是哪个插件的能力')
+
+    // 关键断言：被拒的那次**没有进入处理器**（否则"闸门"只是装饰）
+    assert.equal(handlerCalls, 1, `只有放行的那次应执行处理器，实际执行了 ${handlerCalls} 次`)
+  })
+})
+
+test('★ F9 能力闸门：access 与 capability 是两层，匿名的 401 先于能力的 403', async () => {
+  const h = await server()
+  await withEnvToken(ADMIN_TOKEN, async () => {
+    handlerCalls = 0
+    /*
+     * 该路由同时声明 `access:'user'` 与 `capability:'test/granted'`。
+     * 匿名请求必须拿到 **401**（"你先登录"），而不是 403 capability_required ——
+     * 顺序反了会把"没登录"报成"能力不足"，用户于是永远不知道该去登录。
+     */
+    const res = await fetch(base(h, '/api/t/cap-user'))
+    assert.equal(res.status, 401)
+    const body = (await res.json()) as { error: string }
+    assert.equal(body.error, 'unauthorized')
+    assert.equal(handlerCalls, 0)
+
+    // 带上管理员令牌后两层都满足 ⇒ 放行
+    const ok = await fetch(base(h, '/api/t/cap-user'), { headers: adminHeaders() })
+    assert.equal(ok.status, 200)
+  })
 })

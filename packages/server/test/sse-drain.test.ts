@@ -562,7 +562,7 @@ test('SSE：未登记 owner 的连接无法被定向回收（显式契约，非�
 
 /* ============ 8. 长连接可观测性（stats / health） ============ */
 
-/** 生产形态的持有者：登记 owner，并在客户端断开时**注销**（@geewiki/ai 在 finally 里做同样的事）。
+/** 生产形态的持有者：登记 owner，并在客户端断开时**注销**（@geewiki/ai-qa 在 finally 里做同样的事）。
  *  用它才能断言 active 计数随真实生命周期归零——ssePlugin() 刻意不注销（见用例 5 的契约）。 */
 function sseObservedPlugin(name: string, path: string): RegisteredPlugin {
   return testPlugin({
