@@ -40,7 +40,23 @@ export const PLUGIN_UI_TABLE_PATH = '/api/plugins/ui'
  * 这正是 `core/src/slots.ts` 文件头点名的那种镜像：**副本无法伪装成同一个对象**，
  * 而"内容相等"在有人刚抄完一份时是通过的，只在漂移发生后才红。
  */
-export { PLUGIN_UI_PREFIX, PLUGIN_UI_FILE_SEGMENT } from '@geewiki/core/domain'
+/*
+ * ⚠️ 这里**同时**需要一条 `import` 与一条 `export … from`：
+ * 本文件内部（`isSlotName` 一带的运行期注册校验）要用这两个值，而
+ * `export { X } from '…'` **只转出、不建立本地绑定**（core 文件头把这个坑记为
+ * 一次实测教训）。写成本文件只转出、内部再 import 一遍，是这条语法规则下的最短写法。
+ */
+import { PLUGIN_ROUTE_ID, RESERVED_ROUTE_IDS } from '@geewiki/core/domain'
+
+export {
+  PLUGIN_UI_PREFIX,
+  PLUGIN_UI_FILE_SEGMENT,
+  // ★ 这两项此前是本文件的**本地副本**（core 的镜像，由"逐元素相等"的守卫钉住）。
+  // 真源已搬进浏览器安全的 `@geewiki/core/domain`，这里改为**转出** ——
+  // 于是前端拿到的与 core 是**同一个对象**，漂移在结构上不可能，不再依赖守卫去发现。
+  PLUGIN_ROUTE_ID,
+  RESERVED_ROUTE_IDS,
+} from '@geewiki/core/domain'
 
 /** 入口表中单个插件的条目 */
 export interface UiTableEntry {
@@ -73,32 +89,6 @@ export interface UiTableEntry {
   routes?: PluginRouteDecl[]
 }
 
-/**
- * 插件页面路由 id 语法 —— **core 的镜像**（`packages/core/src/index.ts` 的 `PLUGIN_ROUTE_ID`）。
- * 与内置路由同处 hash 首段，故同样是小写 kebab、不含 `/`。
- */
-export const PLUGIN_ROUTE_ID = /^[a-z][a-z0-9-]*$/
-
-/**
- * 宿主保留的路由首段 —— **core 的镜像**（`RESERVED_ROUTE_IDS`）。
- *
- * 前端也留一份是必要的：后端的裁决保证"不会有两个插件抢同一个 id"，
- * 但前端仍要能判断"某个已注册 id 是不是宿主的页面"——否则插件可能渲染出一个
- * 与内置页面同名、但内容完全不同的页面（后端拒绝的是**声明**，而运行期注册无法被后端预知）。
- */
-export const RESERVED_ROUTE_IDS: readonly string[] = [
-  'wiki',
-  'plugins', // 「插件管理」页（原 id 为 graph，本轮转正）
-  'graph', // 旧 id：在路由解析处被改写成 plugins（core 的镜像）
-  'access',
-  'audit',
-  'org',
-  'login',
-  'setup',
-  'denied',
-  'account',
-  'notfound',
-]
 
 /** 插件页面路由声明 —— **core 的镜像**（字段名/可选性必须逐字对应，由守卫测试钉住） */
 export interface PluginRouteDecl {
