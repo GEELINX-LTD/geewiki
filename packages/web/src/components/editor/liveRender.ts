@@ -437,6 +437,28 @@ function buildDecorations(state: EditorState, opts: LiveRenderOptions): Decorati
 
       if (!HIDDEN_MARKS.has(name)) return
       if (!opts.hideMarks) return false
+
+      /*
+       * ★ 标题的 `#` **连同其后的空格**一起吃掉。
+       *
+       * Lezer 的 `HeaderMark` 只覆盖 `#` / `##` 本身，**不含后面那个空格**（实测：
+       * `# 标题` ⇒ `HeaderMark [0,1]`；`## 二级` ⇒ `[10,12]`）。只藏标记就会把空格
+       * 留在文档里 ⇒ 标题文本比正文右移一个空格宽，而标题字号更大、偏移更显眼 ——
+       * 用户报的「正文和标题的缩进不一样」就是它。
+       *
+       * 只吃空格与制表符（不含换行）：空标题 `##` 后面直接是换行，吃进去就会把行并掉。
+       */
+      if (name === 'HeaderMark') {
+        const isBlank = (i: number): boolean => {
+          const ch = state.doc.sliceString(i, i + 1)
+          return ch === ' ' || ch === '\t'
+        }
+        let to = node.to
+        while (to < state.doc.length && isBlank(to)) to += 1
+        ranges.push(Decoration.replace({}).range(node.from, to))
+        return false
+      }
+
       ranges.push(Decoration.replace({}).range(node.from, node.to))
       return false
     },
