@@ -13,6 +13,7 @@
  */
 import { Component, lazy, Suspense, useCallback, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import { Skeleton } from '../ui/Skeleton'
+import { DEFAULT_EDITOR_MIN_HEIGHT } from '../lib/editorHeightPlan'
 import { Textarea } from '../ui/Input'
 import { EditorToolbar } from './editor/EditorToolbar'
 import { applyFormatAction, detectActiveFormats, type FormatAction } from '../lib/markdownActions'
@@ -98,7 +99,7 @@ function FallbackEditor(props: MarkdownEditorProps): ReactNode {
         placeholder={props.placeholder}
         spellCheck={false}
         className="font-mono text-note leading-relaxed"
-        style={{ minHeight: props.minHeight ?? '420px' }}
+        style={{ minHeight: props.minHeight ?? DEFAULT_EDITOR_MIN_HEIGHT }}
         onChange={(e) => {
           props.onChange(e.target.value)
           sync()
@@ -164,7 +165,7 @@ class EditorErrorBoundary extends Component<
 
 export function MarkdownEditorLazy(props: MarkdownEditorProps): ReactNode {
   const [failed, setFailed] = useState(false)
-  const height = props.minHeight ?? '420px'
+  const height = props.minHeight ?? DEFAULT_EDITOR_MIN_HEIGHT
 
   if (failed) return <FallbackEditor {...props} minHeight={height} />
 

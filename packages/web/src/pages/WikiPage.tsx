@@ -38,6 +38,7 @@ import {
 import { Tooltip } from '../ui/Tooltip'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
+import { DEFAULT_EDITOR_MIN_HEIGHT } from '../lib/editorHeightPlan'
 import { ArticleSummarySlotOutlet, EditorSlotOutlet, EditorToolbarSlotOutlet, type EditorHandle, type EditorToolbarSelection, useEditorSlot } from '../lib/slots'
 import {
   ReadonlyHistoryButton,
@@ -3002,7 +3003,15 @@ function WikiEdit(props: {
         {/* 编辑面板：**单栏**（与真实布局一致：模式切换在编辑器内部） */}
         <div className="flex flex-col gap-3">
           <Skeleton className="h-8 w-full" />
-          <Skeleton className="h-[420px] w-full" />
+          {/*
+            编辑区骨架：高度必须与**真实编辑面**一致，否则数据到达时整页跳一下（CLS）——
+            而这里曾经是 `h-[420px]`、真编辑器却是 480px，两边各自写死。
+            现在两者都取 `DEFAULT_EDITOR_MIN_HEIGHT`（`Skeleton` 只收 className，
+            故用一层定高 div 包住，与 `MarkdownEditorLazy` 的 Suspense 骨架同款）。
+          */}
+          <div style={{ height: DEFAULT_EDITOR_MIN_HEIGHT }} className="w-full">
+            <Skeleton className="h-full w-full" />
+          </div>
         </div>
         {/* 权限区：档位卡片 + 段落档位说明 */}
         <Skeleton className="h-32 w-full" />
@@ -3206,7 +3215,10 @@ function WikiEdit(props: {
             onSave={() => void save()}
             disabled={saving}
             ariaLabel="Markdown 正文编辑器"
-            minHeight="480px"
+            /*
+              刻意**不传** `minHeight`：默认值（`lib/editorHeightPlan.ts`）就是页面编辑器的下限，
+              传一遍等于把同一个数值写第二处 —— 上面那个骨架屏刚刚才因为这样而漂移过。
+            */
             /*
               附件上传（M4）：粘贴截图 / 拖入文件都由编辑器接住，这里只负责"真发请求"。
               ★ F5：插槽路径（上面的 `EditorSlotOutlet`）现在拿到的是**同一个** `uploadFiles`——
