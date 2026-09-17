@@ -196,3 +196,30 @@ test('右栏 TOC：包含块必须被撑高，否则 position: sticky 形同虚�
   assert.match(nav, /max-h-\[calc\(100vh/, 'nav 必须自身限高')
   assert.match(nav, /overflow-y-auto/, 'nav 必须自身可滚（超长目录不能溢出视口）')
 })
+
+test('阅读页：折叠摘要卡挂在标题**下面**（2026-09-17 用户要求；别再挪回标题之上）', () => {
+  /*
+    用户原话：「把摘要的显示位置调整到标题下面」。
+
+    摘要位刚落地时渲染在 `<h1>` **之前**（"文章最上方"的字面要求，当时的理由写在
+    `WikiPage.tsx` 的挂载点注释里）；本批按用户口径改为**标题之后、正文之前**。
+    守卫钉三件事，都不靠数值：
+      ① 标题在前、摘要在后；
+      ② 摘要仍落在 `article.gw-reader` 里（不能跑到栅格其它列，也不该跑到面包屑之上）；
+      ③ 摘要仍在正文之前 —— 它是标题的补充，不是正文的第一段。
+  */
+  const articleAt = wiki.indexOf('<article className="gw-reader">')
+  const articleEnd = wiki.indexOf('</article>', articleAt)
+  assert.ok(articleAt > 0 && articleEnd > articleAt, '应能找到 article.gw-reader 的开闭标签')
+
+  const card = wiki.slice(articleAt, articleEnd)
+  const h1At = card.indexOf('<h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>')
+  const summaryAt = card.indexOf('<ArticleSummarySlotOutlet slug={page.slug} title={page.title} />')
+  const bodyAt = card.indexOf('<MarkdownBody html={shown.html} className="md-body" />')
+
+  assert.ok(h1At >= 0, '文章标题 <h1> 必须仍在 article.gw-reader 内')
+  assert.ok(summaryAt >= 0, 'article-summary 出口必须仍在 article.gw-reader 内（不能挪去栅格其它列）')
+  assert.ok(bodyAt >= 0, '正文 <MarkdownBody> 必须仍在 article.gw-reader 内')
+  assert.ok(h1At < summaryAt, `摘要必须在标题**之后**（现状 h1@${h1At}、summary@${summaryAt}）—— 用户要求"调整到标题下面"`)
+  assert.ok(summaryAt < bodyAt, `摘要必须在正文**之前**（现状 summary@${summaryAt}、body@${bodyAt}）`)
+})
