@@ -1,0 +1,25 @@
+{
+  // 根 tsconfig 的**唯一用途**：给从仓库根启动的工具（`tsx` / esbuild）提供 JSX 设置。
+  // 本文件**不承载任何项目** —— 各包仍用自己的 tsconfig 做类型检查。
+  //
+  // ## 为什么需要它
+  // `tsx` 用一个"这个 tsconfig 是否**适用于**该文件"的判定来挑 tsconfig。从仓库根跑一个
+  // 会加载 `.tsx` 的测试时，它找不到 `packages/web/tsconfig.json`（那里写着
+  // `"jsx": "react-jsx"`），于是退回**经典 JSX 转换**，运行期抛
+  // `ReferenceError: React is not defined` —— 报错点指向 JSX 内部，**完全看不出与工作目录有关**。
+  // （实测：`cd packages/web && tsx --test test/navGate.test.ts` 通过；从根跑同一条命令失败。
+  //   也可用 `npx tsx --tsconfig packages/web/tsconfig.json …` 绕过。）
+  //
+  // 这与本仓库既定的方向一致：`resolveProjectPath` / `findRepoRoot` 那一组工作就是为了
+  // **消除 cwd 依赖**（`packages/manager/test/repo-paths.test.ts` 专门验证"切换工作目录后
+  // 结果不变"），测试文件也一律用 `import.meta.url` 定位资源。
+  //
+  // ## `include` 不能写成 `[]`
+  // 写 `[]` 会让这份 tsconfig 被判定为"不适用于任何文件"，jsx 设置**根本不生效**
+  // （实测踩过）。故这里明确列出真正需要 JSX 转换的范围。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx"
+  },
+  "include": ["packages/web/src/**/*", "packages/web/test/**/*"]
+}
