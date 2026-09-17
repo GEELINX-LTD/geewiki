@@ -1828,7 +1828,7 @@ function WikiDetail(props: {
   })
   /*
     ⚠️ 必须在下面的任何 early return 之前调用（hook 顺序不能随分支改变，否则 React 抛 #310）。
-    慢请求提示与列表/管理台/依赖图同款，避免同一个产品里两种加载反馈。
+    慢请求提示与列表/管理台/插件管理同款，避免同一个产品里两种加载反馈。
   */
   const slowDetail = useSlowHint(detailState === 'loading')
   if (detailState === 'error') {
@@ -1947,7 +1947,7 @@ function WikiDetail(props: {
       而不是一叠等高条。理由见 `ui/Skeleton.tsx` 的注释：骨架必须与最终尺寸一致，
       否则数据到达时照样布局跳动（CLS），骨架屏就白做了。
       加载反馈统一走 `LoadingState`（role="status" + aria-live + aria-busy + 慢请求文案），
-      与列表页/管理台/依赖图一致；此前这里是裸 `aria-busy` + 一个多余的 Spinner。
+      与列表页/管理台/插件管理一致；此前这里是裸 `aria-busy` + 一个多余的 Spinner。
     */
     return (
       <LoadingState slow={slowDetail} label="正在加载页面…">
