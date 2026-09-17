@@ -1,0 +1,421 @@
+/**
+ * 「审计与运维」插件的样式。
+ *
+ * ## 为什么自带 CSS 而不是用宿主的 Tailwind 工具类
+ *
+ * 两条硬理由，第二条是决定性的：
+ *
+ * 1. **插件产物是独立构建的**（`react` 系是唯一 external），插件代码里写的 Tailwind
+ *    类名**不会**被宿主的 Tailwind 扫描到 —— 宿主只扫 `packages/web/src`。写了 `px-4`
+ *    的结果是"没有任何样式，也不报错"。
+ * 2. **外部插件更彻底**：`plugins/<name>/` 位于仓库其它位置，宿主构建时根本看不到它。
+ *    所以"插件自带 CSS"不是本项目三个内置插件的巧合，而是**唯一可移植的做法**。
+ *
+ * ## 配色只用宿主的语义变量，一个回退值都不写
+ *
+ * `--color-*` 这批名字由宿主 `tokens.css` 无条件输出（见该文件第 4b 节的说明），
+ * 深浅两套主题各自解出正确的值。**写回退值是有害的**：变量缺失时回退到浅色常量，
+ * 深色主题下就是一块白斑 —— 而它只在某个部署里出现，本地永远复现不了。
+ * 变量缺失就该**没有颜色**（一眼看得出），而不是"看起来像另一种主题"。
+ *
+ * ## 前缀 `gw-ops-`
+ *
+ * 插件 CSS 是**全局注入**的（宿主的已知边界：没有样式隔离）。前缀是唯一的分隔手段，
+ * 且必须足够具体 —— `gw-` 前缀已被宿主与其它插件大量使用，只用 `gw-` 会撞车。
+ */
+
+.gw-ops {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--color-ink);
+  font-size: 13px;
+}
+
+/* ---------- 头部 ---------- */
+
+.gw-ops-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.gw-ops-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.gw-ops-sub {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.gw-ops-spacer {
+  flex: 1;
+}
+
+/* ---------- 分区标签 ---------- */
+
+.gw-ops-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-sunken);
+}
+
+.gw-ops-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink-soft);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.gw-ops-tab:hover {
+  background: var(--color-hover);
+  color: var(--color-ink);
+}
+
+.gw-ops-tab-on,
+.gw-ops-tab-on:hover {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+}
+
+.gw-ops-tab:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 1px;
+}
+
+.gw-ops-hint {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+/* ---------- 卡片 ---------- */
+
+.gw-ops-card {
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.gw-ops-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.gw-ops-card-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.gw-ops-card-desc {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.gw-ops-card-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ---------- 表单 ---------- */
+
+.gw-ops-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.gw-ops-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.gw-ops-field-grow {
+  flex: 1;
+  min-width: 160px;
+}
+
+.gw-ops-label {
+  color: var(--color-muted);
+  font-size: 11px;
+}
+
+.gw-ops-input {
+  font: inherit;
+  font-size: 12px;
+  color: var(--color-ink);
+  background: var(--color-bg);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  min-width: 0;
+}
+
+.gw-ops-input:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 1px;
+  border-color: var(--color-accent);
+}
+
+/* ---------- 按钮 ---------- */
+
+.gw-ops-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.gw-ops-btn:hover:not(:disabled) {
+  background: var(--color-hover);
+}
+
+.gw-ops-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.gw-ops-btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 1px;
+}
+
+.gw-ops-btn-primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+.gw-ops-btn-primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.gw-ops-btn-danger {
+  border-color: var(--color-danger-line);
+  background: var(--color-danger-bg);
+  color: var(--color-danger-ink);
+}
+
+.gw-ops-btn-danger:hover:not(:disabled) {
+  background: var(--color-danger-bg);
+  filter: brightness(0.97);
+}
+
+.gw-ops-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* ---------- 表格 ---------- */
+
+.gw-ops-scroll {
+  overflow-x: auto;
+}
+
+.gw-ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+}
+
+.gw-ops-table th {
+  font-weight: 500;
+  color: var(--color-muted);
+  padding: 4px 8px 4px 0;
+  white-space: nowrap;
+}
+
+.gw-ops-table td {
+  padding: 5px 8px 5px 0;
+  border-top: 1px solid var(--color-line);
+  vertical-align: top;
+}
+
+.gw-ops-mono {
+  font-family: var(--gw-font-mono);
+  font-size: 11px;
+}
+
+.gw-ops-nowrap {
+  white-space: nowrap;
+}
+
+.gw-ops-dim {
+  color: var(--color-muted);
+}
+
+/* ---------- 标记 ---------- */
+
+.gw-ops-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-line);
+  background: var(--color-sunken);
+  color: var(--color-ink-soft);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.gw-ops-badge-ok {
+  background: var(--color-ok-bg);
+  border-color: var(--color-ok-line);
+  color: var(--color-ok-ink);
+}
+
+.gw-ops-badge-warn {
+  background: var(--color-warn-bg);
+  border-color: var(--color-warn-line);
+  color: var(--color-warn-ink);
+}
+
+.gw-ops-badge-bad {
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-line);
+  color: var(--color-danger-ink);
+}
+
+/* ---------- 结论块 ---------- */
+
+.gw-ops-verdict {
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: var(--color-sunken);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.gw-ops-verdict-ok {
+  background: var(--color-ok-bg);
+  border-color: var(--color-ok-line);
+}
+
+.gw-ops-verdict-warn {
+  background: var(--color-warn-bg);
+  border-color: var(--color-warn-line);
+}
+
+.gw-ops-verdict-bad {
+  background: var(--color-danger-bg);
+  border-color: var(--color-danger-line);
+}
+
+.gw-ops-verdict-head {
+  font-weight: 600;
+}
+
+.gw-ops-verdict-line {
+  color: var(--color-ink-soft);
+  font-size: 12px;
+}
+
+/* ---------- 分页与提示 ---------- */
+
+.gw-ops-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.gw-ops-status {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-ink-soft);
+}
+
+.gw-ops-error {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-danger-line);
+  background: var(--color-danger-bg);
+  color: var(--color-danger-ink);
+  font-size: 12px;
+}
+
+.gw-ops-empty {
+  margin: 0;
+  padding: 14px 0;
+  color: var(--color-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ---------- 变更明细（before → after） ---------- */
+
+.gw-ops-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gw-ops-diff-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.gw-ops-diff-before {
+  color: var(--color-danger-ink);
+  text-decoration: line-through;
+}
+
+.gw-ops-diff-after {
+  color: var(--color-ok-ink);
+}
+
+/* ---------- 反向展开的来源表 ---------- */
+
+.gw-ops-reach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.gw-ops-reach-item {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}

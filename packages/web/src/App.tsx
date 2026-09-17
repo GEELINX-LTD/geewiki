@@ -6,7 +6,6 @@ import {
   Menu as MenuIcon,
   MonitorSmartphone,
   Puzzle,
-  ScrollText,
   Search,
   ShieldCheck,
   UserRound,
@@ -38,7 +37,6 @@ import { AppDock } from './components/AppDock'
 import { SlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AccessPage } from './pages/AccessPage'
-import { OpsPage } from './pages/OpsPage'
 import { OrgPage } from './pages/OrgPage'
 import { AccountPage } from './pages/AccountPage'
 import { DeniedPage } from './pages/DeniedPage'
@@ -241,14 +239,17 @@ const ADMIN_NAV: NavItem[] = [
    */
   { id: 'plugins', label: '插件管理', icon: <GitBranch className="size-4" />, requires: 'administer' },
   /*
-   * 审计与运维（P4）。能力键用既有的 `administer`（`AuthCapabilities` 只有
-   * editContent / administer / manageVisibility 三个），不新开字段 —— 它对应的
-   * 后端端点全部标了 `access: 'admin'`，判据与其余运维入口一致。
+   * 审计与运维（P4）**已搬成插件**（2026-09-17，`packages/plugin-ops`）。
    *
-   * ⚠️ 本注释刻意**不写出那个键的完整字面量**：`packages/web/test/navPlan.test.ts`
+   * 这里不再有条目，也不再在下面分派页面：它的导航项来自插件清单的
+   * `routes: [{ id: 'audit', label: '审计与运维', requires: 'administer', group: 'admin' }]`，
+   * 由 `pluginNavDests()` 转成 `NavItem` 后并入 `adminDests`（见下方 `adminDests` 的合并）。
+   * 同时 `audit` 也从 `RESERVED_ROUTE_IDS` 移出 —— 保留清单与宿主条目必须一起删，
+   * 只删一边的两种后果都是静默的（要么插件声明被整条拒绝，要么宿主分支永远赢）。
+   *
+   * ⚠️ 本注释刻意**不写出能力键的完整字面量**：`packages/web/test/navPlan.test.ts`
    * 用文本正则统计"声明了几个能力"，注释里出现同样的字面量会让它多数出一个。
    */
-  { id: 'audit', label: '审计与运维', icon: <ScrollText className="size-4" />, requires: 'administer' },
   /*
    * 组织与邀请管理（P5-B M4/M5）。判据与其余运维入口一致（`administer`）：
    * 成员、用户组、邀请这 12 个端点里除 `GET /api/org` 外全部要 `admin+`
@@ -488,7 +489,6 @@ export function App(): ReactNode {
       但页面本身只做重定向 —— 权限已并入页面（见 LEGACY_ROUTES 与 pages/AccessPage.tsx）。
     */
     body = <AccessPage sub={route.slice('access'.length).replace(/^\/+/, '')} onNavigate={nav} />
-  else if (active === 'audit') body = <OpsPage />
   // 组织与邀请管理（P5-B M4/M5）：独立首段 `#/org`，页面自己按 `administer` 门控
   else if (active === 'org') body = <OrgPage onNavigate={nav} />
   else if (active === 'login') body = <LoginPage />

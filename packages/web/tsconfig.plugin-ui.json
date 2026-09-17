@@ -39,6 +39,7 @@
   "include": [
     "../../packages/plugin-ai-assistant/ui",
     "../../packages/plugin-ai-summary/ui",
-    "../../packages/plugin-oidc/ui"
+    "../../packages/plugin-oidc/ui",
+    "../../packages/plugin-ops/ui"
   ]
 }

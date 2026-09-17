@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "build:fixtures": "rm -rf public/plugins-ui && FIXTURE_OUT_DIR=../../../plugins/ui-demo/dist vite build --config fixtures/vite.config.ts && FIXTURE_OUT=@geewiki-plugin/hello FIXTURE_OUT_DIR=../../../plugins/hello-geewiki/dist vite build --config fixtures/vite.config.ts && FIXTURE_OUT=@geewiki/editor-plain FIXTURE_ENTRY=./editor/index.tsx vite build --config fixtures/vite.config.ts && pnpm run build:plugin-ui",
-    "build:plugin-ui": "rm -rf public/plugins-ui/@geewiki/ai-assistant && FIXTURE_OUT=@geewiki/ai-assistant FIXTURE_ENTRY=../../plugin-ai-assistant/ui/index.tsx vite build --config fixtures/vite.config.ts && rm -rf public/plugins-ui/@geewiki/oidc && FIXTURE_OUT=@geewiki/oidc FIXTURE_ENTRY=../../plugin-oidc/ui/index.tsx vite build --config fixtures/vite.config.ts && FIXTURE_OUT=@geewiki/ai-summary FIXTURE_ENTRY=../../plugin-ai-summary/ui/index.tsx vite build --config fixtures/vite.config.ts",
+    "build:plugin-ui": "rm -rf public/plugins-ui/@geewiki/ai-assistant && FIXTURE_OUT=@geewiki/ai-assistant FIXTURE_ENTRY=../../plugin-ai-assistant/ui/index.tsx vite build --config fixtures/vite.config.ts && rm -rf public/plugins-ui/@geewiki/oidc && FIXTURE_OUT=@geewiki/oidc FIXTURE_ENTRY=../../plugin-oidc/ui/index.tsx vite build --config fixtures/vite.config.ts && FIXTURE_OUT=@geewiki/ai-summary FIXTURE_ENTRY=../../plugin-ai-summary/ui/index.tsx vite build --config fixtures/vite.config.ts && rm -rf public/plugins-ui/@geewiki/ops && FIXTURE_OUT=@geewiki/ops FIXTURE_ENTRY=../../plugin-ops/ui/index.tsx vite build --config fixtures/vite.config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.plugin-ui.json",
     "test": "node --import tsx --test test/*.test.ts"
   },

@@ -150,7 +150,9 @@ test('设计系统：全仓源码不得使用未注册的 Tailwind token', () =>
   for (const must of [
     'App.tsx',
     'pages/WikiPage.tsx',
-    'pages/OpsPage.tsx',
+    // 注：`pages/OpsPage.tsx` 已删（2026-09-17 搬成插件 @geewiki/ops）。插件的界面产物
+    // **自带 CSS**（`packages/plugin-ops/ui/style.css`），一个 Tailwind 类都不用，故不在此扫描集内。
+    'pages/OrgPage.tsx',
     'pages/AccessPage.tsx',
     'components/CommandPalette.tsx',
   ]) {

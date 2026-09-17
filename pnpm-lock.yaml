@@ -410,6 +410,19 @@ importers:
         specifier: ^22.0.0
         version: 22.20.1
 
+  packages/plugin-ops:
+    dependencies:
+      '@geewiki/core':
+        specifier: workspace:*
+        version: link:../core
+      cordis:
+        specifier: ^4.0.0-rc.10
+        version: 4.0.0-rc.10
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
   packages/plugin-org:
     dependencies:
       '@geewiki/core':
@@ -529,6 +542,9 @@ importers:
       '@geewiki/openai':
         specifier: workspace:*
         version: link:../plugin-openai
+      '@geewiki/ops':
+        specifier: workspace:*
+        version: link:../plugin-ops
       '@geewiki/org':
         specifier: workspace:*
         version: link:../plugin-org
