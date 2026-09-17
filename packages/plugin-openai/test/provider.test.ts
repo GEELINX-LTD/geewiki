@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import type { LlmChunk, LlmProvider, LlmRequest } from '@geewiki/llm'
+import { resolveCredential, type LlmChunk, type LlmProvider, type LlmRequest, type LlmSettings } from '@geewiki/llm'
 import { createOpenAiProvider } from '../src/provider.js'
 
 /* ------------------------------ mock 上游 ------------------------------ */
@@ -90,15 +90,54 @@ function freshEnvName(): string {
   return `GEEWIKI_TEST_OPENAI_KEY_${envCounter}`
 }
 
-function makeProvider(baseUrl: string, overrides: Partial<{ apiKeyEnv: string; timeoutMs: number; model: string; includeUsage: boolean }> = {}): LlmProvider {
+/**
+ * 一份"统一接入设置"夹具。
+ *
+ * 本批起适配器**不再持有配置**：端点、模型、超时、思考强度都从 `settings()` 现读
+ * （见 `../src/index.ts` 的文件头）。故测试夹具也从"构造参数"变成"设置对象"。
+ */
+function settingsFixture(overrides: Partial<LlmSettings> = {}): LlmSettings {
+  return {
+    provider: '',
+    baseUrl: '',
+    model: '',
+    contextWindow: 128000,
+    maxOutputTokens: 4096,
+    reasoningEffort: 'off',
+    timeoutMs: 5000,
+    includeUsage: true,
+    extraBody: '',
+    apiKeyEnv: 'GEEWIKI_TEST_UNSET_KEY',
+    ...overrides,
+  }
+}
+
+/**
+ * 可变的设置对象（契约里的 `LlmSettings` 字段是 `readonly`——它描述的是"某一刻的值"）。
+ * 测"配置热更新后适配器现读新值"时必须能改它，故这里显式去掉只读修饰。
+ */
+type MutableSettings = { -readonly [K in keyof LlmSettings]: LlmSettings[K] }
+
+function makeProvider(
+  baseUrl: string,
+  overrides: Partial<{ apiKeyEnv: string; timeoutMs: number; model: string; includeUsage: boolean; reasoningEffort: LlmSettings['reasoningEffort']; extraBody: string }> = {},
+): LlmProvider {
+  const apiKeyEnv = overrides.apiKeyEnv ?? 'GEEWIKI_TEST_UNSET_KEY'
   return createOpenAiProvider({
     route: 'openai-test',
     label: '测试端点',
-    baseUrl,
-    model: overrides.model ?? 'test-model',
-    apiKeyEnv: overrides.apiKeyEnv ?? 'GEEWIKI_TEST_UNSET_KEY',
-    timeoutMs: overrides.timeoutMs ?? 5000,
-    includeUsage: overrides.includeUsage ?? true,
+    description: '测试用 OpenAI 兼容端点',
+    // 用户没填 baseUrl / model 时的兜底属于**适配器**（见 OpenAiProviderOptions.defaults）
+    defaults: { baseUrl, model: overrides.model ?? 'test-model' },
+    settings: () =>
+      settingsFixture({
+        apiKeyEnv,
+        timeoutMs: overrides.timeoutMs ?? 5000,
+        includeUsage: overrides.includeUsage ?? true,
+        ...(overrides.reasoningEffort !== undefined ? { reasoningEffort: overrides.reasoningEffort } : {}),
+        ...(overrides.extraBody !== undefined ? { extraBody: overrides.extraBody } : {}),
+      }),
+    resolveApiKey: () => resolveCredential(apiKeyEnv),
   })
 }
 
@@ -398,6 +437,294 @@ test('401 时错误体不可读也不影响归一化（状态码已足够判码�
     const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
     assert.equal(chunks.length, 1)
     assert.equal(chunks[0]?.type, 'error')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+/* ------------------- 统一配置：现读、思考强度、额外请求体 ------------------- */
+
+test('现读设置：改 baseUrl / model 后下一次请求就用新值（无需重建 provider）', async () => {
+  const first = await startMock({ frames: [frame('甲'), DONE] })
+  const second = await startMock({ frames: [frame('乙'), DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  const settings: MutableSettings = { ...settingsFixture({ apiKeyEnv: name }) }
+  const provider = createOpenAiProvider({
+    route: 'openai-test',
+    label: '测试端点',
+    description: '测试',
+    defaults: { baseUrl: first.baseUrl, model: 'fallback-model' },
+    settings: () => settings,
+    resolveApiKey: () => resolveCredential(name),
+  })
+  try {
+    await collect(provider)
+    assert.equal(JSON.parse(first.requests[0]!).model, 'fallback-model', '未配置时回落适配器默认模型')
+
+    // 模拟"用户在「模型接入」里改了端点与模型"：设置对象变了，provider 不用重建
+    settings.baseUrl = second.baseUrl
+    settings.model = 'new-model'
+    await collect(provider)
+    assert.equal(second.requests.length, 1, '第二次请求必须打到新端点')
+    assert.equal(JSON.parse(second.requests[0]!).model, 'new-model')
+    assert.equal(provider.descriptor.model, 'new-model', 'descriptor 也必须现读（管理台显示不得滞后）')
+  } finally {
+    delete process.env[name]
+    await first.close()
+    await second.close()
+  }
+})
+
+test('思考强度：off 不发 reasoning_effort；high 发 reasoning_effort=high；自定义档位原样发', async () => {
+  const off = await startMock({ frames: [DONE] })
+  const high = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(off.baseUrl, { apiKeyEnv: name, reasoningEffort: 'off' }))
+    const offBody = JSON.parse(off.requests[0]!) as Record<string, unknown>
+    assert.equal('reasoning_effort' in offBody, false, 'off = 不发该参数（各家对"关闭"的写法并不一致）')
+
+    await collect(makeProvider(high.baseUrl, { apiKeyEnv: name, reasoningEffort: 'high' }))
+    const highBody = JSON.parse(high.requests[0]!) as Record<string, unknown>
+    assert.equal(highBody['reasoning_effort'], 'high')
+
+    // 自定义档位（各家网关不统一：Qwen 用 minimal 之类）必须原样到达上游
+    await collect(makeProvider(high.baseUrl, { apiKeyEnv: name, reasoningEffort: 'minimal' }))
+    const customBody = JSON.parse(high.requests[1]!) as Record<string, unknown>
+    assert.equal(customBody['reasoning_effort'], 'minimal', '配置里的自定义值不得被白名单吃掉')
+  } finally {
+    delete process.env[name]
+    await off.close()
+    await high.close()
+  }
+})
+
+test('采样温度：请求不给就不发（由服务端定），给了才原样带上', async () => {
+  const mock = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
+    const silent = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+    assert.equal('temperature' in silent, false, '配置里没有温度，请求里也不该长出一个——那会覆盖服务端的默认值')
+
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), { temperature: 0 })
+    const explicit = JSON.parse(mock.requests[1]!) as Record<string, unknown>
+    assert.equal(explicit['temperature'], 0, '调用方显式给 0 是它的决定，必须透传')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('额外请求体：并入 payload，且同名键由它覆盖（网关私有参数的逃生口）', async () => {
+  const mock = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(
+      makeProvider(mock.baseUrl, {
+        apiKeyEnv: name,
+        extraBody: '{"thinking":{"type":"enabled"},"temperature":0.9}',
+      }),
+      { temperature: 0.3 },
+    )
+    const body = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+    assert.deepEqual(body['thinking'], { type: 'enabled' }, '网关私有形态原样透传')
+    assert.equal(body['temperature'], 0.9, '同名键由额外请求体覆盖（它排在 payload 最后）')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('额外请求体损坏时按"没有额外参数"处理（绝不让透传字段毁掉整次请求）', async () => {
+  const mock = await startMock({ frames: [frame('好'), DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name, extraBody: '{坏 JSON' }))
+    assert.deepEqual(
+      chunks.filter((c) => c.type === 'text-delta'),
+      [{ type: 'text-delta', text: '好' }],
+      '坏透传值不得影响正常流式内容',
+    )
+    assert.equal(chunks.at(-1)?.type, 'done', '仍以终止 chunk 收尾')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+/* ============================ 工具调用（function calling） ============================ */
+
+/** 一帧工具调用片段（上游按 index 分片：首帧给 id/name，后续帧给 arguments 分片） */
+function toolFrame(part: Record<string, unknown>, finishReason?: string): string {
+  const delta: Record<string, unknown> = { tool_calls: [part] }
+  const choice: Record<string, unknown> = { delta }
+  if (finishReason !== undefined) choice['finish_reason'] = finishReason
+  return `data: ${JSON.stringify({ choices: [choice] })}\n\n`
+}
+
+test('不发 tools 时请求体里**没有** tools / tool_choice 键（存量调用方逐字节不变）', async () => {
+  const mock = await startMock({ frames: [frame('好'), DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
+    const body = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+    assert.equal('tools' in body, false, '不填就是键根本不出现，不是发一个空数组')
+    assert.equal('tool_choice' in body, false, '给了 tools 才谈 tool_choice；这里两个都不该有')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('toolChoice 不填时绝不下发 tool_choice（不替服务端补默认值）', async () => {
+  // 与 temperature 同一条理由：各家网关对"默认"的写法与含义并不一致，
+  // 客户端补一个默认值等于替服务端做决定。
+  const mock = await startMock({ frames: [frame('好'), DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), {
+      tools: [{ name: 'search_kb', description: '检索知识库', parameters: { type: 'object' } }],
+    })
+    const body = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+    assert.equal(Array.isArray(body['tools']), true, '给了 tools 就要发')
+    assert.equal('tool_choice' in body, false, '没给 toolChoice 就不发该键')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('tools 折成上游 {type:function, function:{…}} 形态；三档策略与指名形态各自正确', async () => {
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  const tool = { name: 'search_kb', description: '检索知识库', parameters: { type: 'object', properties: {} } }
+  const cases: { choice: LlmRequest['toolChoice']; expected: unknown }[] = [
+    { choice: 'auto', expected: 'auto' },
+    { choice: 'none', expected: 'none' },
+    { choice: 'required', expected: 'required' },
+    { choice: { name: 'search_kb' }, expected: { type: 'function', function: { name: 'search_kb' } } },
+  ]
+  for (const c of cases) {
+    const mock = await startMock({ frames: [DONE] })
+    try {
+      await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), { tools: [tool], toolChoice: c.choice })
+      const body = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+      assert.deepEqual(body['tools'], [{ type: 'function', function: tool }], `tools 形态（choice=${JSON.stringify(c.choice)}）`)
+      assert.deepEqual(body['tool_choice'], c.expected, `tool_choice 形态（choice=${JSON.stringify(c.choice)}）`)
+    } finally {
+      await mock.close()
+    }
+  }
+  delete process.env[name]
+})
+
+test('messages 折成上游形态：assistant 带 tool_calls、tool 带 tool_call_id；普通消息不多任何键', async () => {
+  const mock = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), {
+      messages: [
+        { role: 'system', content: '你是助手' },
+        { role: 'user', content: '主页怎么新建内容' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_1', name: 'search_kb', arguments: '{"q":"新建"}' }],
+        },
+        { role: 'tool', content: '["命中 1 条"]', toolCallId: 'call_1' },
+      ],
+    })
+    const body = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+    assert.deepEqual(body['messages'], [
+      { role: 'system', content: '你是助手' },
+      { role: 'user', content: '主页怎么新建内容' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'search_kb', arguments: '{"q":"新建"}' } }],
+      },
+      { role: 'tool', content: '["命中 1 条"]', tool_call_id: 'call_1' },
+    ])
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('流式工具片段逐个透传为 tool-call-delta（id/name 首帧、arguments 分片）', async () => {
+  const mock = await startMock({
+    frames: [
+      toolFrame({ index: 0, id: 'call_1', type: 'function', function: { name: 'search_kb', arguments: '' } }),
+      toolFrame({ index: 0, function: { arguments: '{"q":' } }),
+      toolFrame({ index: 0, function: { arguments: '"麒麟"}' } }),
+      toolFrame({ index: 0 }, 'tool_calls'),
+      DONE,
+    ],
+  })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), {
+      tools: [{ name: 'search_kb', description: 'd', parameters: { type: 'object' } }],
+    })
+    const deltas = chunks.filter((c) => c.type === 'tool-call-delta')
+    assert.deepEqual(deltas, [
+      { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'search_kb', argumentsDelta: '' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '{"q":' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '"麒麟"}' },
+    ])
+    const tail = chunks.at(-1)
+    assert.equal(tail?.type, 'done', '仍以终止 chunk 收尾')
+    assert.equal(tail?.type === 'done' ? tail.finishReason : undefined, 'tool_calls', 'finish_reason 透传到 done')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('finish_reason 只在非空时透传：中间帧的 null 不算"结束了"', async () => {
+  const mock = await startMock({
+    frames: [`data: ${JSON.stringify({ choices: [{ delta: { content: '好' }, finish_reason: null }] })}\n\n`, DONE],
+  })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
+    const tail = chunks.at(-1)
+    assert.equal(tail?.type, 'done')
+    assert.equal(tail?.type === 'done' ? 'finishReason' in tail : true, false, 'null 不该变成字段')
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('空壳工具片段（上游发 {index:0} 不带任何字段）不产生噪声 chunk', async () => {
+  const mock = await startMock({ frames: [toolFrame({ index: 0 }), frame('好'), DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
+    assert.deepEqual(
+      chunks.filter((c) => c.type === 'tool-call-delta'),
+      [],
+      '没有 id/name/arguments 的片段没有信息量',
+    )
+    assert.deepEqual(
+      chunks.filter((c) => c.type === 'text-delta'),
+      [{ type: 'text-delta', text: '好' }],
+      '同一条流里的正文不受影响',
+    )
   } finally {
     delete process.env[name]
     await mock.close()

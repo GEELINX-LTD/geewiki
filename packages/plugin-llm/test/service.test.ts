@@ -12,6 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from 'cordis'
 import {
+  FALLBACK_SETTINGS,
   LLM_SERVICE_KEY,
   LlmPlugin,
   NULL_PROVIDER,
@@ -283,8 +284,8 @@ test('路由选择：defaultRoute 生效；未指定时取第一个可用路由'
   assert.equal((assertSingleTerminal(picked, 'done') as { provider: string }).provider, 'second-up')
 })
 
-test('服务级默认值：仅在请求未显式给出时填充 maxTokens/temperature', async () => {
-  const svc = createLlmService({ maxTokens: 128, temperature: 0.25 })
+test('服务级默认值：仅在请求未显式给出时填充 maxTokens；temperature 永不代填', async () => {
+  const svc = createLlmService({ maxTokens: 128 })
   const seen: LlmRequest[] = []
   const provider: LlmProvider = {
     route: 'echo-req',
@@ -297,10 +298,28 @@ test('服务级默认值：仅在请求未显式给出时填充 maxTokens/temper
   svc.register(provider)
   await collect(svc.stream(request))
   assert.equal(seen[0]?.maxTokens, 128)
-  assert.equal(seen[0]?.temperature, 0.25)
+  assert.equal('temperature' in (seen[0] ?? {}), false, '服务层不得替调用方补一个温度：温度由服务端默认值决定')
   await collect(svc.stream({ ...request, maxTokens: 7, temperature: 0 }))
   assert.equal(seen[1]?.maxTokens, 7, '显式值不得被覆盖')
-  assert.equal(seen[1]?.temperature, 0, '显式 0 不得被当成缺省')
+  assert.equal(seen[1]?.temperature, 0, '调用方显式写 0 时原样透传（这是它的决定，不是我们的）')
+})
+
+test('接上统一配置后：maxTokens 来自设置，temperature 依然不出现', async () => {
+  const svc = createLlmService({
+    settings: () => ({ ...FALLBACK_SETTINGS, maxOutputTokens: 2048, reasoningEffort: 'high' }),
+  })
+  const seen: LlmRequest[] = []
+  svc.register({
+    route: 'echo-settings',
+    descriptor: { route: 'echo-settings', label: 'x', vendor: 'test', model: 'm', available: () => true },
+    async *stream(req: LlmRequest): AsyncIterable<LlmChunk> {
+      seen.push(req)
+      yield { type: 'done', provider: 'echo-settings', model: 'm' }
+    },
+  })
+  await collect(svc.stream(request))
+  assert.equal(seen[0]?.maxTokens, 2048)
+  assert.equal('temperature' in (seen[0] ?? {}), false, '统一配置里没有温度，这里也不该凭空长出一个')
 })
 
 test('status chunk 的 message 经脱敏；text-delta 原样透传（模型输出不得被改写）', async () => {
@@ -463,4 +482,63 @@ test('apply：正常配置提供 llm-service，dispose 后注销（含兜底路�
 
   await fork.dispose()
   assert.equal(ctx.get(LLM_SERVICE_KEY), undefined, 'dispose 后服务应被注销')
+})
+
+/* --------------------- 工具调用：chunk 归一化必须放行 --------------------- */
+
+test('tool-call-delta 原样透传（不被"契约外类型丢弃"那句吞掉）', async () => {
+  // ★ 这是本链路最容易静默失败的一处：sanitizeNonTerminal 末尾有一句
+  //   `return undefined`（丢弃契约外类型）。少写工具片段那一个分支**不会报错、
+  //   不会有测试变红**，只会让模型产出的工具调用一个都到不了消费者手里。
+  //   这条用例就是钉住那个分支。
+  const svc = createLlmService()
+  svc.register(
+    makeProvider('tools', {
+      chunks: [
+        { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'search_kb', argumentsDelta: '' },
+        { type: 'tool-call-delta', index: 0, argumentsDelta: '{"q":"新建"}' },
+        { type: 'done', provider: 'tools', model: 'm' },
+      ],
+    }),
+  )
+  const chunks = await collect(svc.stream({ ...request, route: 'tools' }))
+  assert.deepEqual(chunks, [
+    { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'search_kb', argumentsDelta: '' },
+    { type: 'tool-call-delta', index: 0, argumentsDelta: '{"q":"新建"}' },
+    { type: 'done', provider: 'tools', model: 'm' },
+  ])
+  assertSingleTerminal(chunks, 'done')
+})
+
+test('done.finishReason 透传；上游没给时该字段不出现', async () => {
+  const svc = createLlmService()
+  svc.register(makeProvider('trunc', { chunks: [{ type: 'done', provider: 'trunc', model: 'm', finishReason: 'length' }] }))
+  svc.register(makeProvider('plain', { chunks: [{ type: 'done', provider: 'plain', model: 'm' }] }))
+
+  const truncated = assertSingleTerminal(await collect(svc.stream({ ...request, route: 'trunc' })), 'done')
+  assert.equal(
+    (truncated as { finishReason?: string }).finishReason,
+    'length',
+    'finishReason=length 必须能传到调用方：它意味着工具调用参数可能是半截 JSON',
+  )
+
+  const plain = assertSingleTerminal(await collect(svc.stream({ ...request, route: 'plain' })), 'done')
+  assert.equal('finishReason' in (plain as object), false, '上游没给就不该凭空出现该字段')
+})
+
+test('status.message 仍经脱敏，工具链路不影响既有脱敏出口', async () => {
+  const svc = createLlmService()
+  svc.register(
+    makeProvider('leak', {
+      chunks: [
+        { type: 'status', provider: 'leak', model: 'm', message: 'trace Authorization: Bearer sk-abcdef1234567890' },
+        { type: 'tool-call-delta', index: 0, id: 'c', name: 'n' },
+        { type: 'done', provider: 'leak', model: 'm' },
+      ],
+    }),
+  )
+  const chunks = await collect(svc.stream({ ...request, route: 'leak' }))
+  const status = chunks[0] as { type: string; message?: string }
+  assert.equal(status.type, 'status')
+  assert.equal(status.message?.includes('sk-abcdef1234567890'), false, '诊断文本里的密钥必须被脱敏')
 })

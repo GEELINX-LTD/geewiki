@@ -60,10 +60,12 @@ export function isEnvVarName(value: string): boolean {
   return ENV_VAR_NAME_RE.test(v) && ENV_VAR_NAME_CONVENTION_RE.test(v) && v.includes('_')
 }
 
-/** 凭据解析结果（不抛异常：调用方多半处在"降级"语境里） */
-export type CredentialResult =
-  | { ok: true; value: string }
-  | { ok: false; code: 'MISSING_CREDENTIAL' | 'INVALID_CREDENTIAL' }
+/*
+ * ★ F3：`CredentialResult` 已下沉到 `@geewiki/core`（真源 `packages/core/src/llm.ts`）。
+ * `resolveCredential` 是**运行期**实现（读环境变量），留在本包。
+ */
+export type { CredentialResult } from '@geewiki/core'
+import type { CredentialResult } from '@geewiki/core'
 
 /**
  * 按环境变量名取凭据。
