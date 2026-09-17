@@ -696,8 +696,8 @@ pnpm run install-plugin --verify [--json]
 #### 验证读数（取数方式一并给出）
 
 - `pnpm run typecheck`：27 个项目 + `scripts/` + `plugin-ops`，`grep -c 'error TS'` = **0**，exit 0
-  （日志 `data/verify/tc-users2.log`）。
-- `pnpm run test`：**2210 例 / 2210 通过 / 0 失败**，exit 0（日志 `data/verify/test-users2.log`）。
+  （日志 `data/verify/tc-actor.log`）。
+- `pnpm run test`：**2226 例 / 2226 通过 / 0 失败**，exit 0（日志 `data/verify/test-actor.log`）。
   本轮新增 `packages/plugin-ops/test/opsPlan.test.ts`（26 例，纯判据）+ `opsUi.test.ts`（12 例，
   源码级不变量）+ `packages/web/test/opsOwnership.test.ts`（4 例，归属）；`opsPage.test.ts` 已删
   （它钉的页面不在宿主里了）。
@@ -712,7 +712,7 @@ pnpm run install-plugin --verify [--json]
 - **渲染实测**（headless Chrome 挂真实组件 + 打桩 fetch，五个分区各渲染一份）：
   五分区全部 `渲染=ok`，`table` 3 张、`[role=tab]` 25 个（5 分区 × 5 标签）、
   变更明细 `private → org` 真的画出来了、分页文案 `第 1 / 3 页` 与 `共 120 条` 正确；用户列解析为 `张三` / `zhang@example.com · #1`（无显示名时退回邮箱 `li@example.com` / `#2`），查不到的 id 显示 `#404` + 「不在当前成员列表（可能已退出或被删除）」，匿名显示「（匿名）」+「无用户身份」—— 三种「解析不出来」互相可区分。
-  产物 `client.js` **41.35 kB / gzip 9.90 kB**、`client.css` **5.33 kB**（加入用户目录后的最终读数）。
+  产物 `client.js` **42.59 kB / gzip 10.12 kB**、`client.css` **6.15 kB**（加入用户目录与操作者筛选后的最终读数）。
 
 #### 用户定位（追加一问：「方便定位用户」）
 
@@ -748,8 +748,33 @@ pnpm run install-plugin --verify [--json]
 
 - 落成插件后 `@geewiki/ops` **可以被停用**。这是「万物皆插件」的应有之义，但也意味着
   "停用之后就没地方看审计了"。（用户明确表示这一条不用管。）
-- 审计端点**没有按操作者筛选**的参数（只有 `view/action/targetKind/targetId/since/until/limit/offset`），
-  故"看某个人做过什么"目前只能翻页找。那是一次后端契约变更，留作显式决定。
+- ~~审计端点没有按操作者筛选的参数~~ —— **用户已确认要加，本轮已落地**，见下。
+
+#### 按操作者收窄审计（追加一问：「看某个人做过什么」）
+
+- **后端**：`/api/admin/audit` 新增 `actorId` 查询参数。两种形态，且**都**是真实存在的排查需求：
+  非负整数 ⇒ `actor_id = ?`；字面量 `anonymous` ⇒ **`actor_id IS NULL`**。
+  后者不能靠"传一个不存在的 id"代替 —— 匿名行的 `actor_id` 是 NULL，`actor_id = 0`
+  在 SQL 三值逻辑下匹配不到任何行，而**那看起来像"这个人没做过任何事"**。
+  非法值**显式 400**（`invalid_actor_id`），不静默忽略：静默忽略会让"我筛了但结果还是全部"
+  被读成"这个人做了这么多事" —— 一个**错误结论**，而不是"少了过滤"。
+- **查询语义抽成纯函数** `packages/plugin-authz/src/audit-query.ts` 的 `planAuditQuery()`
+  （零 import，白名单由调用方传值进来）。抽出来的理由**不是"为了测试"**，而是这段逻辑的
+  风险全在三个**静默**错法上：WHERE 与 `params` 是两条靠 push 先后对齐的平行列表（错位不报错，
+  只是把 `since` 拿去比 `action` 然后返回空集）、匿名的 NULL、非法值静默忽略 ——
+  三者症状都是"返回空集"，而空集在这里读起来就是"没有这类事件"。
+  抽成纯函数后这四条都能在 node 里逐条断言，不必起数据库、造会话、发 HTTP。
+- **前端**：审计表每一行的操作者列多一个**「只看 TA」/「只看匿名」**入口（这正是
+  "看懂是谁 → 看他做过什么"的自然动线，比让人手输一个 id 现实得多）；筛选条上显示
+  **「只看：张三 ✕」** —— 筛选后那些行本身就不在页面上了，不留标记用户会以为"库里的记录变少了"。
+  标签走 `actorFilterLabel()`，用 `resolveUser` 解析成人名而不是 `#12`。
+
+**验证**：`packages/plugin-authz/test/audit-query.test.ts` 16 例（每个用例都断言
+"占位符数 == 参数数"，那是唯一能自动发现参数错位的判据）；插件侧 4 例；
+渲染实测（headless Chrome，点击第一行的「只看 TA」）——
+首请求 `/api/admin/audit?view=security&limit=50&offset=0`，
+点击后 `/api/admin/audit?view=security&actorId=1&limit=50&offset=0`，
+筛选条显示「只看：张三」。
 
 
 ---

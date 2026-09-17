@@ -265,20 +265,60 @@ export function cacheVerdict(r: CachePlanResponse): Verdict {
 
 /* ============================== 查询串与分页 ============================== */
 
+/**
+ * 按操作者收窄：
+ *   · 一个非负整数 ⇒ 某个具体的人；
+ *   · `'anonymous'` ⇒ **匿名**的那一批（`actor_id IS NULL`）；
+ *   · `null` ⇒ 不限。
+ *
+ * 匿名不能用一个"不存在的 id"代替：匿名行的 `actor_id` 是 NULL，而
+ * `actor_id = 0` 在 SQL 三值逻辑下匹配不到任何行 —— 那看起来像"这个人没做过任何事"。
+ */
+export type AuditActorFilter = number | 'anonymous' | null
+
 export interface AuditFilters {
   readonly action: string
   readonly targetKind: string
   readonly since: string
   readonly until: string
+  readonly actorId: AuditActorFilter
 }
 
-export const EMPTY_AUDIT_FILTERS: AuditFilters = { action: '', targetKind: '', since: '', until: '' }
+export const EMPTY_AUDIT_FILTERS: AuditFilters = {
+  action: '',
+  targetKind: '',
+  since: '',
+  until: '',
+  actorId: null,
+}
 
 /** 每页条数。50 与后端 `limit` 的缺省口径一致 */
 export const AUDIT_PAGE_SIZE = 50
 
 export function hasAuditFilters(f: AuditFilters): boolean {
-  return f.action.trim() !== '' || f.targetKind.trim() !== '' || f.since !== '' || f.until !== ''
+  return (
+    f.action.trim() !== '' ||
+    f.targetKind.trim() !== '' ||
+    f.since !== '' ||
+    f.until !== '' ||
+    f.actorId !== null
+  )
+}
+
+/**
+ * 操作者筛选的显示文案。
+ *
+ * 用 `resolveUser` 而不是直接打 `#12`：筛选条上只写 `#12` 的话，用户在点下"只看 TA"
+ * 之后仍然不知道自己筛的是谁 —— 而这一整条功能存在的理由就是"看懂是谁"。解析不出来
+ * 时 `resolveUser` 会退回 `#id`，那是如实的。
+ */
+export function actorFilterLabel(
+  actorId: AuditActorFilter,
+  index: ReadonlyMap<number, MemberEntry>,
+): string {
+  if (actorId === null) return ''
+  if (actorId === 'anonymous') return '（匿名）'
+  return resolveUser(actorId, index).name
 }
 
 /**
@@ -299,6 +339,9 @@ export function auditQuery(
   for (const key of ['action', 'targetKind', 'since', 'until'] as const) {
     const v = filters[key].trim()
     if (v !== '') q.set(key, v)
+  }
+  if (filters.actorId !== null) {
+    q.set('actorId', filters.actorId === 'anonymous' ? 'anonymous' : String(filters.actorId))
   }
   q.set('limit', String(limit))
   q.set('offset', String(Math.max(0, offset)))

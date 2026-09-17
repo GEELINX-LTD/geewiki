@@ -9,6 +9,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  actorFilterLabel,
   AUDIT_PAGE_SIZE,
   buildUserIndex,
   auditQuery,
@@ -16,6 +17,7 @@ import {
   cacheVerdict,
   changedFields,
   clampPage,
+  EMPTY_AUDIT_FILTERS,
   formatTime,
   hasAuditFilters,
   pageCount,
@@ -34,7 +36,7 @@ import {
 /* ============================== 查询串 ============================== */
 
 test('auditQuery：view 恒在，筛选值去空白，空值不写进查询串', () => {
-  const q = new URLSearchParams(auditQuery('security', { action: '  page.visibility  ', targetKind: '', since: '', until: '' }, 0))
+  const q = new URLSearchParams(auditQuery('security', { ...EMPTY_AUDIT_FILTERS, action: '  page.visibility  ' }, 0))
   assert.equal(q.get('view'), 'security')
   assert.equal(q.get('action'), 'page.visibility', '首尾空白必须去掉：带空白的动作名在服务端是精确匹配，会恒不命中')
   assert.equal(q.has('targetKind'), false, '空筛选不得写进查询串（服务端会把它当成一个真的筛选条件）')
@@ -43,13 +45,13 @@ test('auditQuery：view 恒在，筛选值去空白，空值不写进查询串',
 })
 
 test('auditQuery：offset 不接受负数', () => {
-  const q = new URLSearchParams(auditQuery('acl', { action: '', targetKind: '', since: '', until: '' }, -5))
+  const q = new URLSearchParams(auditQuery('acl', EMPTY_AUDIT_FILTERS, -5))
   assert.equal(q.get('offset'), '0')
 })
 
 test('hasAuditFilters：只有空白也算没有筛选', () => {
-  assert.equal(hasAuditFilters({ action: '   ', targetKind: '', since: '', until: '' }), false)
-  assert.equal(hasAuditFilters({ action: '', targetKind: 'page', since: '', until: '' }), true)
+  assert.equal(hasAuditFilters({ ...EMPTY_AUDIT_FILTERS, action: '   ' }), false)
+  assert.equal(hasAuditFilters({ ...EMPTY_AUDIT_FILTERS, targetKind: 'page' }), true)
 })
 
 test('分页：pageCount 至少 1 页；clampPage 把越界页码夹回来', () => {
@@ -270,4 +272,36 @@ test('清缓存指引：建议清 ⇒ warn；否则 ok', () => {
   const rec = cacheVerdict({ ...base, purgeRecommended: true, targets: ['/api/wiki/*'] })
   assert.equal(rec.level, 'warn')
   assert.ok(rec.lines.some((l) => l.includes('/api/wiki/*')))
+})
+
+test('★ actorId 筛选：数字 / anonymous / null 三种形态各自生成正确的查询串', () => {
+  const withActor = new URLSearchParams(
+    auditQuery('security', { ...EMPTY_AUDIT_FILTERS, actorId: 12 }, 0),
+  )
+  assert.equal(withActor.get('actorId'), '12')
+
+  const anon = new URLSearchParams(auditQuery('security', { ...EMPTY_AUDIT_FILTERS, actorId: 'anonymous' }, 0))
+  assert.equal(
+    anon.get('actorId'),
+    'anonymous',
+    '匿名要走字面量：服务端据此生成 `actor_id IS NULL`，而"传一个不存在的 id"在 SQL 三值逻辑下恒不命中，' +
+      '看起来像"这个人没做过任何事"',
+  )
+
+  const none = new URLSearchParams(auditQuery('security', EMPTY_AUDIT_FILTERS, 0))
+  assert.equal(none.has('actorId'), false, '不限时不得写进查询串')
+})
+
+test('hasAuditFilters：只有操作者筛选也算"有筛选"（否则清除按钮会是灰的，筛完清不掉）', () => {
+  assert.equal(hasAuditFilters({ ...EMPTY_AUDIT_FILTERS, actorId: 3 }), true)
+  assert.equal(hasAuditFilters({ ...EMPTY_AUDIT_FILTERS, actorId: 'anonymous' }), true)
+  assert.equal(hasAuditFilters(EMPTY_AUDIT_FILTERS), false)
+})
+
+test('actorFilterLabel：筛选条上显示的是"谁"，不是 #12', () => {
+  const index = buildUserIndex([member()])
+  assert.equal(actorFilterLabel(12, index), '张三')
+  assert.equal(actorFilterLabel(99, index), '#99', '解析不出来时退回 #id（如实，不编造）')
+  assert.equal(actorFilterLabel('anonymous', index), '（匿名）')
+  assert.equal(actorFilterLabel(null, index), '')
 })
