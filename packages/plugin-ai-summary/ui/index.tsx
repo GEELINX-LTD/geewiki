@@ -184,14 +184,6 @@ export function SummaryCard(props: ArticleSummarySlotProps): ReactNode {
             已过期
           </span>
         )}
-        {view.audience === 'public' && (
-          /*
-           * 只在**公开档**标注一句：组织内页面的读者都是成员，说"公开部分"是噪音；
-           * 而公开页若含受限段落，摘要只覆盖公开的那部分——读者有权知道这一点
-           * （否则他会以为整篇就讲了这么多）。
-           */
-          <span className="gw-summary-note">仅公开部分</span>
-        )}
         {/*
           折叠态的一行预览。**它不重复摘要正文的排版**：这里是纯文本、单行、截断，
           目的是让读者判断值不值得展开，而不是让他在这里读完。
@@ -214,6 +206,21 @@ export function SummaryCard(props: ArticleSummarySlotProps): ReactNode {
             <span className="gw-summary-meta">
               {view.generatedAt === null ? '' : `${view.generatedAt.slice(0, 10)} 由 AI 生成`}
             </span>
+          )}
+          {view.audience === 'public' && (
+            /*
+             * 2026-09-17 用户原话：「把摘要的 仅公开部分 字样放到 由AI生成 的后面」。
+             *
+             * 这句话搬过一次家：原先在**折叠态**的 head 里（紧跟「摘要」/「已过期」），现在在
+             * 展开态的脚注里、紧跟「… 由 AI 生成」。代价要如实说：**折叠态不再提这件事**，
+             * 只有展开后才看得到这句限定。
+             *
+             * 语义没变，也没有放宽：只在**公开档**标注——组织内页面的读者都是成员，说
+             * "公开部分"是噪音；而公开页若含受限段落，摘要只覆盖公开的那部分，读者有权知道
+             * （否则他会以为整篇就讲了这么多）。所以它**不塞进上面的三元分支**：重新生成
+             * 失败（`err` 占了那一格）时这句限定仍然要在。
+             */
+            <span className="gw-summary-note">仅公开部分</span>
           )}
         </div>
       </div>
