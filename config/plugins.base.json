@@ -81,24 +81,6 @@
     },
     {
       "name": "@geewiki/ai-admin"
-    },
-    {
-      "name": "@geewiki/oidc",
-      "config": {
-        "issuer": "https://idp.example.test",
-        "clientId": "demo-client",
-        "clientSecretEnv": "",
-        "scopes": [
-          "openid",
-          "email",
-          "profile"
-        ],
-        "redirectUri": "http://127.0.0.1:3000/api/auth/oidc/callback",
-        "providerId": "oidc",
-        "label": "企业 SSO",
-        "timeoutMs": 10000,
-        "probeIntervalSeconds": 60
-      }
     }
   ]
 }
