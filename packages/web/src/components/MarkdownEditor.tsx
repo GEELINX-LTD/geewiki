@@ -124,7 +124,17 @@ const baseTheme = EditorView.theme({
   },
   '.cm-content': {
     fontFamily: 'var(--gw-font-mono)',
-    padding: '10px 0',
+    /*
+     * ★ 水平内边距**不能是 0**。
+     *
+     * 这里曾是 `padding: '10px 0'`，看着没事是因为**源码模式有行号栏**
+     * （`lineNumbers()` 只在 source 模式加载，见下方 modeExtensions）—— 行号栏
+     * 顺带充当了左边距。而**实时渲染模式没有行号栏**，于是正文直接贴住编辑器边框，
+     * 且从源码切过去时整块向左跳了整整一个行号栏的宽度。用户报的"缩进很奇怪"就是它。
+     *
+     * 给一个**两种模式都有**的基础内缩，右边距同时解决"正文贴住右边框"。
+     */
+    padding: '10px 16px',
     caretColor: 'var(--gw-accent)',
     lineHeight: '1.6',
   },
