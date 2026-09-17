@@ -42,6 +42,7 @@ import { AccountPage } from './pages/AccountPage'
 import { DeniedPage } from './pages/DeniedPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 import { LoginPage } from './pages/LoginPage'
+import { InvitePage } from './pages/InvitePage'
 import { SetupPage } from './pages/SetupPage'
 import { WikiPage } from './pages/WikiPage'
 import { logout, refreshCapabilitiesIfVisible, useAuth } from './lib/authStore'
@@ -286,7 +287,11 @@ const LEGACY_ROUTES: NavItem[] = [
  * 身份相关路由（P1）。它们**不进导航菜单** —— 由"需要登录"的实际动作把用户带到那里
  * （或顶栏的身份区），列在这里只是为了路由分派与文档标题。
  */
-const AUTH_ROUTES = ['login', 'setup', 'denied', 'account'] as const
+/*
+ * `invite` 与这几个同类：**未登录也要能到**（凭邀请码开户的人此刻还没有账号）。
+ * 放进这张表同时满足两件事：`known` 认它，以及它不落 `notfound`。
+ */
+const AUTH_ROUTES = ['login', 'setup', 'denied', 'account', 'invite'] as const
 
 function isAuthRoute(id: string): boolean {
   return (AUTH_ROUTES as readonly string[]).includes(id)
@@ -491,6 +496,12 @@ export function App(): ReactNode {
     body = <AccessPage sub={route.slice('access'.length).replace(/^\/+/, '')} onNavigate={nav} />
   // 组织与邀请管理（P5-B M4/M5）：独立首段 `#/org`，页面自己按 `administer` 门控
   else if (active === 'org') body = <OrgPage onNavigate={nav} />
+  else if (active === 'invite')
+    /*
+      邀请码在**路由首段之后**：`#/invite/<token>`。与 `access` 同款取法（独立首段，
+      否则 token 会被 `parseWikiRoute` 当成 slug 的一部分）。
+    */
+    body = <InvitePage token={route.slice('invite'.length).replace(/^\/+/, '')} />
   else if (active === 'login') body = <LoginPage />
   else if (active === 'setup') body = <SetupPage />
   else if (active === 'denied') body = <DeniedPage />

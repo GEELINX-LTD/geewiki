@@ -171,10 +171,16 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 /** 邮箱输入的服务端上限（`EMAIL_MAX`），前端与它一致。 */
 export const EMAIL_MAX = 254
 
-/** 校验邀请邮箱：空 / 格式不合法 / 过长 ⇒ 中文提示，合法 ⇒ `null`。 */
-export function emailError(raw: string): string | null {
+/**
+ * 校验邮箱：空 / 格式不合法 / 过长 ⇒ 中文提示，合法 ⇒ `null`。
+ *
+ * `emptyMessage` 可覆盖"空值"那句：同一个规则在不同场景要不同的话 ——
+ * 管理员签发邀请时是「请填写**受邀人**的邮箱」，而被邀请人自己开户时填的是**自己**的邮箱
+ * （见 `pages/InvitePage.tsx`）。**规则只有这一份**，只有文案按场景变。
+ */
+export function emailError(raw: string, emptyMessage = '请填写受邀人的邮箱'): string | null {
   const v = raw.trim()
-  if (v === '') return '请填写受邀人的邮箱'
+  if (v === '') return emptyMessage
   if (!EMAIL_RE.test(v.toLowerCase())) return '邮箱格式不合法（例如 someone@example.com）'
   if (v.length > EMAIL_MAX) return `邮箱过长（上限 ${EMAIL_MAX} 字符）`
   return null

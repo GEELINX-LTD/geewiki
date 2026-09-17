@@ -482,7 +482,21 @@ test('0002 迁移：建出排序索引、可重复执行（幂等）、且与查
     //     生产幂等性由 `_migrations` 控制器提供（已应用的文件不再执行），
     //     所以这里**把这个限制钉死**：第一次必须成功，第二次必须抛
     //     `duplicate column name` —— 哪天有人误以为它能重放，这条断言会红。
-    const isReplayable = (sql: string) => !/\bADD\s+COLUMN\b/i.test(sql)
+    /*
+     * ★ 分类必须跑在**剥掉注释之后**的文本上。
+     *
+     * 这是本仓反复踩到的同一类坑（第 7 次）：解释"为什么这个迁移不可重放"的注释里
+     * **必然**会写出那个字面量 —— `0022_invitation_open_code.sql` 的头注释就写了
+     * "（0012/0017/0019/0020 全是 ADD COLUMN）"。于是它被误判成不可重放，
+     * 进而在下面的 `assert.throws` 报 "Missing expected exception" ——
+     * 一个**纯粹由注释引起**的失败。
+     *
+     * 注意：只有**分类**用剥注释的文本；`db.exec` 仍然执行原文（注释是 SQL 的一部分，
+     * 但 SQLite 会忽略它，剥不剥都一样）。
+     */
+    const stripComments = (sql: string): string =>
+      sql.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+    const isReplayable = (sql: string) => !/\bADD\s+COLUMN\b/i.test(stripComments(sql))
     for (const m of migrations) db.exec(m.sql)
 
     for (const m of migrations.filter((x) => isReplayable(x.sql))) {

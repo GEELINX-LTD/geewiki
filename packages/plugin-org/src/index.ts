@@ -789,7 +789,8 @@ export const OrgPlugin = {
           if (!requireAdmin(h)) return
           const rows = await db.query<{
             id: string
-            email: string
+            /** `null` = 通用码（见 0022 迁移） */
+            email: string | null
             org_role: string | null
             group_id: number | null
             expires_at: string
@@ -828,10 +829,24 @@ export const OrgPlugin = {
           if (!requireAdmin(h)) return
           const body = await readBodyOr400(h)
           if (!body) return
-          const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
-          if (!EMAIL_RE.test(email) || email.length > EMAIL_MAX) {
-            h.json(400, { ok: false, error: 'invalid_email', message: '邮箱格式不合法' })
-            return
+          /*
+           * `email` **可选**（2026-09-17 起）：
+           *   · 不传 / 空串 ⇒ **通用码**，落库为 NULL —— 持码者注册时自填邮箱；
+           *   · 传了 ⇒ **定向码**，注册时填的邮箱必须与它相等。
+           *
+           * ★ 定向码这一半**不是兼容包袱**：OIDC 的 `invite_only` 闸门是
+           * **按邮箱查这张表**的（`@geewiki/auth` 的 `hasUnconsumedInvite(email)`）。
+           * 把 email 整列删掉会让"OIDC 首次登录要不要放行"失去判据 —— 所以它保留，
+           * 只是不再是必填。（OIDC 那条路本轮**一行不改**。）
+           */
+          const rawEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
+          let email: string | null = null
+          if (rawEmail !== '') {
+            if (!EMAIL_RE.test(rawEmail) || rawEmail.length > EMAIL_MAX) {
+              h.json(400, { ok: false, error: 'invalid_email', message: '邮箱格式不合法' })
+              return
+            }
+            email = rawEmail
           }
           /*
            * `orgRole` 缺省 / null ⇒ **guest 通道**（入伙但不给组织角色）。这不是"最低档
@@ -1015,7 +1030,8 @@ export const OrgPlugin = {
 
     interface InvitationRow {
       id: string
-      email: string
+      /** `null` = **通用码**（持码者注册时自填邮箱）；非 null = 定向码（邮箱必须相等） */
+      email: string | null
       org_role: string | null
       group_id: number | null
       expires_at: string
@@ -1123,10 +1139,14 @@ export const OrgPlugin = {
           ])
           const myEmail = users[0]?.email?.toLowerCase()
           /*
-           * **必须邮箱一致**：邀请是发给某个邮箱的；凭一个被转发的令牌让任意登录用户
-           * 入伙，等于把"发给谁"这个决策作废。失败关闭 —— 拿不到自己的邮箱也拒绝。
+           * **定向码必须邮箱一致**：它是发给某个邮箱的，凭一个被转发的令牌让任意登录用户
+           * 入伙等于把"发给谁"这个决策作废。失败关闭 —— 拿不到自己的邮箱也拒绝。
+           *
+           * ★ 通用码（`invite.email === null`）**不做这一比**：它本来就不限定人，
+           * 唯一的凭据是那个 256 位熵的令牌本身。这是 2026-09-17 起的新语义
+           * （见 0022 迁移），不是放宽 —— 通用码的防滥用靠"一次性 + 7 天 + 可随时吊销"。
            */
-          if (!myEmail || myEmail !== invite.email.toLowerCase()) {
+          if (invite.email !== null && (!myEmail || myEmail !== invite.email.toLowerCase())) {
             h.json(403, {
               ok: false,
               error: 'email_mismatch',
@@ -1160,9 +1180,13 @@ export const OrgPlugin = {
      * 要求登录才能接受邀请会让这条路径永远不可达。
      *
      * **它为什么不是"开放注册"**：必须先出示一个 256 位熵（`randomBytes(32)`）、
-     * 未过期、未消费的邀请令牌；而**邮箱取自邀请本身**，注册者无法自选
-     * （自选邮箱会让"邀请发给谁"这个决策形同虚设）。令牌的传递是带外的（管理员
-     * 自己发出去），与"用邮件里的链接注册"是同一个信任模型。
+     * 未过期、未消费的邀请令牌。令牌的传递是带外的（管理员自己发出去），
+     * 与"用邮件里的链接注册"是同一个信任模型。
+     *
+     * ★ **2026-09-17 起邮箱由注册者自选**（原先取自邀请本身）。邀请码因此分两种
+     * （见 0022 迁移）：定向码仍限定邮箱（必须一致），通用码不限定 ——
+     * 后者是默认形态，因为"登录标识符"是账号最私人的属性，不该由管理员代填。
+     * 防滥用改为依赖"一次性 + 有效期 + 可随时吊销"，而不是"码只发给某个人"。
      *
      * 开户成功后**不在本端点里建会话**：客户端拿用户自己刚设的口令去调
      * `/api/auth/login` 即可 —— 会话的建立属于身份域，绕开它去手搓 cookie
@@ -1177,6 +1201,11 @@ export const OrgPlugin = {
           if (!body) return
           const token = typeof body.token === 'string' ? body.token.trim() : ''
           const password = typeof body.password === 'string' ? body.password : ''
+          /*
+           * 注册时自填的邮箱（**通用码必填**，定向码可选且必须与邀请一致）。
+           * 格式校验交给 auth-service（身份域的规则只有一份实现，见下面的注释）。
+           */
+          const bodyEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
           if (token.length === 0) {
             h.json(400, { ok: false, error: 'invalid_token', message: '缺少邀请令牌' })
             return
@@ -1201,7 +1230,31 @@ export const OrgPlugin = {
             })
             return
           }
-          const email = invite.email.toLowerCase()
+          /*
+           * 确定本次开户用的邮箱。两条分支的取舍：
+           *   · 定向码 ⇒ **以邀请里的邮箱为准**（客户端可以不传，行为与 0022 之前完全一致）；
+           *     但若客户端传了一个**不同的**邮箱，直接拒绝 —— 不静默用邀请里那个，
+           *     否则用户会以为"我注册成了 alice@b.com"，实际是邀请里的 alice@a.com。
+           *   · 通用码 ⇒ 必须由客户端给出邮箱；没给就明确报错，而不是编一个。
+           */
+          let email: string
+          if (invite.email !== null) {
+            if (bodyEmail !== '' && bodyEmail !== invite.email.toLowerCase()) {
+              h.json(403, {
+                ok: false,
+                error: 'email_mismatch',
+                message: '该邀请码是发给另一个邮箱的',
+              })
+              return
+            }
+            email = invite.email.toLowerCase()
+          } else {
+            if (bodyEmail === '') {
+              h.json(400, { ok: false, error: 'email_required', message: '请填写邮箱' })
+              return
+            }
+            email = bodyEmail
+          }
           const displayName =
             typeof body.displayName === 'string' && body.displayName.trim().length > 0
               ? body.displayName.trim()
@@ -1217,7 +1270,7 @@ export const OrgPlugin = {
               })
               return
             }
-            h.json(400, { ok: false, error: created.error, message: created.error === 'invalid_email' ? '邀请里的邮箱格式不合法' : '口令长度不合法' })
+            h.json(400, { ok: false, error: created.error, message: created.error === 'invalid_email' ? '邮箱格式不合法' : '口令长度不合法' })
             return
           }
 

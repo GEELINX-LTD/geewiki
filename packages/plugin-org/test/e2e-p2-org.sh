@@ -101,6 +101,16 @@ check "C3 GET /api/org/invitations" 200 "$(req "$JAR" GET /api/org/invitations)"
 check "C3b ★ 列表里没有任何令牌字段" "" "$(node -e "const o=require('$TMP/body.json');console.log(o.invitations.map(i=>Object.keys(i).filter(k=>/token/i.test(k)).join(',')).join(''))")"
 
 echo
+echo "=== C4. 通用码：不绑定邮箱（持码者自填） ==="
+check "C4 签发通用码（不传 email）" 201 "$(req "$JAR" POST /api/org/invitations '{"orgRole":"member"}')"
+OPEN_A=$(field token)
+check "C4b ★ 通用码的 email 落库为 null（不是空串）" "null" "$(node -e "const o=require('$TMP/body.json');console.log(o.invitation.email===null?'null':JSON.stringify(o.invitation.email))")"
+check "C5 再签一个通用码" 201 "$(req "$JAR" POST /api/org/invitations '{"orgRole":"member"}')"
+OPEN_B=$(field token)
+check "C6 非法邮箱仍被拒（可选项不等于不校验）" 400 "$(req "$JAR" POST /api/org/invitations '{"email":"not-an-email","orgRole":"member"}')"
+check "C6b 错误码" "invalid_email" "$(field error)"
+
+echo
 echo "=== D. 凭邀请自助开户（匿名，这是新用户唯一的入口） ==="
 check "D1 错误令牌 → 400 且文案统一" 400 "$(req_raw POST /api/org/invitations/redeem '{"token":"bogus","password":"memberpass123"}')"
 check "D1b 错误码" "invalid_invitation" "$(field error)"
@@ -110,14 +120,34 @@ check "D2b 入伙角色为 member" "member" "$(field orgRole)"
 check "D3 同一令牌**不能**二次使用" 400 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$TOKEN\",\"password\":\"another123\"}")"
 
 echo
+echo "=== D4. 通用码：注册者自选邮箱 + 用户名 ==="
+check "D4 ★ 通用码但不传邮箱 → 400（必须显式给出，不编一个）" 400 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$OPEN_A\",\"password\":\"selfpass12345\"}")"
+check "D4b 错误码 email_required" "email_required" "$(field error)"
+check "D5 ★ 通用码 + 自选邮箱 → 201" 201 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$OPEN_B\",\"email\":\"self@example.com\",\"password\":\"selfpass12345\",\"displayName\":\"自选\"}")"
+check "D5b 开户邮箱就是自选的那个" "self@example.com" "$(field email)"
+JAR3="$TMP/self.jar"
+check "D5c ★ 用自选邮箱能登录" 200 "$(req "$JAR3" POST /api/auth/login '{"email":"self@example.com","password":"selfpass12345"}')"
+check "D6 签发定向码（限定 bound@example.com）→ 201" 201 "$(req "$JAR" POST /api/org/invitations '{"email":"bound@example.com","orgRole":"member"}')"
+BOUND=$(field token)
+check "D6b ★ 定向码 + 另一个邮箱 → 403" 403 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$BOUND\",\"email\":\"someone-else@example.com\",\"password\":\"boundpass12345\"}")"
+check "D6c 错误码 email_mismatch" "email_mismatch" "$(field error)"
+check "D6d 定向码 + 正确邮箱 → 201" 201 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$BOUND\",\"email\":\"bound@example.com\",\"password\":\"boundpass12345\"}")"
+
+echo
 echo "=== E. 新成员登录后的主体语义 ==="
 check "E1 新成员登录" 200 "$(req "$JAR2" POST /api/auth/login '{"email":"member@example.com","password":"memberpass123"}')"
 check "E1b orgRole=member" "member" "$(field user.orgRole)"
 # login 的响应体里没有 capabilities（那是 state / me 的字段），必须另查一次
 check "E1c capabilities.editContent=true" "true" "$(reqfield "$JAR2" GET /api/auth/me 'capabilities.editContent')"
 check "E1d capabilities.administer=false" "false" "$(reqfield "$JAR2" GET /api/auth/me 'capabilities.administer')"
-check "E2 ★ member 过不了 access:'admin'" 403 "$(req "$JAR2" GET /api/org/members)"
-check "E2b 错误码 forbidden" "forbidden" "$(field error)"
+# ★ 2026-09-17 更正：本条原先断言 member GET /api/org/members → 403，**已经过时** ——
+#  该端点后来刻意放宽为 `access:'user'`（handler 里有注释：「让我选一个授权对象」，
+#  凡是能走到授权界面的人都该看得到）。断言没跟上，于是在本次改动之前就一直是红的
+#  （它不在 pnpm test 里，故没人发现）。改成断言它**真正的**语义：
+#  读得到列表，但过不了 admin **动作**。
+check "E2 ★ member 能读成员列表（access:'user'，用于选授权对象）" 200 "$(req "$JAR2" GET /api/org/members)"
+check "E2c ★ member 过不了 admin 动作（改别人的角色）" 403 "$(req "$JAR2" PUT "/api/org/members/$NEW_UID" '{"role":"viewer"}')"
+check "E2d 错误码 forbidden" "forbidden" "$(field error)"
 check "E3 ★ 组身份进了 Principal.groupIds" "$GROUP_ID" "$(reqfield "$JAR2" GET /api/org "me.groupIds.join(',')")"
 
 echo
@@ -142,13 +172,29 @@ check "G4 把真实成员加入新组（这次会真实变更）" 200 "$(req "$J
 check "G5 GET /api/org/groups 能看到两个组" "2" "$(reqfield "$JAR" GET /api/org/groups 'groups.length')"
 
 echo
+echo "=== I. 改资料（邮箱 / 用户名）—— 必须验当前口令 ==="
+check "I1 未登录 → 401" 401 "$(req_raw POST /api/auth/profile '{"currentPassword":"x","displayName":"y"}')"
+check "I2 ★ 当前口令错误 → 401（这正是防"被盗会话改登录标识符"的那道闸门）" 401 "$(req "$JAR2" POST /api/auth/profile '{"currentPassword":"wrong","displayName":"新名字"}')"
+check "I2b 错误码 invalid_credentials" "invalid_credentials" "$(field error)"
+check "I3 改成已被占用的邮箱 → 409" 409 "$(req "$JAR2" POST /api/auth/profile '{"currentPassword":"memberpass123","email":"owner@example.com"}')"
+check "I3b 错误码 email_taken" "email_taken" "$(field error)"
+check "I4 空内容 → 400" 400 "$(req "$JAR2" POST /api/auth/profile '{"currentPassword":"memberpass123"}')"
+check "I4b 错误码 nothing_to_update" "nothing_to_update" "$(field error)"
+check "I5 改显示名 → 200" 200 "$(req "$JAR2" POST /api/auth/profile '{"currentPassword":"memberpass123","displayName":"改名了"}')"
+check "I5b changed=true" "true" "$(field changed)"
+check "I5c 新显示名生效" "改名了" "$(reqfield "$JAR2" GET /api/auth/me 'user.displayName')"
+check "I6 改邮箱 → 200" 200 "$(req "$JAR2" POST /api/auth/profile '{"currentPassword":"memberpass123","email":"renamed@example.com"}')"
+check "I6b ★ 新邮箱能登录（登录标识符真的换了）" 200 "$(req "$TMP/renamed.jar" POST /api/auth/login '{"email":"renamed@example.com","password":"memberpass123"}')"
+check "I6c ★ 旧邮箱**不能**再登录" 401 "$(req_raw POST /api/auth/login '{"email":"member@example.com","password":"memberpass123"}')"
+
+echo
 echo "=== H. 审计留痕 ==="
 AUD=$(node -e "
 const D=require('$ROOT/packages/db-sqlite/node_modules/better-sqlite3');
 const db=new D('$TMP/data/geewiki.db',{readonly:true});
 const rows=db.prepare('select action, count(*) c from audit_log group by action order by action').all();
 for (const r of rows) console.error('      '+r.action+' x'+r.c);
-const need=['org.invitation.create','org.invitation.redeem','org.group.create','org.member.set_role','org.group.add_member'];
+const need=['org.invitation.create','org.invitation.redeem','org.group.create','org.member.set_role','org.group.add_member','user.profile.update'];
 const have=rows.map(r=>r.action);
 console.log(need.every(a=>have.includes(a))?'OK':'MISSING:'+need.filter(a=>!have.includes(a)).join(','));
 const leak=db.prepare(\"select count(*) c from audit_log where coalesce(after_json,'') like ? or coalesce(before_json,'') like ?\").get('%$TOKEN%','%$TOKEN%').c;
@@ -156,6 +202,19 @@ console.log('leak='+leak);
 ")
 check "H1 关键动作都有审计" "OK" "$(echo "$AUD" | head -1)"
 check "H2 ★ 审计里不含邀请令牌" "leak=0" "$(echo "$AUD" | tail -1)"
+
+# 身份变更的台账价值全在 before/after —— 只记"某人改了资料"等于没记
+PROF=$(node -e "
+const D=require('$ROOT/packages/db-sqlite/node_modules/better-sqlite3');
+const db=new D('$TMP/data/geewiki.db',{readonly:true});
+// 注意取**最后**一条：本轮有两次改资料（先只改显示名、再改邮箱），
+// 取第一条会拿到"只改显示名"那条，于是断言永远看不到邮箱变化。
+const r=db.prepare(\"select before_json b, after_json a from audit_log where action='user.profile.update' order by id desc limit 1\").get();
+const okB=!!r&&/member@example\.com/.test(r.b||'');
+const okA=!!r&&/renamed@example\.com/.test(r.a||'');
+console.log(okB&&okA?'OK':'BAD:'+(r?JSON.stringify(r).slice(0,120):'no-row'));
+")
+check "H3 ★ 改资料记了 before/after（能答出"改成了什么"）" "OK" "$PROF"
 
 echo
 echo "==================================="

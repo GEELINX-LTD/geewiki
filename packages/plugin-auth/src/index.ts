@@ -1466,6 +1466,144 @@ export const AuthPlugin = {
       ),
     )
 
+    /* ---------- POST /api/auth/profile（user）：改邮箱 / 显示名 ---------- */
+    /*
+     * ★ 为什么邮箱与显示名走**同一个**端点，而不是各开一个：
+     * 两者的准入条件必须完全一样（下一条），而"改邮箱要口令、改名字不要"这种差别
+     * 一旦拆开，就会在前端与后端各写一遍判据，迟早漏一处。合成一个动作之后，
+     * 这条规则只有一个形态。
+     *
+     * ★ **必须验当前口令**。邮箱是**登录标识符**，改它等于改"这个账号怎么被认出来"；
+     * 只凭一个会话 cookie 就能改的话，一个被盗的会话（或一台没锁屏的机器）就等于
+     * 账号接管 —— 攻击者把邮箱改成自己的，再走"忘记密码"那条路（若将来有）就完成了。
+     * 验证当前口令把这一步重新绑回"知道凭据的人"。
+     *
+     * ★ 改邮箱**不吊销其它会话**（与改口令那条不同）。两者对应的是不同的威胁：
+     * 改口令是"凭据可能已泄露"的应对，故必须把别人踢下线；改邮箱是可逆的展示层
+     * 归属变更，且已经要求了口令 —— 顺手把用户自己的其它设备全踢下线是净损失。
+     *
+     * ★ **OIDC 用户走不通这条路**（`no_local_credential`）：SSO 开户的账号没有
+     * `user_credentials` 行，因而没有可验证的当前口令。本轮**不动 OIDC**，
+     * 这条边界是刻意留着的 —— 处理它需要一个显式的产品决定（允许改显示名？
+     * 还是以 IdP 为准、这里干脆不给改？）。
+     */
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/auth/profile',
+        async (h) => {
+          const userId = h.principal?.userId ?? null
+          if (userId === null) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '需要登录' })
+            return
+          }
+          let body: Record<string, unknown>
+          try {
+            body = await readJsonBody(h)
+          } catch (err) {
+            const message = (err as Error).message
+            const [code = 'invalid_body'] = message.split(':')
+            h.json(code === 'payload_too_large' ? 413 : 400, { ok: false, error: code, message })
+            return
+          }
+          const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : ''
+          // 空串 = "这一项不改"（与"改成空"区分开：邮箱与显示名都不允许为空）
+          const rawEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
+          const rawDisplay = typeof body.displayName === 'string' ? body.displayName.trim() : ''
+          if (rawEmail === '' && rawDisplay === '') {
+            h.json(400, { ok: false, error: 'nothing_to_update', message: '没有要修改的内容' })
+            return
+          }
+          if (rawEmail !== '' && (!EMAIL_RE.test(rawEmail) || rawEmail.length > EMAIL_MAX)) {
+            h.json(400, { ok: false, error: 'invalid_email', message: '邮箱格式不合法' })
+            return
+          }
+          if (rawDisplay !== '' && rawDisplay.length > DISPLAY_NAME_MAX) {
+            h.json(400, { ok: false, error: 'invalid_display_name', message: '显示名过长' })
+            return
+          }
+
+          const credRows = await db.query<StoredCredential>(
+            'SELECT algo, params, salt, hash FROM user_credentials WHERE user_id = ?',
+            [userId],
+          )
+          const stored = credRows[0]
+          if (!stored) {
+            h.json(409, {
+              ok: false,
+              error: 'no_local_credential',
+              message: '该账号通过 SSO 登录，没有本地口令，暂不支持在这里修改资料',
+            })
+            return
+          }
+          if (!(await verifyPassword(currentPassword, stored))) {
+            h.json(401, { ok: false, error: 'invalid_credentials', message: '当前口令不正确' })
+            return
+          }
+
+          const current = await db.query<{ email: string; display_name: string }>(
+            'SELECT email, display_name FROM users WHERE id = ?',
+            [userId],
+          )
+          const row = current[0]
+          if (!row) {
+            h.json(401, { ok: false, error: 'unauthorized', message: '账号不存在' })
+            return
+          }
+          const nextEmail = rawEmail !== '' ? rawEmail : row.email
+          const nextDisplay = rawDisplay !== '' ? rawDisplay : row.display_name
+
+          /*
+           * 唯一性判据与 `idx_users_org_email`（0010）一致：**org_id + email**。
+           * 只在真的改了邮箱时查 —— 否则"只改显示名"会撞上自己那一行。
+           * 不靠捕获唯一索引冲突来报错：那样拿到的是驱动的错误串，翻不成一句人话。
+           */
+          if (nextEmail !== row.email) {
+            const dup = await db.query<{ id: number }>(
+              'SELECT id FROM users WHERE org_id = ? AND email = ? AND id <> ?',
+              [DEFAULT_ORG_ID, nextEmail, userId],
+            )
+            if (dup[0]) {
+              h.json(409, { ok: false, error: 'email_taken', message: '该邮箱已被占用' })
+              return
+            }
+          }
+
+          if (nextEmail === row.email && nextDisplay === row.display_name) {
+            // 没有任何字段真的变了：如实返回"没变"，不写一条空审计
+            h.json(200, { ok: true, changed: false, user: { id: userId, email: row.email, displayName: row.display_name } })
+            return
+          }
+
+          await db.run('UPDATE users SET email = ?, display_name = ? WHERE id = ?', [
+            nextEmail,
+            nextDisplay,
+            userId,
+          ])
+          /*
+           * `before` / `after` 都写全：审计页会把它们渲染成「改成了什么」的差异
+           * （`changedFields`）。身份变更的台账价值全在这里 —— 只记"某人改了资料"
+           * 等于没记。
+           */
+          audit({
+            action: 'user.profile.update',
+            targetKind: 'user',
+            targetId: String(userId),
+            actorId: userId,
+            actorIpHash: auditIpHash(clientIp(h.req)),
+            before: { email: row.email, displayName: row.display_name },
+            after: { email: nextEmail, displayName: nextDisplay },
+          })
+          h.json(200, {
+            ok: true,
+            changed: true,
+            user: { id: userId, email: nextEmail, displayName: nextDisplay },
+          })
+        },
+        { access: 'user' },
+      ),
+    )
+
     /* ---------- GET /api/auth/identities（user） ---------- */
     cleanups.push(
       router.register(
