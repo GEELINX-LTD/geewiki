@@ -11,6 +11,22 @@
 **已合入：P0 / P1 / 文档 v7→v8 / P1.5 / P2（含 M5 全部四项）/ P3a / P3b / P3c / P3d / P4（含剩余四项）** —— 即设计文档 §8.1 阶段表里的**全部阶段，无遗留分支**。
 **设计文档已回写为 v8**：本轮把实现反馈的更正写进了 `access-control.md`（含一处**安全相关的方向性错误**订正、一条**新增的跨阶段不变量 §4.6**），见其 **§13.6**。
 
+### ★ 本批（工作树**未提交**，基线 `98b4618`）：权限入口归并 + 编辑器两模式
+
+> 上面那段"全部阶段已合入 `main`"是**历史结论**；本批是它**之后**的新改动，且**尚未提交**。接手者按本节读现状，
+> 设计侧的追加记录见 `access-control.md` 文末的「**追加：权限入口的归并（本批）**」。
+
+- **★ 编辑路径的正文口径改了（修的是一处权限事故，先读这条）**：编辑页此前拿到的是**投影后**的正文（受限段落变占位、`<!--gated:…-->` 标记被消费），"改一个标点再保存"会把段落标记写没 ⇒ **受限段落静默变公开**（实测复现：公开页 + org 受限段，保存后匿名访客读到该段全文）。修法：详情端点新增 **`GET /api/pages/:slug?content=raw`**（仅 `canEdit`；不可编辑者 **403 `raw_requires_edit`**；非法取值 **400 `invalid_content_mode`**；响应多一个 **`contentMode: 'raw'`** 自述口径），编辑页改用 `api.page(slug, { raw: true })`；客户端另有 `looksProjected()` 作为**第二道防线**（拦旧草稿：提示 + 保存前确认，两条出路）。设计侧详见 `access-control.md` 追加节 **§6**。
+- **独立「权限治理」页从导航移除**（桌面标签、窄屏菜单、命令面板都移除）：`packages/web/src/App.tsx` 的导航常量改名 **`LEGACY_ROUTES`**（唯一条目 `id: 'access'`，`requires: 'manageVisibility'`），但**仍在 `known` 路由集合里**。`#/access/<slug>` 仍存在、但**重定向**到 `#/wiki/<slug>?access=1`（阅读页的「权限」对话框）—— 落点**刻意不是编辑页**：那个对话框对**所有有 `manageVisibility` 的人**可用，包括**没有正文编辑权**的人。`#/access`（无 slug）改为一页说明；`packages/web/src/pages/AccessPage.tsx` 按此重写（**文件与导出名保留**）。
+- **编辑页改单栏**（`packages/web/src/pages/WikiPage.tsx` 的 `WikiEdit`）：原先与编辑区并排的预览面板去掉，预览改为「按访客视角预览」**对话框**。编辑器有**源码/实时渲染**两种模式与排版工具栏（见下条）。
+- **★ 同批末按作者要求收掉的两处界面**（改前请先读这条，别照着旧描述找控件）：① 编辑页底部的「权限」区**已整体移除** —— 页面档位的入口只有页面自己的「权限」对话框（那里同时有例外授予与访问申请，是一处完整的治理界面）；编辑页只保留页面档位的**只读**值（工具栏锁按钮要靠它提示"这一段不能比页面更宽"）。随之删掉的是 `PERMISSION_SECTION_LABEL_ID`、`grantsOpen`/`canManageVisibility` 状态，以及 `PageAccessPanel` 的 `sections` 属性（唯一使用者就是那个对话框）。② 权限对话框里的**块级分区**（`BlocksSection`）从面板移除 —— 段落档位在编辑器里改；`BlocksSection.tsx` 与块授权端点**都保留**（界面收起、能力不删），要恢复加回面板渲染即可。「权限」按钮的文案也从 `权限…` 改成 `权限`（不带省略号）。
+- **★ 同一回合内补回的功能缺口（重要：别以为"块级授权删干净了"）**：块级分区从权限面板移除后，**"授权给谁"一度没有任何界面**，而 `granted`（需单独授权）档的语义就是"默认谁都读不到、靠名单放人" ⇒ 那一档成了死档（作者设完，连他想给的同事也读不到）。现修：**授予与档位放在同一处** —— 编辑器工具栏锁菜单新增 **「授权给谁…」** → `packages/web/src/components/access/BlockGrantsDialog.tsx`，按 `ordinal` 换服务端块 id（`GET /api/pages/:slug/blocks`），增删走既有块授权端点。授予表单的唯一实现是 `packages/web/src/components/access/BlockGrantEditor.tsx`（对话框与 `BlocksSection` 共用）。两条契约后果已在界面里如实表达：块 id 只有**保存正文时**才生成（未保存的段落给的是"先保存正文，再继续授权"），未保存的改动会让**段落序号与上次保存的正文错位**（故对话框顶部显示该段摘要）。守卫 `packages/web/test/blockGrantsInEditor.test.ts`；端到端 `scripts/acceptance/editor-modes-cdp.mjs` 的 `L0a–L0e`。
+- **授权对象填什么（作者问过"所谓的 id 是什么"）**：`subjectId` 是数据库 id 字符串 —— 用户 = `users.id`，用户组 = `groups.id`（`packages/plugin-authz/src/index.ts` 逐字比对）。名单端点 `GET /api/org/members|groups` **原本要管理员**（授权只要 `manageVisibility` ⇒ 出现过"有权授权却看不到名单"的人）；**本批已按作者要求放宽为"任何登录用户可读"**（`{ access: 'user' }`），放宽边界：读名单登录即可，**写**（成员角色 / 邀请 / 建组 / 组的成员增删）与 `GET /api/org/invitations` **仍只有管理员**（守卫 `packages/plugin-org/test/memberDirectory.test.ts`；端到端以**普通成员 alice** 复核：`editor-modes-cdp.mjs` 的 O1–O4）。`packages/web/src/lib/subjectDirectory.ts` 用三态处理（可列名单 / 403 无权限 / 读取失败），能列名单时**给下拉选择**并把人名显示出来，不能列时手填并说明去哪儿看 id —— 三种情形界面都必须能走通，别把它做成"只有管理员能用"。
+- **编辑器两模式 + 排版工具栏**：**源码** / **实时渲染**（`packages/web/src/lib/editorModePlan.ts`，localStorage `gw.editor-mode.v1`，默认 `live`；就地渲染 `packages/web/src/components/editor/liveRender.ts`）；工具栏 `packages/web/src/components/editor/EditorToolbar.tsx`，格式动作是 `packages/web/src/lib/markdownActions.ts` 的纯函数（CodeMirror 路径与降级 `<textarea>` 共用）。**边界**：能渲染的是行内标记与图片，以及**整块**的表格 / 代码块 / 整块 HTML / 分隔线（见下条）；**段落内部的行内 HTML 标签仍按源码显示**；**实时渲染下不显示行号**；gated 标记不合法时**不做任何装饰**。
+- **★ 同批末按作者反馈补的（第二件）：页面「权限」对话框里的授权对象也能**下拉选人**了**（反馈原文「权限按钮进去那个页面的还不能下拉选择用户」）。根因是**修一处漏一处**：名单端点 `GET /api/org/members|groups` 放宽为"任何登录用户可读"（`{ access: 'user' }`）时，只有**编辑器**的授权表单改成了成员下拉，而**页面「权限」对话框 →「例外授予（页级）」**（`packages/web/src/components/access/GrantsSection.tsx`）仍是手填「对象 id」，旁边甚至还留着放宽之前的理由（"成员/组列表需要组织管理员权限，本页不拉取它"）。修法不是再改一遍那一处，而是**把字段本体抽成唯一实现** `packages/web/src/components/access/GrantTargetFields.tsx`（类别 / 授权对象 / 角色 / 到期 + 手填出口 + 三态说明），`BlockGrantEditor`（段落授权）与 `GrantsSection`（页面授权）**共用**它；同时这一页的成功回执与授权名单也从"用户 id 42"改成 `describeSubject()` 的**人名/组名**（原始 id 以 `#42` 留在后面便于核对）。`lib/subjectDirectory.ts` 的文件头同步改掉"名单是 admin-only"这条**已过期**的前提（放宽 ≠ 三态可以塌成两态：未登录、端点被改回 admin、读取失败仍会落到手填那一支）。**守卫**：源码级 `packages/web/test/blockGrantsInEditor.test.ts`（新增一例：页面级授权必须 `<GrantTargetFields>` + `directory={directory}` + `loadSubjectDirectory()` 只调一次 + "本页不拉取它"不得再出现在源码里）；浏览器端到端 `scripts/acceptance/editor-modes-cdp.mjs` 新增 **M3–M5**（`?access=1` 对话框里 `#page-grant-subject` 必须是 `SELECT`、选项形如 `演示管理员 —— admin@example.com`、选中后控件值是**数字 id**、字段标签是「授权给谁」）⇒ **41/41 通过**；截图 `data/verify/shots/08-page-grant-dropdown.png`。⚠️ 验收脚本里**别点**「添加授权」——那是提交按钮（`GrantsSection` 的表单常驻，没有展开这一步），点了会拿空 id 提交并留下一条校验错误。
+- **★ 同批末按作者反馈补的：实时渲染真的渲染块了**（反馈原文「当前实时预览部分无法渲染」，落点 `http://127.0.0.1:3100/#/wiki/home/edit`）。此前表格 / 代码块 / 原始 HTML **按源码显示**（只给底色）；现在 `Table` / `FencedCode` / `CodeBlock` / `HTMLBlock` / `HorizontalRule` 五类节点**整块换成渲染结果** —— 判据与范围对齐在 `packages/web/src/lib/liveRenderPlan.ts`（纯逻辑，`packages/web/test/liveRenderPlan.test.ts` 13 例），装饰在 `packages/web/src/components/editor/liveRender.ts`：内容走**阅读页同一条** `mdToHtml`（marked + DOMPurify）并套 `.md-body` 复用阅读页排版，**不另写一套表格渲染**（两条路径各画各的，实时渲染里看到的就不是发布稿了，而「看到发布稿」正是这个模式的目的）。**两条不可忘的实现约束**：① **必须是 `StateField` + `EditorView.decorations.from(field)`** —— CodeMirror 只允许**静态**装饰带块效果，插件路径连 `block: true` 都不许用（`@codemirror/view` 的 `emit()` 抛 `RangeError: Block decorations may not be specified via plugins`，判据是 facet 值 `typeof d === 'function'`）；**不要改回 `ViewPlugin.fromClass`**，改了是渲染表格时**直接抛异常**，不是「渲染不出来」。② **块装饰范围必须与行边界对齐**（`alignToLines()`），错开会吃掉相邻正文。**渲染块是只读投影**：点它 ⇒ `mousedown` 处理把光标送进这一块的源码，配合既有的「活动块显示源码」规则 ⇒ 渲染块消失、源码出现（编辑永远发生在源码上）；渲染块**落在受限区段里时会带上区段底纹类名**（整块被替换 ≠ 权限提示消失 —— 这是最危险的一条静默回归）。**顺带修掉三处行内漏网**：行内代码的反引号（`CodeMark`，只藏父节点是 `InlineCode` 的）、无序列表的 `-` / `*` / `+`（换成「•」；**有序列表的 `1.` 刻意不动** —— 那就是渲染后的样子）、任务列表的 `[ ]` / `[x]`（换成 ☐ / ☑）。**端到端**：`scripts/acceptance/editor-modes-cdp.mjs` 新增 **P0–P4**（这一页本身不含渲染块 → 在 org 区段里亲手打一个围栏代码块**和一张表格** → 断言 `pre>code` + `language-ts` 与真 `<table>`（3 行 / 2 表头）、围栏与 `| --- |` 都不再露出、渲染块带区段底纹 → 点击回源码 → **Ctrl+Z 一次撤回且区段原文完好**），**38/38 通过**；**本批读数（HEAD `98b4618` + 未提交工作树，取数 `2026-09-13T22:0x+08:00`）**：`pnpm typecheck` exit 0（17 包 Done、0 个 `error TS`）、`pnpm test` **1245/1245 通过 / 0 失败**、`pnpm build` exit 0、验收脚本 **38/38**。截图 `data/verify/shots/live-blocks2-architecture-table.png`、`live-blocks2-getting-started-code.png`、`live-blocks2-gated-code-block.png`，明细 `data/verify/editor-modes-cdp.out.json`。**仍未渲染**：段落内的行内 HTML 标签（有意，见上）。
+- **段落档位在编辑器里改，不是新端点**：工具栏锁按钮 / 源码模式手写标记改的是**正文里的 gated 标记**，改写走 `packages/web/src/lib/editorBlocks.ts`（`applyBlockTiers` 整篇重建 + 自检：块数、每块文本、每块档位三条对不上就**放弃改动**）；服务端保存时仍由 `packages/plugin-wiki/src/blocks.ts` 重新解析，**同一条保存路径、同一份版本历史**。`packages/web/src/components/access/BlocksSection.tsx` **仍无档位改动控件**（这是对的：块档位就是正文的一部分），文案改为把作者指向编辑器的锁按钮。
+
 ### ★ 合并后的验证基线（`main` = `ed2a3a9`，**由编排者实际复跑**）
 
 `pnpm typecheck` **exit 0（17 包全 Done）**；`pnpm test` **886 例 / 886 通过 / 0 失败**；`pnpm build` **exit 0**；
@@ -275,6 +291,9 @@ feat/p2-m5-frontend-ia              均已合入，worktree .wt-p0/.wt-p1/.wt-p1
   与"扇出整个失败"（永久泄漏）⇒ 遂有 `index_tiers_resync_failed` + 审计 `acl.resync_failed`。
   ⇒ **凡"计数为 0"的信号，都要问一句"0 是不是有两种含义"**。
 - **★ 不要给判定层加 TTL 缓存**（`acl_revision` 那条"代际失效"从未实现、也**不必**实现 —— 判定每请求现查库）。
+- **★ 遍历里"跳过"要用「整段落在里面」而不是「相交」，否则会在根节点上把整棵树截断**（本批实测，症状极具误导性）：`liveRender` 的树遍历对"已落在渲染块里"的节点 `return false`（含义是"不再往下走"），而判据若写成**相交**（`overlaps`），`Document` 根节点与任何渲染块都相交 ⇒ 根节点直接返回 false ⇒ **整棵树一个节点都走不到**。表现是"只要文里有一个渲染块，行内标记（`#`/`**`/反引号）就全部不再隐藏，而渲染块照常画出来"—— 看起来像另一套装饰坏了。正解：`isInsideCovered()`（`from >= c.from && to <= c.to`），并单独写一条注释说明它**不是** `isCovered` 的别名。
+- **★ 用状态行判断「有没有未保存改动」会骗人**（本批实测）：编辑页那句「有未保存的改动」在**草稿自动保存（900ms 防抖）之后会被换成「草稿已自动保存（…）」**，于是"脏"与"已保存"在文本上不可区分 —— 端到端里据此断言会得到假绿/假红。判据改成**看正文**（探针字符串在不在、原文有没有回来）。
+- **★ CDP 里发 ⌘Z 必须用 Ctrl（modifiers 2）**：CodeMirror 的 `Mod-` 在非 macOS 上就是 Ctrl，发 Meta 在 Linux 上**什么都不会发生**，而"撤销后正文没变"很容易被读成"符合预期"（`editor-modes-cdp.mjs` 的 H2 与 P4 两处都写着这条）。
   这条现在是**明文禁令**（见 `access-control.md` §9 R10 第 3 条与 §13.6 第 11 条）。
 
 ## 验证基线（复现用）
@@ -327,6 +346,10 @@ bash packages/plugin-authz/test/e2e-p4.sh                # 37/37
 > - `feat/m5b-redlink-tristate` @ `94006ee`（*"feat(web): 出链红链三态 —— 「存在但无权查看」不得渲染成「不存在」"*）⇒ 对应下面第 1 项；
 > - `feat/p4b-ops-ui` @ `aa59056`（*"feat(web): P4b-M4 审计与运维台面 —— 两类视图在界面上也分开"*）⇒ 对应下面第 5 项的**前端界面**部分。
 > **⇒ 动手前先 `git log`/`git branch` 确认这两项是否已合入，避免重复劳动。**
+>
+> **★ 本批追记（基线 `98b4618`，工作树未提交）**：本清单里"CodeMirror 内的标记语法高亮 / 自动补全"**仍未做**；
+> **`editor-toolbar-slots` 插件扩展点也仍未实现** —— 本批落地的排版工具栏是**宿主内置**的（由编辑页直接渲染，不是插件可贡献按钮的插槽），
+> 两者**不是一回事**（详见下面新增的那条）。
 
 - **M5 的红链三步态 `exists: 'hidden'`**（设计 §6.6 / §5.5 要求保留三步态以区分"不存在"与"存在但不可见"）—— 本批未实现
 - **P4 的反向展开**（"谁能看这条"：直接授予 / 祖先链收紧 / 组织角色覆盖三条来源）—— 设计 §8.1 P4 行有此项
@@ -335,6 +358,8 @@ bash packages/plugin-authz/test/e2e-p4.sh                # 37/37
 - **`invitations.expires_at` 的回收**（本轮只做了 `page_grants`；`invitations` 在 `packages/plugin-org`）
 - **前端界面**：审计页与会话管理页**都只有后端端点**，未接界面
 - **CodeMirror 内的标记语法高亮 / 自动补全**（标记的书写体验部分）
+- **`editor-toolbar-slots` 扩展点**（插件往编辑区贡献工具栏按钮）—— **仍未实现**。本批落地的**排版工具栏**是**宿主内置**的
+  （`packages/web/src/components/editor/EditorToolbar.tsx`，由编辑页直接渲染），**不是**这个插件插槽；两者不要混为一谈
 - 组织站点级设置接到界面
 
 ## 未验证项（诚实清单）

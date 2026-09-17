@@ -1224,6 +1224,24 @@ interface ContentView {
 3. **`gatedCount` 的正确用法**：它是"**存在但你看不到**"的唯一合法信号。`packages/plugin-ai/src/select.ts` 可据此产生一句**高层提示**："该问题的答案可能位于 3 个需要更高权限的内容块中。" —— **对权限不足的主体，只说"需要更高权限"，绝不透露块的内容、标题或计数以外的任何信息**；对匿名主体，`gatedCount > 0` **也不得出现**（否则等于确认存在受限内容），此时退化为"未在知识库中找到"。
 4. **`SearchHit` 增 `blocks` 字段**（块级命中定位）：`packages/plugin-search/src/index.ts:83-98` 的 `SearchHit { slug, title, content, ... }` 中 `content` 必须**删除**（它就是泄漏源），改为 `blocks: { ordinal, kind, text }[]` + `gatedCount`。**这是一处破坏性契约变更**：需 grep 全部消费方（`packages/web/src/lib/searchPlan.ts`、`packages/web/src/components/SearchView.tsx`、`packages/plugin-ai`）。
 
+
+> **修正（本批，2026-09-14）——AI 拆分为 `@geewiki/ai-assist` + `@geewiki/ai-qa` 后，本节的路径与一处契约形状需更正**（决策本身不变，改的是落点与一处更严的签名）。
+>
+> **① 上表的路径全部失效，按此更正**：`packages/plugin-ai/src/index.ts:438`（"唯一的生产调用点"）→ **`packages/plugin-ai-qa/src/index.ts:431`（召回）与 `:438-441`（取正文）**；`packages/plugin-ai/src/select.ts:41` / `:44` → **`packages/plugin-ai-qa/src/select.ts:79`（`selectSources()`）与 `:58`（`accumulateBlocks()`）**；`docs/plugin-platform-plan.md:642` 那一行也已改写（见该文件批次 G 的修正块）。
+>
+> **② `contents()` 的 `principal` 不是"可选参数"——本节的这条裁决被实现推翻，且是往更严的方向推翻。** 现签名 **`contents(principal: Principal, slugs: readonly string[]): Promise<ReadonlyMap<string, ContentView>>`**（`packages/plugin-search/src/index.ts:223`），`search` 同样以主体为首参（`:191`）。理由与本节自己的泄漏逻辑一致：**可选参数会把"忘传主体"变成一个静默的、只表现为"少给内容"的 bug**（可发现但难归因），而必填 + 运行期守卫**抛错而不是"当作匿名"**（`~:226-231` 的注释原话："当作匿名会静默少给内容（可发现），而'不过滤'会静默多给（不可发现且是安全事故）"）把这一类缺陷变成编译期报错 + 响亮失败。上表"省略 ⇒ 按匿名投影（失败关闭）"那一行因此作废：**没有"省略"这条路径了**。
+>
+> **③ `ContentView` 的形状已按本节落地**（`packages/plugin-search/src/index.ts:162-175`：`text` / `blocks` / `gatedCount` / `maxVisibleTier`，且注释明写 `maxVisibleTier` **仅诊断用**、判定一律走 `policy-service`）；约束 4 也已落地——**`SearchHit.content` 已删除**，改为 `blocks: readonly SearchBlockRef[]` + `gatedCount`（`:92-111`），且 `gatedCount` **对匿名主体恒为 0**（`:558` 附近：非 0 等于向匿名确认"这里存在你看不到的内容"，属存在性泄漏）。
+>
+> **④ 约束 2（分块必须块对齐）已落地**：`accumulateBlocks()`（`packages/plugin-ai-qa/src/select.ts:58-70`）**按整块累加、遇到预算不够就停**，绝不从块中间截断，因此"public 块与 org 块拼成一个 chunk 再截断"这条新泄漏面在结构上不成立。**唯一残余**：当**单块自身**就超预算时取该块前缀（`select.ts:68-69`）——切的是**同一块内部**，不跨可见性边界，故与本节约束不冲突，但值得记档。
+>
+> **⑤ 约束 1（`sources` 与答案同源）已落地**：问答只调一次 `contents()`，`sources` 与进上下文的文本都从**同一返回对象**派生（`selectFrom()` 走 `RetrievalStage` 的同一份 `contents`），无二次查询。
+>
+> **⑥ 约束 3（`gatedCount` 的合法用法）**：**信号已就位、下游尚未消费**。`selectSources()` 会汇总出 `Selection.gatedTotal`（`select.ts:42` 声明其语义、`:98` 累加），但**问答响应体与界面目前都不读它**——"答案可能位于 N 个需要更高权限的内容块中"这句高层提示**尚未接线**。已核实的部分是"不许泄漏"这一半（匿名一律 0，故不会出现存在性泄漏）；未落地的部分是"可以提示"这一半。⚠️ 登记为**待办**，不要当成已完成。
+>
+> **⑦ 新增一条本节的兄弟红线：辅助写作（`@geewiki/ai-assist`）根本不读正文，因此没有"RAG 泄漏面"可堵。** 它的上下文**只来自请求体**（前端从编辑器缓冲区取出的 `selection` / `before`，`packages/plugin-ai-assist/src/assist.ts` 文件头的硬规则 1），服务端**不查 `search-service`、不读 `pages` / `blocks`**——受限块"进入模型上下文"这件事在**代码路径层面**就不成立，比"记得按主体过滤"强一档（过滤会漏，路径不存在不会漏）。**`slug` 只用于一次编辑权限判定**：唯一消费点是 `assist.ts:233` 的 `deps.resolveEditAccess(principal, slug)`，接线在 `packages/plugin-ai-assist/src/index.ts:247-254`——`ctx.get('policy-service')` 取不到即 `return null`，经 `pageEditableFrom(null)` 判假 ⇒ **失败关闭 403**（`@geewiki/authz` 被卸载也放行不了）。判定顺序钉死为 **解析(400) → 有编辑能力(403) → 该页可编辑(403) → 降级投影(503) → 生成**；**权限在降级之前**是刻意的：否则"没配密钥"会退化成一条权限探测通道（无编辑权者能从响应差异里分辨"这个 slug 存不存在 / 我能不能问"）。**两处对设计契约的有意偏离**：(a) 匿名与"已登录但无编辑权"给**同一个 403**，不分 401——区分两者等于把响应变成"你是否已登录"的探测口，代价是契约里写的 401 在真实链路上不会出现；(b) 输入超长是 **400 `payload_too_large`**（`ASSIST_TEXT_MAX = 4000`，`assist.ts:46`、检查 `:153`、消息 `:158`），不是 413。**守卫是源码级的**（`packages/plugin-ai-assist/test/assist.test.ts`）：『守卫：assist.ts 不得出现任何"取正文/检索"的调用点』在剥掉注释与字符串的源码里禁止 `search-service` / `wiki-service` / `contents(` / `retrieve(` / `getPage(` / `readPage(` / `loadPage(` / `pageContent` / `FROM pages` / `page_versions` / `blocks_fts`，并反向自证 `resolveEditAccess` 与 `canEdit` 确实在场（防"整段被删空也算通过"）；第二条守卫用白名单正则约束**每一行出现 `slug` 的代码**，并断言 `resolveEditAccess(principal, slug)` 是 `slug` 的唯一消费点。**验收边界（别误读）**：`data/verify/ai-split-e2e/` 用的是 owner 会话，**不覆盖这条 403 线**（脚本注释明文：少了 `authz` 会按设计失败关闭 403，但那不是它要测的东西）——这条红线目前由上述两条源级守卫 + 行为用例守，**尚无 HTTP 层端到端用例**。
+
+
 ### 4.6 ★ v8 新增：跨阶段不变量 —— 写了 `pages` 的档位，就要补齐子孙 `tier`
 
 > **这一节为什么存在**：它与 §4.3 的 tier 方案是**同一件事的两半**，但**它是"跨阶段"的** ——
@@ -1338,6 +1356,20 @@ interface ContentView {
 `packages/plugin-ai/src/index.ts:419`（`ctx.get('search-service')`）、端点 `:879`（`POST /api/ai/ask`）、`:903`（GET 变体）、`:913`（`POST /api/ai/stream` SSE）
 **改法**：`ask`/`stream` 端点接受 `principal`；检索结果在**进入 prompt 之前**过滤；SSE 的 `sources` 帧只发可见条目的 `{slug,title}`；**`stream` 的鉴权必须在建立连接时完成**（`trackStream(res, owner)` 的 `owner` 是插件名 `packages/core/src/index.ts:591-611`，**不是鉴权**，不能复用）。
 
+
+> **修正（本批，2026-09-14）——本节的行号与包名全部失效，且"改法"三条已按更严的形态落地。**
+>
+> **① 落点更正**：`packages/plugin-ai/src/index.ts:419` / `:879` / `:903` / `:913` 随拆分失效（该目录已不存在）。现在是 **`@geewiki/ai-qa`**（`packages/plugin-ai-qa/src/index.ts`）：`POST /api/ai/ask` `:897`、`GET /api/ai/ask` `:922`、`POST /api/ai/stream` `:931`、`GET /api/ai/capabilities` `:939`；服务契约 `ask(principal, q, opts?)` 的 **`principal` 是必填首参**（`:204`，注释 `:201-202`："漏传在编译期即报错，运行期还会在 `retrieve` 里经 search-service 的守卫再兜一道"）。
+>
+> **② "检索结果在进入 prompt 之前过滤"落地为两层，且都在 SQL 层**：召回 `search.search(principal, query, { limit, mode: 'terms' })`（`:431`）+ 取正文 `search.contents(principal, hits.map(h => h.slug))`（`:438-441`）。**两层都必须带主体**——只过滤正文会泄漏"哪些 slug 存在"（命中列表本身），只过滤召回则 `contents()` 会把不可见页的正文交出来。`search-service` 侧的主体守卫**抛错而不是"当作匿名"**（`packages/plugin-search/src/index.ts:223` 附近），故"忘传主体"不可能静默通过。
+>
+> **③ "SSE 的鉴权必须在建立连接时完成"已落地**：流式路径在进入任何帧之前判 `h.principal`，缺失即 **普通 JSON `401 {ok:false,error:'unauthorized'}`**（`packages/plugin-ai-qa/src/index.ts:652-656`），且注释把两条理由都写在了那里——(a) 主体一次定下、整个流沿用，否则"连接建立后权限被撤销"会留下"流仍按旧权限推送"的窗口；(b) `trackStream(res, owner)` 的 `owner` 是**插件名**、用于在途排空，**不是鉴权**（该签名现在是 `trackStream?(res, owner?)`，`packages/core/src/index.ts:749`；本节旧文引的 `packages/core/src/index.ts:591-611` 已移位）。**所有前置判定一律在写 SSE 头之前以普通 JSON 返回**：实测缺模型时 `POST /api/ai/stream` 回 **503 + `content-type: application/json`、零事件帧**（`data/verify/ai-split-e2e/result-backend.json` 的 `A_stream`）；空 `q` 与未知字段是 400 JSON。
+>
+> **④ 状态码按原因二分**（本节与 §4.5 都没写过这条，实现期补上）：**503 = 前置条件不满足**（`model_unavailable` / `search_unavailable` / 辅助写作的 `unavailable`，**模型根本没被调用**）vs **502 = 上游真的失败**（`generation_failed` + `degraded.code`，实测 429 ⇒ `RATE_LIMIT`、上游 200 但零 token ⇒ `PROVIDER_ERROR`）。**"上游正常结束但一个字符都没给"判为失败**，判据是文本是否为空而不是 `usage.completionTokens`（用量字段可选）。检索 0 命中**仍不是错误**：`200 mode:'no-context'` + `answer:null` + 不调用模型。
+>
+> **⑤ `GET /api/ai/capabilities`（与辅助写作的 `GET /api/ai/assist/capabilities`）是 `access: 'public'`，其外发的模型路由信息必须脱敏——本批补上了这条守卫。** 两个端点注册时都用三参形式 ⇒ 默认 public（`packages/core/src/index.ts:501-504`："省略等价于 `{ access: 'public' }`"；注册点 `packages/plugin-ai-qa/src/index.ts:939`、`packages/plugin-ai-assist/src/index.ts:280`）。它们把 descriptor 的字段**直接抄给调用方**，而 **`label` / `model` 不是静态字面量**——`@geewiki/openai` 的 `model` 是对管理员所设值的**实时 getter**（`packages/plugin-openai/src/provider.ts:145`），于是外发的是"管理员在后台填进去的字符串"；只要某个适配器的 `label` 取自可配的 baseUrl，而该 URL 带 basic-auth（`https://user:sk-xxx@gateway/…` 是能工作的写法），密钥就会**匿名**出现在响应里。**修法在投影处、不在各端点里**：`listRouteInfos()` 的每个字段都过 `safeText() = redact()`（`packages/plugin-llm/src/availability.ts:59`，理由记在 `:29-45`），两个插件共用同一份。守卫：`packages/plugin-llm/test/degrade.test.ts:219`『listRouteInfos：label/model 里的形似密钥片段必须被脱敏（capabilities 是公开端点）』，断言 `info.label.includes('***')`（`:252`）。**为什么保留 public 而不是收紧为 admin**：前端要在未登录页给出"AI 能不能用"的可执行提示（"去模型接入填密钥" / "启用全文检索"），收紧会让内容浏览路径回归——这条裁决记在 `packages/manager/src/index.ts:1714-1720`。**顺带闭合本节 §5.11 的前端连带项（AI 这一条线）**：入口可用性不再探测 `GET /api/plugins` + 硬编码插件名（`WikiPage.tsx` 的 `stateOf('@geewiki/ai')` 已删），改读**入口表 + 插槽仲裁**（`pluginUiDeclaredFor()`，`packages/web/src/lib/pluginUi.ts:190`），故"收紧管理端点后普通用户页插件探测 403 ⇒ AI 按钮恒灰"这个连锁不再适用于 AI 入口。**仍开放**：其它仍按硬编码插件名探测的功能入口未一并改造。
+
+
 ### 5.8 图与导航
 `packages/web/src/components/Sidebar.tsx`（吃全量列表）、`packages/web/src/lib/navTree.ts`、`#/graph` → `GraphPage`
 **改法**：侧边栏与图均消费 `visibleSlugs` 的结果；`GraphPage` 若走 `/api/pages` 则自动受 §5.1 保护，需确认它没有第二条取数路径。
@@ -1357,6 +1389,8 @@ interface ContentView {
 `packages/manager/src/index.ts:1562`（`GET /api/plugins`）、`:1566`（graph）、`:1572`（slots）、`:1582`（ui）、`:1602`（session）、`:1603`（**enable**）、`:1617`/`:1626`（config 读写）、`:1638`（**replace**）、`:1652`（**disable**）、`:1662`（**session/persist**）
 **改法**：全部 `register(..., { access:'admin' })`；`POST enable/disable/replace` + `PUT config` + `persist` **额外**要求 `X-GW-CSRF` 头与 `Origin` 校验，并写审计（`actor/action/target/before/after`）。
 > **注意最容易漏的连带改动**：`GET /api/plugins` 被前端当作"插件是否 active"的探测源（`packages/web/src/pages/WikiPage.tsx:249-252`）。收紧为 admin 后**普通用户页面上的插件探测会 403** ⇒ 会出现"控制台一片红 + AI 按钮恒灰"。**必须同步改前端**（§8 的前端项）。
+
+> **落地后的两处偏离（本批核对，行号已整体位移）**：① 上面那串行号是设计时的快照，现管理端点整体后移（`GET /api/plugins` 在 `packages/manager/src/index.ts` 更靠后处，读端点里 **`GET /api/plugins/slots` 与 `GET /api/plugins/ui` 刻意保持 `access:'public'`** —— 它们是"这个界面有没有人渲染"的只读投影，收紧就会把公开内容页的入口判断一起打死；裁决理由记在 `packages/manager/src/index.ts:1714-1720`）。所以"全部 `access:'admin'`"这句**只对写端点与配置端点成立**。② 上面"注意最容易漏的连带改动"里担心的那条连锁**已在 AI 这条线上闭合**：前端不再用 `GET /api/plugins` + 硬编码插件名判功能入口，改读入口表 + 插槽仲裁（`pluginUiDeclaredFor()`，`packages/web/src/lib/pluginUi.ts:190`），详见 §5.7 修正块。**仍开放**：其它仍以硬编码插件名探测的功能入口未一并改造（本节不代为宣布完成）。
 
 ### 5.12 `GET /sitemap.xml` 的定位变更（**v2 新增**）
 即使不收录，也**必须保留**该端点并让它复用 `visibleSlugs` —— 它的价值从"给爬虫"变成**"给运维做泄漏核对"**（用它与匿名可见集合做集合差，必须为空）。这是一条**可自动化的安全回归测试**。
@@ -1431,7 +1465,7 @@ Vary: Cookie          ← ★ 新增：让任何中间缓存不把两者混用
 | 项 | 改法 |
 |---|---|
 | 块占位渲染 | `MarkdownBody` / `renderMarkdownBody`（`packages/web/src/lib/markdownRender.ts`）新增一种节点：`{ kind:'gated', count:N, minVisibility:'org'\|'granted' }`（★ v3：原名 `minRole`，因为它的取值是**可见性档位**、不是角色，故改名，见 §12 第 16 条；★ v4：取值域随块级三档改为 `'org'\|'granted'`）→ 渲染为"🔒 此处有 N 段内容需登录查看" + 申请入口；**措辞不得包含块内容/标题/字数以外的信息** |
-| 预览为匿名视角 | 编辑器预览（`packages/web/src/pages/WikiPage.tsx:1135-1140` 的 `renderMarkdownBodyForPreview`、挂载于 `:1670`）新增"预览为匿名/组织成员视角"开关 —— 否则作者无法自查块级可见性（**这是块级模型唯一的可用性救生圈**，P3d 交付） |
+| 预览为匿名视角 | 编辑器预览（`packages/web/src/pages/WikiPage.tsx:1135-1140` 的 `renderMarkdownBodyForPreview`、挂载于 `:1670`）新增"预览为匿名/组织成员视角"开关 —— 否则作者无法自查块级可见性（**这是块级模型唯一的可用性救生圈**，P3d 交付）。**★ 本批已取代**：内嵌预览改为「按访客视角预览」**对话框**（按钮按需打开，视角开关仍在），上列"内嵌预览"的位置与 `:1135-1140` / `:1670` 行号引用**已过期** —— 详见文末「追加：权限入口的归并（本批）」 |
 | 块级共享面板 | 条目详情页新增"内容块"面板：列出被收紧的块（`ordinal` + 摘要 + 可见性 + 单独授予），供 `canManageVisibility` 者治理 |
 | 红链 | v1 的三步态 `exists: false \| true \| 'hidden'` 不变，**新增** `visibleBlocks`（§5.5）用于区分"部分可见" |
 | `系统状态`（服务健康 / DB 方言 / 表清单） | **★ v8 新增：随 `管理 ▾` 下沉为管理员专属** |
@@ -1584,6 +1618,8 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 
 **依赖关系**：P0 → P1 → P2 → P3a → P3b → P3c → P3d → P4（**严格串行**：每阶段都建立在前一阶段的 principal 与 policy 之上）。
 **可并行**：P0 的"钩子表 + 路由声明"与 P1 的"用户/会话表迁移"可并行开发（不冲突），合流点在 P1 的 `resolvePrincipal`；**P1.5 可与 P2 并行，但不得阻塞 P1 上线**。
+
+> **★ 本批现状（见文末「追加：权限入口的归并（本批）」）**：P3d 的"预览为匿名视角"**已交付**，但形态是**「按访客视角预览」对话框**（不再是内嵌预览，故 P3d 行里的 `WikiPage.tsx:1135-1140,1670` 行号引用**已过期**）；**标记语法高亮 / 自动补全**与**块级可见性侧栏**本批**仍未做** —— 本批交付的是**宿主内置的排版工具栏**（不是 `editor-toolbar-slots` 插件插槽）与**工具栏锁按钮**式的段落档位入口。
 
 ### 8.2 各阶段可测验收标准
 
@@ -2433,5 +2469,83 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 6. **全文既有的 `文件:行号` 引用仍未逐条复核**（继承 §13.3 第 4 条、§13.5 第 5 条）；v8 只核对了**本次新增内容所引用的行号**。
 7. **v8 未修改 §12 的任何既有条目**（第 1–21 条原文保持），只**新增第 22–26 条**并在其现状表里追加五行。
 
+---
+
+## 追加：权限入口的归并（本批）
+
+> **★ 本批 = 基线上 `98b4618` 的未提交工作树。** 改动全部落在 `packages/web`（另有验收脚本 `scripts/acceptance/editor-modes-cdp.mjs`），**无迁移、无端点、无服务端解析规则变更**；本节这几段文档补写也是本批的一部分。
+> 本节是**追加记录**：上面 §1–§13 的历史一律不改动，本节只记本批把"权限入口"与"编辑体验"改成了什么样、以及上面哪几条因此被取代。
+> **核验方式**：本节每条事实都来自**逐行读工作树里的源文件**（文件路径随文给出）；**没有**跑 typecheck / test / 浏览器。
+
+### 1. 独立的「权限治理」页从导航移除，路由保留为兜底
+
+- `packages/web/src/App.tsx` 的导航常量改为 **`LEGACY_ROUTES`**（唯一条目 `id: 'access'`，`label: '权限治理（已并入页面）'`，`requires: 'manageVisibility'`）。它**不再出现在任何导航里**（桌面标签、窄屏菜单、命令面板都移除），但**仍在 `known` 路由集合内**（`[WIKI_ITEM, ...ADMIN_NAV, ...LEGACY_ROUTES].some(...)`），故 `#/access/...` 仍被 App 认识、不会掉进未知路由。
+- `#/access/<slug>` **仍存在但重定向**到 **`#/wiki/<slug>?access=1`**，由阅读页打开「权限…」对话框（`packages/web/src/pages/AccessPage.tsx`）。
+- **落点为什么不是编辑页**：阅读页的权限对话框对**所有有 `manageVisibility` 的人**可用 —— 包括**没有正文编辑权**的人（只负责治理的成员）。一律送去编辑页会把这类人挡在门外（编辑页要 `canEdit`），那才是真的功能倒退。查询串 `?access=1` 是**可分享的地址**，不是一次性的跳转副作用。
+- `#/access`（无 slug）改为一页说明（标题「权限设置已并入页面本身」，列出三处入口 + 无 `manageVisibility` 时的 warn 说明）。**`packages/web/src/pages/AccessPage.tsx` 与导出名 `AccessPage` 刻意保留**（避免深链与既有引用出现第二个去处）。
+- **本文档 §1–§13 里没有"独立权限治理页"这一条设计条目**（本节写入前 `grep 权限治理` 在本文档零命中）—— 本批把它从导航移除，与 §6.6 的"权限跟着动作走"口径一致，不是对某条规格的偏离。
+
+### 2. ~~编辑页新增「权限」区~~ —— **本批末按作者要求已移除**（页面档位的入口只有页面自己的「权限」对话框）
+
+- `packages/web/src/pages/WikiPage.tsx` 的 `WikiEdit` 内新增 `<section aria-labelledby={PERMISSION_SECTION_LABEL_ID}>`（`PERMISSION_SECTION_LABEL_ID` 在 `packages/web/src/lib/domIds.ts`）：页面档位**就地**复用既有 `VisibilitySection`（谁能读 / 是否继承 / 是否发布），旁边一条说明指向"段落档位写在正文里"，按钮「例外授予与访问申请」打开 `PageAccessPanel`。
+> **★ 后续订正（同批，作者验收时提出）**：编辑页底部的「权限」区**整体移除**。理由是它把**页面档位**这一"这条目对谁可见"的治理动作放进了**编辑**上下文，而完整的治理界面（档位 + 例外授予 + 访问申请）本来就在页面自己的「权限」对话框里 —— 两处入口既重复，又制造了"同一屏两个可编辑档位控件"的风险（各有本地状态，而"只发改动过的字段"的部分更新会让后者拿旧基线发出反向 patch）。
+>
+> 移除范围：`WikiEdit` 里的 `<section aria-labelledby={PERMISSION_SECTION_LABEL_ID}>`、「例外授予与访问申请」对话框、`canManageVisibility` / `grantsOpen` 状态，以及 `lib/domIds.ts` 的 `PERMISSION_SECTION_LABEL_ID`；`PageAccessPanel` 的 `sections` 属性随之删掉（它唯一的使用者就是那个对话框，留着是死接口）。**编辑页仍保留**页面档位的**只读**值（`pagePerm`）：工具栏锁按钮要靠它给出"这一段不能比页面更宽"的提示。段落档位不受影响 —— 它一直在**正文**里，由工具栏的锁按钮改写。
+>
+> **★ 紧接着补回的一处功能缺口（同一个验收回合内）**：块级分区从面板移除后，**"授权给谁"没有任何界面了** —— 而 `granted`（需单独授权）档的语义正是"默认谁都读不到，靠名单放人"。于是作者把一段设成"需单独授权"之后，**连他想给的同事也读不到**，那一档成了死档。
+>
+> 修法：**把授予放到档位旁边** —— 编辑器工具栏的锁菜单新增「授权给谁…」，打开 `BlockGrantsDialog`（`packages/web/src/components/access/BlockGrantsDialog.tsx`），列出**光标所在那一段**的现有授权并可增删。链路：编辑器（**不发请求**，只交出 `{ ordinal, excerpt }`）→ 宿主 `WikiEdit` → 对话框按 `ordinal` 在 `GET /api/pages/:slug/blocks` 里换成服务端块 id → `BlockGrantEditor` 执行 `POST/DELETE /api/pages/:slug/blocks/:blockId/grants`。
+>
+> 两条契约后果都在界面里如实表达（不静默）：① **块 id 只有保存正文时才有**，所以"刚写好还没保存"的段落拿到的是「先保存正文，再继续授权」这条出路，而不是一个必然 404 的按钮；② 手上**未保存的改动会让段落序号与上次保存的正文错位**，故对话框顶部永远显示该段摘要（第一行），让作者确认"要授权的就是这一段"。
+>
+> **★ 授权对象怎么选（作者反馈"所谓的 id 是什么"）**：`subjectId` 是**数据库 id 的字符串形式** —— `subjectKind='user'` ⇒ `users.id`，`subjectKind='group'` ⇒ `groups.id`（判定侧逐字比对：`packages/plugin-authz/src/index.ts` 用主体的 `userId` 与所属组的 id 列表去命中）。而 `GET /api/org/members` / `GET /api/org/groups` **曾经要求管理员**，授权却只要 `manageVisibility` ⇒ 出现过**"有权授权但看不到名单"**的人。**本批已放宽：任何登录用户都能读这两份名单**（`{ access: 'user' }`，`packages/plugin-org/src/index.ts`）——**能看到名单，才谈得上按名单授权**；放宽的边界是"读名单登录即可、**写**（成员角色 / 邀请 / 建组 / 组的成员增删）与 `GET /api/org/invitations` 仍只有管理员"，守卫见 `packages/plugin-org/test/memberDirectory.test.ts`。故界面按三态走（`packages/web/src/lib/subjectDirectory.ts`）：能列名单 ⇒ **下拉选择成员/用户组**（显示"姓名 —— 邮箱"），并把已有授权显示成"爱丽丝（用户 2）"；确知被拒（401/403，放宽后通常只剩未登录或运维把端点改回 admin 的情形）⇒ 手填 id 并说明"看不到名单，id 可在「管理 → 组织」里看到或向管理员索取"；其它失败 ⇒ 手填 + 如实报错（**不谎称没权限**）。有名单时也保留"改用手填 id"的出口（要授权的人可能不在名单里）。**★ 字段只有一份实现**：`packages/web/src/components/access/GrantTargetFields.tsx`（类别 / 授权对象 / 角色 / 到期），**段落授权与页面授权共用**——这条是补出来的：放宽名单端点时只改了编辑器那一份，页面「权限」对话框里的「例外授予（页级）」仍是手填「对象 id」，旁边还留着放宽之前的理由"成员/组列表需要组织管理员权限，本页不拉取它"（作者反馈："权限按钮进去那个页面的还不能下拉选择用户"）。两处各修一遍必然再漂一次，故字段本体只留一份，两处都从这里取（源码级守卫在 `packages/web/test/blockGrantsInEditor.test.ts`，浏览器端到端在验收脚本 M3–M5）。
+>
+> 授予表单**只有一份实现**：`BlockGrantEditor` 同时被对话框与 `BlocksSection`（只读总览，当前无界面渲染它）使用 —— 两份必然漂移，而漂移的后果是"两处授权结果不一致"。守卫见 `packages/web/test/blockGrantsInEditor.test.ts`（含一条既有约定的机器检查：**编辑器不得值导入 `api`、不得 `fetch`**）。
+>
+> 同期另一处：权限对话框里的**块级分区**（`BlocksSection`：逐块档位与逐块授权名单）从面板移除。段落档位就是正文里的标记，改它在编辑器里；而"给某一段单独授权"要先把那段标成 `granted` 才有意义 —— 那件事也发生在编辑器里。**代码与端点都保留**（`components/access/BlocksSection.tsx`、`GET /api/pages/:slug/blocks` 与块授权端点），要恢复只需把它加回面板渲染。
+
+- ~~打开该对话框时**显式传 `sections={['grants','requests']}`**；`PageAccessPanel` 因此新增**可选的 `sections` 属性**~~（该属性已随编辑页权限区一并删除，见上方订正）。
+- 三种兜底各有**可见**文案、不静默：新建页（还没落库）/ 无 `manageVisibility`（"正文仍可编辑"）/ 正在读取档位。
+
+### 3. 段落档位在编辑器里改 —— **不是新端点**
+
+- 工具栏的锁按钮（`packages/web/src/components/editor/EditorToolbar.tsx`）与源码模式下手写的标记，改的都是**正文里的 gated 标记**；改写走 `packages/web/src/lib/editorBlocks.ts` 的 `applyBlockTiers` / `setBlockTier` / `setRegionTier`。
+- 它采用**整篇重建 + 自检**：重建后重新解析，**块数不变、每块文本一字不变、每块档位等于目标值**，任一条不成立就**放弃改动并返回错误**（"宁可不改，也不留一份自己都不确定的标记结构给服务端"）。正文原本就有解析问题、或存在**空的**受限区段时，同样直接拒绝改写。
+- **服务端没有新端点**：保存正文时仍由 `packages/plugin-wiki/src/blocks.ts` 重新解析标记，`syncBlocksForPage` 仍是 `blocks` 的唯一写入路径。故段落档位与正文**同一条保存路径、同一份版本历史**（§4.1 的"标记就是普通文本、CodeMirror 零改造"这条设计前提不变）。
+- `packages/web/src/components/access/BlocksSection.tsx` **仍然没有档位改动控件** —— 这是对的（块档位就是正文的一部分，凭一个按钮改写正文会绕开草稿、冲突检测与版本校验）；它的文案把作者指向**编辑器的锁按钮**。**★ 同批末：该组件已不再被任何界面渲染**（见上方订正的第二段），文件与它依赖的端点都保留。§6.6「块级共享面板」与 §8.1 P3b 行里的「内容块」治理面板因此**仍是只读清单**：**改块档位要改正文**。
+
+### 4. 相邻改动：编辑区改单栏 + 编辑器两模式（一并记在这里）
+
+- 编辑页原先的**左右分屏预览已去掉**（写的地方窄、看的地方也窄），预览改为「按访客视角预览」**对话框**：渲染的是**真的**投影后 HTML（含可见性判定与视角切换、"该视角下 N 段内容被遮蔽"），与编辑器的**就地渲染**不是一回事 —— 就地渲染不会替你算可见性。
+- 编辑器两模式：**源码** / **实时渲染**（`packages/web/src/lib/editorModePlan.ts`；localStorage 键 `gw.editor-mode.v1`，默认 `live`；就地渲染实现在 `packages/web/src/components/editor/liveRender.ts`）。模式只影响**编辑区怎么画**，不影响正文内容与保存结果（装饰全是 `Decoration`）。
+- **边界（必须照实读）**：能渲染的是**行内标记与图片**，以及**整块**的表格 / 围栏与缩进代码块 / 整块 HTML / 分隔线 —— 块内容由 `mdToHtml`（marked + DOMPurify）渲染并套 `.md-body`，与阅读页**同一套**，故"实时渲染里看到的就是发布稿"；渲染块是**只读投影**（点它即把光标送进这一块的源码）；**段落内部的行内 HTML 标签按源码显示**（逐个替换会丢掉标签之间的内容）；**整块被替换 ≠ 权限提示消失** —— 落在受限区段里的渲染块会带上区段的底纹类名。**实现上不可改回 `ViewPlugin`**：块装饰只能由**静态**装饰提供（`StateField` + `EditorView.decorations.from(field)`，判据是 facet 值 `typeof d === "function"`），插件路径会抛 `RangeError: Block decorations may not be specified via plugins`；块装饰范围还必须与**行边界**对齐（`packages/web/src/lib/liveRenderPlan.ts` 的 `alignToLines()`）。**实时渲染模式下不显示行号**（软换行的段落会占好几屏、行号却只递增一次，"会撒谎"）；正文 gated 标记不合法时**不做任何装饰**（该看到的是标记报错）。**排版工具栏**（15 个格式动作 + 撤销/重做 + 附件 + 段落权限锁按钮）的动作是 `packages/web/src/lib/markdownActions.ts` 的纯函数，CodeMirror 路径与降级 `<textarea>` 共用；降级态**不渲染**模式切换、撤销/重做与段落权限控件，并用一行可见文案说明降级了什么。
+
+### 5. 本批取代/未动的清单（对着上面的章节读）
+
+- **被取代**：§6.6 的「预览为匿名视角」行所描述的**内嵌编辑器预览**（含其 `WikiPage.tsx:1135-1140` / `:1670` 行号引用）—— 现为「按访客视角预览」对话框（已在 §6.6 该行与 §8.1 表下就地标注）。§8.1 的 P3d 行写的"编辑器预览"同理；而该行里并列的**块级可见性侧栏**本批**也没做**（做的是工具栏锁按钮 + 弹窗里的只读块清单，见下条）。
+- **未被取代、只是确认**：§6.6「块级共享面板」/ §8.1 P3b 的「内容块」面板仍是只读（见上）；§4.1 的标记语法与 `parseBlocks` 契约一行未改。
+- **本批未做**：`editor-toolbar-slots` 这类**插件扩展点**（本批的工具栏是**宿主内置**的，不是插件可贡献按钮的插槽）；标记的**语法高亮 / 自动补全**；块档位的"侧栏"形态（现在是工具栏锁按钮 + 弹窗里的只读清单）。
 
 
+
+
+### 6. ★ 编辑路径的正文口径：新增 `?content=raw`（本批修掉的一处**权限事故**）
+
+**事故（改前，实测复现）**：详情接口返回的是**按读者投影后**的正文 —— 受限段落被换成占位文案、`<!--gated:org-->` 这类标记被消费掉。编辑页此前用的正是这份正文，于是最普通的一次操作（打开编辑页 → 改一个标点 → 保存）会把标记写没：
+
+```
+改前：公开页 + <!--gated:org--> 段 → 编辑者改一个标点后保存
+结果：库里的标记消失；页面本就是 public + published ⇒ 匿名访客直接读到该受限段落全文
+```
+
+**为什么它一直没被发现**：投影对**读者**是正确的（这正是 §2.4 约束 1 要的），而"作者的正文来源"从来没被单独审视过 —— 两条路径共用同一个端点，且共用时看起来毫无异常（都是一段 Markdown）。
+
+**修法（本批）**：详情端点新增显式口径 `GET /api/pages/:slug?content=raw`。
+
+- **权限**：必须是 `canEdit`。不可编辑者 ⇒ **显式 403 `raw_requires_edit`**（不是 404 —— 只读用户可能读得到这一页，对他说"页面不存在"是撒谎；也不是静默降级成投影，那会让调用方以为拿到了原文）。`content` 参数取其它值 ⇒ **400 `invalid_content_mode`**，同样不静默。
+- **不新增暴露面**：能编辑这一页的人本来就能从版本快照端点（`GET /api/pages/:slug/versions/:id`，同样要求 `canEdit`）读到含标记的原文。
+- **响应自述口径**：原文模式下多一个 `contentMode: 'raw'`（`WikiPageDetail.contentMode`）。两种正文长得几乎一样，而**拿错口径的后果不对称**：把投影当原文存回去会毁标记，故响应必须自己说清是哪种。
+- **编辑页只走原文**：`packages/web/src/pages/WikiPage.tsx` 的 `WikiEdit.load()` 用 `api.page(slug, { raw: true })`；`packages/web/src/test/editContentSource.test.ts` 用源码级守卫钉住这一点（不得用默认口径填充正文），服务端用例见 `packages/plugin-wiki/test/service.test.ts` 的「★ 原文模式」。
+- **第二道防线（客户端）**：`looksProjected()`（`packages/web/src/lib/gatedPreview.ts`，与占位文案同源）识别"手上的正文里有服务端占位"，编辑区给 `role="alert"` 提示、保存前拦一次并给出两条出路（「重新加载原文」/「仍然保存」）。它覆盖的是**修复之前留下的 localStorage 草稿**与用户粘贴这类路径 —— 那些正文里已经没有标记了，服务端无从判断是"作者有意删除"还是"被投影吃掉"，所以只能在编辑侧拦。
+
+**验收**：`scripts/acceptance/editor-modes-cdp.mjs`（浏览器端到端，22 项，含"改档位只动这一段/⌘Z 一次还原/匿名视角不泄露受限段"）；`packages/web/test/editContentSource.test.ts`、`packages/plugin-wiki/test/service.test.ts`（原文模式四条断言）。

@@ -101,7 +101,7 @@ GEEWIKI_WEB_DIST=/app/packages/web/dist
 容器内以**非 root** 的 `node` 用户（uid/gid 默认 `1000`）运行。绑定挂载时宿主目录的属主决定容器能否写入：
 
 - `./data`：必须可写。SQLite 需要在该目录创建 `geewiki.db` 及其 `-wal`/`-shm` 文件；崩溃自愈标记 `crash.marker` 也写在这里。
-- `./config`：必须可写。除只读的 `plugins.base.json` 外，插件管理器还会写 `plugins.session.json`（会话层清单）与 `plugins.base.json`（持久化操作）。目录不可写会导致「启用插件/持久化」失败。
+- `./config`：必须可写。除只读的 `plugins.base.json` 外，插件管理器还会写 `plugins.session.json`（会话层清单）、`plugins.base.json`（持久化操作）与 **`secrets.json`**（`role: 'secret'` 字段的落盘位置：模型 API 密钥等，权限 `0600`，已被 `.gitignore` 忽略）。目录不可写会导致「启用插件/持久化/**保存密钥**」失败——典型症状是管理台里填了密钥、保存报错或重启后"未配置"。容器内进程以 `node`（uid 1000）运行，宿主目录属主不对时先 `chown -R 1000:1000 config`。
 - `./plugins`：外部插件的发现根。每个子目录识别为一个插件（清单见下节），插件文件需可读；容器内该路径固定为 `/app/plugins`（由镜像的 `GEEWIKI_PLUGINS_DIR` 决定）。
 
 两种处理方式，任选其一：
@@ -176,6 +176,7 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `./data/crash.marker` | 崩溃自愈标记，仅异常退出时出现（见下节） |
 | `./config/plugins.base.json` | 基础层清单（随仓库提交，含 db-sqlite、http、wiki 三个内置插件） |
 | `./config/plugins.session.json` | 会话层清单（运行时生成，已被 `.gitignore` 忽略） |
+| `./config/secrets.json` | **密钥文件**（`role: 'secret'` 字段的值，如模型 API 密钥；运行时生成，权限 `0600`，已被 `.gitignore` 忽略）。**备份它 = 备份密钥**：请与数据库同级看待——放进受控的备份位置，不要把备份产物提交进版本库。不需要它时删掉即可（配置里只留下"未配置"） |
 | `./plugins/` | 外部插件源码（每个子目录一个插件）。**不打进镜像**，容器只通过该绑定挂载发现（见第 2 节） |
 
 热备份（在线，无需停机；走 SQLite backup API）：
@@ -224,11 +225,60 @@ echo "DB_PASSWORD=请改成强口令" >> .env
 docker compose --profile production up -d --build
 ```
 
-该 profile 会额外启动 `postgres:15`（不映射宿主端口，仅在同网络内以 `postgres:5432` 可达）。注意 `@geewiki/db-pg` 插件尚在路线图中（见 `docs/roadmap.md`），当前应用仍使用 SQLite 内置插件，因此该服务目前只是为后续切换预置。
+该 profile 会额外启动 `postgres:15`（不映射宿主端口，仅在同网络内以 `postgres:5432` 可达）。应用侧对应的插件是 **`@geewiki/postgres`**（`packages/db-postgres/`，**不是** `@geewiki/db-pg`）——它**已实现**（异步适配器 + schema 化配置 + 自有迁移，20 例单测），与 `@geewiki/db-sqlite` 同属 `conflictGroup: 'database-provider'`（天然互斥）且**默认不启用**。该 profile 只负责把 Postgres 服务跑起来，**切换动作在应用侧显式做**，见下。
 
 `docker-compose.yml` 里 `POSTGRES_PASSWORD` 写成 `${DB_PASSWORD:-}`：未启用该 profile 时不会再出现 `The "DB_PASSWORD" variable is not set` 告警；而一旦启用却没有提供口令，postgres 官方镜像会拒绝以空口令初始化并立即退出（`Error: Database is uninitialized and superuser password is not specified.`，已实测），属安全失败，不会产生弱口令实例。
 
 ---
+
+### 应用侧：怎么切到 PostgreSQL
+
+包名是 **`@geewiki/postgres`**（`packages/db-postgres/`，**不是** `@geewiki/db-pg`）。它已实现——异步适配器 + schema 化配置 + 自有迁移，与 `@geewiki/db-sqlite` 同属 `conflictGroup: 'database-provider'`（**天然互斥**），并且**默认不启用**：刻意不写进 `config/plugins.base.json`，因为"切库"是显式决策。
+
+**⚠️ 切库是冷操作，不能热切。** 本批实测确认：`@geewiki/postgres` 与 `@geewiki/db-sqlite` 都声明了 `runtime.supportsHotReload: false`，因此
+
+- `POST /api/plugins/%40geewiki%2Fdb-sqlite/disable` → **409 `base_layer`**：`@geewiki/db-sqlite 属于基础层（冷操作），请编辑基础层清单 plugins.base.json 后重启进程`（基础层插件不可热卸载）；
+- `POST /api/plugins/%40geewiki%2Fpostgres/enable` → **409 `hot_reload_not_supported`**：`@geewiki/postgres 未声明 runtime.supportsHotReload: true，仅支持持久化安装 + 进程重启（冷操作）`。
+
+**正确步骤**：① 在外部设好连接串环境变量；② **直接编辑 `config/plugins.base.json`**，把 `{"name": "@geewiki/db-sqlite"}` 换成 `@geewiki/postgres` 条目并带上 `config`；③ 重启进程。
+
+```bash
+export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewiki'
+```
+
+```jsonc
+// config/plugins.base.json —— 把 db-sqlite 换成 postgres（示例，凭据一律用变量名）
+{
+  "enabled": [
+    { "name": "@geewiki/postgres",
+      "config": { "connectionStringEnv": "GEEWIKI_DATABASE_URL", "ssl": false } },
+    { "name": "@geewiki/http" },
+    { "name": "@geewiki/wiki" }
+    // ⚠️ 不要同时保留 @geewiki/db-sqlite：两者同属 database-provider 冲突组，互斥
+    // ⚠️ 也不建议保留 @geewiki/search：它依赖 SQLite 专有 FTS5，在 PG 方言下会激活失败（见「已知限制」⑬）
+  ]
+}
+```
+
+`@geewiki/postgres` 的 `configSchema` 字段（真源 `packages/db-postgres/src/index.ts:41` 的 `PostgresConfigSchema`）：
+
+| 字段 | 类型 / 默认 | 说明（schema 里的原文） |
+| --- | --- | --- |
+| `connectionStringEnv` | string，`''` | 存放连接串的**环境变量名**（推荐；留空则用下面的分项配置）。例如 `GEEWIKI_DATABASE_URL` |
+| `host` | string，`'127.0.0.1'` | 数据库主机 |
+| `port` | number，`5432`（1–65535） | 端口 |
+| `database` | string，`'geewiki'` | 库名 |
+| `user` | string，`'geewiki'` | 用户名 |
+| `passwordEnv` | string，`''` | 存放密码的**环境变量名**（推荐；留空表示无密码）。例如 `GEEWIKI_DB_PASSWORD` |
+| `password` | string（`role: password`），`''` | ⚠️ **明文密码（仅本地开发）**——会明文落进入库清单，生产请改用 `passwordEnv` |
+| `max` | number，`10`（1–100） | 连接池上限 |
+| `connectionTimeoutMillis` | number，`10000` | 建立连接超时（毫秒） |
+| `idleTimeoutMillis` | number，`30000` | 空闲连接回收（毫秒） |
+| `ssl` | boolean，`false` | 是否使用 SSL |
+
+**关于"`config/plugins.base.json` 能否承载连接配置"**：**能**。本批实测：`PUT /api/plugins/:name/config` 会把 `config` 写进该插件所在清单层的条目上，`POST /api/session/persist`（管理台的「应用并持久化」）再把它并入入库的 `config/plugins.base.json`——条目形状就是 `{ "name": …, "config": { … } }`（`packages/manager/src/index.ts:642` 的 `persistConfig()`，已实测看到 postgres 的完整配置出现在入库文件里）。**所以"把凭据放进环境变量名"是纪律问题而非结构限制**——别把明文密码填 `password` 字段。
+
+**两条必须知道的边界**：① 切到 PostgreSQL 后 **`/api/search` 与 `/api/ai` 的问答都不可用**——`@geewiki/search` 依赖 SQLite 专有的 FTS5，启用时会显式抛错拒绝（详见「已知限制」⑬）；② 本批**未做真实 PG 端到端验证**（本机无 PG 实例可用），只核实了代码路径（`async apply` + `@geewiki/wiki` 已适配异步 `DatabaseAdapter`）与 `packages/db-postgres` 的 20 例单测。`docker-compose.yml` 的 `--profile production` 预留了 Postgres 服务（默认不启动），详见 [docs/deployment.md](docs/deployment.md)。
 
 ## 8. 升级与重建
 
