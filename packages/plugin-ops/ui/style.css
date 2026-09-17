@@ -426,3 +426,56 @@
   font-size: 11px;
   color: var(--color-muted);
 }
+
+/* ---------- 筛选标记（「只看 TA」） ---------- */
+
+.gw-ops-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 4px 3px 9px;
+  border: 1px solid var(--color-accent-soft-line);
+  border-radius: var(--radius-full);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-soft-ink);
+  font-size: 12px;
+}
+
+.gw-ops-chip-x {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  padding: 1px 5px;
+  border-radius: var(--radius-full);
+}
+
+.gw-ops-chip-x:hover {
+  background: var(--color-hover);
+}
+
+.gw-ops-chip-x:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 1px;
+}
+
+/* 表格行内的"只看 TA"：像链接一样轻，不跟行首的操作按钮抢注意力 */
+.gw-ops-linkbtn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--color-accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.gw-ops-linkbtn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}

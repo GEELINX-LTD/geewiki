@@ -185,3 +185,28 @@ test('★ 审计与会话两处都必须把 id 解析成人（否则退回 #12 �
   assert.match(plan, /#\$\{userId\}/, '解析不出来时仍须显示 #id')
   assert.match(plan, /不在当前成员列表/, '查不到时必须说明原因，而不是只显示一个 #id')
 })
+
+/*
+ * ★ 「看某个人做过什么」：操作者筛选必须真的接上。
+ *
+ * 这条守卫防的同样是**静默退化**：把「只看 TA」按钮删掉、或把 actorId 从查询串里漏掉，
+ * 页面照常渲染、筛选条照常工作 —— 只是"按人筛"这个能力悄悄没了，没有任何报错。
+ */
+test('★ 按操作者筛选必须接上（按钮 → 查询串 → 筛选条可见）', () => {
+  const plan = codeOnly(read('../ui/plan.ts'))
+  assert.match(plan, /actorId/, 'plan.ts 的筛选类型里必须有 actorId')
+  assert.match(plan, /'anonymous'/, '匿名必须走字面量而不是一个不存在的 id')
+  assert.match(ui, /filterByActor\(/, '界面必须有设置操作者筛选的入口')
+  assert.match(ui, /只看 TA|只看匿名/, '表格行里要有"只看 TA / 只看匿名"的按钮')
+  assert.match(ui, /actorFilterLabel\(/, '筛选条上要显示筛的是谁（只显示 #12 等于没解决"看不懂"）')
+  /*
+   * 筛选必须**三个 state 一起改**（filters / applied / page）。少改 applied 的症状是
+   * "按钮看起来没反应"；少回第 1 页的症状是筛完之后停在越界页，返回空数组 ——
+   * 而那读起来像"这个人没做过任何事"。
+   */
+  const body = /const filterByActor = \(actorId: AuditActorFilter\): void => \{([\s\S]*?)\n  \}/.exec(ui)
+  assert.ok(body, '未能抽出 filterByActor 的函数体（判据失效即红）')
+  for (const call of ['setFilters(', 'setApplied(', 'setPage(1)']) {
+    assert.ok((body[1] as string).includes(call), `filterByActor 必须调用 ${call}`)
+  }
+})

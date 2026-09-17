@@ -50,6 +50,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import './style.css'
 import {
+  actorFilterLabel,
   AUDIT_PAGE_SIZE,
   buildUserIndex,
   blocksVerifyVerdict,
@@ -67,6 +68,7 @@ import {
   SECTIONS,
   sitemapVerdict,
   type AccessExplainResponse,
+  type AuditActorFilter,
   type AuditFilters,
   type BlocksResyncResponse,
   type BlocksVerifyResponse,
@@ -233,6 +235,20 @@ function AuditSection(props: {
 
   const offset = (page - 1) * AUDIT_PAGE_SIZE
 
+  /**
+   * 按操作者收窄。
+   *
+   * 三个 state 必须**一起**改：`filters`（输入区）、`applied`（真正发出去的），
+   * `page` 回到第 1 页。只改 `filters` 的话按钮看起来没反应；忘了回第 1 页的话，
+   * 筛完之后停在越界的页码上，后端返回空数组 —— 而那看起来像"这个人没做过任何事"。
+   */
+  const filterByActor = (actorId: AuditActorFilter): void => {
+    const next: AuditFilters = { ...filters, actorId }
+    setFilters(next)
+    setApplied(next)
+    setPage(1)
+  }
+
   useEffect(() => {
     let alive = true
     setLoading(true)
@@ -340,6 +356,23 @@ function AuditSection(props: {
           >
             清除
           </button>
+          {/*
+            当前的操作者筛选**必须显式可见**：它是从表格行里点出来的，而筛选后那些行
+            本身就不在页面上了 —— 不留一个标记，用户会以为"库里的记录变少了"。
+          */}
+          {applied.actorId !== null && (
+            <span className="gw-ops-chip">
+              只看：{actorFilterLabel(applied.actorId, props.users)}
+              <button
+                type="button"
+                className="gw-ops-chip-x"
+                aria-label="清除操作者筛选"
+                onClick={() => filterByActor(null)}
+              >
+                ✕
+              </button>
+            </span>
+          )}
         </form>
 
         {rows === null ? (
@@ -376,6 +409,13 @@ function AuditSection(props: {
                         </td>
                         <td>
                           <UserCell userId={r.actorId} users={props.users} />
+                          <button
+                            type="button"
+                            className="gw-ops-linkbtn"
+                            onClick={() => filterByActor(r.actorId === null ? 'anonymous' : r.actorId)}
+                          >
+                            {r.actorId === null ? '只看匿名' : '只看 TA'}
+                          </button>
                         </td>
                         <td>
                           {diff.length === 0 ? (

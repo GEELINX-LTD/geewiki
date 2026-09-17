@@ -35,6 +35,7 @@ import {
   type Principal,
   type RouteHandlerContext,
 } from '@geewiki/core'
+import { AUDIT_PAGE_MAX, planAuditQuery } from './audit-query.js'
 
 /* ============================== 类型 ============================== */
 
@@ -838,7 +839,6 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
       ])
 
       /** 单页上限：审计表是 append-only 且无上界增长（§9 R16 的邻域），不给上限等于给了一个全表下载口 */
-      const AUDIT_PAGE_MAX = 200
 
       interface AuditRow {
         id: number
@@ -867,56 +867,26 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
         'GET',
         '/api/admin/audit',
         async (h: RouteHandlerContext) => {
-          const q = h.url.searchParams
-          const view = q.get('view') ?? 'all'
-          if (view !== 'all' && view !== 'acl' && view !== 'security') {
-            h.json(400, {
-              ok: false,
-              error: 'invalid_view',
-              message: 'view 须为 all | acl | security 之一',
-            })
+          /*
+           * 查询语义（WHERE 子句、绑定参数、分页）**全部在 `planAuditQuery` 里**。
+           * 理由与三条静默错法（参数顺序错位、匿名的 NULL、非法值静默忽略）见
+           * `packages/plugin-authz/src/audit-query.ts` 的文件头 —— 那三条的共同症状是
+           * "返回空集"，而空集在这里读起来就是"没有这类事件"。
+           */
+          const planned = planAuditQuery({
+            q: h.url.searchParams,
+            aclActions: [...ACL_ACTIONS],
+            securityActions: [...SECURITY_ACTIONS],
+            maxLimit: AUDIT_PAGE_MAX,
+          })
+          if (!planned.ok) {
+            h.json(400, { ok: false, error: planned.code, message: planned.message })
             return
           }
-
-          const where: string[] = []
-          const params: unknown[] = []
-          if (view === 'acl' || view === 'security') {
-            const names = [...(view === 'acl' ? ACL_ACTIONS : SECURITY_ACTIONS)]
-            where.push(`action IN (${names.map(() => '?').join(', ')})`)
-            params.push(...names)
-          }
-          for (const [key, column] of [
-            ['action', 'action'],
-            ['targetKind', 'target_kind'],
-            ['targetId', 'target_id'],
-          ] as const) {
-            const v = q.get(key)
-            if (v !== null && v !== '') {
-              where.push(`${column} = ?`)
-              params.push(v)
-            }
-          }
-          const since = q.get('since')
-          if (since !== null && since !== '') {
-            where.push('at >= ?')
-            params.push(since)
-          }
-          const until = q.get('until')
-          if (until !== null && until !== '') {
-            where.push('at <= ?')
-            params.push(until)
-          }
-          const sql = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
-
-          const rawLimit = Number(q.get('limit') ?? AUDIT_PAGE_MAX)
-          const limit = Number.isFinite(rawLimit)
-            ? Math.min(Math.max(1, Math.trunc(rawLimit)), AUDIT_PAGE_MAX)
-            : AUDIT_PAGE_MAX
-          const rawOffset = Number(q.get('offset') ?? 0)
-          const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0
+          const { view, where, params, limit, offset } = planned.plan
 
           const countRows = await db.query<{ n: number | string }>(
-            `SELECT COUNT(*) AS n FROM audit_log${sql}`,
+            `SELECT COUNT(*) AS n FROM audit_log${where}`,
             params,
           )
           // PG 的 COUNT(*) 返回字符串，必须强转（否则 "1" + 1 → "11"）
@@ -924,7 +894,7 @@ ${slugs.length === 0 ? '<p>暂无公开内容。</p>' : `<ul>\n${items}\n</ul>`}
           const rows = await db.query<AuditRow>(
             `SELECT id, at, actor_id, actor_ip_hash, action, target_kind, target_id,
                     before_json, after_json, request_id
-               FROM audit_log${sql}
+               FROM audit_log${where}
               ORDER BY at DESC, id DESC
               LIMIT ? OFFSET ?`,
             [...params, limit, offset],
