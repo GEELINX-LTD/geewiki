@@ -744,7 +744,7 @@ export function GraphPage(): ReactNode {
     <div className="mx-auto flex w-full max-w-[76rem] flex-col gap-4 p-4 sm:p-6">
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1">
-          <h1 className="m-0 text-xl font-semibold text-ink">插件依赖图</h1>
+          <h1 className="m-0 text-xl font-semibold text-ink">插件管理</h1>
           <p className="m-0 mt-0.5 text-xs text-muted">
             箭头从「被依赖的插件」指向「依赖它的插件」。<strong className="font-medium text-ink-soft">点任意节点</strong>即可查看详情、改配置、启停。
           </p>
@@ -931,7 +931,7 @@ export function GraphPage(): ReactNode {
               </p>
             ) : (
               <p className="m-0 text-xs text-ink-soft">
-                它仍有正在运行的依赖方（服务端未返回名单，可在依赖图中查看指向它的连线）。
+                它仍有正在运行的依赖方（服务端未返回名单，可在「插件管理」页查看指向它的连线）。
               </p>
             )}
             <p className="m-0 text-xs text-ink-soft">

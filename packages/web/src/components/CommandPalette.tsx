@@ -176,7 +176,7 @@ export function CommandPalette({
       },
       {
         id: 'action:graph',
-        label: '依赖图与插件',
+        label: '插件管理',
         hint: '看依赖关系、点节点启停与改配置',
         keywords: 'graph plugins dependencies admin',
         icon: <GitBranch className="size-4" aria-hidden="true" />,

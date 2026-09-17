@@ -181,7 +181,7 @@ class RouteErrorBoundary extends Component<{ source: string; id: string; childre
     if (this.state.error !== null) {
       return (
         <div className="route-error" data-route={this.props.id} data-error={this.state.error} role="alert">
-          {`插件页面「${this.props.id}」渲染失败，其功能在本页不可用。请在「依赖图」页检查该插件状态。`}
+          {`插件页面「${this.props.id}」渲染失败，其功能在本页不可用。请在「插件管理」页检查该插件状态。`}
         </div>
       )
     }

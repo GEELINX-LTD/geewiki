@@ -75,14 +75,14 @@ class GraphBoundary extends Component<{ children: ReactNode }, { broken: boolean
   }
 
   override componentDidCatch(error: Error): void {
-    console.warn('[geewiki-graph] 依赖图页面加载失败：', error)
+    console.warn('[geewiki-graph] 插件管理页加载失败：', error)
   }
 
   override render(): ReactNode {
     if (!this.state.broken) return this.props.children
     return (
       <ErrorState
-        title="依赖图加载失败"
+        title="插件管理加载失败"
         hint="页面资源可能没有取到。刷新页面可重试；若一直失败，请联系管理员。"
       />
     )
@@ -204,14 +204,14 @@ function pluginDestsToNavItems<T extends NavDest>(dests: readonly T[]): NavItem[
  *   该去检查插件。
  *
  * 合成一个的代价在实测里很具体：用户把"插件页面打不开"报成"这个链接失效了"，
- * 而实际原因在插件侧。文案因此刻意给出**可执行的下一步**（去依赖图页看状态）。
+ * 而实际原因在插件侧。文案因此刻意给出**可执行的下一步**（去「插件管理」页看状态）。
  */
 function PluginRoutePendingPage({ id }: { id: string }): ReactNode {
   return (
     <div className="mx-auto w-full max-w-2xl p-6" data-plugin-route-pending={id}>
       <ErrorState
         title="插件页面未就绪"
-        hint={`路由「${id}」已在插件清单里声明，但它的页面组件还没注册。通常意味着该插件的界面产物加载失败，或声明的路由与客户端注册的 id 不一致。请到「依赖图」页检查该插件的状态与产物。`}
+        hint={`路由「${id}」已在插件清单里声明，但它的页面组件还没注册。通常意味着该插件的界面产物加载失败，或声明的路由与客户端注册的 id 不一致。请到「插件管理」页检查该插件的状态与产物。`}
       />
     </div>
   )
@@ -238,7 +238,7 @@ const ADMIN_NAV: NavItem[] = [
    * "同一个插件有两个管理界面"，配置表单和状态措辞迟早分叉。
    * 保留的 id 仍是 `graph`；旧链接 `#/plugins` 在路由解析处改写成 `graph`（见下方 `root`）。
    */
-  { id: 'graph', label: '依赖图', icon: <GitBranch className="size-4" />, requires: 'administer' },
+  { id: 'graph', label: '插件管理', icon: <GitBranch className="size-4" />, requires: 'administer' },
   /*
    * 审计与运维（P4）。能力键用既有的 `administer`（`AuthCapabilities` 只有
    * editContent / administer / manageVisibility 三个），不新开字段 —— 它对应的

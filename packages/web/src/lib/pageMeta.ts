@@ -12,7 +12,7 @@ export const APP_NAME = 'GeeWiki'
 /** 路由首段 → 展示名（不含详情页的动态标题） */
 const SECTION_LABEL: Record<string, string> = {
   wiki: '知识库',
-  graph: '依赖图',
+  graph: '插件管理',
   // 权限治理（M1）。它是**独立首段**（`#/access` 与 `#/access/<slug>`），
   // 不能挂在 `wiki/` 下：`parseWikiRoute` 只保留 search|ask|new|list 四个首段，
   // `#/wiki/<slug>/access` 会被解析成"slug 含 /access"的页面。

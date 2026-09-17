@@ -356,8 +356,9 @@ test('守卫：插件编辑器路径必须拦住默认拖放，并给出可见�
   const hint = slots.match(/export const EDITOR_SLOT_NO_UPLOAD_HINT =\s*\n?\s*'([^']+)'/)
   assert.ok(hint !== null, '应存在导出的兜底文案常量（界面与测试共用同一份来源）')
   const text = hint[1] as string
-  // 入口已并入依赖图页（原先的「插件管理」导航项已删除），文案随之指向新落点
-  assert.ok(text.includes('依赖图'), '文案要指出下一步去哪（依赖图页）')
+  // 入口是合并后的那一页（原先的「插件管理」与「依赖图」各占一项，已合二为一），
+  // 而该页**后来改名为「插件管理」**，文案随之指向新名字
+  assert.ok(text.includes('插件管理'), '文案要指出下一步去哪（「插件管理」页）')
   assert.ok(text.includes('内置编辑器'), '文案要点名该换成哪个编辑器')
   assert.ok(!text.includes('已上传') && !text.includes('已插入'), '兜底提示不得暗示上传成功')
 })
