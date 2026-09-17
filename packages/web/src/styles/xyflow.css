@@ -1,0 +1,40 @@
+/*
+ * React Flow 组件的**主题适配**（把库的配色挂到本项目的 `--gw-*` token 上）。
+ *
+ * ## 症状
+ * 「插件管理」依赖图左下角那三个按钮（放大 / 缩小 / 适应窗口，由 `PluginGraph.tsx` 的
+ * `ViewControls` 用库的 `ControlButton` 渲染）在暗色模式下仍是**浅底深图标**，
+ * 与页面其余部分割裂。
+ *
+ * ## 为什么只在 Tailwind 类上写 `bg-surface` 没用
+ * 库里是用**自己的 CSS 变量**画这些按钮的（`@xyflow/react` v12：
+ * `background: var(--xy-controls-button-background-color, var(--…-default))`），
+ * 而这些变量在库的样式表里只有浅色的 `-default`。所以正确的接法不是覆盖规则，
+ * 而是**把变量的值改成我们的 token** —— 库就是为这件事留的口子，且不会随库升级失效。
+ *
+ * ## 为什么这个文件未分层（紧跟 `markdown.css` 之后 `@import`）
+ * 库里那份 `style.css` 是**未分层**的，而本项目的 Tailwind 在 `@layer utilities` 等层里：
+ * CSS 级联中**未分层规则一律压过分层规则**（与顺序、特异性都无关）。变量本身靠"非 default
+ * 优先"就能生效、不受分层影响，但 `:focus-visible` 那类**规则级**补充一旦写进分层里，
+ * 就会反过来被库的未分层规则压住 —— 故本文件保持未分层，口径统一、不留隐患。
+ *
+ * 只用 `--gw-*` token，不写死颜色。
+ */
+.react-flow {
+  --xy-controls-button-background-color: var(--gw-surface);
+  --xy-controls-button-background-color-hover: var(--gw-surface-hover);
+  --xy-controls-button-color: var(--gw-ink);
+  --xy-controls-button-color-hover: var(--gw-ink);
+  --xy-controls-button-border-color: var(--gw-line);
+  /* 库默认的投影在深色底上会变成一团糊，换成 token 化的阴影 */
+  --xy-controls-box-shadow: var(--gw-shadow-sm, 0 1px 2px rgb(0 0 0 / 0.12));
+}
+
+/*
+ * 键盘焦点必须可见（WCAG 2.4.7）—— 库的默认样式在这一项上是空的。
+ * 用内缩的 outline 而不是外扩：面板已 `overflow: hidden`，外扩会被裁掉。
+ */
+.react-flow__controls-button:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: -2px;
+}
