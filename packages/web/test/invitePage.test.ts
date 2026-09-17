@@ -81,7 +81,7 @@ test('★ 未登录分支：redeem → 自动登录 → 进知识库（缺一环
   assert.match(page, /await login\(/, '开户成功后必须接着登录（redeem 不建会话）')
   assert.match(page, /window\.location\.hash = '\/wiki'/, '登录后应进知识库')
   // 反空洞：login 的入参必须是刚才开户用的那对凭据
-  assert.match(page, /await login\(trimmedEmail, password\)/, '必须用刚设的邮箱口令登录')
+  assert.match(page, /await login\(trimmedEmail, password\)/, '必须用刚设的邮箱密码登录')
 })
 
 test('★ 已登录分支：走 accept 入伙，不再开户', () => {
@@ -102,21 +102,21 @@ test('邀请页不得把令牌写进任何持久位置（它只应存在于当�
 
 /* ============================== 账号页：两个"有端点没界面"的补口 ============================== */
 
-test('★ 账号页必须真的接上「改资料」与「改口令」（它们此前调用者数量都是 0）', () => {
+test('★ 账号页必须真的接上「改资料」与「改密码」（它们此前调用者数量都是 0）', () => {
   assert.match(api, /authProfile:/, 'api.ts 要定义 authProfile')
   assert.match(api, /authChangePassword:/, 'api.ts 要定义 authChangePassword')
   assert.match(account, /api\.authProfile\(/, '账号页必须调用 authProfile —— 否则端点能用、界面进不去')
   assert.match(account, /api\.authChangePassword\(/, '账号页必须调用 authChangePassword（此前全仓 0 个调用者）')
 })
 
-test('★ 改邮箱必须带当前口令（它是登录标识符，只凭会话 cookie 改等于账号接管）', () => {
+test('★ 改邮箱必须带当前密码（它是登录标识符，只凭会话 cookie 改等于账号接管）', () => {
   const call = /api\.authProfile\(\{([\s\S]*?)\}\)/.exec(account)
   assert.ok(call, '未能抽出 authProfile 的调用（判据失效即红）')
   assert.match(call[1] as string, /currentPassword/, 'authProfile 必须带 currentPassword')
   assert.match(
     account,
     /type="password"[\s\S]{0,120}?name="currentPassword"/,
-    '资料表单里要有一个当前口令输入框（不能只靠状态里的 secret）',
+    '资料表单里要有一个当前密码输入框（不能只靠状态里的 secret）',
   )
 })
 

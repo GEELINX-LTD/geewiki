@@ -221,13 +221,13 @@ docker compose exec geewiki-app sh -lc 'node -e "const D=require(process.argv[1]
 ## 7. 生产 profile（PostgreSQL）
 
 ```bash
-echo "DB_PASSWORD=请改成强口令" >> .env
+echo "DB_PASSWORD=请改成强密码" >> .env
 docker compose --profile production up -d --build
 ```
 
 该 profile 会额外启动 `postgres:15`（不映射宿主端口，仅在同网络内以 `postgres:5432` 可达）。应用侧对应的插件是 **`@geewiki/postgres`**（`packages/db-postgres/`，**不是** `@geewiki/db-pg`）——它**已实现**（异步适配器 + schema 化配置 + 自有迁移，20 例单测），与 `@geewiki/db-sqlite` 同属 `conflictGroup: 'database-provider'`（天然互斥）且**默认不启用**。该 profile 只负责把 Postgres 服务跑起来，**切换动作在应用侧显式做**，见下。
 
-`docker-compose.yml` 里 `POSTGRES_PASSWORD` 写成 `${DB_PASSWORD:-}`：未启用该 profile 时不会再出现 `The "DB_PASSWORD" variable is not set` 告警；而一旦启用却没有提供口令，postgres 官方镜像会拒绝以空口令初始化并立即退出（`Error: Database is uninitialized and superuser password is not specified.`，已实测），属安全失败，不会产生弱口令实例。
+`docker-compose.yml` 里 `POSTGRES_PASSWORD` 写成 `${DB_PASSWORD:-}`：未启用该 profile 时不会再出现 `The "DB_PASSWORD" variable is not set` 告警；而一旦启用却没有提供密码，postgres 官方镜像会拒绝以空密码初始化并立即退出（`Error: Database is uninitialized and superuser password is not specified.`，已实测），属安全失败，不会产生弱密码实例。
 
 ---
 
@@ -303,7 +303,7 @@ docker compose build --no-cache && docker compose up -d
 | 启动即退出，日志含 `[@geewiki/http] 监听失败:` | 宿主端口被占用（退出码 1，不写崩溃标记）。改 `GEEWIKI_HOST_PORT` 或释放端口：`ss -ltnp \| grep 3000` |
 | 服务在跑但页面接口全部 404；`/api/health` 里 `db.present` 为 `false`；插件列表中 `@geewiki/db-sqlite` 为 `state: error` | 数据目录不可写（SQLite 建不了库）。插件激活失败不影响主进程启动，因此接口照常响应：`/api/health` 仍返回 **HTTP 200** 但 `db.present:false`，业务接口全部 404；镜像 HEALTHCHECK 会据此把容器标为 **`unhealthy`**（间隔 30s × 3 次后）。按第 3 节 chown，或用 `GEEWIKI_UID/GID` 对齐宿主用户 |
 | 日志出现 `[@geewiki/manager] http 路由服务不可用：REST API 未挂载`，所有接口 404 | 配置目录中缺少 `plugins.base.json`（或其中 `enabled` 为空）→ 没有任何插件被激活。从仓库复制一份：`cp config/plugins.base.json <配置目录>/`。**容器内**注意两点：镜像已自带 `/app/config/plugins.base.json`，但你若把 `./config`（宿主空目录）挂到 `/app/config`，镜像内那份就被遮蔽了，必须自己放入该文件；反之完全不挂载 config 时（`docker run` 只挂 data）镜像自带的默认清单会生效，服务照常起来 |
-| 启用 `--profile production` 后 `postgres` 容器立即退出，日志含 `Error: Database is uninitialized and superuser password is not specified.` | 未提供 `DB_PASSWORD`。compose 中该变量写成 `${DB_PASSWORD:-}` 只是为了避免未启用 profile 时每条命令都告警；实际启用时为空串会被 postgres 官方镜像拒绝（安全失败，不会造出弱口令实例）。在 `.env` 中写入 `DB_PASSWORD=强口令` 后重试。未启用该 profile 时不会再出现该告警 |
+| 启用 `--profile production` 后 `postgres` 容器立即退出，日志含 `Error: Database is uninitialized and superuser password is not specified.` | 未提供 `DB_PASSWORD`。compose 中该变量写成 `${DB_PASSWORD:-}` 只是为了避免未启用 profile 时每条命令都告警；实际启用时为空串会被 postgres 官方镜像拒绝（安全失败，不会造出弱密码实例）。在 `.env` 中写入 `DB_PASSWORD=强密码` 后重试。未启用该 profile 时不会再出现该告警 |
 | 启动即退出，日志含 `Error: EACCES: permission denied, open '/app/package.json'` | pnpm deploy 生成的部署树中少量文件权限为 `600`（仅 root 可读），非 root 运行时读取 `package.json` 会被拒绝。镜像已在构建末尾用 `find` 只给**缺少全局读位/进入位**的条目补 `o+rX`（见 `Dockerfile` 的权限归一化步骤）；自行改写 Dockerfile 或更换基础镜像时请保留该步骤 |
 | 插件页「启用/持久化」报错 | `./config` 不可写（需要写 `plugins.session.json`），同上处理 |
 | `Could not locate the bindings file` / better-sqlite3 加载失败 | 镜像内依赖预编译产物；若自行改动了依赖或基础镜像（如换成 Alpine/musl、或其他 CPU 架构），需确认对应 `prebuilds/*.node` 存在 |

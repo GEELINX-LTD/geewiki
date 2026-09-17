@@ -1,0 +1,24 @@
+-- 0023_invitation_accepted_by.sql —— 邀请记录"是谁用它进来的"
+--
+-- ★★ 为什么要它：
+--   `invitations.accepted_at` 只回答了"什么时候被用了"，没回答"**谁**用了"。
+--   而邀请列表是管理界面：一行写着"已接受"却看不出是谁接受了，管理员就只能去成员列表里
+--   靠时间猜 —— 而这条信息本来就在写入的那一刻知道（`joinAndConsume` 手里就有 userId）。
+--
+-- ★ 语义：`accepted_by` = **凭这条邀请入伙的那个用户**。
+--   · NULL 且 `accepted_at IS NULL` ⇒ 还没被用；
+--   · NULL 但 `accepted_at` 非 NULL ⇒ 0023 之前的历史行（**不回溯猜测**：审计里有
+--     `org.invitation.accept` / `org.invitation.redeem` 的 actorId，但那是审计表的职责，
+--     不该在这里做一次可能猜错的回填）；
+--   · 非 NULL ⇒ 就是这个人。
+--
+-- ★ 为什么允许 NULL 且不加 NOT NULL：加 NOT NULL 就必须给历史行一个默认值，
+--   而任何默认值都是**编造**一个"谁接受的"。宁可留 NULL 让界面显示「—」。
+--
+-- ★ 外键与 `invited_by` 同款（`REFERENCES users(id) ON DELETE SET NULL`）：
+--   用户被删除后邀请记录必须留存（它是入伙与授权的溯源链），
+--   故删用户只把这一格置空，而不是删掉整条记录。
+--
+-- ★ **本文件在 SQLite 上不可重放**（`ALTER TABLE ADD COLUMN` 无 `IF NOT EXISTS`），
+--   生产幂等性由 `_migrations` 提供 —— 同 0017/0019/0020/0022 的说明。
+ALTER TABLE invitations ADD COLUMN accepted_by INTEGER REFERENCES users(id) ON DELETE SET NULL;

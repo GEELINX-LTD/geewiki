@@ -205,7 +205,7 @@ function parseFrames(text: string): Frame[] {
 /* ------------------------------ 造一个登录主体 ------------------------------ */
 
 /*
- * 数据目录是 `data/geewiki.db` 的副本，里面已有账号而口令未知，故直接插一个口令已知的主体。
+ * 数据目录是 `data/geewiki.db` 的副本，里面已有账号而密码未知，故直接插一个密码已知的主体。
  * `org_members` 那一行不是装饰：它决定这个主体能不能看见 org 档页面（见 p3 脚本的说明）。
  */
 const EMAIL = 'web-search@example.com'

@@ -22,7 +22,7 @@
  */
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { Copy, MailPlus, RefreshCw, Trash2 } from 'lucide-react'
-import { api, type OrgGroup, type OrgInvitationView } from '../../api'
+import { api, type OrgGroup, type OrgInvitationView, type OrgMember } from '../../api'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Card, CardBody, CardHeader } from '../../ui/Card'
@@ -57,6 +57,14 @@ const NO_GROUP_VALUE = ''
 export function InvitationsCard(): ReactNode {
   const [rows, setRows] = useState<OrgInvitationView[] | null>(null)
   const [groups, setGroups] = useState<OrgGroup[]>([])
+  /**
+   * 成员表：只为把 `acceptedBy`（用户 **id**）解析成"这是谁"。
+   *
+   * 服务端刻意只回 id（它不查 users 表 —— 那是身份域），所以这一层映射归界面。
+   * 与审计台面的操作者列同款理由：`#12` 无法定位到具体的人，而"谁接受了这条邀请"
+   * 正是这一列存在的全部意义。
+   */
+  const [members, setMembers] = useState<OrgMember[]>([])
   const [err, setErr] = useState<unknown>(null)
   const [conflict, setConflict] = useState<string | null>(null)
   const [notice, setNotice] = useState('')
@@ -91,9 +99,11 @@ export function InvitationsCard(): ReactNode {
     setErr(null)
     try {
       // 组列表只为下拉与"这条邀请入了哪个组"的名称解析，故与邀请列表一起取
-      const [inv, g] = await Promise.all([api.orgInvitations(), api.orgGroups()])
+      // 组列表与成员表都只为**展示**解析用（下拉的组名、"谁接受了"的邮箱）
+      const [inv, g, m] = await Promise.all([api.orgInvitations(), api.orgGroups(), api.orgMembers()])
       setRows(inv.invitations)
       setGroups(g.groups)
+      setMembers(m.members)
     } catch (e: unknown) {
       setErr(e)
       setRows(null)
@@ -111,6 +121,32 @@ export function InvitationsCard(): ReactNode {
       return g === undefined ? `#${groupId}` : g.name
     },
     [groups],
+  )
+
+  /**
+   * 「谁接受的」单元格。
+   *
+   * 三种情况**必须可区分**（与审计台面的操作者列同款纪律）：
+   *   · 还没被用 ⇒ `—`；
+   *   · 已被用但 `acceptedBy` 为 null ⇒ `—（0023 之前的历史记录）` ——
+   *     **明说原因**，而不是只给一个 `—`：后者与"还没被用"长得一模一样；
+   *   · 有 id ⇒ 解析成邮箱；解析不出来（已退出/已删除）就如实退回 `#id`，
+   *     绝不假装已经解析过。
+   */
+  const acceptorLabel = useCallback(
+    (inv: OrgInvitationView, list: OrgMember[]): ReactNode => {
+      if (inv.acceptedAt === null) return <span className="text-muted">—</span>
+      if (inv.acceptedBy === null) {
+        return <span className="text-muted">—（0023 之前的记录）</span>
+      }
+      const m = list.find((x) => x.userId === inv.acceptedBy)
+      return m === undefined ? (
+        <span className="font-mono text-muted">{`#${String(inv.acceptedBy)}（已不在成员列表）`}</span>
+      ) : (
+        <span className="font-mono">{m.email}</span>
+      )
+    },
+    [],
   )
 
   const submit = useCallback(async (): Promise<void> => {
@@ -427,7 +463,7 @@ export function InvitationsCard(): ReactNode {
               邀请码原文：{created.token}
             </p>
             <p className="m-0 mt-1 text-xs leading-relaxed text-muted">
-              对方点开链接即进入注册页：未登录就可以填**自己的**邮箱、用户名与口令开户；
+              对方点开链接即进入注册页：未登录就可以填**自己的**邮箱、用户名与密码开户；
               若他已有账号，则会用当前账号直接入伙。两种都走同一个邀请码，且只能用一次。
             </p>
             {copyHint !== '' && (
@@ -470,7 +506,7 @@ export function InvitationsCard(): ReactNode {
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm" aria-label="邀请列表">
                 <caption className="sr-only">
-                  邀请列表：邮箱、授予的组织角色、入伙时加入的用户组、过期时间与状态。
+                  邀请列表：邮箱、授予的组织角色、入伙时加入的用户组、过期时间、状态与接受者。
                 </caption>
                 <thead className="text-xs text-muted">
                   <tr>
@@ -479,6 +515,7 @@ export function InvitationsCard(): ReactNode {
                     <th scope="col" className="py-1 pr-3 font-medium">用户组</th>
                     <th scope="col" className="py-1 pr-3 font-medium">过期时间</th>
                     <th scope="col" className="py-1 pr-3 font-medium">状态</th>
+                    <th scope="col" className="py-1 pr-3 font-medium">谁接受的</th>
                     <th scope="col" className="py-1 font-medium">操作</th>
                   </tr>
                 </thead>
@@ -510,6 +547,9 @@ export function InvitationsCard(): ReactNode {
                         <td className="py-1.5 pr-3 font-mono text-xs">{fmtTime(inv.expiresAt)}</td>
                         <td className="py-1.5 pr-3">
                           <Badge tone={STATE_TONE[state]}>{INVITATION_STATE_LABEL[state]}</Badge>
+                        </td>
+                        <td className="py-1.5 pr-3 text-xs">
+                          {acceptorLabel(inv, members)}
                         </td>
                         <td className="py-1.5">
                           <div className="flex flex-wrap gap-2">

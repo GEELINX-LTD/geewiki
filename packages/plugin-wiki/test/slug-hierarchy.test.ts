@@ -496,14 +496,49 @@ test('0002 迁移：建出排序索引、可重复执行（幂等）、且与查
      */
     const stripComments = (sql: string): string =>
       sql.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
-    const isReplayable = (sql: string) => !/\bADD\s+COLUMN\b/i.test(stripComments(sql))
+    /*
+     * ★ 迁移按**重放行为**分三类，不是两类（2026-09-17 补第三类）。
+     *
+     * 前两类早就有：
+     *   · **幂等**（只含 `CREATE ... IF NOT EXISTS`）：重放不得抛错；
+     *   · **加列**（`ALTER TABLE ... ADD COLUMN`）：SQLite 无 `ADD COLUMN IF NOT EXISTS`，
+     *     重放必须抛 `duplicate column name`。
+     *
+     * 第三类是 `0022_invitation_open_code.sql` 引入的**表重建**
+     * （`CREATE 新表 → INSERT SELECT → DROP 旧表 → RENAME`）：它重放**不抛错**，
+     * 却会把表**还原成那一刻的形状** —— 也就是**静默丢掉之后迁移给它加的列**。
+     * 这比"抛错"危险得多，而原来的二分法把它归进"幂等"、直接重放：
+     * 0023 加的 `accepted_by` 被抹掉 ⇒ 0023 的重放不再抛错 ⇒ 这条断言以
+     * "Missing expected exception" 报错（**报的是现象，不是原因**）。
+     *
+     * 所以第三类**不重放**（它会污染后面断言依赖的表结构），改为断言它的**形状**：
+     * 必须同时含 `DROP TABLE` 与 `RENAME TO`。生产幂等性由 `_migrations` 提供
+     * （已应用的文件不再执行），故"不可重放"本身不是缺陷 —— 但**必须被如实分类**。
+     */
+    const isAddColumn = (sql: string): boolean => /\bADD\s+COLUMN\b/i.test(stripComments(sql))
+    const isTableRebuild = (sql: string): boolean => {
+      const c = stripComments(sql)
+      return /\bDROP\s+TABLE\b/i.test(c) && /\bRENAME\s+TO\b/i.test(c)
+    }
+    const isReplayable = (sql: string): boolean => !isAddColumn(sql) && !isTableRebuild(sql)
     for (const m of migrations) db.exec(m.sql)
 
     for (const m of migrations.filter((x) => isReplayable(x.sql))) {
       db.exec(m.sql) // 重放：不得抛错
     }
 
-    const notReplayable = migrations.filter((x) => !isReplayable(x.sql))
+    const rebuilt = migrations.filter((x) => isTableRebuild(x.sql))
+    assert.ok(
+      rebuilt.length > 0,
+      '应存在表重建迁移（0022_invitation_open_code.sql）；若为空说明这条断言失去了对象',
+    )
+    for (const m of rebuilt) {
+      // 反空洞：形状必须真的是"重建"（少了 RENAME 就变成"每次重放都丢表"）
+      assert.match(stripComments(m.sql), /\bDROP\s+TABLE\b/i, `${m.name} 声明为表重建却没有 DROP TABLE`)
+      assert.match(stripComments(m.sql), /\bRENAME\s+TO\b/i, `${m.name} 声明为表重建却没有 RENAME TO`)
+    }
+
+    const notReplayable = migrations.filter((x) => isAddColumn(x.sql))
     assert.ok(
       notReplayable.length > 0,
       'P2 起应存在含 ADD COLUMN 的迁移（0012_page_acl.sql）；若为空说明这条断言失去了对象',

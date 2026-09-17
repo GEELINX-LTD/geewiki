@@ -97,6 +97,7 @@ check "C1b 同名组重复创建被拒" 409 "$(req "$JAR" POST /api/org/groups '
 check "C2 POST /api/org/invitations" 201 "$(req "$JAR" POST /api/org/invitations "{\"email\":\"member@example.com\",\"orgRole\":\"member\",\"groupId\":$GROUP_ID}")"
 TOKEN=$(field token)
 [[ -n "$TOKEN" ]] && ok "C2b 返回了一次性原始令牌（长度 ${#TOKEN}）" || bad "C2b 未返回令牌"
+INV_ID=$(field invitation.id)
 check "C3 GET /api/org/invitations" 200 "$(req "$JAR" GET /api/org/invitations)"
 check "C3b ★ 列表里没有任何令牌字段" "" "$(node -e "const o=require('$TMP/body.json');console.log(o.invitations.map(i=>Object.keys(i).filter(k=>/token/i.test(k)).join(',')).join(''))")"
 
@@ -104,6 +105,7 @@ echo
 echo "=== C4. 通用码：不绑定邮箱（持码者自填） ==="
 check "C4 签发通用码（不传 email）" 201 "$(req "$JAR" POST /api/org/invitations '{"orgRole":"member"}')"
 OPEN_A=$(field token)
+OPEN_A_ID=$(field invitation.id)
 check "C4b ★ 通用码的 email 落库为 null（不是空串）" "null" "$(node -e "const o=require('$TMP/body.json');console.log(o.invitation.email===null?'null':JSON.stringify(o.invitation.email))")"
 check "C5 再签一个通用码" 201 "$(req "$JAR" POST /api/org/invitations '{"orgRole":"member"}')"
 OPEN_B=$(field token)
@@ -118,6 +120,10 @@ check "D2 redeem 开户" 201 "$(req_raw POST /api/org/invitations/redeem "{\"tok
 NEW_UID=$(field userId)
 check "D2b 入伙角色为 member" "member" "$(field orgRole)"
 check "D3 同一令牌**不能**二次使用" 400 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$TOKEN\",\"password\":\"another123\"}")"
+
+# ★ 0023：列表必须能答出"这条邀请是**谁**用的"，而不只是"什么时候用的"
+check "D3b ★ 列表里能看出是谁接受的（acceptedBy = 新用户 id）" "$NEW_UID" "$(reqfield "$JAR" GET /api/org/invitations "invitations.find(i=>i.id==='$INV_ID').acceptedBy")"
+check "D3c 未被使用的邀请 acceptedBy 为 null" "" "$(reqfield "$JAR" GET /api/org/invitations "invitations.find(i=>i.id==='$OPEN_A_ID').acceptedBy")"
 
 echo
 echo "=== D4. 通用码：注册者自选邮箱 + 用户名 ==="

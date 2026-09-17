@@ -11,7 +11,7 @@
  *   POST   /api/auth/login              登录（public）
  *   POST   /api/auth/logout             登出（public；吊销服务端会话，不只是删 cookie）
  *   GET    /api/auth/me                 当前身份（user）
- *   POST   /api/auth/password           修改自己的口令（user）
+ *   POST   /api/auth/password           修改自己的密码（user）
  *   GET    /api/auth/identities         列出自己的外部身份（user）—— P1.5
  *   POST   /api/auth/identities/link    确认绑定外部身份（user）—— P1.5，读 HttpOnly 票据 cookie
  *   POST   /api/auth/identities/unlink  解绑外部身份（user）—— P1.5，至少保留一种登录方式
@@ -226,7 +226,7 @@ const DISPLAY_NAME_MAX = 100
 const PASSWORD_MIN = 8
 const PASSWORD_MAX = 200
 
-/** 请求体上限（登录/设置口令都是小 JSON；1MB 与全仓其它读体处同量级） */
+/** 请求体上限（登录/设置密码都是小 JSON；1MB 与全仓其它读体处同量级） */
 const MAX_BODY_BYTES = 64 * 1024
 
 /**
@@ -430,7 +430,7 @@ export const AuthPlugin = {
     let credentialSource = false
     const refreshCredentialSource = async (): Promise<void> => {
       /*
-       * **"可登录的账号"必须把 OIDC 身份也算上**：OIDC 首登建出来的账号**没有口令行**
+       * **"可登录的账号"必须把 OIDC 身份也算上**：OIDC 首登建出来的账号**没有密码行**
        * （身份即凭据）。若这里只数 `user_credentials`，一个"只有 SSO 用户"的实例会被判成
        * 没东西可登录 ⇒ 所有 `access:'user'` 端点返回 503 `bootstrap_required`（系统未就绪）
        * 而不是 401，前端会掉进"去初始化"的死循环。
@@ -709,7 +709,7 @@ export const AuthPlugin = {
        * F7 平台事件：登录成功（**SSO 侧**）。
        *
        * `loginAs` 被 SSO 的两条子路径共用（已绑定账号 / 首次建号），在这里发一次即可；
-       * **本地口令路径不走 `loginAs`**（它在 `POST /api/auth/login` 里内联建会话），
+       * **本地密码路径不走 `loginAs`**（它在 `POST /api/auth/login` 里内联建会话），
        * 那边单独发同一个事件——两处都必须发，漏一处就是"某种登录方式不触发订阅者"，
        * 而那种缺口极难被发现。`method` 字段正是用来让订阅者区分两者的。
        *
@@ -995,7 +995,7 @@ export const AuthPlugin = {
           h.json(400, {
             ok: false,
             error: 'invalid_password',
-            message: `口令长度须在 ${PASSWORD_MIN}–${PASSWORD_MAX} 之间`,
+            message: `密码长度须在 ${PASSWORD_MIN}–${PASSWORD_MAX} 之间`,
           })
           return
         }
@@ -1097,7 +1097,7 @@ export const AuthPlugin = {
           return
         }
         /*
-         * LEFT JOIN 而非 INNER：账号存在但凭据行缺失（数据损坏、或建号时未设口令）时，
+         * LEFT JOIN 而非 INNER：账号存在但凭据行缺失（数据损坏、或建号时未设密码）时，
          * 仍要走到"凭据不存在"这条分支，而不是让查询返回空集把它伪装成"账号不存在"。
          * 凭据列因此可空 —— 类型上如实声明为 `| null`，不靠断言掩盖。
          */
@@ -1120,7 +1120,7 @@ export const AuthPlugin = {
         }
         /*
          * **账号不存在（或无凭据）时补跑一次同代价的 scrypt**：否则"邮箱不存在"（快）与
-         * "口令错"（慢）的耗时有数量级差异，攻击者可据此枚举出哪些邮箱已注册。
+         * "密码错"（慢）的耗时有数量级差异，攻击者可据此枚举出哪些邮箱已注册。
          * 响应文案与错误码在两条路径上**完全一致**（设计文档 §7.4 第 7 条同理）。
          */
         if (credential === null) await dummyVerify(password)
@@ -1135,7 +1135,7 @@ export const AuthPlugin = {
             targetId: email || '(empty)',
             actorIpHash: auditIpHash(clientIp(h.req)),
           })
-          h.json(401, { ok: false, error: 'invalid_credentials', message: '邮箱或口令不正确' })
+          h.json(401, { ok: false, error: 'invalid_credentials', message: '邮箱或密码不正确' })
           return
         }
         clearFailures(key)
@@ -1152,11 +1152,11 @@ export const AuthPlugin = {
         })
         h.res.setHeader('set-cookie', sessionCookie(session.rawToken, { maxAgeSeconds: session.maxAgeSeconds, secure: secureCookie }))
         /*
-         * F7 平台事件：登录成功（**本地口令路径**）。
+         * F7 平台事件：登录成功（**本地密码路径**）。
          *
          * 这条路径**不走 `loginAs`**（它内联建会话），所以事件必须在这里单独发一次。
-         * 两处都发是刻意的：只发 SSO 那一处，症状是"用口令登录的人不触发订阅者"——
-         * 而写订阅者的插件作者通常只用口令测试，于是这个缺口会一直潜伏到某个用户报障。
+         * 两处都发是刻意的：只发 SSO 那一处，症状是"用密码登录的人不触发订阅者"——
+         * 而写订阅者的插件作者通常只用密码测试，于是这个缺口会一直潜伏到某个用户报障。
          */
         try {
           ctx.emit(USER_LOGIN_EVENT, { userId, method: 'password' } satisfies UserLoginEvent)
@@ -1422,7 +1422,7 @@ export const AuthPlugin = {
             h.json(400, {
               ok: false,
               error: 'invalid_password',
-              message: `口令长度须在 ${PASSWORD_MIN}–${PASSWORD_MAX} 之间`,
+              message: `密码长度须在 ${PASSWORD_MIN}–${PASSWORD_MAX} 之间`,
             })
             return
           }
@@ -1432,7 +1432,7 @@ export const AuthPlugin = {
           )
           const stored = rows[0]
           if (!stored || !(await verifyPassword(currentPassword, stored))) {
-            h.json(401, { ok: false, error: 'invalid_credentials', message: '当前口令不正确' })
+            h.json(401, { ok: false, error: 'invalid_credentials', message: '当前密码不正确' })
             return
           }
           const next = await hashPassword(newPassword)
@@ -1444,7 +1444,7 @@ export const AuthPlugin = {
               [next.algo, next.params, next.salt, next.hash, now, userId],
             )
             /*
-             * 改密后**吊销除当前会话外的全部会话**：口令泄露的典型应对就是改密，
+             * 改密后**吊销除当前会话外的全部会话**：密码泄露的典型应对就是改密，
              * 若旧会话仍然有效，改密就挡不住已经进来的攻击者。
              * 保留当前会话是为了不把正在操作的这个浏览器自己也踢下线。
              */
@@ -1469,21 +1469,21 @@ export const AuthPlugin = {
     /* ---------- POST /api/auth/profile（user）：改邮箱 / 显示名 ---------- */
     /*
      * ★ 为什么邮箱与显示名走**同一个**端点，而不是各开一个：
-     * 两者的准入条件必须完全一样（下一条），而"改邮箱要口令、改名字不要"这种差别
+     * 两者的准入条件必须完全一样（下一条），而"改邮箱要密码、改名字不要"这种差别
      * 一旦拆开，就会在前端与后端各写一遍判据，迟早漏一处。合成一个动作之后，
      * 这条规则只有一个形态。
      *
-     * ★ **必须验当前口令**。邮箱是**登录标识符**，改它等于改"这个账号怎么被认出来"；
+     * ★ **必须验当前密码**。邮箱是**登录标识符**，改它等于改"这个账号怎么被认出来"；
      * 只凭一个会话 cookie 就能改的话，一个被盗的会话（或一台没锁屏的机器）就等于
      * 账号接管 —— 攻击者把邮箱改成自己的，再走"忘记密码"那条路（若将来有）就完成了。
-     * 验证当前口令把这一步重新绑回"知道凭据的人"。
+     * 验证当前密码把这一步重新绑回"知道凭据的人"。
      *
-     * ★ 改邮箱**不吊销其它会话**（与改口令那条不同）。两者对应的是不同的威胁：
-     * 改口令是"凭据可能已泄露"的应对，故必须把别人踢下线；改邮箱是可逆的展示层
-     * 归属变更，且已经要求了口令 —— 顺手把用户自己的其它设备全踢下线是净损失。
+     * ★ 改邮箱**不吊销其它会话**（与改密码那条不同）。两者对应的是不同的威胁：
+     * 改密码是"凭据可能已泄露"的应对，故必须把别人踢下线；改邮箱是可逆的展示层
+     * 归属变更，且已经要求了密码 —— 顺手把用户自己的其它设备全踢下线是净损失。
      *
      * ★ **OIDC 用户走不通这条路**（`no_local_credential`）：SSO 开户的账号没有
-     * `user_credentials` 行，因而没有可验证的当前口令。本轮**不动 OIDC**，
+     * `user_credentials` 行，因而没有可验证的当前密码。本轮**不动 OIDC**，
      * 这条边界是刻意留着的 —— 处理它需要一个显式的产品决定（允许改显示名？
      * 还是以 IdP 为准、这里干脆不给改？）。
      */
@@ -1532,12 +1532,12 @@ export const AuthPlugin = {
             h.json(409, {
               ok: false,
               error: 'no_local_credential',
-              message: '该账号通过 SSO 登录，没有本地口令，暂不支持在这里修改资料',
+              message: '该账号通过 SSO 登录，没有本地密码，暂不支持在这里修改资料',
             })
             return
           }
           if (!(await verifyPassword(currentPassword, stored))) {
-            h.json(401, { ok: false, error: 'invalid_credentials', message: '当前口令不正确' })
+            h.json(401, { ok: false, error: 'invalid_credentials', message: '当前密码不正确' })
             return
           }
 
@@ -1626,7 +1626,7 @@ export const AuthPlugin = {
           )
           h.json(200, {
             ok: true,
-            /** 前端据此判断"能不能解绑"：没有口令且只有一个身份时不可以 */
+            /** 前端据此判断"能不能解绑"：没有密码且只有一个身份时不可以 */
             hasPassword: Number(cred[0]?.n ?? 0) > 0,
             identities: rows.map((r) => ({
               id: Number(r.id),
@@ -1761,7 +1761,7 @@ export const AuthPlugin = {
             return
           }
           /*
-           * **至少保留一种登录方式**（设计文档 §7.2）：解绑最后一个身份且没有口令
+           * **至少保留一种登录方式**（设计文档 §7.2）：解绑最后一个身份且没有密码
            * ⇒ 该账号再也无法登录，而它可能还挂着内容的所有权。
            */
           const cred = await db.query<{ n: number | string }>(
@@ -1777,7 +1777,7 @@ export const AuthPlugin = {
             h.json(409, {
               ok: false,
               error: 'last_credential',
-              message: '这是最后一个登录方式，无法解绑（请先设置口令）',
+              message: '这是最后一个登录方式，无法解绑（请先设置密码）',
             })
             return
           }
@@ -1827,9 +1827,9 @@ export const AuthPlugin = {
        * ★ P2 新增：由**受信插件**（当前只有 @geewiki/org 的邀请流程）建本地账号。
        *
        * 为什么放在服务契约而不是再加一个 HTTP 端点：账号创建是**身份域**的能力
-       * （口令哈希、唯一性、credentialSource 的维护都在本插件），而"凭什么是这个人
+       * （密码哈希、唯一性、credentialSource 的维护都在本插件），而"凭什么是这个人
        * 可以有账号"是**组织域**的判断（有效邀请）。让组织插件经服务调用来要这个能力，
-       * 比让它自己写 `user_credentials` 表要正确得多 —— 后者会把口令哈希算法复制成
+       * 比让它自己写 `user_credentials` 表要正确得多 —— 后者会把密码哈希算法复制成
        * 两份，将来升级算法必然漏掉一处。
        *
        * **它不是"开放注册"**：这个方法本身不做任何鉴权，暴露面由调用方承担；
@@ -1838,7 +1838,7 @@ export const AuthPlugin = {
       async createLocalUser(input) {
         const email = input.email.trim().toLowerCase()
         /*
-         * 校验放在**服务这一侧**而不是调用方：口令强度与邮箱格式是身份域的规则，
+         * 校验放在**服务这一侧**而不是调用方：密码强度与邮箱格式是身份域的规则，
          * 让 org 插件各写一份"长度至少几位"必然与这里漂移，而漂移的方向通常是
          * "某个入口悄悄放宽了"。调用方只需要把用户输入原样递进来。
          */

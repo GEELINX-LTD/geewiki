@@ -1,7 +1,7 @@
 /**
- * 口令哈希：`scrypt`（`node:crypto`，**零新依赖**）。
+ * 密码哈希：`scrypt`（`node:crypto`，**零新依赖**）。
  *
- * 设计依据见 docs/design/access-control.md：口令存储用 scrypt，参数与算法名**都入库**
+ * 设计依据见 docs/design/access-control.md：密码存储用 scrypt，参数与算法名**都入库**
  * （`user_credentials.algo` / `.params`），以便将来无痛升级到 argon2id —— 升级时按
  * 每条凭据自己记录的算法校验，登录成功后可就地重算为新算法。
  *
@@ -57,9 +57,9 @@ export interface StoredCredential {
 }
 
 /**
- * 口令规范化：先做 Unicode NFKC。
+ * 密码规范化：先做 Unicode NFKC。
  *
- * 理由：同一个"看起来一样"的口令在不同输入法/平台下可能产生不同的码点序列
+ * 理由：同一个"看起来一样"的密码在不同输入法/平台下可能产生不同的码点序列
  * （如全角与半角、组合字符与预组合字符）。规范化让"用户以为一样"就等于"哈希一样"，
  * 避免出现"明明输对了却登不上"的不可解释故障。
  */
@@ -115,7 +115,7 @@ function parseParams(raw: string): ScryptParams | null {
 }
 
 /**
- * 校验口令。**任何异常路径一律返回 `false`**（失败关闭）：算法未知、参数非法、
+ * 校验密码。**任何异常路径一律返回 `false`**（失败关闭）：算法未知、参数非法、
  * salt/hash 非法 hex 都不得"抛出去被上层当成成功"，也不得因为解析失败而跳过比较。
  *
  * 比较用 `timingSafeEqual`（定长），避免逐字节短路比较泄漏前缀匹配长度。
@@ -144,7 +144,7 @@ export async function verifyPassword(password: string, stored: StoredCredential)
 /**
  * 定时补偿用的"假校验"。
  *
- * 登录失败路径上，若"账号不存在"直接返回、而"账号存在但口令错"要先算一次 scrypt，
+ * 登录失败路径上，若"账号不存在"直接返回、而"账号存在但密码错"要先算一次 scrypt，
  * 两者的响应耗时会有数量级差异 ⇒ 攻击者可据此**枚举出哪些 email 已注册**。
  * 因此在"账号不存在"时也跑一次同等代价的 scrypt，把两条路径的耗时拉平。
  */

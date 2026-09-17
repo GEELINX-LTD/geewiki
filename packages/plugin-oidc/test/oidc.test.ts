@@ -799,7 +799,7 @@ test('绑定票据：篡改 / 过期 / 被他人占用 一律拒绝', async () =
   }
 })
 
-test('解绑：最后一个登录方式 ⇒ 409 last_credential；有口令时可解绑（P1.5 验收项）', async () => {
+test('解绑：最后一个登录方式 ⇒ 409 last_credential；有密码时可解绑（P1.5 验收项）', async () => {
   const h = await makeHarness({ oidcProvisioningMode: 'auto' })
   try {
     await setupLocal(h, 'boss@example.com')
@@ -817,7 +817,7 @@ test('解绑：最后一个登录方式 ⇒ 409 last_credential；有口令时�
     assert.equal(link.status, 200)
     const identId = Number(h.q<{ id: number }>('SELECT id FROM user_identities')[0]?.id ?? 0)
 
-    // 造一个"只有身份、没有口令"的账号来测 last_credential
+    // 造一个"只有身份、没有密码"的账号来测 last_credential
     const onlySso = h.q<{ id: number }>('SELECT id FROM users LIMIT 1')[0]?.id ?? 0
     h.adapter.run('DELETE FROM user_credentials WHERE user_id = ?', [onlySso])
     const blocked = await h.call('POST', '/api/auth/identities/unlink', {
@@ -831,7 +831,7 @@ test('解绑：最后一个登录方式 ⇒ 409 last_credential；有口令时�
     assert.equal(blocked.status, 409, JSON.stringify(blocked.body))
     assert.equal(blocked.body.error, 'last_credential')
 
-    // 有口令后可以解绑
+    // 有密码后可以解绑
     const { hashPassword } = await import('../../plugin-auth/src/password.js')
     const cred = await hashPassword(GOOD_PASSWORD)
     h.adapter.run(
@@ -987,7 +987,7 @@ test('IdP 不可达：capabilities 降级为 unreachable，本地密码通道不
     assert.equal(oidc.available, false)
     assert.ok(typeof oidc.reason === 'string' && oidc.reason.length > 0)
 
-    // **本地口令登录必须完全正常**
+    // **本地密码登录必须完全正常**
     const login = await h.call('POST', '/api/auth/login', {
       body: { email: 'boss@example.com', password: GOOD_PASSWORD },
     })

@@ -3,7 +3,7 @@
  *
  * 用户指出的现象：**没装 SSO 插件时，账号页照样显示讲企业 SSO 的空态**
  * ——那是一个指向不存在功能的界面。修法是把这块界面从宿主搬进 `@geewiki/oidc`
- * 通过插槽 `account-identities` 贡献，宿主只留「本地口令」。
+ * 通过插槽 `account-identities` 贡献，宿主只留「本地密码」。
  *
  * 这里钉三件事：
  *   ① 账号页不再出现任何 SSO 文案（宿主不认识这个概念），且真的渲染那个插槽；
@@ -28,7 +28,7 @@ const plan = readFileSync(join(SRC, 'lib', 'pluginUiPlan.ts'), 'utf8')
  */
 const core = readFileSync(join(import.meta.dirname, '..', '..', 'core', 'src', 'slots.ts'), 'utf8')
 
-test('账号页不出现 SSO 文案（宿主不认识"外部身份"），只留本地口令 + 插槽位', () => {
+test('账号页不出现 SSO 文案（宿主不认识"外部身份"），只留本地密码 + 插槽位', () => {
   // 注释里解释历史是允许的（它正是这次归属变更的记录），所以先剥注释再查文案
   const code = page.replace(/\/\*[\s\S]*?\*\//g, '')
   assert.doesNotMatch(code, /SSO/, '代码里不得再出现 SSO')
@@ -36,7 +36,7 @@ test('账号页不出现 SSO 文案（宿主不认识"外部身份"），只留�
   assert.doesNotMatch(code, /authLinkIdentity|authUnlinkIdentity|AuthIdentity/, '绑定/解绑与身份类型都归插件')
   assert.match(code, /<AccountIdentitiesSlotOutlet linkPending=\{linkPending\} \/>/, '必须渲染插槽位，并把"这次回跳要确认"的提示传下去')
   assert.match(code, /ensureSlotLoaded\('account-identities'\)/, '插槽是按需加载的，进页面时要触发')
-  assert.match(code, /本地口令/, '核心那件事（本地口令状态）要留着')
+  assert.match(code, /本地密码/, '核心那件事（本地密码状态）要留着')
 })
 
 test('提示由宿主传（插件不碰 location）：props 与"路由归宿主"这条纪律', () => {

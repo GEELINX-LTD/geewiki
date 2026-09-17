@@ -366,7 +366,7 @@ test('setup：凭据来源探针从 false 变 true（供 judgeAccess 区分 503 
   }
 })
 
-test('setup：参数校验（邮箱格式 / 口令长度）分别给 400 与对应机器码', async () => {
+test('setup：参数校验（邮箱格式 / 密码长度）分别给 400 与对应机器码', async () => {
   const h = await makeHarness()
   try {
     const badEmail = await h.call('POST', '/api/auth/setup', {
@@ -389,7 +389,7 @@ test('setup：参数校验（邮箱格式 / 口令长度）分别给 400 与对�
 
 /* ------------------------------ 3. 登录 ------------------------------ */
 
-test('login：正确口令下发会话；错误口令与不存在账号的响应**完全一致**（128 位不提枚举面）', async () => {
+test('login：正确密码下发会话；错误密码与不存在账号的响应**完全一致**（128 位不提枚举面）', async () => {
   const h = await makeHarness()
   try {
     await h.call('POST', '/api/auth/setup', { body: { email: 'a@b.co', password: GOOD_PASSWORD } })
@@ -424,7 +424,7 @@ test('login：连续 10 次失败后第 11 次返回 429；成功登录后计数
     const blocked = await h.call('POST', '/api/auth/login', {
       body: { email: 'a@b.co', password: GOOD_PASSWORD },
     })
-    assert.equal(blocked.status, 429, '超过阈值后**即使口令正确**也要先被限流挡下')
+    assert.equal(blocked.status, 429, '超过阈值后**即使密码正确**也要先被限流挡下')
     assert.equal(blocked.body.error, 'too_many_requests')
 
     // 换一个邮箱（不同限流键）不受影响 —— 限流键是 ip+email，不是全局开关
@@ -577,9 +577,9 @@ test('CSRF：带 cookie 的非 GET 缺 X-GW-CSRF ⇒ 403；补齐后放行；跨
   }
 })
 
-/* ---------------------------- 6. 修改口令 ---------------------------- */
+/* ---------------------------- 6. 修改密码 ---------------------------- */
 
-test('改口令：当前口令错 ⇒ 401；成功后吊销其它会话、保留当前会话', async () => {
+test('改密码：当前密码错 ⇒ 401；成功后吊销其它会话、保留当前会话', async () => {
   const h = await makeHarness()
   try {
     const setup = await h.call('POST', '/api/auth/setup', { body: { email: 'a@b.co', password: GOOD_PASSWORD } })
@@ -604,7 +604,7 @@ test('改口令：当前口令错 ⇒ 401；成功后吊销其它会话、保留
     assert.ok(await h.svc().resolveSession(s1), '当前会话应保留（不把正在操作的浏览器踢下线）')
     assert.equal(await h.svc().resolveSession(s2), undefined, '其它会话必须被吊销')
 
-    // 新口令可登录、旧口令不可
+    // 新密码可登录、旧密码不可
     const oldLogin = await h.call('POST', '/api/auth/login', { body: { email: 'a@b.co', password: GOOD_PASSWORD } })
     assert.equal(oldLogin.status, 401)
     const newLogin = await h.call('POST', '/api/auth/login', {
@@ -616,12 +616,12 @@ test('改口令：当前口令错 ⇒ 401；成功后吊销其它会话、保留
   }
 })
 
-/* ------------------------------ 7. 口令哈希 ------------------------------ */
+/* ------------------------------ 7. 密码哈希 ------------------------------ */
 
-test('口令哈希：同一口令两次哈希不同（随机 salt）；错误口令校验失败；参数入库可升级', async () => {
+test('密码哈希：同一密码两次哈希不同（随机 salt）；错误密码校验失败；参数入库可升级', async () => {
   const a = await hashPassword('same-password')
   const b = await hashPassword('same-password')
-  assert.notEqual(a.hash, b.hash, 'salt 必须随机：否则相同口令会得出相同哈希')
+  assert.notEqual(a.hash, b.hash, 'salt 必须随机：否则相同密码会得出相同哈希')
   assert.notEqual(a.salt, b.salt)
 
   assert.equal(await verifyPassword('same-password', a), true)
@@ -635,7 +635,7 @@ test('口令哈希：同一口令两次哈希不同（随机 salt）；错误口
 
 /* ------------------------------ 8. 审计 ------------------------------ */
 
-test('审计：口令变更与登出都落库；before/after 不含任何凭据字段', async () => {
+test('审计：密码变更与登出都落库；before/after 不含任何凭据字段', async () => {
   const h = await makeHarness()
   try {
     const setup = await h.call('POST', '/api/auth/setup', { body: { email: 'a@b.co', password: GOOD_PASSWORD } })
@@ -655,7 +655,7 @@ test('审计：口令变更与登出都落库；before/after 不含任何凭据�
     )
     // IP 只以哈希形态落库（不留原文）
     assert.match(rows[0]?.actor_ip_hash ?? '', /^[0-9a-f]{64}$/)
-    // 审计里不得出现口令/令牌
+    // 审计里不得出现密码/令牌
     const dumped = JSON.stringify(rows)
     assert.doesNotMatch(dumped, /correct-horse-battery/)
     assert.doesNotMatch(dumped, /brand-new-password/)

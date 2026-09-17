@@ -1,24 +1,24 @@
 /**
- * 账号页（`#/account`）：**本地凭据这一侧归宿主**（邮箱 / 用户名 / 口令），
+ * 账号页（`#/account`）：**本地凭据这一侧归宿主**（邮箱 / 用户名 / 密码），
  * **外部身份那一侧归提供者插件**（`account-identities` 插槽）。
  *
  * ## 2026-09-17 的补齐（本页此前只有"状态"，没有"操作"）
  *
- * 本页原先是：一张「本地口令」卡片只显示 `已设置 / 未设置` 徽标，外加 SSO 插槽。
+ * 本页原先是：一张「本地密码」卡片只显示 `已设置 / 未设置` 徽标，外加 SSO 插槽。
  * 也就是说 **`POST /api/auth/password` 与后来新增的 `POST /api/auth/profile`
- * 两个端点都没有任何界面入口** —— 用户根本无法在这里改口令（`api.authChangePassword`
+ * 两个端点都没有任何界面入口** —— 用户根本无法在这里改密码（`api.authChangePassword`
  * 在全仓的调用者数量是 **0**）。这与"审计页那四个端点"是同一类问题：
  * 后端能力齐了、前端没接上，而它**不会报错**，只是"这个功能不存在"。
  *
  * 现在补成两张卡片：
- * 1. **资料** —— 邮箱（登录标识符）与用户名，改它们必须**验当前口令**；
- * 2. **本地口令** —— 改口令（原端点，现在真的接上了）。
+ * 1. **资料** —— 邮箱（登录标识符）与用户名，改它们必须**验当前密码**；
+ * 2. **本地密码** —— 改密码（原端点，现在真的接上了）。
  *
- * ## 为什么"改资料"要单独输一次口令，而不是复用登录态
+ * ## 为什么"改资料"要单独输一次密码，而不是复用登录态
  *
  * 邮箱是**登录标识符**：只凭一个会话 cookie 就能改它的话，一个被盗的会话
  * （或一台没锁屏的机器）等于账号接管 —— 攻击者把邮箱改成自己的就完成了。
- * 要求当前口令把这一步重新绑回"知道凭据的人"。理由与判据在服务端那份
+ * 要求当前密码把这一步重新绑回"知道凭据的人"。理由与判据在服务端那份
  * （`packages/plugin-auth/src/index.ts` 的 `POST /api/auth/profile`）写得更全。
  *
  * ## 归属（2026-09-16 的重划，仍然有效）
@@ -69,7 +69,7 @@ export function AccountPage(): ReactNode {
   const [profileErr, setProfileErr] = useState<unknown>(null)
   const [profileNotice, setProfileNotice] = useState('')
 
-  // 改口令表单
+  // 改密码表单
   const [curPwd, setCurPwd] = useState('')
   const [newPwd, setNewPwd] = useState('')
   const [confirmPwd, setConfirmPwd] = useState('')
@@ -178,7 +178,7 @@ export function AccountPage(): ReactNode {
     setPwdNotice('')
     if (newPwd !== confirmPwd) {
       // 本地先挡一道：两次不一致是纯客户端可判定的事实，没必要打一次网络往返
-      setPwdErr(new Error('两次输入的新口令不一致'))
+      setPwdErr(new Error('两次输入的新密码不一致'))
       return
     }
     setPwdBusy(true)
@@ -191,7 +191,7 @@ export function AccountPage(): ReactNode {
        * 服务端会吊销**除当前会话外**的全部会话。如实说出来 —— 用户若在别的设备上还开着，
        * 那些会话此刻已经掉了，他有权知道原因。
        */
-      setPwdNotice('口令已更新。其它设备上的登录已失效，需要重新登录。')
+      setPwdNotice('密码已更新。其它设备上的登录已失效，需要重新登录。')
     } catch (err) {
       setPwdErr(err)
     } finally {
@@ -237,7 +237,7 @@ export function AccountPage(): ReactNode {
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted">
-              当前口令（确认是你本人在改）
+              当前密码（确认是你本人在改）
               <Input
                 type="password"
                 name="currentPassword"
@@ -272,10 +272,10 @@ export function AccountPage(): ReactNode {
       </Card>
 
       <Card>
-        <CardHeader title="本地口令" description="用邮箱与口令登录这个账号" />
+        <CardHeader title="本地密码" description="用邮箱与密码登录这个账号" />
         <CardBody className="flex flex-col gap-3">
           <div className="flex items-center justify-between gap-3">
-            <span className="text-note text-muted">本地口令</span>
+            <span className="text-note text-muted">本地密码</span>
             {view.kind === 'ready' ? (
               <Badge tone={view.hasPassword ? 'ok' : 'warn'}>{view.hasPassword ? '已设置' : '未设置'}</Badge>
             ) : (
@@ -295,14 +295,14 @@ export function AccountPage(): ReactNode {
             />
           )}
           {/*
-            只有**已经有本地口令**的账号才显示改口令表单：没有口令的账号（SSO 开户）
-            点了会得到 401「当前口令不正确」—— 那是一个"看起来坏了"的正常结果，
+            只有**已经有本地密码**的账号才显示改密码表单：没有密码的账号（SSO 开户）
+            点了会得到 401「当前密码不正确」—— 那是一个"看起来坏了"的正常结果，
             不该出现在界面上。
           */}
           {view.kind === 'ready' && view.hasPassword && (
             <form className="flex flex-col gap-3" onSubmit={(e) => void onPassword(e)}>
               <label className="flex flex-col gap-1 text-xs text-muted">
-                当前口令
+                当前密码
                 <Input
                   type="password"
                   name="currentPassword"
@@ -314,7 +314,7 @@ export function AccountPage(): ReactNode {
                 />
               </label>
               <label className="flex flex-col gap-1 text-xs text-muted">
-                新口令（至少 {PASSWORD_MIN} 位）
+                新密码（至少 {PASSWORD_MIN} 位）
                 <Input
                   type="password"
                   name="newPassword"
@@ -327,7 +327,7 @@ export function AccountPage(): ReactNode {
                 />
               </label>
               <label className="flex flex-col gap-1 text-xs text-muted">
-                再输一次新口令
+                再输一次新密码
                 <Input
                   type="password"
                   name="confirmPassword"
@@ -352,7 +352,7 @@ export function AccountPage(): ReactNode {
                   loading={pwdBusy}
                   disabled={curPwd === '' || newPwd === '' || confirmPwd === ''}
                 >
-                  修改口令
+                  修改密码
                 </Button>
               </div>
             </form>

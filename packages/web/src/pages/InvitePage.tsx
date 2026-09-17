@@ -12,7 +12,7 @@
  *
  * ## 两条路径，按"有没有登录"分
  *
- * - **未登录** ⇒ 这是绝大多数情况（被邀请人此刻还没有账号）。填邮箱 / 用户名 / 口令，
+ * - **未登录** ⇒ 这是绝大多数情况（被邀请人此刻还没有账号）。填邮箱 / 用户名 / 密码，
  *   走 `redeem` 开户，然后**自动登录**并进知识库。
  * - **已登录** ⇒ 他已有账号，凭同一个码**入伙**（`accept`），不再开户。
  *   这条分支不能省：管理员把码发给一个已有账号的同事是完全正常的用法，
@@ -22,7 +22,7 @@
  *
  * `redeem` **刻意不建会话**（会话的建立属于身份域，绕开 `login` 去手搓 cookie 等于把
  * 会话令牌的纪律复制到第二个地方）。所以这里紧接着调一次 `login` —— 用的是用户**刚设的**
- * 那对邮箱口令，走的是与登录页**完全同一条**路径。这比让用户"注册成功后再去登录页输一遍"
+ * 那对邮箱密码，走的是与登录页**完全同一条**路径。这比让用户"注册成功后再去登录页输一遍"
  * 少一次往返，且不会让任何一处绕过身份域。
  */
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
@@ -66,7 +66,7 @@ export function InvitePage(props: { readonly token: string }): ReactNode {
     e.preventDefault()
     setFailure(null)
     /*
-     * 两道纯客户端可判定的校验先挡在本地：不该为"两次口令不一致"打一次网络往返。
+     * 两道纯客户端可判定的校验先挡在本地：不该为"两次密码不一致"打一次网络往返。
      * 邮箱格式用 `emailError`（与邀请签发同一份规则），只换掉"空值"那句文案 ——
      * 这里填的是**自己的**邮箱，不是"受邀人的"。
      */
@@ -76,7 +76,7 @@ export function InvitePage(props: { readonly token: string }): ReactNode {
       return
     }
     if (password !== confirm) {
-      setFailure(new Error('两次输入的口令不一致'))
+      setFailure(new Error('两次输入的密码不一致'))
       return
     }
     setSubmitting(true)
@@ -88,7 +88,7 @@ export function InvitePage(props: { readonly token: string }): ReactNode {
         password,
         ...(displayName.trim() === '' ? {} : { displayName: displayName.trim() }),
       })
-      // 用刚设的那对邮箱口令登录 —— 与登录页走同一条路（见文件头最后一段）
+      // 用刚设的那对邮箱密码登录 —— 与登录页走同一条路（见文件头最后一段）
       await login(trimmedEmail, password)
       window.location.hash = '/wiki'
     } catch (err) {
@@ -176,7 +176,7 @@ export function InvitePage(props: { readonly token: string }): ReactNode {
       <Card>
         <CardHeader
           title="创建你的账号"
-          description="你收到了一个邀请码。填好下面三项即可开始使用 —— 邮箱、用户名与口令之后都能在「账号」页修改。"
+          description="你收到了一个邀请码。填好下面三项即可开始使用 —— 邮箱、用户名与密码之后都能在「账号」页修改。"
         />
         <CardBody>
           <form className="flex flex-col gap-3" onSubmit={(e) => void onRedeem(e)}>
@@ -204,7 +204,7 @@ export function InvitePage(props: { readonly token: string }): ReactNode {
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted">
-              口令（至少 {PASSWORD_MIN} 位）
+              密码（至少 {PASSWORD_MIN} 位）
               <Input
                 type="password"
                 name="password"

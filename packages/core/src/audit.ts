@@ -3,7 +3,7 @@
  *
  * **为什么放在 core 而不是某个插件里**：`audit_log` 表由 **db 插件的迁移**（`0013_audit.sql`）
  * 建立、属于核心基础设施，而不是某一个业务插件的表。写入方至少有两处且分属不同包
- * （server 写 `access.break_glass`，plugin-auth 写 `login.ok` / `login.fail` / 口令变更），
+ * （server 写 `access.break_glass`，plugin-auth 写 `login.ok` / `login.fail` / 密码变更），
  * 放任何一侧都会让另一侧产生跨包反向依赖。
  *
  * **本文件刻意不 import `./index.js`**：`index.ts` 会 re-export 本文件，若这里再反向
@@ -21,7 +21,7 @@ export interface AuditExecutor {
 /**
  * 审计条目。
  *
- * `before` / `after` **只放元数据与差异**：不得出现页面正文、口令、令牌或任何凭据值。
+ * `before` / `after` **只放元数据与差异**：不得出现页面正文、密码、令牌或任何凭据值。
  * 写入前会再过一道 {@link redactForAudit} 兜底（删掉敏感键名），但那是安全网、
  * 不是许可 —— 调用方仍必须自己保证不传正文（OWASP CWE-779：日志过量且含敏感数据
  * 本身就是弱点）。
