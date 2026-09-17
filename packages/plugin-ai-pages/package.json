@@ -1,0 +1,24 @@
+{
+  "name": "@geewiki/ai-pages",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki AI 页面写工具：让 AI 能改页面正文，每次改动都记入变更日志因而可回退",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/ai-journal": "workspace:*",
+    "@geewiki/ai-tools": "workspace:*",
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@geewiki/db-sqlite": "workspace:*"
+  }
+}

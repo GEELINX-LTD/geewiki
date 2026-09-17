@@ -1,0 +1,25 @@
+{
+  "name": "@geewiki/ai-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki AI 助手会话核心：无状态轮次的 agent loop（工具由 @geewiki/ai-tools 提供），SSE 流式；界面经 app-dock 插槽插入",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "build:ui": "pnpm --filter @geewiki/web build:plugin-ui"
+  },
+  "dependencies": {
+    "@geewiki/ai-tools": "workspace:*",
+    "@geewiki/core": "workspace:*",
+    "@geewiki/llm": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

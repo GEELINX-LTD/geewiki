@@ -1,0 +1,21 @@
+{
+  "name": "@geewiki/ai-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki AI 工具总线：把「AI 能做的动作」做成可贡献的注册表（纯注册表，不含任何具体工具）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

@@ -1,0 +1,147 @@
+/*
+ * `@geewiki/ai-summary` 的摘要卡样式。
+ *
+ * 三条约束（由 `packages/web/test/pluginUi.test.ts` 读字节守卫）：
+ *  ① **只用自己的 `.gw-summary-*` 类**，不搭宿主全局类（`.card` / `.notice` / `.btn` …）的便车；
+ *  ② 引用的 `var(--…)` 必须是 `packages/web/src/styles/tokens.css` 里**真实存在**的宿主 token
+ *     —— 错名字不会报错，只会静默回退，于是"看起来只是颜色有点怪"；
+ *  ③ 有 `:focus-visible`（键盘用户必须看得见焦点）。
+ *
+ * 关于外观取舍：这是一条**一行高的横条**。它出现在标题之前，读起来应当是
+ * "这一页的入口"，而不是正文的一部分——所以底色用 `--color-sunken`（比页面底色沉一档），
+ * 与 `md-body` 的正文块在视觉上分开。
+ */
+
+.gw-summary {
+  margin: 0 0 1rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: var(--color-sunken);
+  font-size: var(--text-note);
+}
+
+/* 过期不是错误，是"这份摘要落后了"——用 warn 系而不是 danger 系 */
+.gw-summary[data-stale='true'] {
+  border-color: var(--color-warn-line);
+}
+
+.gw-summary-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  list-style: none;
+  color: var(--color-ink-soft);
+}
+
+/* 去掉浏览器默认的三角：它会在 flex 布局里挤出一个不对齐的空档 */
+.gw-summary-head::-webkit-details-marker {
+  display: none;
+}
+
+.gw-summary-head:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.gw-summary-label {
+  flex: none;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.gw-summary-tag {
+  flex: none;
+  padding: 0 0.375rem;
+  border: 1px solid var(--color-warn-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-warn-bg);
+  color: var(--color-warn-ink);
+  font-size: var(--text-2xs);
+}
+
+.gw-summary-note {
+  flex: none;
+  color: var(--color-muted);
+  font-size: var(--text-2xs);
+}
+
+/* 折叠态的一行预览：单行 + 截断。它不承担排版，只回答"值不值得点开" */
+.gw-summary-peek {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--color-muted);
+}
+
+/* 展开后不再需要那一行预览：正文就在下面，留着是同一句话说两遍 */
+.gw-summary[open] .gw-summary-peek {
+  display: none;
+}
+
+.gw-summary-body {
+  padding: 0 0.75rem 0.75rem;
+}
+
+.gw-summary-text {
+  margin: 0;
+  color: var(--color-ink);
+  line-height: 1.7;
+}
+
+.gw-summary-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.gw-summary-meta,
+.gw-summary-err {
+  color: var(--color-muted);
+  font-size: var(--text-2xs);
+}
+
+.gw-summary-err {
+  color: var(--color-danger-ink);
+}
+
+.gw-summary-btn {
+  padding: 0.125rem 0.5rem;
+  border: 1px solid var(--color-line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+
+.gw-summary-btn:hover:not(:disabled) {
+  background: var(--color-hover);
+}
+
+.gw-summary-btn:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+}
+
+.gw-summary-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* 还没生成时的那一行：文案 + 生成按钮 */
+.gw-summary-empty {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.gw-summary-empty-text {
+  color: var(--color-muted);
+}

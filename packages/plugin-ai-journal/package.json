@@ -1,0 +1,22 @@
+{
+  "name": "@geewiki/ai-journal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki AI 变更日志与回退：记录 AI 的每一次写操作，支持按轮回退（他人改过则拒绝，绝不覆盖）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@geewiki/db-sqlite": "workspace:*",
+    "@types/node": "^22.0.0"
+  }
+}
