@@ -9,47 +9,30 @@
  * "只要可见性管理权就能读到所有 `granted` 块正文"的旁路，而 `granted` 档的语义恰恰是
  * "默认谁都不能看"。所以这里在列表上方**显式声明**这一事实，免得管理员以为"看不到正文是加载失败"。
  *
- * ## 为什么没有"改块档位"的控件
+ * ## 为什么这里没有"改块档位"的控件（但编辑页有）
  *
  * 块档位由作者在 Markdown 里用 `<!--gated:org-->` / `<!--gated:granted-->` 声明，保存正文时
- * 解析入库；**后端没有改块档位的端点**。凭空造一个按钮（或造一个改不动的下拉）比不提供更坏：
- * 前者点了必然 404，后者让人以为自己改成功了。这里只**只读地**展示声明档位、`tier` 的含义，
- * 以及"本页档位下允许的块档位集合"（`blockVisibilityOptions()` 的收敛结果）。
+ * 解析入库；**后端没有改块档位的端点**，因为这个档位**就是正文的一部分**。
+ * 故"改块档位"不是一次 PUT，而是**改正文**：编辑页里用工具栏的锁按钮（或源码模式直接写标记），
+ * 与正文一起保存、一起进版本历史。在这里凭一个按钮去改写正文会绕开草稿、冲突检测与版本校验，
+ * 那才是真的危险。
+ * 所以本组件只**只读地**展示解析结果（含 `tier` 的含义）、"本页档位下允许的块档位集合"
+ * （`blockVisibilityOptions()` 的收敛结果）与**逐块的授权名单**（那部分是真有端点的写操作）。
  */
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
-import { KeyRound, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react'
-import { api, type BlockRow, type GrantRole, type SubjectKind } from '../../api'
+import { RefreshCw } from 'lucide-react'
+import { api, type BlockRow } from '../../api'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Card, CardBody, CardHeader } from '../../ui/Card'
 import { EmptyState } from '../../ui/EmptyState'
+import { BlockGrantEditor } from './BlockGrantEditor'
 import { ErrorNotice } from '../../ui/ErrorNotice'
-import { Input } from '../../ui/Input'
 import { LoadingState } from '../../ui/LoadingState'
 import { Skeleton } from '../../ui/Skeleton'
-import { cn } from '../../ui/cn'
-import {
-  BLOCK_VISIBILITIES,
-  GRANT_ROLE_OPTIONS,
-  SUBJECT_KIND_OPTIONS,
-  blockVisibilityOptions,
-  expiresAtFromLocal,
-  expiryLabel,
-  narrowingHint,
-  subjectIdError,
-  visibilityLabel,
-} from '../../lib/accessPlan'
+import { BLOCK_VISIBILITIES, blockVisibilityOptions, narrowingHint, visibilityLabel } from '../../lib/accessPlan'
 import { errorLine } from '../../lib/errorText'
-
-/** 每块的表单状态（只保存正在编辑的那一块，避免几十块时 state 爆炸） */
-interface Draft {
-  blockId: number
-  subjectKind: SubjectKind
-  subjectId: string
-  role: GrantRole
-  expiresLocal: string
-  error: string | null
-}
+import { loadSubjectDirectory, type SubjectDirectory } from '../../lib/subjectDirectory'
 
 export function BlocksSection({
   slug,
@@ -63,9 +46,6 @@ export function BlocksSection({
 }): ReactNode {
   const [blocks, setBlocks] = useState<BlockRow[] | null>(null)
   const [err, setErr] = useState<unknown>(null)
-  const [busy, setBusy] = useState(false)
-  const [notice, setNotice] = useState('')
-  const [draft, setDraft] = useState<Draft | null>(null)
 
   const load = useCallback(async (): Promise<void> => {
     setErr(null)
@@ -82,77 +62,34 @@ export function BlocksSection({
     void load()
   }, [load])
 
+  /*
+   * ⚠️ 列表的**刷新**由本组件负责（它是数据的主人）；而**添加/撤销**授权由
+   * `BlockGrantEditor` 负责 —— 那份表单与对话框（编辑器的「授权给谁…」）**共用同一份实现**，
+   * 两份必然漂移，而漂移的后果是"两处授权结果不一样"。
+   */
+  const refresh = useCallback((): void => {
+    void load()
+    onChanged?.()
+  }, [load, onChanged])
+
+  /** 本页档位下允许的块档位（规则 B1：块只能更窄）—— 只用于说明文案 */
   const allowed = blockVisibilityOptions(pageVisibility, BLOCK_VISIBILITIES)
 
-  const openDraft = (blockId: number): void =>
-    setDraft({ blockId, subjectKind: 'user', subjectId: '', role: 'viewer', expiresLocal: '', error: null })
-
-  const submit = useCallback(
-    async (block: BlockRow): Promise<void> => {
-      if (draft === null || draft.blockId !== block.id) return
-      const idErr = subjectIdError(draft.subjectId)
-      if (idErr !== null) {
-        setDraft({ ...draft, error: idErr })
-        return
-      }
-      const expiry = expiresAtFromLocal(draft.expiresLocal)
-      if (!expiry.ok) {
-        setDraft({ ...draft, error: '到期时间格式不正确，请重新选择（留空表示不过期）' })
-        return
-      }
-      setBusy(true)
-      setErr(null)
-      setNotice('')
-      try {
-        const r = await api.addBlockGrant(slug, block.id, {
-          subjectKind: draft.subjectKind,
-          subjectId: draft.subjectId.trim(),
-          role: draft.role,
-          expiresAt: expiry.iso,
-        })
-        /*
-         * 响应里的 `block_visibility` 是**该块自身声明**的档位。规则 B1 让"块只能更窄"，
-         * 所以当块比页面宽时，这条授权并不会突破页面上限 —— 必须说出来，
-         * 否则用户会以为"授权没生效"（或者更糟：以为页面已经放宽）。
-         */
-        setNotice(
-          `已在第 ${block.ordinal} 块添加授权：${draft.subjectKind === 'group' ? '用户组' : '用户'} ` +
-            `${draft.subjectId.trim()} → ${draft.role}。` +
-            `该块自身档位为「${visibilityLabel(r.block_visibility)}」。` +
-            `${narrowingHint({ visibility: r.block_visibility, tier: block.tier }, pageVisibility)}`,
-        )
-        setDraft(null)
-        await load()
-        onChanged?.()
-      } catch (e: unknown) {
-        setErr(e)
-      } finally {
-        setBusy(false)
-      }
-    },
-    [slug, draft, pageVisibility, load, onChanged],
-  )
-
-  const remove = useCallback(
-    async (block: BlockRow, grantId: number, subjectId: string): Promise<void> => {
-      const ok = window.confirm(`撤销第 ${block.ordinal} 块对「${subjectId}」的授权？撤销后对方立刻失去该块的访问权。`)
-      if (!ok) return
-      setBusy(true)
-      setErr(null)
-      setNotice('')
-      try {
-        await api.removeBlockGrant(slug, block.id, grantId)
-        setNotice(`已撤销第 ${block.ordinal} 块的授权 #${grantId}`)
-        await load()
-        onChanged?.()
-      } catch (e: unknown) {
-        setErr(e)
-      } finally {
-        setBusy(false)
-      }
-    },
-    [slug, load, onChanged],
-  )
+  /*
+   * 授权对象的名单**取一次、传给每一块**（不是每块各拉一次）：几十块时那样会打出几十个请求，
+   * 而且它们的结果必然相同。名单端点本批放宽为"任何登录用户可读"，但未登录 / 被改回 admin /
+   * 读取失败时会拿到 `forbidden` / `failed`（见 subjectDirectory.ts）—— 那时退回手填。
+   */
+  const [directory, setDirectory] = useState<SubjectDirectory | null>(null)
+  useEffect(() => {
+    let alive = true
+    void loadSubjectDirectory().then((d) => {
+      if (alive) setDirectory(d)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
 
   return (
     <Card>
@@ -166,16 +103,18 @@ export function BlocksSection({
             iconOnly
             icon={<RefreshCw className="size-4" />}
             aria-label="刷新块列表"
-            disabled={busy}
             onClick={() => void load()}
           />
         }
       />
       <CardBody>
         <p className="m-0 text-xs leading-relaxed text-muted">
-          块的档位由作者在正文里用 <code className="font-mono">{'<!--gated:org-->'}</code> /{' '}
+          段落档位由作者在正文里用 <code className="font-mono">{'<!--gated:org-->'}</code> /{' '}
           <code className="font-mono">{'<!--gated:granted-->'}</code> 标记声明（保存正文时解析入库），
-          本界面不提供改块档位的按钮 —— 后端没有这个端点。块只能比页面更窄（规则 B1）：
+          <strong className="font-semibold">改它要改正文</strong> —— 在**编辑页**里改：
+          把光标放到某一段，用编辑器工具栏的锁按钮切档位（源码模式下也可以直接写标记）。
+          这里只读展示解析结果与逐块的授权名单，是因为权限面板不能凭一个按钮就改写正文
+          （那会与服务端的版本校验、草稿、冲突检测各自为政）。块只能比页面更窄（规则 B1）：
           本页档位为「{visibilityLabel(pageVisibility)}」，因此块档位只能取
           {allowed.length === 0
             ? '（没有可比页面更窄的档位）'
@@ -183,14 +122,6 @@ export function BlocksSection({
           。
         </p>
 
-        {notice !== '' && (
-          <p
-            role="status"
-            className="m-0 mt-3 rounded-md border border-ok-line bg-ok-bg px-3 py-1.5 text-note leading-relaxed text-ok-ink"
-          >
-            {notice}
-          </p>
-        )}
         {err !== null && (
           <div className="mt-3">
             <ErrorNotice error={err} role="alert" />
@@ -229,130 +160,24 @@ export function BlocksSection({
                     </span>
                   )}
                   {b.inherit && <span className="text-xs text-muted">继承页面档位</span>}
-                  <span className="ml-auto">
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      icon={<KeyRound className="size-3.5" />}
-                      disabled={busy}
-                      onClick={() => openDraft(b.id)}
-                    >
-                      添加授权
-                    </Button>
-                  </span>
                 </div>
 
                 <p className="m-0 mt-2 text-xs leading-relaxed text-muted">{narrowingHint(b, pageVisibility)}</p>
                 <p className="m-0 mt-1 text-xs text-muted">
                   检索等级（tier）：
                   {b.tier === null ? '无（不属于任何读者等级）' : b.tier}
-                  {'　'}已授予 {b.grants.length} 个对象
                 </p>
 
-                {b.grants.length > 0 && (
-                  <ul className="m-0 mt-2 flex list-none flex-col gap-1 p-0">
-                    {b.grants.map((g) => (
-                      <li key={g.id} className="flex flex-wrap items-center gap-2 text-xs">
-                        <ShieldCheck aria-hidden="true" className="size-3.5 text-ok-ink" />
-                        <span>{g.subjectKind === 'group' ? '用户组' : '用户'}</span>
-                        <span className="font-mono">{g.subjectId}</span>
-                        <span className="text-muted">{g.role}</span>
-                        <span className="text-muted">到期 {expiryLabel(g.expiresAt)}</span>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon={<Trash2 className="size-3.5" />}
-                          disabled={busy}
-                          onClick={() => void remove(b, g.id, g.subjectId)}
-                        >
-                          撤销
-                        </Button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {draft !== null && draft.blockId === b.id && (
-                  <div className="mt-3 grid gap-3 border-t border-line pt-3 sm:grid-cols-2">
-                    <div className="flex flex-col gap-1">
-                      <label htmlFor={`block-kind-${b.id}`} className="text-xs font-medium text-ink-soft">
-                        授权对象类别
-                      </label>
-                      <select
-                        id={`block-kind-${b.id}`}
-                        className={cn(
-                          'h-8 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink',
-                          'focus:border-accent',
-                        )}
-                        value={draft.subjectKind}
-                        disabled={busy}
-                        onChange={(e) =>
-                          setDraft({ ...draft, subjectKind: e.target.value === 'group' ? 'group' : 'user' })
-                        }
-                      >
-                        {SUBJECT_KIND_OPTIONS.map((o) => (
-                          <option key={o.id} value={o.id}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label htmlFor={`block-subject-${b.id}`} className="text-xs font-medium text-ink-soft">
-                        对象 id
-                      </label>
-                      <Input
-                        id={`block-subject-${b.id}`}
-                        value={draft.subjectId}
-                        disabled={busy}
-                        invalid={draft.error !== null}
-                        onChange={(e) => setDraft({ ...draft, subjectId: e.target.value })}
-                      />
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label htmlFor={`block-role-${b.id}`} className="text-xs font-medium text-ink-soft">
-                        授予角色
-                      </label>
-                      <select
-                        id={`block-role-${b.id}`}
-                        className={cn(
-                          'h-8 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink',
-                          'focus:border-accent',
-                        )}
-                        value={draft.role}
-                        disabled={busy}
-                        onChange={(e) => setDraft({ ...draft, role: e.target.value === 'editor' ? 'editor' : 'viewer' })}
-                      >
-                        {GRANT_ROLE_OPTIONS.map((o) => (
-                          <option key={o.id} value={o.id}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <label htmlFor={`block-expires-${b.id}`} className="text-xs font-medium text-ink-soft">
-                        到期时间（留空 = 不过期）
-                      </label>
-                      <Input
-                        id={`block-expires-${b.id}`}
-                        type="datetime-local"
-                        value={draft.expiresLocal}
-                        disabled={busy}
-                        onChange={(e) => setDraft({ ...draft, expiresLocal: e.target.value })}
-                      />
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 sm:col-span-2">
-                      <Button variant="primary" size="sm" loading={busy} onClick={() => void submit(b)}>
-                        确认添加
-                      </Button>
-                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => setDraft(null)}>
-                        取消
-                      </Button>
-                      {draft.error !== null && <span className="text-note text-danger-ink">{draft.error}</span>}
-                    </div>
-                  </div>
-                )}
+                <div className="mt-2">
+                  <BlockGrantEditor
+                    slug={slug}
+                    block={b}
+                    pageVisibility={pageVisibility}
+                    idPrefix={`blocks-section-${b.id}`}
+                    directory={directory}
+                    onChanged={refresh}
+                  />
+                </div>
               </div>
             ))
           ) : (

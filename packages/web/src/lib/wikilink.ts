@@ -11,11 +11,19 @@
  * 更高优先级的规则吃掉，因此天然不会误伤（实测确认，见 `test/wikilink.test.ts`：
  * ```\n[[x]]\n``` 与 `` `[[x]]` `` 都保持字面量）。
  *
- * ## 为什么在这里 `marked.use()` 而不改 `lib/sanitize.ts`
+ * ## ★ F8：改为注册进 `markdownExt.ts` 的扩展表，而不是直接 `marked.use()`
  *
- * `marked.use()` 是**在共享的 marked 单例上注册扩展**，因此可以从任意模块调用，
- * 不需要动消毒链路（`mdToHtml` 仍是唯一出口，仍是那个文件里的一行）。
- * 注册是幂等的（模块级 flag 兜底，避免重复 push 同名扩展）。
+ * 原先本模块在**共享的 marked 单例**上 `marked.use(...)`。那个做法的问题是
+ * `marked.use()` **只增不减**（marked 没有 `unuse`）：插件产物更新后整页刷新、
+ * 模块重新求值，同一扩展就被再 push 一次，于是 tokenizer 被多次调用、renderer 被套娃 ——
+ * **不报错**，只是"用久了渲染越来越怪"。
+ *
+ * 现在扩展统一登记到 `markdownExt.ts` 的注册表，渲染时按版本装配出一个独立的
+ * `Marked` 实例。本模块变成"注册表的第一个内置扩展"，既证明机制可用，
+ * 也不再需要碰全局单例。
+ *
+ * 消毒链路**一字未变**：产出仍是 HTML 字符串，仍由 `mdToHtml` 的 DOMPurify 收口。
+ * 注册是幂等的（模块级 flag 兜底）。
  *
  * ## 链接怎么落地
  *
@@ -27,7 +35,7 @@
  * 安全：产出仍会整体经过 DOMPurify（`mdToHtml`），且本模块自己对文本做转义
  * （纵深防御：万一将来有人把 `mdToHtml` 换掉，这里也不会因为未转义而变成注入口）。
  */
-import { marked } from 'marked'
+import { registerMarkdownExtension, type MarkdownExtension } from './markdownExt'
 import { normalizeSlugTarget, pageHash } from './linkPlan'
 
 /** 标记属性：后处理层靠它识别"这是 wikilink"，并据此回填页面标题 */
@@ -63,14 +71,15 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;')
 }
 
-let registered = false
-
-/** 注册 `[[wikilink]]` 扩展（幂等；模块加载时自动调用一次） */
-export function registerWikilink(): void {
-  if (registered) return
-  registered = true
-
-  marked.use({
+/**
+ * `[[wikilink]]` 的 marked 扩展对象（导出以便测试直接装配，不必依赖模块级副作用）。
+ *
+ * 只描述"怎么解析/怎么产出 HTML"，**不含任何注册动作** ——
+ * 注册由下面的 {@link registerWikilink} 负责，语义清晰且可重复调用。
+ */
+export const WIKILINK_EXTENSION: MarkdownExtension = {
+  name: 'wikilink',
+  marked: {
     extensions: [
       {
         name: 'wikilink',
@@ -106,8 +115,23 @@ export function registerWikilink(): void {
         },
       },
     ],
-  })
+  },
 }
 
-// 模块加载即注册：`markdownRender.ts` 导入本模块，因此**任何渲染路径之前**都已生效
+let registered = false
+
+/**
+ * 注册 `[[wikilink]]` 扩展（幂等；模块加载时自动调用一次）。
+ *
+ * 幂等靠模块级 flag：重复调用只有第一次真的写进注册表。
+ * （即便 flag 被绕过，注册表自己也会按"同名先到先得"拒绝第二次并告警 —— 两道保险。）
+ */
+export function registerWikilink(): void {
+  if (registered) return
+  registered = true
+  registerMarkdownExtension('@geewiki/wikilink', WIKILINK_EXTENSION)
+}
+
+// 模块加载即注册：`sanitize.ts` 与 `markdownRender.ts` 都会导入本模块，
+// 因此**任何渲染路径之前**它都已生效（见 sanitize.ts 的显式副作用导入）
 registerWikilink()

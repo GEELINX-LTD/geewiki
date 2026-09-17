@@ -11,9 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   MAX_QUERY_LENGTH,
-  answerRenderer,
   checkQuery,
-  degradedNotice,
   hasHighlight,
   scoreBadges,
   snippetToHtml,
@@ -94,57 +92,6 @@ test('checkQuery：超过上限（500）被拦下，边界值通过', () => {
 test('checkQuery：2 字中文查询合法（会走 like 路径，前端不拦）', () => {
   const r = checkQuery('检索')
   assert.equal(r.ok, true)
-})
-
-/* ------------------------- degradedNotice ------------------------- */
-
-test('degradedNotice：null/undefined → 无提示条', () => {
-  assert.equal(degradedNotice(null), null)
-  assert.equal(degradedNotice(undefined), null)
-})
-
-test('degradedNotice：无密钥类原因是 **info** 级（信息性，不是错误）', () => {
-  const a = degradedNotice({ reason: 'no_provider', code: null, message: '' })
-  assert.ok(a)
-  assert.equal(a.level, 'info')
-  assert.match(a.title, /未配置模型密钥/)
-  const b = degradedNotice({ reason: 'missing_credential', code: 'MISSING_CREDENTIAL', message: '' })
-  assert.ok(b)
-  assert.equal(b.level, 'info')
-})
-
-test('degradedNotice：search_unavailable 有专门文案', () => {
-  const n = degradedNotice({ reason: 'search_unavailable', code: null, message: '' })
-  assert.ok(n)
-  assert.match(n.title, /检索服务不可用/)
-})
-
-test('degradedNotice：按 reason 分支，且采用后端 message 作为 detail', () => {
-  const n = degradedNotice({ reason: 'rate_limit', code: 'RATE_LIMIT', message: '上游限流，请稍后重试' })
-  assert.ok(n)
-  assert.equal(n.detail, '上游限流，请稍后重试')
-  assert.equal(n.level, 'warn')
-})
-
-test('degradedNotice：未知 reason 回退到通用文案且不抛错', () => {
-  const n = degradedNotice({ reason: 'brand_new_reason' as never, code: null, message: '新原因' })
-  assert.ok(n)
-  assert.equal(n.detail, '新原因')
-  assert.match(n.title, /已降级/)
-})
-
-test('degradedNotice：message 为空时用内置 detail 兜底（不出现空白提示条）', () => {
-  const n = degradedNotice({ reason: 'timeout', code: 'TIMEOUT', message: '' })
-  assert.ok(n)
-  assert.notEqual(n.detail, '')
-})
-
-/* ------------------------- answerRenderer ------------------------- */
-
-test('answerRenderer：markdown 走 markdown 渲染，其余按纯文本', () => {
-  assert.equal(answerRenderer('markdown'), 'markdown')
-  assert.equal(answerRenderer('plain'), 'plain')
-  assert.equal(answerRenderer(undefined), 'plain')
 })
 
 /* ------------------------- scoreBadges ------------------------- */

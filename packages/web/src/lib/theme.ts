@@ -10,7 +10,8 @@
  * `index.html` 里的**内联同步脚本**完成——React 要等 bundle 下载执行后才渲染，
  * 那时用户已经看到一帧白底了。内联脚本在 `<head>` 里同步执行，早于任何绘制。
  * 因此这里的 `readStoredTheme()` 与内联脚本读的是**同一个 key**，
- * 且有单测钉住两者一致（见 test/theme.test.ts）。
+ * 且有单测钉住两者一致（见 `test/designSystem.test.ts`——**不是** `test/theme.test.ts`，
+ * 后者从来不存在，本注释与 index.html 的同类说明曾长期指向一个不存在的文件）。
  *
  * 存储键名改动会同时影响内联脚本与这里——两处必须同步（单测覆盖）。
  */

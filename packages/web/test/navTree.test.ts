@@ -17,7 +17,9 @@ import {
 } from '../src/lib/navTree'
 
 function pg(slug: string, title = slug, updated = '2026-01-01T00:00:00.000Z'): NavPage {
-  return { slug, title, updated_at: updated, version: 1 }
+  // 导航批起 NavPage 多了两个必填字段（与 API 的 PageSummary 结构一致）：
+  // 默认"未隐藏、没排过序"，本文件里的既有断言因此保持原样
+  return { slug, title, updated_at: updated, version: 1, nav_hidden: false }
 }
 
 /**

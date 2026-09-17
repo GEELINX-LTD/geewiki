@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { HOME_SLUG, parseWikiRoute, wikiRouteHash } from '../lib/wikiRoute'
-import { hashQueryOf, stripHashQuery } from '../lib/hashAnchor'
+import { HOME_SLUG, isWikiHomeAlias, parseWikiRoute } from '../lib/wikiRoute'
+import { hashQueryOf } from '../lib/hashAnchor'
 import { invalidatePages, usePages } from '../lib/pagesStore'
+import { onContentChanged } from '../lib/contentEvents'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
-import { ChevronLeft, ChevronRight, FileText, History, List as ListIcon, LogIn, MessageSquareText, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, GripVertical, History, List as ListIcon, LogIn, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
 /*
  * 相对/绝对时间的唯一真源（`lib/timePlan.ts`）：右栏「本页信息」与版本下拉共用同一套口径，
  * 避免"11小时前"与"2026/9/12 15:56:59"两种写法在同一个页面里各说各的。
  */
-import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary, type VersionMeta } from '../api'
+import { api, ApiError, uploadAttachment, type PageDetail, type PageSummary, type PageVisibility, type VersionMeta } from '../api'
 import { ApplyAccessDialog } from '../components/access/ApplyAccessDialog'
+import { BlockGrantsDialog } from '../components/access/BlockGrantsDialog'
 import { PageAccessPanel } from '../components/access/PageAccessPanel'
 import { refreshCapabilitiesIfVisible, useAuth } from '../lib/authStore'
 import {
@@ -20,7 +22,6 @@ import {
   newPageEntry,
   type NewPageEntry,
 } from '../lib/newPageGate'
-import { AskPanel } from '../components/AskPanel'
 import {
   PREVIEW_ATTACHMENT_NOTE,
   PREVIEW_INVALID_TEXT,
@@ -37,8 +38,7 @@ import {
 import { Tooltip } from '../ui/Tooltip'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
-import { EditorSlotOutlet, useEditorSlot } from '../lib/slots'
-import { AssistToolbar } from '../components/ai/AssistToolbar'
+import { ArticleSummarySlotOutlet, EditorSlotOutlet, EditorToolbarSlotOutlet, type EditorHandle, type EditorToolbarSelection, useEditorSlot } from '../lib/slots'
 import {
   ReadonlyHistoryButton,
   VersionBadge,
@@ -46,7 +46,6 @@ import {
 } from '../components/VersionPicker'
 import { VersionDiffDialog } from '../components/VersionDiffDialog'
 import type { MarkdownEditorHandle } from '../components/MarkdownEditor'
-import { unavailableText, type AssistSelection } from '../lib/assistPlan'
 import { ensureSlotLoaded } from '../lib/pluginUi'
 import { SearchView } from '../components/SearchView'
 import { TableOfContents } from '../components/TableOfContents'
@@ -69,7 +68,7 @@ import {
 } from '../lib/draftPlan'
 import { scrollToAnchor, settleHashAnchor } from '../lib/hashAnchor'
 import { renderMarkdownBody } from '../lib/markdownRender'
-import { projectForAudience, type PreviewAudience } from '../lib/gatedPreview'
+import { looksProjected, projectForAudience, type PreviewAudience } from '../lib/gatedPreview'
 import {
   charCount,
   hasErrors,
@@ -82,11 +81,17 @@ import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
 import {
   buildBreadcrumb,
   buildNavTree,
+  moveWithinSiblings,
+  navOrderMap,
+  navRows,
+  type NavNode,
+  type NavRow,
   hasSeparatorBefore,
   intermediateCrumbCount,
   neighborsOf,
 } from '../lib/navTree'
 import { attachmentMarkdown } from '../lib/attachmentPlan'
+import { registerEditorTools, type EditorCapability } from '../lib/editorTools'
 import { describeError, errorLine } from '../lib/errorText'
 import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
@@ -160,9 +165,15 @@ const DRAFT_DEBOUNCE_MS = 900
 /** hash 段里的查询串解码（用户可能在地址栏手输，容错返回原文） */
 /**
  * Wiki 页：sub 为 hash 中 'wiki/' 之后的子路径。
- * 保留段：'' | 'list'（列表）、'new'（新建）、'search/<q>'（检索）、'ask[/<q>]'（问答）、
- * `<slug>[/edit]`（详情/编辑）。**检索与问答是宿主原生 UI**（见 lib/slots.tsx 的冻结裁决：
- * 插件组件不接收 props），因此不走 Slot，而是这里自己的路由。
+ * 保留段：'' | 'list'（列表）、'new'（新建）、'search/<q>'（检索）、`<slug>[/edit]`（详情/编辑）。
+ *
+ * **`ask` 已不再是本组件的视图**（P8，决策 17）：`#/wiki/ask/<q>` 与 `wiki-ask` 插槽一起拆除，
+ * AI 对话的唯一入口是常驻的 `app-dock`（渲染点在 `App.tsx` 的 `<main>` 之外，切页不重挂）。
+ * 拆它的理由正是原先那段注释想解决而没解决好的问题：同一个功能有两条界面路径时，两条都会漂移
+ * ——dock 与问答页各有一套输入、各自维护会话，"我刚问的那个去哪了"两处都答不上来。
+ * `'ask'` 仍留在 `WIKI_RESERVED_FIRST_SEGMENTS` 里（理由见 lib/wikiRoute.ts）。
+ *
+ * 检索仍是宿主原生 UI（检索不是对话，没有"会话要去哪"的问题）。
  */
 export function WikiPage(props: {
   sub: string
@@ -216,8 +227,42 @@ export function WikiPage(props: {
    * 点击版本下拉时丢 `?v=` 的根因就在这里。
    */
   const normalizeHome = route.kind === 'detail' && route.slug === HOME_SLUG
+  /*
+   * 别名**不止裸 slug 一种写法**：`#/wiki/home/`（尾斜杠）、`#/wiki/home?v=68`（历史快照）、
+   * `#/wiki/home?a=usage`（页内锚点）都是主页。
+   *
+   * ⚠️ 实测缺陷（2026-09-14，3100 上跑的产物）：`#/wiki/home/`（**尾斜杠**）冷加载**永久空白**。
+   * 逐形态实测（每个用例一个全新浏览器进程、首个导航就是目标地址）：
+   *   `#/wiki`            → 正常
+   *   `#/wiki/home`       → 正常（重写到 `#/wiki`）
+   *   `#/wiki/home/`      → **空白**：`#root` 只剩 5903 字节空壳、`main` 文本长度 0
+   *   `#/wiki/home?v=3`   → 正常（重写到 `#/wiki?v=3`，快照提示如实出现）
+   *   `#/wiki/home?a=…`   → 正常（重写到 `#/wiki?a=…`）
+   *
+   * 根因是 effect 里的守卫写成**字符串全等**（`stripHashQuery(hash) !== 'wiki/home'`），
+   * 而 `#/wiki/home/` 剥掉前缀后是 `wiki/home/`（带尾斜杠）⇒ 串不等 ⇒ 守卫 `return`，
+   * 既不重写 URL；同时 `parseWikiRoute('home/')` 得到的是 `detail + home` ⇒ `normalizeHome`
+   * 为真 ⇒ `return null`。两者叠加就是"**既不重写、也不渲染**"的夹缝：页面停在空白，
+   * 而且不像未知 slug 那样给"页面不存在"提示 —— 这就是"打开别名地址没有内容"的真身。
+   * 地址栏自动补全、从别处粘贴、IM 自动加链接都可能产出这条尾斜杠，命中概率不低。
+   *
+   * 判据因此不再拼字符串，而是**复用唯一的路由解析器** `isWikiHomeAlias`（见
+   * `lib/wikiRoute.ts`：它剥掉 `#` 与查询串后，把 `wiki/` 之后的部分交给 `parseWikiRoute`
+   * ——与 `App.tsx` 传 `sub` 同一个口径，解析成 `detail + home` 就是别名）。
+   * 判据本身带单测（`test/wikiRoute.test.ts`），尾斜杠、`?…`、`homework`、`home/edit`
+   * 这些形态都被钉死，不会再有第二套判定在组件里悄悄漂移。
+   * ⚠️ 它收的是**整串 `window.location.hash`**（不是 `props.sub`），因为本 effect 要判的
+   * 正是"**当前 URL** 是不是别名"，而不是"这次渲染的 route 是什么"。
+   */
+  const isHomeAlias = isWikiHomeAlias
   useEffect(() => {
-    if (!normalizeHome) return
+    /*
+     * 依赖数组是 `[]`（**订阅一次，生命周期内一直有效**），而不是 `[normalizeHome]`。
+     * 理由：判据已经完全是"**当前 URL** 是不是别名"（`isHomeAlias` 直接读 `window.location.hash`），
+     * 与 `route` / `query` 这两个 state 谁先落地无关，因此没有需要跟着变的依赖。
+     * 反过来说，若像原来那样用 `normalizeHome` 当**闸门**，`#/wiki/home/` 那条路径就会
+     * 在"守卫串不等 ⇒ 提前 return"里丢掉唯一一次改写机会，永久停在空白。
+     */
     /*
      * ⚠️ 查询串**从当前 URL 现读**，不用 `props.query`。这不是风格偏好，是本页最容易复发的缺陷：
      *
@@ -229,14 +274,37 @@ export function WikiPage(props: {
      * 本 effect 是**URL 级规范化**，输入就该是 URL 本身：读当前 hash ⇒ 与触发本次渲染的地址同源，
      * 于是与"两个 state 谁先落地"彻底无关（顺序再变，改写结果都一样）。这也保证了深链
      * `#/wiki/home?v=68`、点击路径、以及"只有查询串变"的同文档导航三条入口行为一致。
-     *
-     * 再用 `stripHashQuery` 复核一次：被动 effect 可能在**又发生了一次导航之后**才被冲刷，
-     * 那时当前 URL 已经不是别名了 —— 这种过期 effect 必须什么都不做，绝不能把新地址劫持回主页。
      */
-    const hash = window.location.hash
-    if (stripHashQuery(hash) !== `wiki/${HOME_SLUG}`) return
-    window.location.replace(`#/wiki${hashQueryOf(hash)}`)
-  }, [normalizeHome])
+    const normalize = (): void => {
+      const hash = window.location.hash
+      /*
+       * 再用 `isHomeAlias` 复核一次：本函数可能在**又发生了一次导航之后**才被冲刷，
+       * 那时当前 URL 已经不是别名了 —— 这种过期调用必须什么都不做，绝不能把新地址劫持回主页。
+       * 复用解析器也保证了 `wiki/homework`、`wiki/home/edit`、`wiki/guide%2Fhome` 这类只是
+       * "名字里带 home"的地址不会被误判。
+       */
+      if (!isHomeAlias(hash)) return
+      /*
+       * 查询串**必须原样带过去**（`?v=68` 是历史快照、`?a=usage` 是页内锚点）：漏掉它，
+       * 用户拿到的是一条"看起来打开了、其实静默降级成最新版 + 无锚点"的地址。
+       * 只搬 hash 内的查询串：本应用的查询串都写在 hash 里（`App.tsx` 的 `useRouteQuery` 用
+       * `hashQueryOf` 取值），hash 外的 `location.search` 没有任何读取方，拼进来只会造出
+       * `#/wiki?v=3?x=1` 这种畸形地址。
+       */
+      window.location.replace(`#/wiki${hashQueryOf(hash)}`)
+    }
+    // 挂载时先跑一次：**深链/刷新**（`#/wiki/home` 直接冷加载）走的是这条路，
+    // 而它正是"页面停在空白"最容易被撞上的入口。
+    normalize()
+    /*
+     * 再订阅 `hashchange`：**文档内导航**（已经在 wiki 里，地址被改成 `#/wiki/home`）不会让
+     * 本组件重新挂载，只靠挂载那一次会漏掉，地址停在别名、组件 `return null` ⇒ 又是空白。
+     * 这里是"只读当前 URL"的幂等改写：规范地址下 `isHomeAlias` 为 false，不做任何事，
+     * 因此不会与路由自身的 hash 变更互相激发（`replace` 到规范地址后再次回调即返回）。
+     */
+    window.addEventListener('hashchange', normalize)
+    return () => window.removeEventListener('hashchange', normalize)
+  }, [])
   if (normalizeHome) return null
 
   /*
@@ -289,7 +357,6 @@ export function WikiPage(props: {
           onOpen={(slug) => onNavigate(slug)}
           onNew={() => onNavigate('new')}
           onSearch={(q) => onNavigate(`search/${encodeURIComponent(q)}`)}
-          onAsk={(q) => onNavigate(q === '' ? 'ask' : `ask/${encodeURIComponent(q)}`)}
         />
       </WikiShell>
     )
@@ -303,21 +370,6 @@ export function WikiPage(props: {
           onOpen={(slug) => onNavigate(slug)}
           onSearch={(next) => onNavigate(`search/${encodeURIComponent(next)}`)}
         />
-      </WikiShell>
-    )
-  }
-  if (route.kind === 'ask') {
-    return (
-      <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
-        <div className="page">
-          <div className="page-head">
-            <h1>问答</h1>
-            <div className="page-actions">
-              <Button onClick={() => onNavigate('list')}>返回列表</Button>
-            </div>
-          </div>
-          <AskPanel key={route.q} initialQuery={route.q} onOpenPage={(slug) => onNavigate(slug)} />
-        </div>
       </WikiShell>
     )
   }
@@ -557,7 +609,16 @@ function HomeAside(props: { pages: PageSummary[] | null; onNavigate: (path: stri
       <a
         href="#/wiki/list"
         className={cn(
-          'inline-block rounded-md px-2 py-1.5 -ml-2 text-note text-accent-ink',
+          /*
+            ⚠️ 这里原先是 `text-accent-ink` —— **错配**，而且是本仓已经记档过的那个坑
+            （见 components/Sidebar.tsx 的同名注释）：`--gw-accent-ink` 是"**实心** accent
+            底上的字色"，浅色下是白、深色下是近黑，配 `bg-accent` 才对（ui/Button.tsx）。
+            这一处**连 accent 底都没有**，于是浅色下白字压 #f5f7fa = **1.07:1**、
+            深色下近黑压 #0b131d ≈ **1:1** —— 两种主题下这个链接都等于看不见
+            （2026-09-15 深色模式排查时由 axe 在浅色侧扫出；深色侧肉眼可见它整条消失）。
+            没有底色时该用的是 accent 本身，不是它的 ink。
+          */
+          'inline-block rounded-md px-2 py-1.5 -ml-2 text-note text-accent',
           'transition-colors duration-150 ease-standard hover:bg-hover',
           focusRing,
         )}
@@ -583,6 +644,8 @@ function WikiShell(props: {
   const { activeSlug, pages, onNavigate, children } = props
   const navProps = {
     pages: pages.pages,
+    // 同级顺序与 `pages` 同一次请求下发：侧栏、「全部页面」、上一篇/下一篇必须用同一份
+    navOrder: pages.navOrder,
     error: pages.error,
     activeSlug,
     onOpen: (slug: string) => onNavigate(slug),
@@ -610,9 +673,8 @@ function WikiList(props: {
   onOpen: (slug: string) => void
   onNew: () => void
   onSearch: (q: string) => void
-  onAsk: (q: string) => void
 }): ReactNode {
-  const { newEntry, onOpen, onNew, onSearch, onAsk } = props
+  const { newEntry, onOpen, onNew, onSearch } = props
   // 列表数据来自共享 store（与侧边栏、详情页的上一篇/下一篇同源）
   const pagesState = usePages()
   const pages = pagesState.pages
@@ -641,20 +703,96 @@ function WikiList(props: {
   const [filter, setFilter] = useState('')
   const [queryNotice, setQueryNotice] = useState('')
   /**
-   * 检索/问答插件**可能未启用**（默认部署下 `@geewiki/search` 与 `@geewiki/ai` 都不在基础层
-   * 清单里，它们的端点会 404）。探测用**两路**：
-   * 1. `GET /api/plugins`（恒可用）——插件是否 active，这是权威判据，**不产生 404**；
-   * 2. `GET /api/ai/capabilities`（按契约要求调用）——用于拿到"模型是否就绪"的说明；
-   *    若插件未启用它会 404，这里**静默**降级（只 console.debug）。
-   * 三态：null=探测中、true=可用、false=不可用（隐藏入口）。
+   * 检索插件**可能未启用**（不在基础层清单里时它的端点会 404）。判据用
+   * `GET /api/plugins`（恒可用）里该插件是否 active —— 这是权威判据且**不产生 404**：
+   * 直接去探 `/api/search` 会让浏览器把 404 记成 error 级网络日志，用户看到控制台一片红。
+   * 三态：null=探测中、true=可用、false=不可用（禁用检索入口）。
+   *
    */
   const [searchReady, setSearchReady] = useState<boolean | null>(null)
-  const [aiReady, setAiReady] = useState<boolean | null>(null)
-  /** 模型是否就绪（来自 capabilities）；null = 未知（未启用或探测失败） */
-  const [modelReady, setModelReady] = useState<boolean | null>(null)
-
   const load = (): void => {
     pagesState.reload()
+  }
+
+  /*
+   * ══════════════ 页面树 · 在侧栏隐藏 · 同层排序（2026-09-16 导航批） ══════════════
+   *
+   * 三件事共用**一棵未剪枝的树**：
+   *   · 树：`buildNavTree` 的层级来自 slug（`guide/architecture` 的父级是 `guide`），
+   *     同级顺序来自 `nav_order`（与服务端下发的同一份）；
+   *   · 隐藏：**不剪枝**——被隐藏的页面在这一页要以灰色**显示出来**（用户要能看见并取消它），
+   *     剪枝只发生在侧栏（`Sidebar` 里的 `pruneHidden`）与"上一篇/下一篇"里；
+   *   · 排序：只在**同一层内**，提交的是这一层的完整新顺序（`items` 可以是页面 slug，
+   *     也可以是 `guide` 这种没有页面的分组路径）。拖动**永远不改变层级**——
+   *     层级就是 url 里的 `/`，改层级等于改地址，那是"移动页面"而不是排序。
+   */
+  const navOrder = useMemo(() => navOrderMap(pagesState.navOrder), [pagesState.navOrder])
+  const tree = useMemo(() => buildNavTree(pages ?? [], navOrder), [pages, navOrder])
+  /** 折叠的分组（path 集合）；默认全展开——地图是给人看的，默认藏起来等于没有 */
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
+  const rows = useMemo(() => navRows(tree, collapsed), [tree, collapsed])
+  /** 正在提交的行（path 或 `__root__`）——提交期间禁用控件，避免连点产生两次顺序写入 */
+  const [navBusy, setNavBusy] = useState<string | null>(null)
+  const [navNotice, setNavNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
+  /** 拖动中的行（含它所在的层，用于判"只能同层"） */
+  const [drag, setDrag] = useState<{ path: string; parent: string } | null>(null)
+  const [dropAt, setDropAt] = useState<string | null>(null)
+
+  const submitOrder = async (parent: string, items: readonly string[]): Promise<void> => {
+    setNavBusy(parent === '' ? '__root__' : parent)
+    setNavNotice(null)
+    try {
+      await api.setNavOrder(parent === '' ? null : parent, items)
+      pagesState.reload()
+      setNavNotice({ kind: 'ok', text: '顺序已保存（所有人看到的导航都已更新）' })
+    } catch (e) {
+      /*
+       * 失败**不假装成功**：把服务端的原话显示出来。排序要求"这一层里每一篇你都能编辑"
+       * （导航是共享内容），少了权限就会拿到 403 —— 用户要知道是权限问题还是别的问题。
+       */
+      setNavNotice({ kind: 'error', text: `顺序没有保存：${errorLine(e)}` })
+    } finally {
+      setNavBusy(null)
+    }
+  }
+
+  const moveRow = (row: NavRow, delta: number): void => {
+    const ids = row.siblings.map((n) => n.path)
+    const next = moveWithinSiblings(ids, row.index, row.index + delta)
+    if (next.join('\u0000') === ids.join('\u0000')) return
+    void submitOrder(row.parent, next)
+  }
+
+  const toggleHidden = async (row: NavRow): Promise<void> => {
+    const slug = row.node.path
+    const own = row.node.page?.nav_hidden === true
+    setNavBusy(slug)
+    setNavNotice(null)
+    try {
+      await api.setNavHidden(slug, !own)
+      pagesState.reload()
+      setNavNotice({
+        kind: 'ok',
+        text: !own ? `「${slug}」已从左侧边栏隐藏（它仍可被直链与检索访问）` : `「${slug}」已恢复显示`,
+      })
+    } catch (e) {
+      setNavNotice({ kind: 'error', text: `「${slug}」的隐藏设置没有保存：${errorLine(e)}` })
+    } finally {
+      setNavBusy(null)
+    }
+  }
+
+  const onDropRow = (row: NavRow): void => {
+    const from = drag
+    setDrag(null)
+    setDropAt(null)
+    if (from === null || from.parent !== row.parent || from.path === row.node.path) return
+    const ids = row.siblings.map((n) => n.path)
+    const fromIndex = ids.indexOf(from.path)
+    if (fromIndex < 0) return
+    const next = moveWithinSiblings(ids, fromIndex, row.index)
+    if (next.join('\u0000') === ids.join('\u0000')) return
+    void submitOrder(row.parent, next)
   }
   const slowList = useSlowHint(pages === null && pagesState.error === null)
 
@@ -664,40 +802,19 @@ function WikiList(props: {
       .then((r) => {
         const stateOf = (name: string): string | undefined => r.plugins.find((p) => p.name === name)?.state
         setSearchReady(stateOf('@geewiki/search') === 'active')
-        setAiReady(stateOf('@geewiki/ai') === 'active')
       })
       .catch((e: unknown) => {
         // 列表本身失败：不阻塞页面，入口按"不可用"处理（用户仍能正常读写页面）
         console.debug('[geewiki-wiki] 插件列表不可用，隐藏检索/问答入口：', e instanceof Error ? e.message : e)
         /*
-          日志还不够（本批 T4）：入口消失是**用户可见的变化** —— 检索框变灰、问答按钮没了，
+          日志还不够（本批 T4）：入口消失是**用户可见的变化** —— 检索框变灰，
           而此前界面上一个字都不说，用户只会以为"这版没有这个功能"或"我的权限没了"。
           这里复用既有的 `queryNotice` 提示位（就在入口那一行里，不是弹窗）说明原因。
         */
-        setQueryNotice('检索/问答插件当前不可用（插件列表读取失败），入口已隐藏')
+        setQueryNotice('检索功能当前不可用（插件列表读取失败），检索入口已禁用')
         setSearchReady(false)
-        setAiReady(false)
       })
   }, [])
-
-  /**
-   * 能力探测：**只在问答插件确实激活时才调用** `/api/ai/capabilities`。
-   *
-   * 为什么不无条件探测：未启用 `@geewiki/ai` 时该端点返回 404，虽然代码里已静默
-   * 降级（只 console.debug），但**浏览器自身**会把 404 响应记为 error 级网络日志
-   * （"Failed to load resource: 404"）——用户看到的是控制台一片红。既然后端
-   * `/api/plugins` 已经给出了权威的"是否激活"，就没有必要再去撞一次 404。
-   */
-  useEffect(() => {
-    if (aiReady !== true) return
-    api
-      .aiCapabilities()
-      .then((c) => setModelReady(c.available))
-      .catch((e: unknown) => {
-        console.debug('[geewiki-wiki] 问答能力探测跳过：', e instanceof Error ? e.message : e)
-        setModelReady(null)
-      })
-  }, [aiReady])
 
   /**
    * 即时过滤结果。匹配**标题或标识**（标识常是英文、标题是中文，两者都查才实用），
@@ -712,6 +829,36 @@ function WikiList(props: {
       (p) => p.title.toLowerCase().includes(needle) || p.slug.toLowerCase().includes(needle),
     )
   }, [pages, filter])
+
+  /** path → 节点（筛选时要把平铺的页面映射回树上的节点，才能拿到正确的隐藏状态） */
+  const nodeByPath = useMemo(() => {
+    const m = new Map<string, NavNode>()
+    const walk = (list: readonly NavNode[]): void => {
+      for (const n of list) {
+        m.set(n.path, n)
+        walk(n.children)
+      }
+    }
+    walk(tree)
+    return m
+  }, [tree])
+
+  /**
+   * 实际渲染的行序列。
+   *
+   * 筛选态**平铺**（不显示层级、不给排序控件）：筛选是"找某一页"的动作，此时缩进只会让结果跳来跳去；
+   * 隐藏状态仍然取自树上的节点，所以"父级隐藏 ⇒ 子级灰"在筛选结果里也成立。
+   */
+  const view: NavRow[] = useMemo(() => {
+    if (filter.trim() === '') return rows
+    return filtered.map((p, i) => {
+      const node = nodeByPath.get(p.slug)
+      return node === undefined
+        ? { node: { segment: p.slug, path: p.slug, page: p, children: [], hidden: p.nav_hidden }, depth: 0, siblings: [], index: i, parent: '' }
+        : { node, depth: 0, siblings: [], index: i, parent: '' }
+    })
+  }, [filter, rows, filtered, nodeByPath])
+
 
   const submitSearch = (): void => {
     // 与检索视图共用同一套校验（空串 / 超长），这样超长查询在**原地**就给出提示、不必先跳转
@@ -728,7 +875,7 @@ function WikiList(props: {
     <div className="flex flex-col gap-3.5">
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="m-0 text-xl font-semibold">知识库</h1>
-        {/* 动作条（权限…/删除/编辑）与下方右栏**同宽同右缘**：右栏在 styles.css 里固定
+        {/* 动作条（权限/删除/编辑）与下方右栏**同宽同右缘**：右栏在 styles.css 里固定
             240px，这里用同一个值，避免两处各写一个数而漂移（右栏宽度变化时两处一起改）。 */}
         <div className="ml-auto flex w-[240px] flex-wrap items-center justify-end gap-2">
           {/*
@@ -746,7 +893,7 @@ function WikiList(props: {
         </div>
       </div>
 
-      {/* 检索与问答入口（宿主原生 UI；插件未启用时隐藏/禁用对应入口） */}
+      {/* 检索与问答入口：检索按插件激活态禁用，问答按插槽贡献显隐（两套判据各自的真源） */}
       <div className="flex flex-wrap items-center gap-2.5">
         <form
           className="flex min-w-[260px] flex-1 items-center gap-2"
@@ -776,42 +923,6 @@ function WikiList(props: {
           </Button>
         </form>
 
-        {aiReady === true && (
-          <>
-            <Button
-              icon={<MessageSquareText className="size-3.5" />}
-              onClick={() => onAsk('')}
-              title={
-                modelReady === false
-                  ? '未配置模型密钥：问答将以检索结果与抽取式摘要形式提供'
-                  : '基于知识库检索的问答'
-              }
-            >
-              AI 问答
-              {modelReady === false && <span className="text-xs text-muted">（无模型）</span>}
-            </Button>
-            {/*
-              降级原因必须**可见**（本批 T4）。此前它只挂在 `title` 上 —— 触屏用户没有 hover、
-              读屏用户也不会把 title 当作控件的说明读出来，于是"为什么回答看起来不像模型答的"
-              这件事只对鼠标用户可见。
-              用 `role="status"` 播报（降级不是错误，`.notice.err` 那种红条会过度惊吓），
-              `title` 保留作补充说明。
-            */}
-            {modelReady === false && (
-              <span className="text-note text-warn-ink" role="status">
-                未配置模型密钥：将以检索结果与抽取式摘要作答
-              </span>
-            )}
-          </>
-        )}
-        {aiReady === false && (
-          <span
-            className="text-xs text-muted"
-            title="问答插件 @geewiki/ai 未激活（端点 /api/ai/ask 会 404）"
-          >
-            问答插件未启用
-          </span>
-        )}
         {queryNotice !== '' && (
           <span className="rounded-md border border-danger-line bg-danger-bg px-3 py-1 text-note text-danger-ink">
             {queryNotice}
@@ -950,7 +1061,7 @@ function WikiList(props: {
             >
               <thead className="sticky top-0 z-10 bg-bg">
                 <tr>
-                  {['标题', '页面标识', '版本', '最近更新'].map((h) => (
+                  {['标题', '页面标识', '版本', '最近更新', '导航'].map((h) => (
                     <th
                       key={h}
                       scope="col"
@@ -962,57 +1073,175 @@ function WikiList(props: {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((p) => (
-                  /*
-                    行的可访问性语义选择：**标题单元格内放真正的 <a>**，而不是
-                    给 <tr> 加 tabIndex + role="link"。
-                    理由：<tr> 一旦改成 role="link" 就破坏了表格语义（屏幕阅读器不再
-                    播报行列关系），而表格的语义价值正是"这是列表、有几列"。
-                    放链接则两全：链接是原生可聚焦元素（Tab 可达、可中键新开、
-                    可被读作"链接"），表格结构完好。整行点击仅作为**鼠标便利**保留，
-                    且不承担键盘可达性职责。
-                  */
-                  <tr
-                    key={p.slug}
-                    className="group cursor-pointer transition-colors duration-150 hover:bg-hover"
-                    onClick={() => onOpen(p.slug)}
-                  >
-                    <td className="border-b border-line px-3 py-2.5 align-top font-semibold">
-                      {/*
-                        链接的"可辨识性"与正文链接（`.md-body a`）**保持一致**：常驻细下划线、
-                        悬停加粗。理由（实测 + 规范，不是主观偏好）：
-                        - WCAG 2.2 · 1.4.1「不能只靠颜色」的**充分技术 G183**（
-                          https://www.w3.org/WAI/WCAG21/Techniques/general/G183 ）规定：链接若
-                          **仅靠颜色**与周围文字区分，则链接文字与周围文字的对比度须 ≥3:1。
-                          实测本项目 `--gw-accent`(#2563eb) 对正文色 `--gw-ink`(#1c2733)
-                          = **2.93:1**，**低于**该门槛；而 Wikipedia 的链接蓝(#3366cc)刻意调成
-                          3.01:1 正是为了卡这条线。既然我们的链接色达不到 3:1，就**必须**给出
-                          非颜色的线索——下划线是最直接的（G183 也把下划线列为推荐做法）。
-                        - 同一产品里正文链接有下划线、列表标题没有，会让用户学不到统一的规则
-                          （目标里的"视觉系统与一致性"）。
-                        - 噪声顾虑（表格里全是下划线会吵）用**行级悬停**缓解：`tr` 是 `group`，
-                          鼠标落在行内任意位置都会加强下划线，让"整行可点"的暗示浮现出来。
-                      */}
-                      <a
-                        href={`#/wiki/${encodeURIComponent(p.slug)}`}
-                        className="gw-focus-ring rounded-sm py-1 text-accent underline decoration-1 underline-offset-2 hover:text-accent-hover hover:decoration-2 group-hover:decoration-2"
+                {view.map((row) => {
+                  const { node, depth } = row
+                  const page = node.page
+                  const hasChildren = node.children.length > 0
+                  const isCollapsed = collapsed.has(node.path)
+                  const ownHidden = page?.nav_hidden === true
+                  /* 有效隐藏但自己没有开关 ⇒ 是被祖先带下来的（文案要区分，否则用户找不到那个开关） */
+                  const inheritedHidden = node.hidden && !ownHidden
+                  const canReorder = row.siblings.length > 1
+                  const busy = navBusy !== null
+                  return (
+                    <tr
+                      key={node.path}
+                      /*
+                        可拖动 = 这一行参与同层排序。**纯分组也能拖**（`items` 里就是它的路径）——
+                        否则 `guide`、`demo` 这些没有页面的目录永远排不了序。
+                        筛选态 `siblings` 为空 ⇒ 不给排序控件与拖动（那时顺序的"这一层"不完整）。
+                      */
+                      draggable={canReorder && !busy}
+                      onDragStart={() => setDrag({ path: node.path, parent: row.parent })}
+                      onDragOver={(e) => {
+                        if (drag === null || drag.parent !== row.parent || drag.path === node.path) return
+                        e.preventDefault()
+                        setDropAt(node.path)
+                      }}
+                      onDragLeave={() => setDropAt((prev) => (prev === node.path ? null : prev))}
+                      onDrop={(e) => {
+                        e.preventDefault()
+                        onDropRow(row)
+                      }}
+                      onDragEnd={() => {
+                        setDrag(null)
+                        setDropAt(null)
+                      }}
+                      className={cn(
+                        'group cursor-pointer transition-colors duration-150 hover:bg-hover',
+                        node.hidden && 'text-muted',
+                        dropAt === node.path && 'outline outline-2 -outline-offset-2 outline-accent',
+                      )}
+                      onClick={() => {
+                        if (page !== null) onOpen(page.slug)
+                      }}
+                    >
+                      <td
+                        className={cn('border-b border-line px-3 py-2.5 align-top font-semibold', node.hidden && 'opacity-60')}
+                        style={{ paddingLeft: `${12 + depth * 18}px` }}
                       >
-                        {p.title}
-                      </a>
-                    </td>
-                    <td className="border-b border-line px-3 py-2.5 align-top">
-                      <code className="rounded-sm bg-hover px-1.5 py-0.5 font-mono text-2xs text-ink-soft">
-                        {p.slug}
-                      </code>
-                    </td>
-                    <td className="border-b border-line px-3 py-2.5 align-top text-muted">
-                      v{p.version}
-                    </td>
-                    <td className="border-b border-line px-3 py-2.5 align-top text-muted">
-                      {fmtTime(p.updated_at)}
-                    </td>
-                  </tr>
-                ))}
+                        <span className="flex items-center gap-1">
+                          {hasChildren ? (
+                            <button
+                              type="button"
+                              aria-expanded={!isCollapsed}
+                              aria-label={`${isCollapsed ? '展开' : '折叠'}「${page?.title ?? node.segment}」`}
+                              className={cn('rounded-sm p-0.5 text-muted hover:bg-hover', focusRing)}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setCollapsed((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(node.path)) next.delete(node.path)
+                                  else next.add(node.path)
+                                  return next
+                                })
+                              }}
+                            >
+                              {isCollapsed ? <ChevronRight className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+                            </button>
+                          ) : (
+                            <span aria-hidden="true" className="inline-block size-4" />
+                          )}
+                          {page !== null ? (
+                            <a
+                              href={`#/wiki/${encodeURIComponent(page.slug)}`}
+                              className="gw-focus-ring rounded-sm py-1 text-accent underline decoration-1 underline-offset-2 hover:text-accent-hover hover:decoration-2 group-hover:decoration-2"
+                            >
+                              {page.title}
+                            </a>
+                          ) : (
+                            <span className="font-mono text-2xs text-muted" title="只有路径段、没有页面（纯分组）">
+                              {node.segment}
+                            </span>
+                          )}
+                          {node.hidden && (
+                            <span
+                              className="rounded-sm bg-hover px-1.5 py-0.5 text-2xs text-muted"
+                              title={inheritedHidden ? '父级（或更上层）被隐藏，因此这一篇也不在侧栏里' : '已从左侧边栏隐藏'}
+                            >
+                              {inheritedHidden ? '随父级隐藏' : '已隐藏'}
+                            </span>
+                          )}
+                        </span>
+                      </td>
+                      <td className={cn('border-b border-line px-3 py-2.5 align-top', node.hidden && 'opacity-60')}>
+                        {page !== null ? (
+                          <code className="rounded-sm bg-hover px-1.5 py-0.5 font-mono text-2xs text-ink-soft">{page.slug}</code>
+                        ) : (
+                          <span className="text-muted">分组</span>
+                        )}
+                      </td>
+                      <td className={cn('border-b border-line px-3 py-2.5 align-top text-muted', node.hidden && 'opacity-60')}>
+                        {page !== null ? `v${page.version}` : '—'}
+                      </td>
+                      <td className={cn('border-b border-line px-3 py-2.5 align-top text-muted', node.hidden && 'opacity-60')}>
+                        {page !== null ? fmtTime(page.updated_at) : '—'}
+                      </td>
+                      <td className="border-b border-line px-3 py-2.5 align-top whitespace-nowrap">
+                        <span className="flex items-center gap-1">
+                          {canReorder && (
+                            <span className="text-muted" title="拖动可调整同一层内的顺序（不会改变层级）" aria-hidden="true">
+                              <GripVertical className="size-3.5" />
+                            </span>
+                          )}
+                          {/*
+                            ⚠️ 被父级带下来隐藏的行**不给开关**：它已经不在侧栏里了，再放一个"隐藏"
+                            按钮只会让人以为"点一下才有用"，而它的状态完全由父级决定。
+                            要让它出现，得去父级取消隐藏（badge 的 title 已经写明了这一点）。
+                          */}
+                          {page !== null && !inheritedHidden && (
+                            <button
+                              type="button"
+                              aria-pressed={ownHidden}
+                              disabled={busy}
+                              title={
+                                ownHidden
+                                  ? '取消隐藏：恢复出现在左侧边栏'
+                                  : '在左侧边栏隐藏（这一页仍可被直链与检索访问；其子级也会一起不显示）'
+                              }
+                              className={cn('rounded-sm px-1.5 py-0.5 text-2xs text-muted hover:bg-hover disabled:opacity-40', focusRing)}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void toggleHidden(row)
+                              }}
+                            >
+                              {ownHidden ? '取消隐藏' : '隐藏'}
+                            </button>
+                          )}
+                          {canReorder && (
+                            <>
+                              <button
+                                type="button"
+                                aria-label={`上移「${page?.title ?? node.segment}」`}
+                                disabled={busy || row.index === 0}
+                                className={cn('rounded-sm p-0.5 text-muted hover:bg-hover disabled:opacity-30', focusRing)}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  moveRow(row, -1)
+                                }}
+                              >
+                                <ArrowUp className="size-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                aria-label={`下移「${page?.title ?? node.segment}」`}
+                                disabled={busy || row.index === row.siblings.length - 1}
+                                className={cn('rounded-sm p-0.5 text-muted hover:bg-hover disabled:opacity-30', focusRing)}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  moveRow(row, 1)
+                                }}
+                              >
+                                <ArrowDown className="size-3.5" />
+                              </button>
+                            </>
+                          )}
+                          {!canReorder && page === null && <span className="text-2xs text-muted">—</span>}
+                        </span>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -1170,13 +1399,27 @@ function WikiDetail(props: {
   const [notice, setNotice] = useState('')
   // ══════════ M1：权限治理弹窗（独立代码块，可整段摘除） ══════════
   /**
-   * 详情页的「权限…」入口。面板本体与 `#/access/<slug>` 治理台**共用同一个组件**
+   * 详情页的「权限」入口。面板本体与 `#/access/<slug>` 治理台**共用同一个组件**
    * （`PageAccessPanel`）—— 两处各写一份必然漂移，而漂移的后果是权限被改错。
    *
    * 状态放在这里（而不是让面板自己带触发器）是为了让 `Dialog` 成为受控组件：
    * 关闭后 Radix 会卸载内容，面板随之下车，下次打开时重新取数（不会看到过期的档位）。
    */
   const [accessOpen, setAccessOpen] = useState(false)
+  /*
+   * `?access=1`：旧「权限治理」深链（`#/access/<slug>`）的落点。
+   *
+   * 为什么重定向到**本页的权限对话框**而不是编辑页：这个对话框对**所有有
+   * `manageVisibility` 的人**都可用 —— 包括没有正文编辑权的人（只负责治理的成员）。
+   * 一律送去编辑页会把这类人挡在门外（编辑页要 `canEdit`），那才是真的功能倒退。
+   * 无权限时不自动弹：弹出来只会是一张"没有可见性管理权"的卡片，不如让用户正常阅读。
+   */
+  const wantAccess = useMemo(() => new URLSearchParams(query).get('access') === '1', [query])
+  useEffect(() => {
+    if (!wantAccess || page === null) return
+    if (!page.capabilities.canManageVisibility) return
+    setAccessOpen(true)
+  }, [wantAccess, page])
   /** 只用来判「登录了没」（申请入口对匿名不显示）；**能力判据仍以 page.capabilities 为准** */
   const auth = useAuth()
   /**
@@ -1215,10 +1458,15 @@ function WikiDetail(props: {
    * 与 `if (!page)` 两个提前返回，把 hook 放到它们之后会让两次渲染的 hook 数量不同，
    * React 直接抛 #310（"Rendered more hooks than during the previous render"）并白屏。
    */
+  const navOrder = useMemo(() => navOrderMap(pagesState.navOrder), [pagesState.navOrder])
   const neighbors = useMemo(() => {
     if (siblings === null) return { prev: undefined, next: undefined }
-    return neighborsOf(buildNavTree(siblings), slug)
-  }, [siblings, slug])
+    /*
+     * 与侧栏**同一棵树**、同一份同级顺序：`flattenPages` 会跳过被隐藏的页面与子树
+     * （导航批：隐藏的页不参与"上一篇/下一篇"，否则会出现"点下一篇跳到一篇看不见的页"）。
+     */
+    return neighborsOf(buildNavTree(siblings, navOrder), slug)
+  }, [siblings, slug, navOrder])
   const prev = neighbors.prev
   const next = neighbors.next
   /*
@@ -1251,6 +1499,47 @@ function WikiDetail(props: {
   }, [slug])
 
   useEffect(load, [load])
+
+  /*
+   * ---------- 别人改了正文 ⇒ 当前页自动失效（2026-09-16） ----------
+   *
+   * 用户报的缺陷：让 AI 助手改当前这篇文章，AI 的 `page.update` 在服务端跑完、库里已经变了，
+   * 但这一页是组件 state 里那份 `api.page(slug)` 的结果，没人告诉它过期了 ⇒ 用户看到旧正文。
+   *
+   * 为什么这里**可以**直接重取、不必担心冲掉正在编辑的草稿：
+   * 编辑路由（`route.kind === 'edit'`）根本不渲染 `WikiDetail`（它渲染编辑器）⇒
+   * 本 effect 在编辑态下压根没挂载。所以这不是"忽略了编辑态"，而是那一支不存在。
+   *
+   * 别人改的是**别的页**时只失效列表缓存（版本号/标题列会变），不动当前正文——
+   * 无谓地重取当前页会让阅读位置与滚动跳动。
+   */
+  useEffect(() => {
+    return onContentChanged((detail) => {
+      const mine = detail.slugs.length === 0 || detail.slugs.includes(slug)
+      if (mine) {
+        load()
+        setNotice('这一页刚刚被修改，正文已自动刷新')
+      }
+      // 无论改的是不是这一页，列表里的标题/版本/更新时间都可能变了
+      void invalidatePages()
+      console.debug('[geewiki] 内容变更广播：', detail.source, detail.slugs)
+    })
+  }, [slug, load])
+
+  /*
+   * 文章顶部的摘要卡是**按需加载**的（`ON_DEMAND_SLOTS` 里那一份）。
+   *
+   * 这一步不能省：不调它，`article-summary` 插槽的贡献者永远不会被取回来，
+   * 而 `ArticleSummarySlotOutlet` 在"没有贡献者"时**故意什么都不渲染**——
+   * 于是症状是"摘要功能装了但页面上什么都没有"，且不报错、console 也干净。
+   *
+   * 放在读完页面之后（而不是模块初始化或 App 顶层）：宿主此时才**知道**自己要不要它。
+   * 这正是 `ON_DEMAND_SLOTS` 的判据——"宿主是否掌握『现在要不要它』"，
+   * 而不是"它是不是首屏位置"。列表页、图谱页、管理台都不该为它下载任何东西。
+   */
+  useEffect(() => {
+    void ensureSlotLoaded('article-summary').catch(() => {})
+  }, [slug])
 
   /*
    * 这里原来有一段"为上一篇/下一篇单独拉一次全表"的 useEffect。
@@ -1394,7 +1683,16 @@ function WikiDetail(props: {
   })
   /** 正文卡片实际渲染哪一份：预览态用快照，否则用当前正文 */
   const shown = previewing ? renderedSnapshot : rendered
-  const tocIds = useMemo(() => rendered.toc.map((t) => t.id), [rendered.toc])
+  /*
+   * 目录必须跟着**正在显示的那一份**走，不能固定用当前正文的 `rendered.toc`。
+   *
+   * ⚠️ 2026-09-13 实测的缺陷（`#/wiki/getting-started?v=6`）：快照正文里的小节是
+   * 「安装 / 特性」，而右栏目录列的却是当前版的「安装 / 下一步」—— 目录里点得到的小节
+   * 在快照里**不存在**（滚不动），快照里真有的一节又不在目录里。
+   * 两份文件同源（`useRenderedMarkdown` 同一个 hook），只是取的变量取错了。
+   */
+  const shownToc = previewing ? renderedSnapshot.toc : rendered.toc
+  const tocIds = useMemo(() => shownToc.map((t) => t.id), [shownToc])
   const activeId = useActiveHeading(tocIds)
 
   /*
@@ -1406,9 +1704,13 @@ function WikiDetail(props: {
    *
    * ⚠️ 2026-09-13 一度改为**恒为真**（当时右栏放了「本页信息」，它对每篇页面都有内容）。
    * 用户随后明确要求删掉「本页信息」（"那个本页信息没用"），故判据回到这里 ——
-   * 没有两级标题的普通页（`welcome`）右栏整条消失、正文列独自居中，这是**期望**行为。
+   * 没有两级标题的普通页（`welcome`）右栏整条消失、正文列独自吃满阅读区（左对齐），这是**期望**行为。
+   *
+   * ⚠️ 判据用 `shownToc`（预览态即快照的目录）而不是当前正文的目录：右栏列的就是
+   * "你正在读的这一份"的目录。代价是**打开一个标题数不足两条的历史版本时右栏会收起**
+   * （正文列随之变宽）—— 这是正确性优先的取舍：留一条空轨道比布局微动更糟。
    */
-  const hasRightRail = rendered.toc.length >= 2 || (homeMode && siblings !== null && siblings.length > 0)
+  const hasRightRail = shownToc.length >= 2 || (homeMode && siblings !== null && siblings.length > 0)
 
   /*
    * 锚点滚动：URL 带 `?a=<id>` 时滚到该小节。
@@ -1649,36 +1951,62 @@ function WikiDetail(props: {
     */
     return (
       <LoadingState slow={slowDetail} label="正在加载页面…">
-        {/* 面包屑：`知识库 › 标题` */}
-        <Skeleton className="h-4 w-48" />
+        {/*
+          骨架必须与真实阅读页**同构**，而且是**同一套 `.gw-reader-grid` 类**。
 
-        {/* 操作条：左侧「版本 vN」徽标 + 更新时间，右侧编辑/删除按钮 */}
-        <div className="flex flex-wrap items-center gap-2">
-          <Skeleton className="h-5 w-20" />
-          <Skeleton className="h-4 w-40" />
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Skeleton className="h-8 w-20" />
-            <Skeleton className="h-8 w-20" />
+          ⚠️ 2026-09-13 第二版修的就是这里：此前骨架是一叠**整宽**的 `flex flex-col` 方块，
+          而真实页面是栅格（面包屑/正文在正文列、右栏在第 2 列）⇒ 每次切文章都要先闪一屏
+          整宽方块、再整体右移约 165px 并收窄，用户原话"切换文章时闪烁"。
+          实测（1920，人为把接口延迟 2500ms）：加载态面包屑 x=324、宽 734 的正文块，
+          加载完成后面包屑 x=193、正文列 489..1431 —— 一整屏的位移。
+          骨架一律按"有右栏"渲染：编辑权/目录条数都要等页面数据到了才知道，
+          而绝大多数页面有右栏；真有例外时（目录不足两条）也只差右栏那一列。
+
+          ⚠️ 正文那一段**不要再套卡片**（border/bg/shadow/padding）：真实正文早已去掉卡片外观
+          （用户原话"那个本页信息没用，去掉"那一轮同时去掉了卡片），套上去等于先闪一张卡片再消失。
+        */}
+        <div className="gw-reader-grid has-rail">
+          {/* 面包屑：`知识库 › 标题`（第 1 列，与正文同左缘） */}
+          <Skeleton className="h-4 w-48" />
+
+          {/* 操作条：左侧「版本 vN」徽标 + 更新时间，右侧编辑/删除按钮 */}
+          <div className="gw-reader-actions flex flex-wrap items-center gap-2">
+            <Skeleton className="h-5 w-20" />
+            <Skeleton className="h-4 w-40" />
+            <div className="ml-auto flex flex-wrap items-center gap-2">
+              <Skeleton className="h-8 w-20" />
+              <Skeleton className="h-8 w-20" />
+            </div>
           </div>
-        </div>
 
-        {/* 正文卡片：标题 + 若干**不等宽**段落行 + 一个代码块占位 */}
-        <div className="rounded-lg border border-line bg-surface px-6 py-6 shadow-sm sm:px-8">
-          <Skeleton className="h-7 w-1/2" />
-          <div className="mt-6 flex flex-col gap-2.5">
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-11/12" />
-            <Skeleton className="h-4 w-4/5" />
-            <Skeleton className="mt-3 h-16 w-full" />
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-2/3" />
+          {/* 正文（第 1 列）：标题 + 若干**不等宽**段落行 + 一个代码块占位 */}
+          <div className="gw-reader-main flex min-w-0 flex-col gap-4">
+            <div>
+              <Skeleton className="h-7 w-1/2" />
+              <div className="mt-6 flex flex-col gap-2.5">
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-11/12" />
+                <Skeleton className="h-4 w-4/5" />
+                <Skeleton className="mt-3 h-16 w-full" />
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-2/3" />
+              </div>
+            </div>
+
+            {/* 上一篇 / 下一篇：窄屏堆叠、宽屏两列（与真实布局同一断点） */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+            </div>
           </div>
-        </div>
 
-        {/* 上一篇 / 下一篇：窄屏堆叠、宽屏两列（与真实布局同一断点） */}
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-16 w-full" />
+          {/* 右栏（第 2 列）：目录占位，窄屏与真实右栏同一断点隐藏 */}
+          <div className="gw-reader-rail hidden min-w-0 flex-col gap-2.5 xl:flex">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-4 w-28" />
+            <Skeleton className="h-4 w-36" />
+          </div>
         </div>
       </LoadingState>
     )
@@ -1687,14 +2015,17 @@ function WikiDetail(props: {
 
   return (
     /*
-      阅读页的整体栅格（2026-09-13 用户定稿的四条要求）。
-      **两行三列**：第一行是头部（面包屑 + 标题/动作条），第二行是「留白 | 正文 | 右栏」。
-      - 第 1 列（留白 240px）：只为让正文在**整页**里居中而存在的对称留白
-        —— 左有侧栏 240px、右有 240px 留白 ⇒ 正文列真正落在视口中心。
-      - 第 3 列（240px）：右栏（本页目录，或主页的「最近更新」），宽度与动作条上的
-        按钮组**同列同宽**（`本页目录的宽度与上面那三个按钮整体同宽`）。
-      - 动作条放在 `grid-column: 2`：它自动与正文同宽、与右栏同右缘，不需要两处各写一个宽度。
-      没有右栏时（目录不足两条且非主页）退化成单列居中（见 styles.css 的 `.gw-reader-grid`）。
+      阅读页的整体栅格（2026-09-13 第二版定稿）。
+      **两列**：`[正文列 minmax(0,1fr)] [右栏 240px]`，列里从上到下是
+      面包屑 / 动作条 /（预览条）/ 正文，右栏是页内目录；左缘全部对齐正文。
+      · 正文列 = 阅读区里除右栏外的**全部**宽度（用户选定"正文列吃满中间、行宽上限同步放宽"）；
+      · 右栏与动作条上的按钮组**同右缘**（`本页目录的宽度与上面那三个按钮整体同宽`）；
+      · 没有右栏时（目录不足两条且非主页）退化成单列：正文按 `--spacing-measure` 封顶，
+        但**左缘与有右栏时相同**（否则"从有目录的文章切到没目录的文章"会整块左右跳）。
+      · 第一版那条"左侧留白 + `translateX(-131px)` 整页居中"已删除：它既留下 187px 的
+        空白带（用户圈出的"空得太多了"），又让栅格盒子压住侧栏右半边、把侧栏链接点掉了，
+        还把面包屑推进了那一列（"面包屑的位置奇怪"）。缘起与实测写在 styles.css 的
+        `.gw-reader-grid` 那段注释里。
     */
     <div
       className={cn(
@@ -1781,7 +2112,7 @@ function WikiDetail(props: {
               icon={<ShieldCheck className="size-3.5" />}
               onClick={() => setAccessOpen(true)}
             >
-              权限…
+              权限
             </Button>
           )}
           {/* ══════════════════════════════════════════════════════ */}
@@ -1807,16 +2138,21 @@ function WikiDetail(props: {
         预览态状态条：说清"你在看的是哪一版、它是只读的、以及附件的判定口径与正文不同"。
         附件那句不是免责声明而是**真会发生的差异**：快照正文按保存时显示，而附件下载
         按**当前**正文的引用判定（见后端下载端点），所以历史里的图片可能打不开。
+
+        ⚠️ `gw-reader-preview` 不是装饰：栅格里必须显式声明它落在第 1 列（正文列）。
+        此前它没有任何列号，自动放置把它丢进**右侧那一列**（当时是正文列/留白列），
+        实测宽 240px、与侧栏在横向重叠，整块栅格还跟着回流 —— 打开历史版本时的
+        "样子不对"就是它（见 styles.css 的 `.gw-reader-grid` 注释）。
       */}
       {preview !== null && (
         <div
           role="status"
-          className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-note text-warn-ink"
+          className="gw-reader-preview flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-note text-warn-ink"
         >
           <span>{previewBarText(preview.number, preview.savedAt)}</span>
           <span className="text-2xs opacity-80">{PREVIEW_ATTACHMENT_NOTE}</span>
           {/*
-            预览态下「编辑 / 权限… / 删除」被禁用（不是隐藏）。这里用**可见文字**说明原因而不是
+            预览态下「编辑 / 权限 / 删除」被禁用（不是隐藏）。这里用**可见文字**说明原因而不是
             只挂 Tooltip：Tooltip 在禁用按钮上根本触发不了（禁用元素不派发指针事件、也不可聚焦），
             触屏与读屏用户更拿不到 —— 那等于把唯一的解释挂在了够不着的地方。
           */}
@@ -1861,30 +2197,23 @@ function WikiDetail(props: {
       */}
       {/*
         正文与右栏都直接挂在**外层** `.gw-reader-grid` 上（本块此前是一层多余的
-        `div.grid`）：列宽、块宽、居中三件事统一归 styles.css 的 `.gw-reader-grid`，
-        这里不再有第二套栅格。由 `WikiPage` 外层统一声明 `grid-column`，
-        动作条（`gw-reader-actions`）因此自动与正文同宽、与右栏同右缘。
+        `div.grid`）：列宽、块宽、行宽三件事统一归 styles.css 的 `.gw-reader-grid`，
+        这里不再有第二套栅格。各子项的 `grid-column` 也全部由那里声明
+        （面包屑/预览条/正文在第 1 列，动作条占满整行、按钮与右栏同右缘）。
 
         ⚠️ 两个必须保留的既有结论：
           · 双栏只在 `xl`（1280px）以上生效 —— `md`~`xl` 之间用两列会把正文列挤到 177px；
           · 不要再给卡片加 `width`/`margin-inline`（历史上"卡片限宽 + 居中"造成过 86px 阶梯）。
       */}
-        {/*
-          第 1 列的**对称留白**（只在 `xl` 以上、且这一页有右栏时占位）。
-          为什么要有它：左有侧栏 240px、右有留白 240px，正文列才真正落在**视口中心**
-          （用户要求"正文部分显示要居中于整体页面"）。宽度与右栏同为 `--gw-rail`，
-          由 styles.css 定义；窄屏不渲染它（走单列居中）。
-        */}
-        <div className="gw-reader-align hidden xl:block" aria-hidden="true" />
-
         <div className="gw-reader-main flex min-w-0 flex-col gap-4">
-          <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="inline" />
+          <TableOfContents entries={shownToc} activeId={activeId} route={route} variant="inline" />
 
           {/*
             阅读卡片：宽度**跟着栅格列走**，自己不设宽（口径见 styles.css 那段长注释）。
             卡片与同列的「上一篇/下一篇」「相关页面」共用同一个栅格列 ⇒ 左缘天然一致；
-            正文 `.md-body` 另有 `--spacing-measure`（`min(53rem, 50em)`，14px 下 700px
-            = 50 字/行）封顶，所以列里也不会出现"卡片很宽、正文很窄"的空洞。
+            正文 `.md-body` 另有 `--spacing-measure` 封顶（`min(84rem, 92em)`，14px 下 1288px），
+            它只在**没有右栏的单列页**上真正生效 —— 有右栏时正文列本身就只有 1278px，
+            所以列里不会出现"卡片很宽、正文很窄"的空洞。
           */}
           {/*
             ⚠️ 这里**刻意没有卡片外观**（无 bg/border/shadow/padding，2026-09-13 用户反馈）：
@@ -1895,6 +2224,17 @@ function WikiDetail(props: {
             列宽也就等于正文宽（不再需要"列宽 = 正文 + 2×内边距"的换算）。
           */}
           <article className="gw-reader">
+            {/*
+              ★ 折叠摘要卡：渲染在 `<h1>` **之前**，即"文章最上方"（用户需求 ④ 的原话）。
+
+              为什么不放在标题下面：那是"标题下方"，不是"最上方"。折叠态的摘要是一条
+              一行高的横条，它出现在标题之前读起来是**这一页的入口**（点开才展开成正文级的
+              段落）；放在标题与正文之间则会被读成正文的第一段——而它不是正文。
+
+              没有贡献者时这个组件返回 `null`（不留占位）：文章页没有摘要本来就是常态，
+              补一句"暂无摘要"只会让每一篇文章顶部多一行噪音。
+            */}
+            <ArticleSummarySlotOutlet slug={page.slug} title={page.title} />
             <h1 className="mt-0 mb-3 text-2xl leading-tight font-bold text-ink">{page.title}</h1>
             {shown.html === '' ? (
               <p className="text-sm text-muted">（空白页面 —— 点击「编辑」写入内容）</p>
@@ -1947,7 +2287,7 @@ function WikiDetail(props: {
         */}
         <div className="gw-reader-rail hidden min-w-0 flex-col gap-4 xl:flex">
           {homeMode && <HomeAside pages={siblings} onNavigate={onNavigate} />}
-          <TableOfContents entries={rendered.toc} activeId={activeId} route={route} variant="sidebar" />
+          <TableOfContents entries={shownToc} activeId={activeId} route={route} variant="sidebar" />
         </div>
 
       {/*
@@ -1982,7 +2322,12 @@ function WikiDetail(props: {
       <Dialog open={accessOpen} onOpenChange={setAccessOpen}>
         <DialogContent
           title="权限设置"
-          description="档位、例外授予、块级授权与访问申请 —— 与「权限治理」台面同一份实现。"
+          /*
+            描述只列**这个弹窗里真的有**的三件事。曾经写着"块级授权"，而块级分区后来按作者要求
+            从面板移除了 —— 文案比界面多承诺一件事，用户就会在里面找一个不存在的控件。
+            段落档位不在这里：它在**编辑器**里（工具栏的锁按钮 / 源码模式写标记）。
+          */
+          description="页面档位、例外授予与访问申请。段落级档位在编辑器的正文里改（工具栏最右的锁按钮）。"
           className="w-[min(48rem,calc(100vw-2rem))]"
         >
           {accessOpen && <PageAccessPanel slug={slug} />}
@@ -2125,7 +2470,37 @@ function WikiEdit(props: {
   const [slugInput, setSlugInput] = useState(prefillSlug ?? slug)
   const [title, setTitle] = useState('')
   const [content, setContent] = useState('')
-  const [pane, setPane] = useState<'edit' | 'preview'>('edit')
+  /** 「按访客视角预览」对话框：原先是与编辑区并排的第二个面板，现改为按需打开（编辑区独享整宽） */
+  const [previewOpen, setPreviewOpen] = useState(false)
+  /**
+   * 「授权给谁…」的目标段落（编辑器的锁菜单打开它）。
+   *
+   * 编辑器只交出 `{ ordinal, excerpt }`：它不认服务端的块 id（那块是保存时解析出来的），
+   * 换算是 `BlockGrantsDialog` 的职责（按 ordinal 在 `GET /api/pages/:slug/blocks` 里找）。
+   */
+  const [grantBlock, setGrantBlock] = useState<{ ordinal: number; excerpt: string } | null>(null)
+  /**
+   * 页面档位（M1）——**只读**，用于编辑器里"块档位不能宽过页面档位"的提示。
+   *
+   * 为什么编辑页不再放档位设置：页面档位属于"这条目对谁可见"的治理动作，它的入口在
+   * 页面自己的「权限」对话框（阅读页）里 —— 那里同时有例外授予与访问申请，是**一处完整**的
+   * 治理界面。编辑页放第二份会出现两个可编辑的档位控件（本地状态各自为政、"只发改动过的
+   * 字段"的部分更新还会拿旧基线发反向 patch）。编辑页只保留**段落档位**（写在正文里，
+   * 用编辑器工具栏的锁按钮改）与这份只读的页面档位。
+   */
+  const [pagePerm, setPagePerm] = useState<{
+    visibility: PageVisibility
+    inherit: boolean
+    published: boolean
+  } | null>(null)
+  /**
+   * 「正文里有服务端占位文案」的保存拦截。
+   *
+   * 来路：旧客户端写下的草稿（当年存的是**投影后**的正文）或用户粘贴了带占位的文本。
+   * 直接保存会把占位写进正文，并**丢掉段落权限标记** ⇒ 受限段落静默变成公开。
+   * 故保存前拦一次、把两条路都摆出来（重新加载原文 / 仍然保存），而不是默默替他决定。
+   */
+  const [projectedGuard, setProjectedGuard] = useState(false)
   const [loading, setLoading] = useState(!newMode)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
@@ -2171,7 +2546,7 @@ function WikiEdit(props: {
    * （见 `packages/plugin-wiki/src/index.ts:1141-1142` 的 `VALUES (…'org', 1, 0, ?)` 与
    * `:2133-2135` 的"`public` 档必须同时发布才对匿名可见"）。主页是**默认落点**——
    * 建完却不对匿名开放，访客打开站点只会看到"主页当前不可访问"的中性面板，而**没人会告诉他
-   * 这是档位问题**。所以这一条要给的是"下一步动作"：去页面上的「权限…」把档位设为公开并
+   * 这是档位问题**。所以这一条要给的是"下一步动作"：去页面上的「权限」把档位设为公开并
    * 打开「已发布」。
    *
    * 为什么 `outcome === 'updated'` 时**不显示**：那种情况是**覆盖了已存在的页面**，
@@ -2185,54 +2560,22 @@ function WikiEdit(props: {
 
   /*
     AI 辅助写作（编辑器内）：选区由编辑器上报，采纳写回走编辑器的插入句柄。
-    三态探测与列表页同一模式（先问 /api/plugins 拿权威的"插件是否激活"，避免撞 404 红控制台）：
-    `aiPlugin` null=探测中 / true=已激活 / false=未启用；`aiModelAvailable` null=探测中。
+    工具条本体在**插件**里（`editor-toolbar` 插槽），故这里没有"插件是否激活 / 模型是否就绪"
+    的探测 —— 那两件事由插件自己的 capabilities 端点回答给自己的界面。宿主只负责把
+    "此刻编辑器里发生了什么"如实交出去：选区、正文、以及两条写回通道。
   */
-  const [editorSelection, setEditorSelection] = useState<AssistSelection | null>(null)
-  const editorHandleRef = useRef<MarkdownEditorHandle | null>(null)
-  const [aiPlugin, setAiPlugin] = useState<boolean | null>(null)
-  const [aiModelAvailable, setAiModelAvailable] = useState<boolean | null>(null)
-  const [aiProviders, setAiProviders] = useState<number>(0)
-
-  useEffect(() => {
-    let alive = true
-    api
-      .plugins()
-      .then((r) => {
-        if (!alive) return
-        const active = r.plugins.find((p) => p.name === '@geewiki/ai')?.state === 'active'
-        setAiPlugin(active)
-        if (!active) return
-        return api.aiCapabilities().then((c) => {
-          if (!alive) return
-          setAiModelAvailable(c.available)
-          setAiProviders(c.providers.length)
-        })
-      })
-      .catch((e: unknown) => {
-        // 探测失败按"不可用"处理并保留日志；工具条会用可见文案说明原因，不静默
-        console.debug('[geewiki-wiki] AI 辅助能力探测失败：', e instanceof Error ? e.message : e)
-        if (alive) setAiPlugin(false)
-      })
-    return () => {
-      alive = false
-    }
-  }, [])
-
-  /**
-   * 不可用时给用户看的**可见**原因（空串 = 可用）。
+  const [editorSelection, setEditorSelection] = useState<EditorToolbarSelection | null>(null)
+  /*
+   * ★ F5：插件编辑器的两条回传通道（都与内置编辑器路径**并存但互斥**）：
+   * - `pluginEditorHandle`：插件交出的命令式句柄，供 `editor-toolbar` 写回；
+   * - `pluginEditorSelection`：插件上报的选区，供工具栏点亮依赖选区的动作。
    *
-   * 路由：插件未激活 → 提示去插件管理启用；激活但无可用 provider → 区分"没有路由"与
-   * "有路由但缺凭据"（后者才是"未配置模型密钥"）。
+   * 两者独立：插件只报选区而不给句柄时，工具栏仍应把"采纳"类动作保持禁用
+   * （只知道光标在哪、没有办法写回去）。
    */
-  const aiHint =
-    aiPlugin === null || aiModelAvailable === null
-      ? ''
-      : unavailableText({
-          pluginActive: aiPlugin,
-          modelAvailable: aiModelAvailable,
-          degraded: null,
-        }) || (aiModelAvailable ? '' : aiProviders === 0 ? '没有可用的模型路由：AI 辅助写作需要模型，检索与问答仍可用。' : '未配置模型密钥：AI 辅助写作需要模型，检索与问答仍可用。')
+  const [pluginEditorHandle, setPluginEditorHandle] = useState<EditorHandle | null>(null)
+  const [pluginEditorSelection, setPluginEditorSelection] = useState<EditorToolbarSelection | null>(null)
+  const editorHandleRef = useRef<MarkdownEditorHandle | null>(null)
 
   /** 加载时的基线（脏值比较用 state 而非 ref：比较结果要参与渲染） */
   const [original, setOriginal] = useState<PageDraft>({ title: '', content: '', slugInput: slug })
@@ -2256,7 +2599,92 @@ function WikiEdit(props: {
     // 懒加载：只贡献 editor 的插件，其 client.js 推迟到真正进入编辑视图才请求。
     // 失败不阻塞编辑（回落内置编辑器），故只 catch 不弹错。
     void ensureSlotLoaded('editor').catch(() => {})
+    // 工具条插槽同样按需在进入编辑视图时加载（`editor-toolbar` 也在 ON_DEMAND_SLOTS 里）。
+    // 漏掉这一句的后果很隐蔽：辅助写作插件的入口表条目是"生效"的（管理台看着一切正常），
+    // 但组件永不注册 ⇒ 工具条区域**静默空白**，与"该插件没提供界面"长得一模一样。
+    void ensureSlotLoaded('editor-toolbar').catch(() => {})
   }, [])
+
+  /*
+    `editor.*` 客户端工具（P3）：**宿主**登记处理器，`@geewiki/ai-writing` 在服务端声明同名
+    描述符（工具就是这两半，见 `lib/editorTools.ts` 文件头）。为什么处理器在宿主：编辑框句柄
+    与"此刻能不能写回"只有宿主知道。
+
+    值经 ref 传递、注册只做一次 —— 不能把 `content` / `editorSelection` 放进 effect 依赖：
+    那会让**每敲一个字**都注销再重登记一遍工具，而工具名单要经轮次协议上送服务端参与构成
+    发给模型的工具表，名单每帧都变 ⇒ 每轮请求前缀都变 ⇒ 上游前缀缓存全失效。
+    （同样的"最新值 ref"写法见 `components/MarkdownEditor.tsx:462`。）
+  */
+  const editorToolLiveRef = useRef<EditorCapability>({
+    slug: newMode ? '' : slug,
+    readOnly: saving,
+    docText: () => content,
+    selection: editorSlot ? null : () => editorSelection,
+  })
+  editorToolLiveRef.current = {
+    slug: newMode ? '' : slug,
+    readOnly: saving,
+    docText: () => content,
+    /*
+      ★ F5：插件编辑器占住 `editor` 插槽时，选区改由**插件上报**（`onSelectionChange`）。
+      宿主现在**总是**提供这条通道，故这里不再无条件返回 `null` ——
+      插件没上报过就是"当前无选区"，与内置编辑器下没有选区的语义一致。
+    */
+    selection: editorSlot ? () => pluginEditorSelection : () => editorSelection,
+    /*
+      ★ F5：写回通道跟着**句柄**走，不跟着"谁占着插槽"走。
+      插件交了句柄 ⇒ 三条工具照常登记（`setDoc` 缺省时不登记"回退"，那正是"能力不存在"）。
+      插件没交句柄 ⇒ 留空，`registerEditorTools` 干脆不登记那三条工具 ⇒ 它们既不在
+      `clientTools` 名单里、也不进模型看到的工具表 —— 这正是"用可选字段表达'能力不存在'，
+      比塞一个什么都不做的假函数诚实"。
+    */
+    ...(editorSlot
+      ? pluginEditorHandle === null
+        ? {}
+        : {
+            insertAtCursor: (text: string): void => pluginEditorHandle.insertAtCursor(text),
+            replaceSelection: (text: string): boolean => pluginEditorHandle.replaceSelection(text),
+            ...(pluginEditorHandle.setDoc === undefined
+              ? {}
+              : { setDoc: (text: string): void => pluginEditorHandle.setDoc?.(text) }),
+          }
+      : {
+          insertAtCursor: (text: string): void => editorHandleRef.current?.insertAtCursor(text),
+          replaceSelection: (text: string): boolean => editorHandleRef.current?.replaceSelection(text) ?? false,
+          // AI 回退用：把草稿整篇设回某轮之前的样子（同样只在有句柄时存在）
+          setDoc: (text: string): void => editorHandleRef.current?.setDoc(text),
+        }),
+  }
+
+  useEffect(() => {
+    const shape = editorToolLiveRef.current
+    /*
+      代理一层：注册**一次**，而每次调用都读当时的 `editorToolLiveRef.current`。
+      直接 register 上面那个对象是不行的 —— 那是"本次渲染的闭包"，
+      而工具的调用发生在之后（可能隔很多次渲染）。
+    */
+    const proxy: EditorCapability = {
+      get slug() {
+        return editorToolLiveRef.current.slug
+      },
+      get readOnly() {
+        return editorToolLiveRef.current.readOnly
+      },
+      docText: () => editorToolLiveRef.current.docText(),
+      selection: shape.selection === null ? null : () => editorToolLiveRef.current.selection?.() ?? null,
+      ...(shape.insertAtCursor
+        ? { insertAtCursor: (text: string): void => editorToolLiveRef.current.insertAtCursor?.(text) }
+        : {}),
+      ...(shape.replaceSelection
+        ? {
+            replaceSelection: (text: string): boolean =>
+              editorToolLiveRef.current.replaceSelection?.(text) ?? false,
+          }
+        : {}),
+      ...(shape.setDoc ? { setDoc: (text: string): void => editorToolLiveRef.current.setDoc?.(text) } : {}),
+    }
+    return registerEditorTools(proxy)
+  }, [editorSlot])
 
   const load = useCallback((): void => {
     setErr('')
@@ -2270,14 +2698,29 @@ function WikiEdit(props: {
       if (d !== null && !isDraftExpired(d, Date.now())) setPendingDraft(d)
       return
     }
+    /*
+     * ⚠️ **必须请求原文**（`?content=raw`）：默认的详情接口返回的是**按读者投影后**的正文
+     * —— 受限段落被换成占位文案、`<!--gated:org-->` 标记被消费掉。把那份正文当原文编辑并
+     * 保存回去，会**毁掉段落权限标记**：实测复现过"公开页 + 组织内受限段落，编辑者只改了一个
+     * 标点，保存后匿名访客即可读到该受限段落"。原文只对 `canEdit` 的主体下发（服务端强制）。
+     */
     api
-      .page(slug)
+      .page(slug, { raw: true })
       .then((p) => {
         setTitle(p.title)
         setContent(p.content)
         setOrigSlug(p.slug)
         serverUpdatedAt.current = p.updated_at
         setOriginal({ title: p.title, content: p.content, slugInput: slug })
+        /*
+          档位**用这一次响应**填上，不额外发请求 —— 它只用于编辑器里"块档位不能比页面更宽"
+          的提示（没有管理权时服务端不下发档位字段，那时提示按"未知"处理，见 `blockTiers`）。
+        */
+        setPagePerm({
+          visibility: p.visibility ?? 'private',
+          inherit: p.inherit ?? true,
+          published: p.published === true,
+        })
         setLoading(false)
         // 草稿：只有"确实有改动"或"服务端已变"时才打扰用户，内容一致的残留草稿直接清掉
         const d = readDraft(slug)
@@ -2419,7 +2862,7 @@ function WikiEdit(props: {
   )
 
   const save = useCallback(
-    async (opts: { force?: boolean } = {}): Promise<void> => {
+    async (opts: { force?: boolean; allowProjected?: boolean } = {}): Promise<void> => {
       const target = newMode ? slugInput.trim() : slug
       const errors = validatePageForm({ isNew: newMode, slugInput, title })
       setFieldErrors(errors)
@@ -2429,6 +2872,17 @@ function WikiEdit(props: {
         return
       }
       setErr('')
+
+      /*
+       * ★ 占位文案拦截（见 `projectedGuard` 的说明）：正文里出现服务端生成的占位，
+       * 说明手上这份**不是原文** —— 保存会毁掉段落权限标记。先让用户选。
+       * `allowProjected` 由对话框里那个「仍然保存」传进来（与冲突覆盖的 `force` 分开：
+       * 两件事的后果不同，共用一个开关会让文案说不清到底在确认什么）。
+       */
+      if (opts.allowProjected !== true && looksProjected(content)) {
+        setProjectedGuard(true)
+        return
+      }
 
       /*
        * 冲突检测（仅编辑既有页面）：保存前取一次服务端状态，比对 `updated_at`。
@@ -2468,7 +2922,7 @@ function WikiEdit(props: {
         */
         if (createHomeMode && r.outcome === 'created') {
           setHomeCreatedNotice(
-            '主页已创建。它当前只对组织内可见 —— 匿名访客打开站点会看不到主页。要对外公开，请用页面上的「权限…」入口把档位设为公开并打开「已发布」。',
+            '主页已创建。它当前只对组织内可见 —— 匿名访客打开站点会看不到主页。要对外公开，请用页面上的「权限」入口把档位设为公开并打开「已发布」。',
           )
           // 保持 `saving`（按钮 loading）：此时编辑器源文与已入库的正文一致、没什么可再存的；
           // 让用户用下面那条提示里的动作离场，避免"再点一次保存"。
@@ -2545,11 +2999,13 @@ function WikiEdit(props: {
           <Skeleton className="h-10 w-full" />
         </div>
 
-        {/* 编辑面板：宽屏左编辑/右预览两栏（与真实分屏同一断点） */}
-        <div className="grid gap-3 lg:grid-cols-2">
+        {/* 编辑面板：**单栏**（与真实布局一致：模式切换在编辑器内部） */}
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-8 w-full" />
           <Skeleton className="h-[420px] w-full" />
-          <Skeleton className="hidden h-[420px] w-full lg:block" />
         </div>
+        {/* 权限区：档位卡片 + 段落档位说明 */}
+        <Skeleton className="h-32 w-full" />
       </LoadingState>
     )
   }
@@ -2675,204 +3131,353 @@ function WikiEdit(props: {
         </div>
       </div>
 
-      {/* 编辑 / 预览：宽屏分屏，窄屏 Tab 切换（同一份状态，两种呈现） */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex items-center gap-1 rounded-md border border-line bg-surface p-0.5 xl:hidden">
-          <Button
-            size="sm"
-            variant={pane === 'edit' ? 'primary' : 'ghost'}
-            onClick={() => setPane('edit')}
-            aria-pressed={pane === 'edit'}
-          >
-            编辑
-          </Button>
-          <Button
-            size="sm"
-            variant={pane === 'preview' ? 'primary' : 'ghost'}
-            onClick={() => setPane('preview')}
-            aria-pressed={pane === 'preview'}
-          >
-            预览
-          </Button>
-        </div>
-        <span className="text-xs text-muted">
-          {charCount(content)} 字符 · 支持 Markdown
-          <span className="hidden xl:inline"> · ⌘/Ctrl+S 保存 · ⌘/Ctrl+B 加粗 · Tab 缩进</span>
-          <span className="xl:hidden"> · ⌘/Ctrl+S 保存</span>
-        </span>
-      </div>
-
-      <div className="grid items-start gap-4 xl:grid-cols-2">
-        {/*
-          两个面板都做成**可命名区域**（`<section aria-labelledby>`）而不是裸 div + span：
-          按 HTML-AAM，`<section>` 只有具备可访问名称时才映射为 `region` 地标，否则是
-          `generic`（等于白写）。命名后屏幕阅读器可以把「正文」与「预览」当作两个区域来
-          跳转，而不是在一条无结构的文本流里摸索。
-
-          这里**刻意不做**的事（重要）：
-          - 不把预览里的 `h1` 降级、也不加 `aria-hidden`。用户正文自带的一级标题**就是内容
-            结构**，而预览是"Markdown 渲染成什么样"的唯一凭据——对非视觉用户藏掉是净损失。
-            故编辑页出现 2 个 h1 是**合法的**（axe 的 page-has-heading-one 只要求 ≥1，
-            实测也不报此项）。
-        */}
-        <section
-          aria-labelledby={EDITOR_PANE_LABEL_ID}
-          className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'preview' && 'hidden xl:flex')}
-        >
+      {/*
+        编辑区（**单栏**）。
+        两种模式（源码 / 实时渲染）与排版工具栏都在编辑器**内部**（见 `MarkdownEditor.tsx`）：
+        它们只影响"编辑区怎么画"，不影响正文、草稿与保存。原先的左右分屏被去掉 ——
+        写的地方窄、看的地方也窄，而且两边来回找同一段是纯粹的浪费；要看成品效果，
+        用下面的「按访客视角预览」（那是**真的**投影后的 HTML，含可见性判定）。
+      */}
+      <section aria-labelledby={EDITOR_PANE_LABEL_ID} className="gw-editor-pane flex flex-col gap-1.5">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <span id={EDITOR_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
             正文（Markdown）{editorSlot ? ` · 由 ${editorSlot.source} 提供` : ''}
           </span>
-          {editorSlot ? (
+          <span className="text-xs text-muted">
+            {charCount(content)} 字符 · ⌘/Ctrl+S 保存 · ⌘/Ctrl+B 加粗 · Tab 缩进
+          </span>
+          {/*
+            视角预览的入口放在这里（而不是常驻一个面板）：它是**按需**动作，
+            而"作者自己永远看得到全部"这件事必须有一个开关才能看穿（见 PREVIEW_AUDIENCES）。
+            插件编辑器路径下不显示：那条路径的正文不在本组件手里，投影出来的东西不是他正在编的稿。
+          */}
+          {/*
+            ⚠️ 判据是**假值**而不是 `=== null`：`useEditorSlot()` 无插件时返回的是
+            `undefined`（见 `lib/slots.tsx:282`），写成 `=== null` 会让这个按钮**永远不渲染**
+            ——而工具栏照常出现（它判的是 `editorSlot ? … : …`），于是"按钮不见了"看起来
+            像是布局问题，实则是判据写错了值。
+          */}
+          {!editorSlot && (
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Eye className="size-3.5" />}
+              className="ml-auto"
+              onClick={() => setPreviewOpen(true)}
+            >
+              按访客视角预览
+            </Button>
+          )}
+        </div>
+        {editorSlot ? (
+          /*
+           * 插件编辑器路径：宿主把受控值与保存/取消回调交出去，插件只负责"编辑区"。
+           * 草稿、脏值、冲突检测、未保存拦截仍由本组件的既有逻辑承担（见上面的 hook 注释）。
+           * `onSave` 指向同一个 `save()`——不存在第二套保存实现。
+           *
+           * ★ F5：这里**不再是二等公民**。附件上传、段落档位、段落授权、选区上报与
+           * 命令式写回句柄都按"宿主提供 ⇒ 插件可用"的既有口径交出去（全部可选）。
+           * 交给插件的仍是**宿主编排的通道**：真发请求/鉴权/错误文案都在宿主，
+           * 插件只负责自己的光标与 UI 语义（`onUploadFiles` 返回的是可直接插入的 Markdown 片段）。
+           */
+          <EditorSlotOutlet
+            value={content}
+            mode={newMode ? 'create' : 'edit'}
+            slug={slugInput}
+            readOnly={saving}
+            onChange={setContent}
+            onSave={() => void save()}
+            onCancel={onCancel}
             /*
-             * 插件编辑器路径：宿主把受控值与保存/取消回调交出去，插件只负责"编辑区"。
-             * 草稿、脏值、冲突检测、未保存拦截仍由本组件的既有逻辑承担（见上面的 hook 注释）。
-             * `onSave` 指向同一个 `save()`——不存在第二套保存实现。
-             */
-            <EditorSlotOutlet
-              value={content}
-              mode={newMode ? 'create' : 'edit'}
-              slug={slugInput}
-              readOnly={saving}
-              onChange={setContent}
-              onSave={() => void save()}
-              onCancel={onCancel}
-            />
-          ) : (
-            <MarkdownEditorLazy
-              value={content}
-              onChange={setContent}
-              onSave={() => void save()}
-              disabled={saving}
-              ariaLabel="Markdown 正文编辑器"
-              minHeight="480px"
-              /*
-                附件上传（M4）：粘贴截图 / 拖入文件都由编辑器接住，这里只负责"真发请求"。
-                插槽路径（上面的 `EditorSlotOutlet`）**没有**这个能力——插件的编辑区接口
-                不含上传，这是本批明确的边界（见 slots.tsx 的 EditorSlotProps）。
-              */
-              onUploadFiles={uploadFiles}
-              onSelectionChange={setEditorSelection}
-              handleRef={editorHandleRef}
-              placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
-            />
-          )}
-          {/*
-            AI 辅助写作工具条（见 `components/ai/AssistToolbar.tsx` 的三条硬规则）。
-            挂在**宿主**的编辑面板里而不是编辑器内部：`EditorSlotProps` 没有选区/插入通道，
-            且 `editor` 是单占用插槽 —— 放进插件会让第三方编辑器一占插槽就带走宿主的 AI 能力。
-            故这里在插件编辑器路径下也照常渲染（选区缺失即按"无选区"降级为续写/摘要）。
-          */}
-          <AssistToolbar
-            docText={content}
-            title={title}
-            slug={newMode ? '' : slug}
-            selection={editorSelection}
-            handleRef={editorHandleRef}
-            pluginActive={aiPlugin === true}
-            modelAvailable={aiModelAvailable}
-            modelHint={aiHint}
-            onApplied={(text) => setUploadNotice({ tone: 'ok', text })}
+              附件上传：与内置编辑器路径**同一个** `uploadFiles`（不存在第二套上传实现，
+              也就不会出现"插件编辑器能传但没走限流/审计"这类分叉）。
+            */
+            onUploadFiles={uploadFiles}
+            /* 段落档位：与内置编辑器路径同一个事实源（`pagePerm`），只是交出去让插件自己渲染提示 */
+            blockTiers={{ pageVisibility: pagePerm?.visibility ?? null }}
+            onManageBlockGrants={setGrantBlock}
+            onSelectionChange={setPluginEditorSelection}
+            onEditorHandle={setPluginEditorHandle}
           />
-          {/*
-            附件上传的可见提示（M4）。放在编辑区**下方**而不是页头：动作发生在这里，
-            反馈就该在这里（页头那条 `err` 是保存错误的固定位置，两者互不覆盖）。
-            `role`：失败 = `alert`（用户必须有感知），进行中/成功 = `status`（礼貌播报）。
-          */}
-          {uploadNotice !== null && (
-            <p
-              role={uploadNotice.tone === 'err' ? 'alert' : 'status'}
-              className={cn(
-                'm-0 rounded-md border px-3 py-1.5 text-note',
-                uploadNotice.tone === 'err'
-                  ? 'border-danger-line bg-danger-bg text-danger-ink'
-                  : 'border-ok-line bg-ok-bg text-ok-ink',
-              )}
-            >
-              {uploadNotice.text}
-            </p>
-          )}
-          {/*
-            「主页已创建」的常驻提示（独立代码块，可整段摘除）。
-            与上面那条的区别：这不是"某个动作的即时反馈"，而是一条**待办**（去把档位改成公开），
-            所以用 `warn` 配色而不是成功绿 —— 绿色读起来像"一切都好了"，而匿名访客此刻打不开主页。
-            离场动作给「前往主页」：主页**已经建好了**，留在这张"新建页面"表单上没有意义。
-          */}
-          {homeCreatedNotice !== null && (
-            <div
-              role="status"
-              className="m-0 flex flex-col gap-2 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-note text-warn-ink"
-            >
-              <span>{homeCreatedNotice}</span>
-              <div>
-                <Button size="sm" variant="secondary" onClick={() => onDone(HOME_SLUG)}>
-                  前往主页
-                </Button>
-              </div>
-            </div>
-          )}
-        </section>
+        ) : (
+          <MarkdownEditorLazy
+            value={content}
+            onChange={setContent}
+            onSave={() => void save()}
+            disabled={saving}
+            ariaLabel="Markdown 正文编辑器"
+            minHeight="480px"
+            /*
+              附件上传（M4）：粘贴截图 / 拖入文件都由编辑器接住，这里只负责"真发请求"。
+              ★ F5：插槽路径（上面的 `EditorSlotOutlet`）现在拿到的是**同一个** `uploadFiles`——
+              曾经这里写的是"插件编辑区不含上传，是本批明确的边界"，那个边界已按审计 B3 消除。
+              两条路径共用一份上传实现，故限流/审计/错误文案不会分叉。
+            */
+            onUploadFiles={uploadFiles}
+            onSelectionChange={setEditorSelection}
+            handleRef={editorHandleRef}
+            /*
+              段落级阅读权限（写的是正文里的 gated 标记）。
+              对**新建页面**也给：标记是正文的一部分，作者完全可以先写好受限段落再保存；
+              页面档位此时未知（`pageVisibility: null`），界面上会照实说"保存后才判定"。
+            */
+            blockTiers={{ pageVisibility: pagePerm?.visibility ?? null }}
+            /*
+              段落级的「授权给谁」：`granted`（需单独授权）档**只有这里**能指定谁读得到 ——
+              缺了它，作者把一段设成"需单独授权"之后就再没有任何界面能放人进来。
+            */
+            onManageBlockGrants={setGrantBlock}
+            placeholder={'支持 Markdown：标题、列表、代码块、表格、链接…\n\n## 示例小节\n\n- 条目一\n- 条目二\n\n```ts\nconsole.log("hello")\n```'}
+          />
+        )}
+        {/*
+          AI 辅助写作工具条由**插件**渲染（`editor-toolbar` 插槽，多占用：多个插件可各自加一组
+          按钮）。宿主只交事实：模式、slug、正文、选区、以及两条写回通道。
 
-        <section
-          aria-labelledby={PREVIEW_PANE_LABEL_ID}
-          className={cn('gw-split-pane flex flex-col gap-1.5', pane === 'edit' && 'hidden xl:flex')}
-        >
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <span id={PREVIEW_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
-              预览（本地实时渲染，非最终发布稿）
-            </span>
-            {/* ★ P3d：视角切换。见 PREVIEW_AUDIENCES 的说明 —— 作者自己看得到全部，所以必须有这个开关 */}
-            <div role="group" aria-label="预览视角" className="flex items-center gap-1">
-              {PREVIEW_AUDIENCES.map((a) => (
-                <Button
-                  key={a.id}
-                  size="sm"
-                  variant={previewAs === a.id ? 'primary' : 'ghost'}
-                  aria-pressed={previewAs === a.id}
-                  title={a.hint}
-                  onClick={() => setPreviewAs(a.id)}
-                >
-                  {a.label}
-                </Button>
-              ))}
+          ★ F5：插件编辑器路径（`editorSlot` 为真）下，这两条通道改由**插件自己**提供 ——
+          `onSelectionChange` 报选区、`onEditorHandle` 交句柄（见上面的 `EditorSlotOutlet`）。
+          仍是"能力不存在就不给"的那条口径：插件**没**给句柄时这里依然留空，
+          **不用假函数**充数 —— 假函数会让按钮看起来能用、点下去静默无效，
+          而那正是本仓库反复记档的那类缺陷（"看起来正常，其实错位"）。
+          插件据此把"采纳"禁用并说明原因，其余动作（如摘要）照常可用。
+        */}
+        <EditorToolbarSlotOutlet
+          mode={newMode ? 'create' : 'edit'}
+          slug={newMode ? '' : slug}
+          docText={content}
+          /* 插件编辑器上报了选区就照用；没上报则保持 `null` —— "选区未知"是诚实的事实，不是错误 */
+          selection={editorSlot ? pluginEditorSelection : editorSelection}
+          readOnly={saving}
+          {...(editorSlot
+            ? pluginEditorHandle === null
+              ? {}
+              : {
+                  insertAtCursor: (text: string): void => pluginEditorHandle.insertAtCursor(text),
+                  replaceSelection: (text: string): boolean => pluginEditorHandle.replaceSelection(text),
+                }
+            : {
+                insertAtCursor: (text: string): void => editorHandleRef.current?.insertAtCursor(text),
+                replaceSelection: (text: string): boolean => editorHandleRef.current?.replaceSelection(text) ?? false,
+              })}
+        />
+        {/*
+          附件上传的可见提示（M4）。放在编辑区**下方**而不是页头：动作发生在这里，
+          反馈就该在这里（页头那条 `err` 是保存错误的固定位置，两者互不覆盖）。
+          `role`：失败 = `alert`（用户必须有感知），进行中/成功 = `status`（礼貌播报）。
+        */}
+        {uploadNotice !== null && (
+          <p
+            role={uploadNotice.tone === 'err' ? 'alert' : 'status'}
+            className={cn(
+              'm-0 rounded-md border px-3 py-1.5 text-note',
+              uploadNotice.tone === 'err'
+                ? 'border-danger-line bg-danger-bg text-danger-ink'
+                : 'border-ok-line bg-ok-bg text-ok-ink',
+            )}
+          >
+            {uploadNotice.text}
+          </p>
+        )}
+        {/*
+          「主页已创建」的常驻提示（独立代码块，可整段摘除）。
+          与上面那条的区别：这不是"某个动作的即时反馈"，而是一条**待办**（去把档位改成公开），
+          所以用 `warn` 配色而不是成功绿 —— 绿色读起来像"一切都好了"，而匿名访客此刻打不开主页。
+          离场动作给「前往主页」：主页**已经建好了**，留在这张"新建页面"表单上没有意义。
+        */}
+        {homeCreatedNotice !== null && (
+          <div
+            role="status"
+            className="m-0 flex flex-col gap-2 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-note text-warn-ink"
+          >
+            <span>{homeCreatedNotice}</span>
+            <div>
+              <Button size="sm" variant="secondary" onClick={() => onDone(HOME_SLUG)}>
+                前往主页
+              </Button>
             </div>
-            {previewAs !== 'all' && (
-              <span className="text-xs text-ink-soft">
-                {projected.gatedCount > 0
-                  ? `该视角下 ${projected.gatedCount} 段内容被遮蔽`
-                  : '该视角下没有任何内容被遮蔽'}
-              </span>
-            )}
           </div>
-          {/*
-            标记不合法 ⇒ **保存时会被服务端拒绝**（400）。在这里就地提示，别让作者写完一大段
-            才发现。服务端对废弃标记是**显式拒绝**而不是静默忽略 —— 静默忽略会让作者以为
-            收紧了，实际按 public 暴露。
-          */}
-          {projected.invalidMarkers.length > 0 && (
-            <p
-              role="alert"
-              className="m-0 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-xs text-warn-ink"
-            >
-              正文里有 {projected.invalidMarkers.length} 处 gated 标记不合法（
-              {projected.invalidMarkers.join('、')}）—— **保存会被服务端拒绝**。只接受
-              {' '}<code>&lt;!--gated:org--&gt;</code> 与 <code>&lt;!--gated:granted--&gt;</code>，
-              且必须成对、不得嵌套。
-            </p>
-          )}
-          <div className="min-h-[480px] overflow-auto rounded-md border border-line bg-surface px-5 py-4">
-            {previewEmpty ? (
-              <p className="m-0 text-sm text-muted">（空白）</p>
-            ) : (
-              <MarkdownBody html={previewRendered.html} className="md-body" />
-            )}
-          </div>
-        </section>
-      </div>
+        )}
+        {/*
+          ★ 手上不是原文（含服务端占位文案）⇒ **保存会毁掉段落权限标记**。
+          这一条与"标记不合法"不同：那一条服务端会拒，而这一条服务端**照单全收**
+          （从它的角度看，作者就是删掉了标记）—— 后果是受限段落静默变公开，
+          所以必须在这里、在保存之前说出来。
+        */}
+        {looksProjected(content) && (
+          <p
+            role="alert"
+            className="m-0 rounded-md border border-danger-line bg-danger-bg px-3 py-2 text-xs text-danger-ink"
+          >
+            正文里有服务端生成的占位文案（形如「🔒 此处有 N 段内容需…查看」）——
+            说明你现在看到的是<strong className="font-semibold">投影后</strong>的内容，段落级的权限标记已经不在里面了。
+            直接保存会把这段占位写进正文，并丢掉段落权限标记（受限段落会因此变成公开）。
+            请先「重新加载原文」；确实要这么存的话，保存时会再确认一次。
+          </p>
+        )}
+        {/*
+          标记不合法 ⇒ **保存时会被服务端拒绝**（400）。就地提示，别让作者写完一大段才发现。
+          服务端对废弃标记是**显式拒绝**而不是静默忽略 —— 静默忽略会让作者以为收紧了、
+          实际按 public 暴露。这一条从原来的预览面板搬到这里：它与"有没有打开预览"无关，
+          而是**保存阻断项**，必须常驻可见。
+        */}
+        {projected.invalidMarkers.length > 0 && (
+          <p
+            role="alert"
+            className="m-0 rounded-md border border-warn-line bg-warn-bg px-3 py-2 text-xs text-warn-ink"
+          >
+            正文里有 {projected.invalidMarkers.length} 处 gated 标记不合法（
+            {projected.invalidMarkers.join('、')}）—— **保存会被服务端拒绝**。只接受
+            {' '}<code>&lt;!--gated:org--&gt;</code> 与 <code>&lt;!--gated:granted--&gt;</code>，
+            且必须成对、不得嵌套。
+          </p>
+        )}
+      </section>
 
       <p className="m-0 text-xs text-muted">
         保存会把当前正文快照进版本历史（内容未变化则不产生新版本）。
         {origSlug !== '' && origSlug !== slug && ` 提示：原标识 ${origSlug} 的内容已迁移到新标识。`}
       </p>
+
+      {/*
+        「授权给谁…」（编辑器的锁菜单打开）。宿主执行网络请求：编辑器有"绝不发请求"的约定，
+        它只交出光标所在段的 `ordinal` 与摘要。
+      */}
+      <BlockGrantsDialog
+        open={grantBlock !== null}
+        onOpenChange={(open) => !open && setGrantBlock(null)}
+        slug={slug}
+        ordinal={grantBlock?.ordinal ?? 0}
+        excerpt={grantBlock?.excerpt ?? ''}
+        pageVisibility={pagePerm?.visibility ?? null}
+        /* 「先保存正文，再继续授权」：块是保存时解析出来的，没保存就没有块 id 可授权 */
+        onSaveFirst={async () => {
+          await save()
+        }}
+      />
+
+      {/*
+        「按访客视角预览」（★ P3d）：块级模型唯一的可用性救生圈。
+        作者对自己的页有编辑权，因此**他总能看到全部受限段落** —— "我预览里看得到"完全不能
+        说明别人能不能看到。故这里给出视角切换，并把"该视角下遮蔽了几段"写在旁边。
+      */}
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent
+          title="按访客视角预览"
+          description="本地渲染的当前正文（未保存的改动也在内），非最终发布稿。"
+          footer={
+            <DialogClose asChild>
+              <Button>关闭</Button>
+            </DialogClose>
+          }
+        >
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <span id={PREVIEW_PANE_LABEL_ID} className="text-xs font-semibold text-ink-soft">
+                预览（本地实时渲染，非最终发布稿）
+              </span>
+              <div role="group" aria-label="预览视角" className="flex items-center gap-1">
+                {PREVIEW_AUDIENCES.map((a) => (
+                  <Button
+                    key={a.id}
+                    size="sm"
+                    variant={previewAs === a.id ? 'primary' : 'ghost'}
+                    aria-pressed={previewAs === a.id}
+                    title={a.hint}
+                    onClick={() => setPreviewAs(a.id)}
+                  >
+                    {a.label}
+                  </Button>
+                ))}
+              </div>
+              {previewAs !== 'all' && (
+                <span className="text-xs text-ink-soft">
+                  {projected.gatedCount > 0
+                    ? `该视角下 ${projected.gatedCount} 段内容被遮蔽`
+                    : '该视角下没有任何内容被遮蔽'}
+                </span>
+              )}
+            </div>
+            {/*
+              「我的视角」不是"预览"：它显示的是作者自己能看到的一切（含全部受限段落）。
+              这句话必须写出来，否则用户会把这个标签页当成"访客看到的样子"。
+            */}
+            {previewAs === 'all' && (
+              <p className="m-0 text-xs text-muted">
+                「我的视角」显示的是**你**能读到的全部内容（含受限段落），不代表别人看到的样子；
+                想看访客看到什么，请选「组织成员」或「匿名访客」。
+              </p>
+            )}
+            <div
+              /*
+                `role="region"` 是必须的：`aria-labelledby` 在**没有角色**的元素上会被忽略
+                （generic 元素不接受可访问名称），那样这个滚动区就成了一个匿名容器。
+                加 role 后它才真的按名字可跳转（"预览"成为一个区域地标）。
+              */
+              role="region"
+              aria-labelledby={PREVIEW_PANE_LABEL_ID}
+              className="max-h-[55vh] min-h-[8rem] overflow-auto rounded-md border border-line bg-surface px-5 py-4"
+            >
+              {previewEmpty ? (
+                <p className="m-0 text-sm text-muted">（空白）</p>
+              ) : (
+                <MarkdownBody html={previewRendered.html} className="md-body" />
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/*
+        占位文案的保存拦截（见 `projectedGuard`）。两个动作都给出来，且**说清各自后果**：
+        「重新加载原文」会丢掉当前编辑区里的改动（那是投影结果，本来就该丢）；
+        「仍然保存」会把占位当正文写进去 —— 只有用户明确要这样才能做。
+        ⚠️ 这个对话框是**唯一**的出口：保存拦截会把 save() 直接 return 掉，
+        少了它用户就卡在"点了保存什么都不发生"上（实测漏删过一次，故这里留一句提醒）。
+      */}
+      <Dialog open={projectedGuard} onOpenChange={(open) => !open && setProjectedGuard(false)}>
+        <DialogContent
+          title="正文里含服务端占位文案"
+          description="你现在看到的不是原文，而是按读者投影后的内容。"
+          footer={
+            <>
+              <DialogClose asChild>
+                <Button onClick={() => setProjectedGuard(false)}>先不保存</Button>
+              </DialogClose>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setProjectedGuard(false)
+                  // 丢弃手上的（投影）正文，重新取一次原文；草稿一并清掉，免得又被恢复回来
+                  removeDraft(slug)
+                  removeDraft(prefillSlug ?? '')
+                  load()
+                }}
+              >
+                重新加载原文
+              </Button>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setProjectedGuard(false)
+                  void save({ force: true, allowProjected: true })
+                }}
+              >
+                仍然保存
+              </Button>
+            </>
+          }
+        >
+          <p className="m-0">
+            保存会把「🔒 此处有 N 段内容需…查看」这行占位写进正文，并且丢掉
+            <code className="font-mono">{'<!--gated:…-->'}</code> 标记 ——
+            被标记圈起来的段落会因此变成任何人都能读到的普通段落。
+          </p>
+          <p className="m-0 mt-2">
+            要保住段落权限，请选「重新加载原文」（会用服务端原文覆盖编辑区，未保存的改动会丢失）；
+            若你确实要删掉这些段落权限，选「仍然保存」。
+          </p>
+        </DialogContent>
+      </Dialog>
 
       {/* 草稿恢复：用 Dialog 而不是 confirm —— 需要呈现"多久以前""服务端已更新"等信息 */}
       <Dialog open={pendingDraft !== null} onOpenChange={(open) => !open && discardDraft()}>

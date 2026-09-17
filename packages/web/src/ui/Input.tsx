@@ -9,7 +9,7 @@
  *   但仍保留 outline 以确保高对比度模式下可见；
  * - 触控目标 ≥24px（`h-8` = 32px，达标）。
  */
-import type { InputHTMLAttributes, ReactNode, TextareaHTMLAttributes } from 'react'
+import type { InputHTMLAttributes, ReactNode, Ref, TextareaHTMLAttributes } from 'react'
 import { cn } from './cn'
 import { focusRing } from './a11y'
 
@@ -50,7 +50,15 @@ export function Textarea({
   className,
   invalid,
   ...rest
-}: TextareaHTMLAttributes<HTMLTextAreaElement> & { invalid?: boolean }): ReactNode {
+}: TextareaHTMLAttributes<HTMLTextAreaElement> & {
+  invalid?: boolean
+  /**
+   * 原生 textarea 的 ref。React 19 起 `ref` 是**普通 prop**（不再需要 `forwardRef`），
+   * 但它不在 `TextareaHTMLAttributes` 里，故在此显式声明 —— 降级编辑器要用它读写选区
+   * （`MarkdownEditorLazy.tsx` 的 FallbackEditor：工具栏动作要落在正确的光标位置上）。
+   */
+  ref?: Ref<HTMLTextAreaElement>
+}): ReactNode {
   return (
     <textarea
       aria-invalid={invalid || undefined}

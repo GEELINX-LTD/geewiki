@@ -25,6 +25,11 @@ import {
   pluginUiBase,
   type UiTableEntry,
 } from '../src/lib/pluginUiPlan'
+import {
+  PLUGIN_UI_PREFIX as CORE_PLUGIN_UI_PREFIX,
+  PLUGIN_UI_FILE_SEGMENT as CORE_PLUGIN_UI_FILE_SEGMENT,
+  isPluginUiEntryPath,
+} from '@geewiki/core/domain'
 
 const ORIGIN = 'http://127.0.0.1:3000'
 
@@ -40,7 +45,14 @@ const WIKI: UiTableEntry = { entry: 'client.js', css: 'client.css', rev: 'aaa111
 test('常量：入口表端点与 UI 前缀与后端契约一致', () => {
   assert.equal(PLUGIN_UI_TABLE_PATH, '/api/plugins/ui')
   assert.equal(PLUGIN_UI_PREFIX, '/plugins-ui')
-  // 文件名规则与 core 的 PLUGIN_UI_FILE_SEGMENT 同源；这里用同一张输入表钉住两处一致性
+  /*
+   * ★ F13：这里从"两边各一份、用同一张输入表钉住内容一致"改成了**引用同一性**。
+   * 副本无法伪装成同一个对象；而"内容相等"在有人刚抄完一份时是通过的，
+   * 只在漂移发生之后才红 —— 那正是插槽镜像当初失守的方式。
+   */
+  assert.equal(PLUGIN_UI_PREFIX, CORE_PLUGIN_UI_PREFIX)
+  assert.equal(PLUGIN_UI_FILE_SEGMENT, CORE_PLUGIN_UI_FILE_SEGMENT)
+  // 单段规则本身没有放宽（入口路径的放宽走独立的 isPluginUiEntryPath）
   for (const ok of ['client.js', 'client.css', 'a', 'A1', 'x_y-z.9']) {
     assert.ok(PLUGIN_UI_FILE_SEGMENT.test(ok), `应接受：${ok}`)
   }

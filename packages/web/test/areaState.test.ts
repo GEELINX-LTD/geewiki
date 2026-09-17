@@ -94,12 +94,14 @@ test('守卫：界面代码不得把原始错误串直接转成显示文本', ()
 
 test('守卫：错误人话化只有一个入口（errorText.ts）', () => {
   /*
-    `describeError` / `errorLine` / `streamErrorText` 必须定义在 lib/errorText.ts。
+    `describeError` / `errorLine` / `cleanHint` 必须定义在 lib/errorText.ts。
     若有人另起一处"翻译层"，文案会开始漂移（同一失败在不同页面说不同的话）——
     这正是"一个失败多处呈现"的另一半根因。
   */
   const owner = readFileSync(join(SRC, 'lib/errorText.ts'), 'utf8')
-  for (const fn of ['describeError', 'errorLine', 'streamErrorText', 'cleanHint']) {
+      // 原先还包含 `streamErrorText`（LLM 错误码人话化）。它随问答界面迁入 @geewiki/ai-qa，
+    // 守卫也就跟着过去：宿主侧不再定义、也不再需要翻译别人契约里的码。
+    for (const fn of ['describeError', 'errorLine', 'cleanHint']) {
     assert.ok(owner.includes(`export function ${fn}`), `${fn} 应定义在 lib/errorText.ts`)
   }
   const dupes: string[] = []

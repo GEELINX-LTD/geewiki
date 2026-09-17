@@ -282,7 +282,10 @@ test('面包屑的纯分组项 labelKind=segment，有页面项 labelKind=title'
 })
 
 test('侧栏与面包屑对同一纯分组给出**相同文本**（这是抽公共函数的理由）', () => {
-  const pages = [{ slug: 'guides/authoring', title: '撰写指南', updated_at: 'x', version: 1 }]
+  const pages = [
+    // 导航批起 NavPage 多了两个必填字段（未隐藏、没排过序）
+    { slug: 'guides/authoring', title: '撰写指南', updated_at: 'x', version: 1, nav_hidden: false },
+  ]
   const tree = buildNavTree(pages)
   const groupNode = tree.find((n) => n.segment === 'guides')
   assert.ok(groupNode, '应聚合出 guides 分组')

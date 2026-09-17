@@ -16,6 +16,31 @@ export interface NavPage {
   title: string
   updated_at: string
   version: number
+  /**
+   * "在左侧边栏隐藏"（站点级，来自 `GET /api/pages`；老数据/替身可能没有这个字段 ⇒ 未隐藏）。
+   *
+   * 它**不影响可见性**：隐藏的页面照样能直链访问、被检索命中。本模块只负责两件事：
+   * 把有效隐藏状态算进树（父级隐藏 ⇒ 整棵子树有效隐藏），以及由调用方决定是否剪掉。
+   */
+  nav_hidden: boolean
+}
+
+/**
+ * 同级顺序：**父级路径 → 该层 item 的排列**（顶层父级是空串）。
+ *
+ * 为什么是"按父级一整个列表"而不是"每个页面一个序号"：同层里混着**没有页面的分组**
+ * （层级由 slug 决定，`guide`/`demo` 本身可能不是页面），而分组没有可写序号的地方。
+ * 列表里的 item 因此有两种身份，形状却是同一个：页面 slug，或分组路径。
+ */
+export type NavOrderMap = ReadonlyMap<string, readonly string[]>
+
+/** `GET /api/pages` 的 `nav_order` 数组 → 比较用的 Map */
+export function navOrderMap(
+  rows: readonly { parent: string; items: readonly string[] }[] | undefined,
+): NavOrderMap {
+  const map = new Map<string, readonly string[]>()
+  for (const r of rows ?? []) map.set(r.parent, r.items)
+  return map
 }
 
 export interface NavNode {
@@ -25,8 +50,16 @@ export interface NavNode {
   path: string
   /** 该节点**自身**是否有页面（有 ⇒ 点击分组可打开它，即"类目落地页"） */
   page: NavPage | null
-  /** 子节点（按 `segment` 字典序） */
+  /** 子节点（先按自定义顺序、再按 `segment` 字典序；见 {@link compareNodes}） */
   children: NavNode[]
+  /**
+   * **有效**隐藏状态：自身标了隐藏，或者**任一祖先**标了隐藏。
+   *
+   * 为什么算成有效值而不是让每个调用方自己往上找：继承规则只有一处实现才不会有第二种解释。
+   * 注意它与写入的关系：隐藏开关**只写自己那一行**，不级联写子级——
+   * 于是取消父级的隐藏，子级原本的（未隐藏）状态自动恢复；级联写会把这个信息永久丢掉。
+   */
+  hidden: boolean
 }
 
 /**
@@ -44,6 +77,25 @@ export function compareSegment(a: string, b: string): number {
 }
 
 /**
+ * 同一层级的比较器：**先在顺序表里出现过的（按表里的位次），再没记录的（按段名字典序）**。
+ *
+ * `order` 是该**父级**的 item 列表（item 为页面 slug 或分组路径，节点身份用 `path` 比）。
+ * 抽成具名函数是为了让"侧栏、列表页、上一篇/下一篇"三处共用**同一个**比较器 ——
+ * 顺序这种东西一旦有两份实现，迟早会出现"侧栏是这个顺序、翻页是另一个"的漂移
+ * （本模块顶部那段注释记录过一次真实事故）。
+ */
+export function compareNodes(a: NavNode, b: NavNode, order?: readonly string[]): number {
+  const ai = order === undefined ? -1 : order.indexOf(a.path)
+  const bi = order === undefined ? -1 : order.indexOf(b.path)
+  const aKnown = ai >= 0
+  const bKnown = bi >= 0
+  if (aKnown && bKnown && ai !== bi) return ai - bi
+  if (aKnown !== bKnown) return aKnown ? -1 : 1
+  return compareSegment(a.segment, b.segment)
+}
+
+
+/**
  * 把页面列表聚合成树。
  *
  * 行为要点：
@@ -53,7 +105,7 @@ export function compareSegment(a: string, b: string): number {
  * - `guide` 自身是页面时，它既是分组又是可打开的页面（`page !== null`）；
  * - 同名 slug 重复出现时**保留第一个**并跳过后续（后端 slug 唯一，这里是防御性去重）。
  */
-export function buildNavTree(pages: readonly NavPage[]): NavNode[] {
+export function buildNavTree(pages: readonly NavPage[], order: NavOrderMap = new Map()): NavNode[] {
   const roots: NavNode[] = []
   /** path → 节点，便于 O(深度) 找到中间层 */
   const byPath = new Map<string, NavNode>()
@@ -61,7 +113,8 @@ export function buildNavTree(pages: readonly NavPage[]): NavNode[] {
   const ensure = (path: string, segment: string, parent: NavNode[]): NavNode => {
     const found = byPath.get(path)
     if (found !== undefined) return found
-    const node: NavNode = { segment, path, page: null, children: [] }
+    // `hidden` 先占位为 false：有效值在整棵树建好之后由 `markHidden` 统一标（父级隐藏要传下去）
+    const node: NavNode = { segment, path, page: null, children: [], hidden: false }
     byPath.set(path, node)
     parent.push(node)
     return node
@@ -83,13 +136,88 @@ export function buildNavTree(pages: readonly NavPage[]): NavNode[] {
     }
   }
 
-  sortRecursive(roots)
+  sortRecursive(roots, '', order)
+  markHidden(roots, false)
   return roots
 }
 
-function sortRecursive(nodes: NavNode[]): void {
-  nodes.sort((a, b) => compareSegment(a.segment, b.segment))
-  for (const n of nodes) sortRecursive(n.children)
+function sortRecursive(nodes: NavNode[], parentPath: string, order: NavOrderMap): void {
+  const list = order.get(parentPath)
+  nodes.sort((a, b) => compareNodes(a, b, list))
+  for (const n of nodes) sortRecursive(n.children, n.path, order)
+}
+
+/**
+ * 把"有效隐藏"标进每个节点（自身标了，或任一祖先标了）。
+ *
+ * 单向传递、只读：不修改任何页面数据。父级隐藏 ⇒ 整棵子树有效隐藏，
+ * 这正是需求里"父级隐藏，子级也都不显示"的实现；子级自己的开关保持原样。
+ */
+function markHidden(nodes: NavNode[], inherited: boolean): void {
+  for (const n of nodes) {
+    n.hidden = inherited || n.page?.nav_hidden === true
+    markHidden(n.children, n.hidden)
+  }
+}
+
+/**
+ * 一行（= 一个可见节点）在"可折叠的树"里的位置信息。
+ *
+ * `siblings` / `index` / `parent` 是给**排序**用的：拖动或"上移/下移"要提交的是
+ * "这一层的新顺序"，而这一层就是 `siblings`（含同层的分组路径），`parent` 是提交时的键。
+ */
+export interface NavRow {
+  node: NavNode
+  depth: number
+  /** 该行所在的那一层（同一个数组里的节点互为兄弟，顺序即当前顺序） */
+  siblings: readonly NavNode[]
+  /** 它在 `siblings` 里的下标 */
+  index: number
+  /** 该层的父级路径（顶层为空串）—— 提交排序时用它当键 */
+  parent: string
+}
+
+/**
+ * 按当前折叠状态把树展平成**可渲染的行序列**（纯函数，单测可钉）。
+ *
+ * 折叠的分组不展开其子级，但**分组自身仍在序列里**（它就是那一行的展开/折叠按钮）。
+ */
+export function navRows(
+  nodes: readonly NavNode[],
+  collapsed: ReadonlySet<string>,
+  parent = '',
+  depth = 0,
+): NavRow[] {
+  const out: NavRow[] = []
+  nodes.forEach((node, index) => {
+    out.push({ node, depth, siblings: nodes, index, parent })
+    if (node.children.length > 0 && !collapsed.has(node.path)) {
+      out.push(...navRows(node.children, collapsed, node.path, depth + 1))
+    }
+  })
+  return out
+}
+
+/**
+ * 剪掉所有**有效隐藏**的子树，得到"侧栏该显示的那棵树"。
+ *
+ * 与 {@link flattenPages} 的跳过是同一个判据的两处应用（一个出树、一个出序列），
+ * 两处都从 `node.hidden` 读——不会出现"侧栏藏了、翻页还能翻到"。
+ * 返回的节点对象是原对象（只换了数组容器）：调用方不需要深拷贝，也不该改它们。
+ *
+ * 第二条规则：**纯分组（自身没有页面）若可见子级为空，整个分组也丢掉**。
+ * 它不是"隐藏"，而是"没有可显示的东西"——`a/b/c` 里 `a`、`b` 都只是路径段，
+ * 把 `c` 隐藏之后剩下的 `a` → `b` 会在侧栏渲染成两个能展开却是空的项。
+ */
+export function pruneHidden(nodes: readonly NavNode[]): NavNode[] {
+  const out: NavNode[] = []
+  for (const n of nodes) {
+    if (n.hidden) continue
+    const children = pruneHidden(n.children)
+    if (n.page === null && children.length === 0) continue
+    out.push(children === n.children ? n : { ...n, children })
+  }
+  return out
 }
 
 /**
@@ -132,11 +260,32 @@ export function flattenPages(nodes: readonly NavNode[]): NavPage[] {
   const out: NavPage[] = []
   const walk = (list: readonly NavNode[]): void => {
     for (const node of list) {
+      // 隐藏的节点连同其子树一起跳过（`hidden` 已是有效值，祖先隐藏会传下来）
+      if (node.hidden) continue
       if (node.page !== null) out.push(node.page)
       walk(node.children)
     }
   }
   walk(nodes)
+  return out
+}
+
+/**
+ * 把 `slugs` 里第 `from` 项移动到 `to` 位置（同一层级的排序，纯函数）。
+ *
+ * 拖动与键盘"上移/下移"共用它：两种交互最后都要得到"这一层的新顺序"，
+ * 让它们在**同一个**纯函数上收敛，就不会出现"拖完顺序和键盘移出来的不一样"。
+ *
+ * 越界/相同位置返回**输入的一份拷贝**（不是原数组）：调用方拿到的永远是"可以当作新顺序用"
+ * 的数组，不必再判一次"要不要发请求"。
+ */
+export function moveWithinSiblings(slugs: readonly string[], from: number, to: number): string[] {
+  const out = [...slugs]
+  if (from < 0 || from >= out.length) return out
+  const target = Math.max(0, Math.min(out.length - 1, to))
+  if (target === from) return out
+  const [moved] = out.splice(from, 1)
+  out.splice(target, 0, moved as string)
   return out
 }
 
@@ -167,6 +316,8 @@ export function neighborsOf(
 export function countPages(nodes: readonly NavNode[]): number {
   let n = 0
   for (const node of nodes) {
+    // 隐藏的不计入"N 个页面"：这个数字要与用户能在侧栏里点到的条目数一致
+    if (node.hidden) continue
     if (node.page !== null) n += 1
     n += countPages(node.children)
   }

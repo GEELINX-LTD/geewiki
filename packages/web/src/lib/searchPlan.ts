@@ -11,11 +11,14 @@
  *    值域无界、量级随语料规模与查询词变化。实测本仓库语料下只有 `1e-6 ~ 2e-6` 量级，
  *    直接 `toFixed(2)` 会**恒为 `0.00`**（等于没有信息量、还误导用户"分数都为零"）。
  *    因此只呈现**同一次查询内的相对值**（见 {@link scoreBadges}），绝不呈现绝对值。
- * 3. **降级文案**——按 `degraded.reason`（稳定枚举）分叉，**绝不按 `message` 文本分支**。
+ *
+ * 原先这里还有第三类（`degraded.reason` → 提示条文案 + `answerFormat` → 渲染方式）。
+ * 它们服务的是**问答面板**，而面板已随本批移入 `@geewiki/ai-qa` 自带的界面：宿主检索视图
+ * 只呈现检索结果，没有 `degraded` 可解释（`SearchResponse` 里就没有这个字段）。
+ * 留着它们等于在宿主里维护一份没人消费、又必须跟着后端枚举改的死镜像。
  */
-import type { Degraded, DegradedReason } from '../api'
 
-/** 查询串上限（与后端 `MAX_QUERY_LENGTH` 一致：`packages/plugin-ai/src/index.ts` 的 500） */
+/** 查询串上限（与后端一致：`packages/plugin-search/src/index.ts` 的 `MAX_QUERY_LENGTH = 500`） */
 export const MAX_QUERY_LENGTH = 500
 
 /** 片段里允许出现的标签：只有 `<mark>`（服务端高亮的唯一产物） */
@@ -148,58 +151,4 @@ export function checkQuery(raw: string): { ok: true; value: string } | { ok: fal
     return { ok: false, message: `查询过长（${value.length} 字符，上限 ${MAX_QUERY_LENGTH}）` }
   }
   return { ok: true, value }
-}
-
-/** 降级提示条的文案：`title` 简短、`detail` 补充说明（均按 reason 分叉） */
-export interface DegradedNotice {
-  title: string
-  detail: string
-  /** 语义级别：info = 信息性（结果照常可用，不要用红色淹没）；warn = 需要留意 */
-  level: 'info' | 'warn'
-}
-
-const REASON_NOTICE: Record<DegradedReason, DegradedNotice> = {
-  no_provider: {
-    title: '未配置模型密钥，以下为检索结果与摘要',
-    detail: '启用模型插件并配置密钥后，回答将由模型基于这些来源生成。',
-    level: 'info',
-  },
-  missing_credential: {
-    title: '未配置模型密钥，以下为检索结果与摘要',
-    detail: '启用模型插件并配置密钥后，回答将由模型基于这些来源生成。',
-    level: 'info',
-  },
-  invalid_credential: { title: '模型凭据无效，已降级为检索结果', detail: '请检查密钥配置。', level: 'warn' },
-  rate_limit: { title: '模型调用被限流，已降级为检索结果', detail: '稍后重试可恢复。', level: 'warn' },
-  timeout: { title: '模型调用超时，已降级为检索结果', detail: '检索结果不受影响。', level: 'warn' },
-  context_window_exceeded: {
-    title: '命中内容超出模型上下文，已自动截断',
-    detail: '标注「未引用」的来源没有进入模型上下文。',
-    level: 'info',
-  },
-  network: { title: '模型网络异常，已降级为检索结果', detail: '检索结果不受影响。', level: 'warn' },
-  provider_error: { title: '模型调用失败，已降级为检索结果', detail: '检索结果不受影响。', level: 'warn' },
-  search_unavailable: { title: '检索服务不可用', detail: '请先启用检索插件（@geewiki/search）。', level: 'warn' },
-}
-
-/**
- * 把 `degraded` 映射成提示条。
- *
- * 未知 reason（后端将来新增枚举而前端未更新）→ 回退到通用文案并带上 `message`，
- * **绝不 throw**——降级提示本身不该成为新的故障点。
- */
-export function degradedNotice(degraded: Degraded | null | undefined): DegradedNotice | null {
-  if (!degraded) return null
-  const known = REASON_NOTICE[degraded.reason]
-  if (known) return { ...known, detail: degraded.message || known.detail }
-  return {
-    title: '已降级为检索结果',
-    detail: degraded.message || '模型不可用，以下为检索结果。',
-    level: 'warn',
-  }
-}
-
-/** 回答格式 → 渲染方式（markdown 必须经 `lib/sanitize.ts` 的 `mdToHtml` 消毒） */
-export function answerRenderer(format: 'markdown' | 'plain' | undefined): 'markdown' | 'plain' {
-  return format === 'markdown' ? 'markdown' : 'plain'
 }

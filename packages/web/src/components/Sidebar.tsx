@@ -26,7 +26,16 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ChevronDown, ChevronRight, FileText, PanelLeft, X } from 'lucide-react'
-import { ancestorPaths, buildNavTree, containsSlug, countPages, navLabelOf, type NavNode } from '../lib/navTree'
+import {
+  ancestorPaths,
+  buildNavTree,
+  containsSlug,
+  countPages,
+  navLabelOf,
+  navOrderMap,
+  pruneHidden,
+  type NavNode,
+} from '../lib/navTree'
 import type { PageSummary } from '../api'
 import { cn } from '../ui/cn'
 import { Button } from '../ui/Button'
@@ -38,6 +47,8 @@ import { Skeleton } from '../ui/Skeleton'
 
 export interface SidebarProps {
   pages: PageSummary[] | null
+  /** 同级顺序（与 `pages` 同一次请求下发）；缺省 = 全部按段名字典序 */
+  navOrder?: readonly { parent: string; items: readonly string[] }[]
   error: string | null
   /** 当前 slug（列表/新建等非详情态传 null） */
   activeSlug: string | null
@@ -161,8 +172,17 @@ function NodeRow(props: {
 /* -------------------------------- 侧栏本体 -------------------------------- */
 
 function SidebarBody(props: SidebarProps & { closeOnNavigate?: boolean }): ReactNode {
-  const { pages, error, activeSlug, onOpen } = props
-  const tree = useMemo(() => buildNavTree(pages ?? []), [pages])
+  const { pages, error, activeSlug, onOpen, navOrder } = props
+  /*
+   * 树先建全（`buildNavTree` 负责把"有效隐藏"算进每个节点：父级隐藏 ⇒ 整棵子树有效隐藏），
+   * 再**剪掉**隐藏的部分给侧栏用。
+   *
+   * 为什么不直接不把隐藏页传给 `buildNavTree`：那样"父级隐藏 ⇒ 子级也藏"就得在调用方
+   * 自己实现一遍继承（第二份规则）。这里保持"继承只有一处实现"。
+   */
+  const order = useMemo(() => navOrderMap(navOrder), [navOrder])
+  const tree = useMemo(() => pruneHidden(buildNavTree(pages ?? [], order)), [pages, order])
+  // "N 个页面"与用户能在侧栏里点到的条目数一致（`countPages` 自身也跳过隐藏项）
   const total = useMemo(() => countPages(tree), [tree])
   /*
    * 空态里的「新建页面」也必须过门控（本批 G1）：侧栏此前是无条件可点的，

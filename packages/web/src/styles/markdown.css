@@ -138,7 +138,7 @@
     border-radius: var(--radius-sm);
     border: 1px solid rgb(255 255 255 / 18%);
     background: rgb(255 255 255 / 10%);
-    color: var(--gw-header-ink);
+    color: var(--gw-code-ink);
     font-size: 11px;
     line-height: 1;
     cursor: pointer;
@@ -148,7 +148,8 @@
       background-color 150ms var(--ease-standard);
   }
 
-  /* 代码块底色是深色（`--gw-header-bg`），故按钮用浅色前景，两种主题下都够对比度 */
+  /* 代码块底色是**独立的深色语义色** `--gw-code-bg`（不随主题变；见 tokens.css），
+     故按钮用它的浅色前景 `--gw-code-ink`，两种主题下都够对比度 */
   .gw-code:hover .gw-copy-btn,
   .gw-copy-btn:focus-visible,
   .gw-copy-btn.is-copied,
@@ -192,11 +193,148 @@
     }
   }
 
-  /* ---------- 分屏编辑 ---------- */
+  /* ---------- 实时渲染模式（就地渲染）---------- */
 
   /*
-   * 预览面板与编辑面板等高：两边各自独立滚动，避免"左边滚到底、右边还在顶上"。
-   * 用 `min-height: 0` 让 grid 子项可以真正收缩（否则内容会把它撑开，滚动条跑到整页上）。
+   * 这些类名由 `components/editor/liveRender.ts` 的 Decoration 挂到**非活动段落**上。
+   * 全部走 `--gw-*` token（深浅色自动跟随），且**只做视觉**：不改文档、不影响保存。
+   *
+   * 一条纪律：装饰只做"让源码看起来像成品"，**不假装渲染做不到的东西**。
+   * 表格 / 代码块 / 整块 HTML / 分隔线现在**真的渲染**了 —— 但不是在这里另画一套，
+   * 而是由 `liveRender.ts` 用阅读页同一条 `mdToHtml` 管线画进 `.gw-live-block`，
+   * 再套上 `.md-body` 复用阅读页的排版（见下方 `.gw-live-block`）。
+   * 行内 HTML 标签（`<span>` 这类）**保持源码**：逐个换成 widget 会把标签之间的内容丢掉。
+   */
+  .cm-content .gw-live-code-line {
+    background-color: var(--gw-surface-sunken);
+    font-family: var(--gw-font-mono);
+  }
+
+  /* 引用块：左边框 + 斜体，与阅读页 `md-body` 的引用观感一致 */
+  .cm-content .gw-live-quote-line {
+    border-left: 3px solid var(--gw-line-strong);
+    padding-left: 0.6em;
+    color: var(--gw-ink-muted);
+    font-style: italic;
+  }
+
+  /* 表格：光标进入该块后**按源码显示**，用等宽 + 底色表明"这是一整块表格" */
+  .cm-content .gw-live-table-line {
+    background-color: var(--gw-surface-sunken);
+    font-family: var(--gw-font-mono);
+    color: var(--gw-ink-soft);
+  }
+
+  .cm-content .gw-live-html-line {
+    color: var(--gw-ink-muted);
+  }
+
+  /*
+   * ---------- 渲染块（表格 / 代码块 / 整块 HTML / 分隔线）----------
+   *
+   * 块内容由 `mdToHtml` 生成，故这里**同时挂 `.md-body`** —— 表格边框、代码块底色、
+   * 分隔线、标题字号全部复用阅读页那一套（styles.css 的 legacy 层），
+   * 实时渲染里看到的就是发布后的样子。本段只管"块自身"的观感与可点性。
+   */
+  .cm-content .gw-live-block {
+    margin: 0.35em 0;
+    border-radius: var(--radius-md);
+    /* 它是"投影"、不是可编辑内容：给一个文字光标，暗示点进去就能改 */
+    cursor: text;
+  }
+
+  /*
+   * 悬停只加一圈虚线，**不占位**（不用 `::after` 写"点击改源码"——那会在块内凭空多出
+   * 一行，悬停导致编辑区高度跳动比没有提示更烦人）。文案走 `title`（见 widget 的 toDOM）。
+   */
+  .cm-content .gw-live-block:hover {
+    outline: 1px dashed var(--gw-line-strong);
+    outline-offset: 3px;
+  }
+
+  /* 块内首尾元素的外边距不再叠加，避免"块看起来比内容高一头" */
+  .cm-content .gw-live-block > :first-child {
+    margin-top: 0;
+  }
+
+  .cm-content .gw-live-block > :last-child {
+    margin-bottom: 0;
+  }
+
+  /* 无序列表的项目符号（替掉 `-` / `*` / `+`）与任务列表复选框（替掉 `[ ]` / `[x]`） */
+  .gw-live-bullet {
+    color: var(--gw-ink-soft);
+  }
+
+  .gw-live-task {
+    color: var(--gw-ink-soft);
+    font-size: 1.05em;
+  }
+
+  /*
+   * 受限区段：整段底纹 + 左侧竖线，让"权限从哪里生效、到哪里结束"一眼可见 ——
+   * 这是编辑器里唯一能回答"访客到底看得到哪几段"的东西。
+   */
+  .cm-content .gw-live-gated-line {
+    background-color: var(--gw-warn-bg);
+    box-shadow: inset 3px 0 0 var(--gw-warn-line);
+  }
+
+  /*
+   * 区段末行：`box-shadow` 与上面那条**必须写在同一处**（同一属性后写的会覆盖前者），
+   * 故这里把左侧竖线一起再写一遍，再加上底边 —— 区段的结束因此看得见
+   * （闭标记 `<!--/gated-->` 已被藏起来，边界只能靠视觉表达）。
+   */
+  .cm-content .gw-live-gated-end {
+    box-shadow:
+      inset 3px 0 0 var(--gw-warn-line),
+      inset 0 -1px 0 var(--gw-warn-line);
+  }
+
+  /* 锁标记本身：替代 `<!--gated:org-->` 那一行 */
+  .gw-live-gate {
+    display: inline-block;
+    padding: 0 0.4em;
+    border: 1px solid var(--gw-warn-line);
+    border-radius: var(--radius-sm);
+    background-color: var(--gw-warn-bg);
+    color: var(--gw-warn-ink);
+    font-size: 0.85em;
+  }
+
+  /* 就地渲染出来的图片：与阅读页同样限宽，避免大图把编辑区撑破 */
+  .gw-live-image {
+    margin: 0.2em 0;
+    display: block;
+  }
+
+  .gw-live-image img {
+    max-width: 100%;
+    max-height: 22rem;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--gw-line);
+  }
+
+  .gw-live-image figcaption {
+    margin-top: 0.25em;
+    color: var(--gw-ink-muted);
+    font-size: 0.85em;
+  }
+
+  /* 图片加载失败：退回源码文本，用告警底色说明"这里本来是一张图" */
+  .gw-live-image-failed {
+    background-color: var(--gw-danger-bg);
+    color: var(--gw-danger-ink);
+    border-radius: var(--radius-sm);
+    padding: 0.1em 0.3em;
+    font-family: var(--gw-font-mono);
+  }
+
+  /* ---------- 分屏编辑（历史遗留）---------- */
+
+  /*
+   * 编辑页已改为**单栏 + 模式切换**（源码 / 实时渲染），不再有左右分屏。
+   * 这个类名保留给第三方编辑器插件的自建分屏（"可收缩的栅格子项"仍是通用约定），故不删。
    */
   .gw-split-pane {
     min-width: 0;

@@ -205,38 +205,3 @@ export function errorLine(err: unknown): string {
   const view = describeError(err)
   return view.hint === '' ? view.title : `${view.title}：${view.hint}`
 }
-
-/**
- * 流式问答的**内部错误码 → 人话**。
- *
- * 这些码（`LlmErrorCode`）是给程序分支用的稳定标识，**不该出现在界面上**——用户读到
- * "RATE_LIMIT"/"PROVIDER_ERROR" 既不懂也不知道能做什么。原实现直接把 `{code}` 印在答案区，
- * 属于典型的"开发味"。
- *
- * 与 `describeError` 的分工：那个处理**HTTP 层**失败（有无 status），这个处理**已成功建流、
- * 但生成过程中失败**的情况——此时没有 HTTP 状态可依，只有 LLM 契约的错误码。
- * 两者都给 `{title, hint}`，便于同一套 `ErrorState` 渲染。
- */
-export function streamErrorText(code: string): { title: string; hint: string } {
-  switch (code) {
-    case 'RATE_LIMIT':
-      return { title: '模型服务限流了', hint: '稍等片刻再试，或换用其它模型服务。' }
-    case 'TIMEOUT':
-      return { title: '模型响应超时', hint: '问题可能太长或服务较慢，重试或缩短问题都会好些。' }
-    case 'CONTEXT_WINDOW_EXCEEDED':
-      return { title: '内容超出模型可处理长度', hint: '把问题问得更具体一些，或减少引用的资料。' }
-    case 'AUTH':
-    case 'INVALID_CREDENTIAL':
-      return { title: '模型服务拒绝了凭据', hint: '请检查管理台里该插件的密钥配置是否正确。' }
-    case 'MISSING_CREDENTIAL':
-      return { title: '还没有配置模型密钥', hint: '配置后即可获得模型生成的回答；当前只能用检索结果。' }
-    case 'NO_ADAPTER':
-      return { title: '没有可用的模型服务', hint: '请先在管理台启用并配置一个模型插件。' }
-    case 'NETWORK':
-      return { title: '连接模型服务失败', hint: '检查网络或服务地址后重试。' }
-    case 'ABORTED':
-      return { title: '回答已取消', hint: '可以重新提问。' }
-    default:
-      return { title: '回答生成失败', hint: '请重试；若持续失败，请到管理台查看该模型插件的状态。' }
-  }
-}

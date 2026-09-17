@@ -1,5 +1,6 @@
 /**
- * 插件管理台的**展示层映射**（纯函数，无 React/DOM 依赖，便于单测）。
+ * 插件页（合并后的 `pages/GraphPage.tsx` + `components/PluginGraph.tsx`）的**展示层映射**
+ * （纯函数，无 React/DOM 依赖，便于单测）。
  *
  * 为什么单独抽一层：管理台原先直接把 `@geewiki/db-sqlite`、`http-service`、
  * `基础层`、`./src/migrations`、`plugins.base.json` 这类**实现细节**糊在主表格里，
@@ -41,12 +42,17 @@ export const LAYER_TECH: Record<'base' | 'session', string> = {
 }
 
 /** 会话层一句话说明（放在"临时变更"区块的说明位置） */
+/*
+ * ⚠️ 这两个常量会被**当作 JSX 文本**渲染（`pages/GraphPage.tsx` 的卡片说明与持久化确认框），
+ * 因此**不能带 markdown 记号**——JSX 不做 markdown 解析，`**正常重启仍会保留**` 会把星号原样显示出来
+ * （本批在真浏览器截图里看见了这个缺陷）。需要强调就用 <strong>，别用星号。
+ */
 export const SESSION_LAYER_HINT =
-  '临时启用只写入会话清单，立即生效。**正常重启仍会保留**；若进程异常崩溃，系统在下次启动时自动丢弃这些临时变更、回滚到基础清单（自愈机制）。'
+  '临时启用只写入会话清单，立即生效。正常重启仍会保留；若进程异常崩溃，系统在下次启动时自动丢弃这些临时变更、回滚到基础清单（自愈机制）。'
 
 /** "应用并持久化"的后果说明（二次确认框里用） */
 export const PERSIST_HINT =
-  '把当前临时变更写进基础清单，此后**任何**重启都会加载它们，并且不再受自愈回滚影响。'
+  '把当前临时变更写进基础清单，此后任何重启都会加载它们，并且不再受自愈回滚影响。'
 
 /** 来源：内置（随宿主发布）/ 外部（放在插件目录里被发现的） */
 export const SOURCE_TEXT: Record<'builtin' | 'external', string> = {
@@ -133,6 +139,57 @@ export function estimateNodeWidth(label: string, min = 150, max = 260): number {
  * 状态徽章的语义色调（映射到 `ui/Badge` 的 tone，而不是直接给颜色）。
  * `warn` 用于"异常"是因为它是**需要关注**而非致命失败（插件失败不会拖垮宿主）。
  */
+/**
+ * 图上/徽章上的**状态分档**（比 `stateTone` 多两档"临时"状态）。
+ *
+ * 为什么要单独一个函数而不是扩 `stateTone`：`state` 只有三态（运行中/未启用/异常），
+ * 而"临时启用"与"临时停用"是**另一个维度**（它是持久化层与进程内停用登记的组合），
+ * 硬塞进 `state` 会让后端契约里的 `active|inactive|error` 变成五态、波及所有消费方。
+ * 所以分档留在展示层：后端照旧三态 + 两个附加标记，颜色由这里决定。
+ *
+ * 判定顺序即优先级，三条都不能换位置：
+ *   1. `runtimeDisabled` 优先——被就地停掉的插件必然是 inactive，但它要显成"临时停用"；
+ *   2. `error` 次之——异常比"临时启用"更需要被看见（同层异常时不该显示成正常的青色）；
+ *   3. 运行中再按层分：会话层 = 临时启用（青），基础层 = 随启动加载（绿）。
+ */
+export type PluginTone = 'ok' | 'session' | 'suspended' | 'warn' | 'neutral'
+
+export function pluginToneOf(info: {
+  state: PluginStateCode
+  layer?: 'base' | 'session' | null
+  runtimeDisabled?: boolean
+}): PluginTone {
+  if (info.runtimeDisabled === true) return 'suspended'
+  if (info.state === 'error') return 'warn'
+  if (info.state === 'active') return info.layer === 'session' ? 'session' : 'ok'
+  return 'neutral'
+}
+
+/**
+ * 分档 → 界面文案。**三种消费方共用这一份**（图上节点徽章、页头图例、详情弹窗），
+ * 否则同一状态在三处会有三种叫法（"临时停用" / "已挂起" / "已停止"），
+ * 而这正是本仓库反复在纠的"同一个概念多个词"。
+ */
+export const TONE_TEXT: Record<PluginTone, string> = {
+  ok: STATE_TEXT.active,
+  session: LAYER_HUMAN.session,
+  suspended: '临时停用',
+  warn: STATE_TEXT.error,
+  neutral: STATE_TEXT.inactive,
+}
+
+/**
+ * 分档 → 一句话解释"重启后还在不在"。这是本产品里用户唯一真正关心的差别：
+ * 三种"没在跑/怎么跑"的状态在运行态上看起来一样，命运却完全不同。
+ */
+export const TONE_HINT: Record<PluginTone, string> = {
+  ok: '随启动加载：在基础清单里，任何重启都会加载它',
+  session: '临时启用：只写在会话清单里，正常重启仍保留；进程异常崩溃恢复时会被丢弃',
+  suspended: '临时停用：仅当前进程内停用，什么都没写盘——重启后照基础清单恢复；要永久停用请「应用并持久化」',
+  warn: '加载或运行出错：详情见它的弹窗',
+  neutral: '未启用：不在任何清单里，重启也不会加载',
+}
+
 export function stateTone(state: PluginStateCode): 'ok' | 'neutral' | 'warn' {
   if (state === 'active') return 'ok'
   if (state === 'error') return 'warn'

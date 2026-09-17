@@ -3,7 +3,7 @@
  * 后端约定：成功 { ok: true, ... }；失败 { ok: false, error, message, details }，
  * HTTP 状态码与 ManagerError.code 映射（404 not_found / 409 冲突类 / 400 / 500）。
  */
-import { createAiStreamDecoder, type AiStreamEvent } from './lib/aiStreamPlan'
+import type { CapabilitySet, PageVisibility } from '@geewiki/core/domain'
 import { ATTACHMENT_URL_PREFIX } from './lib/attachmentPlan'
 import { authFailureAction, type AuthFailureAction } from './lib/authFailure'
 import type { SlotName } from './lib/slots'
@@ -238,6 +238,12 @@ export interface PluginInfo {
   state: PluginState
   layer: PluginLayer
   hotReloadable: boolean
+  /**
+   * **进程内临时停用**（基础清单里的插件被就地停掉）：重启后照基础清单回来。
+   * 与 `layer`/`state` 是两个维度——`state` 说"现在没在跑"，本字段说"为什么"。
+   * 可选：旧版本后端不返回。
+   */
+  runtimeDisabled?: boolean
   provides?: string
   requires: string[]
   conflictGroup?: string
@@ -294,6 +300,83 @@ export interface PluginConfigResponse {
   activeLayer: PluginLayer | null
   config: Record<string, unknown>
   schema: ConfigSchemaPayload | null
+  /**
+   * 写一次、不可回读的字段（schema `meta.role === 'secret'`，如模型 API 密钥）**是否已有值**。
+   *
+   * 只报有无、**绝不返回值**：`config` 里对应字段恒为空串，这是"保存后不再回显"的落点。
+   */
+  secrets?: Record<string, boolean>
+}
+
+/** 模型服务商（GET /api/llm/providers）：`provider` 字段的动态下拉选项 + 各家的默认端点/模型 */
+export interface LlmProviderOption {
+  id: string
+  label: string
+  vendor: string
+  model: string
+  description: string
+  /** 当前是否可用（缺密钥/未选中等原因下为 false） */
+  available: boolean
+  /** 用户未填 baseUrl / model 时该服务商自带的默认值 */
+  defaults: { baseUrl?: string; model?: string }
+}
+
+export interface LlmProvidersResponse {
+  ok: true
+  providers: LlmProviderOption[]
+  /** 配置里当前选中的服务商（空 = 自动取第一个可用） */
+  selected: string
+  /** 密钥来源：界面填写 / 环境变量 / 未配置（只有来源，没有值） */
+  credential: { source: 'inline' | 'env' | 'none'; configured: boolean }
+  settings: Record<string, unknown>
+  /**
+   * 思考强度的**建议档位**（来自服务端的 `REASONING_EFFORT_PRESETS`）。
+   *
+   * 由服务端给而不是前端抄一份：清单只该有一个出处。它只是下拉里的候选，
+   * 字段本身接受任意文本——各家网关的档位名不统一。
+   */
+  effortPresets?: string[]
+}
+
+/**
+ * 探测请求（`POST /api/llm/models` 与 `/api/llm/test` 的请求体）。
+ *
+ * 传的是**配置表单的草稿**，不是已保存的配置：改一半就能测，不必先保存。
+ * `apiKey` 留空表示"用已保存的密钥"——密钥不回显，空串不能理解为"没有密钥"。
+ */
+export interface LlmProbeInput {
+  provider?: string
+  baseUrl?: string
+  apiKey?: string
+  model?: string
+}
+
+/** 探测失败描述（`code` 供分支，`message` / `detail` 原样显示给用户） */
+export interface LlmProbeFailure {
+  code: string
+  status?: number
+  message: string
+  detail?: string
+}
+
+export interface LlmModelsResponse {
+  ok: boolean
+  provider: string
+  baseUrl: string
+  models: string[]
+  error?: LlmProbeFailure
+}
+
+export interface LlmTestResponse {
+  /** 以**对话探测**为准：有些网关不支持 /models 却能正常对话 */
+  ok: boolean
+  provider: string
+  baseUrl: string
+  model?: string
+  /** 目标没解析出来（没有可用服务商 / 没有密钥 / baseUrl 非法）：两步都没执行 */
+  error?: LlmProbeFailure
+  models?: { ok: boolean; models: string[]; error?: LlmProbeFailure }
+  chat?: { ok: boolean; model?: string; reply?: string; latencyMs?: number; error?: LlmProbeFailure }
 }
 
 export interface ConfigUpdateResult {
@@ -326,6 +409,8 @@ export interface GraphNodeInfo {
   label: string
   layer: PluginLayer
   state: PluginState
+  /** 进程内临时停用（见 {@link PluginInfo.runtimeDisabled}）；可选，旧后端不返回 */
+  runtimeDisabled?: boolean
   hotReloadable: boolean
   conflictGroup?: string
 }
@@ -344,6 +429,12 @@ export interface SessionState {
   base: { enabled: ListEntry[] }
   session: { enabled: ListEntry[] }
   bootErrors: string[]
+  /**
+   * 进程内**临时停用**的插件名（不落盘 ⇒ 重启即恢复）。
+   *
+   * 可选：旧版本后端不返回该字段。消费处一律 `?? []`，不要假定存在。
+   */
+  runtimeDisabled?: string[]
 }
 
 export interface PageSummary {
@@ -351,6 +442,24 @@ export interface PageSummary {
   title: string
   updated_at: string
   version: number
+  /**
+   * 是否被"在左侧边栏隐藏"（站点级）。
+   *
+   * 与 `visibility` 是**正交**的两件事：隐藏只影响导航呈现（侧栏、列表页的灰色标注、
+   * 上一篇/下一篇），不影响谁能读到这一页。见 `lib/navTree.ts` 的继承规则。
+   */
+  nav_hidden: boolean
+}
+
+/**
+ * 一个父级下的**同级顺序**（`parent` 为空串 = 顶层），来自 `GET /api/pages` 的 `nav_order`。
+ *
+ * `items` 里每一项既可能是页面 slug，也可能是**没有页面的分组路径**（如 `guide`）——
+ * 层级由 slug 决定，分组本身不是页面，但它同样需要在同一层里有位次。
+ */
+export interface NavOrderGroup {
+  parent: string
+  items: string[]
 }
 
 /**
@@ -454,6 +563,15 @@ export interface PageDetail extends PageSummary {
   visibility?: 'private' | 'org' | 'public'
   inherit?: boolean
   published?: boolean
+  /**
+   * 正文口径（`?content=raw` 时服务端下发 `'raw'`）。
+   *
+   * ⚠️ `'raw'` 的正文含 `<!--gated:…-->` 标记，**只能用于编辑**，不得当读者可见内容渲染
+   * （受限段落对它来说是明文）。反过来，把**投影后**的正文当原文存回去会毁掉标记、
+   * 让受限段落静默变公开 —— 这正是编辑路径必须请求 `raw` 的原因（见 `pages/WikiPage.tsx`
+   * 的 `WikiEdit.load()` 与 `plugin-wiki` 的路由注释）。
+   */
+  contentMode?: 'raw'
 }
 
 /**
@@ -528,183 +646,16 @@ export interface SearchResponse {
   hits: SearchHit[]
 }
 
-/**
- * 降级原因：**按它分支文案，绝不按 message 文本分支**（上游 message 可能变化/被脱敏）。
+/*
+ * AI 相关的响应类型**不在这里**：问答界面由插件自带，它的契约跟着插件走 ——
+ * `@geewiki/ai-qa` 的 `src/types.ts`。宿主此前在这里手抄了一份 `DegradedReason` /
+ * `AskResponse` / `AiAssistResponse` 镜像（并由 `web/test/degradedReason.test.ts` 守卫两侧对齐），
+ * 但宿主界面上已经没有任何 AI 功能需要它们：留在宿主侧只会变成一份"没人消费却必须跟着改"的
+ * 死镜像。手抄镜像的守卫也随之迁到插件侧（那里才是消费方）。
  *
- * ⚠️ 这是 `packages/plugin-ai/src/types.ts` 的**手抄镜像**（web 不能 import 后端包）。
- * 手抄会漂移 ⇒ 两侧成员集合由 `packages/web/test/degradedReason.test.ts` 的
- * 源码级守卫逐个比对，**改一侧必须改另一侧**。
- *
- * 注意与 **HTTP 错误码**的区别：`empty_query` / `too_long` 等是 400 错误码
- * （走 `ApiError.code`），**不是**降级原因，故都不在本枚举里。
+ * `AiAssistResponse` 那一份随决策 18 **彻底消失**：`@geewiki/ai-assist` 已改成
+ * `@geewiki/ai-writing`，它不再有 HTTP 端点、也不再有前端产物，只声明四条客户端工具名。
  */
-export type DegradedReason =
-  | 'no_provider'
-  | 'missing_credential'
-  | 'invalid_credential'
-  | 'rate_limit'
-  | 'timeout'
-  | 'context_window_exceeded'
-  | 'network'
-  | 'provider_error'
-  | 'search_unavailable'
-
-export interface Degraded {
-  reason: DegradedReason
-  /** 上游错误码（本插件自身原因时为 null，如 search_unavailable） */
-  code: string | null
-  /** 已脱敏的人类可读说明 */
-  message: string
-}
-
-export type AskMode = 'retrieval-only' | 'rag' | 'rag-partial'
-
-export interface AskSource {
-  /** 引用编号（只对 used:true 连续编号）；null = 该条未进模型上下文（被截断丢弃） */
-  n: number | null
-  slug: string
-  title: string
-  /** 同 SearchHit.snippet：已转义、只含 `<mark>`，按 HTML 渲染 */
-  snippet: string
-  score: number
-  updated_at: string
-  /** 是否真的进了模型上下文 */
-  used: boolean
-}
-
-/**
- * `POST /api/ai/ask` / `GET /api/ai/ask` 的响应体。
- * **200 一律正常**——包含「没有模型密钥」与「检索无结果」两种情况（降级信息在 `degraded` 里）。
- * 只有 `400 empty_query` / `400 too_long` 才是输入问题。
- */
-export interface AskResponse {
-  ok: true
-  query: string
-  mode: AskMode
-  degraded: Degraded | null
-  /** 无模型时为抽取式摘要；模型不可用且无来源时为 null */
-  answer: string | null
-  answerFormat: 'markdown' | 'plain'
-  sources: AskSource[]
-  retrieval: { mode: SearchMode; total: number; limit: number }
-  usage: unknown
-  elapsedMs: number
-  /** 回答是否被中断/截断 */
-  partial: boolean
-}
-
-/** `GET /api/ai/capabilities`：仅在 `@geewiki/ai` **已激活**时才有此端点（未启用时 404） */
-export interface AiCapabilitiesResponse {
-  ok: true
-  available: boolean
-  degraded: boolean
-  providers: { route: string; label: string; vendor: string; model: string; available: boolean }[]
-  message: string
-}
-
-/* --------------------------- AI 辅助写作 --------------------------- */
-
-/** 四个动作（与后端 `ASSIST_ACTIONS` 一一对应；新增动作必须同时改两侧与文案映射） */
-export type AiAssistAction = 'continue' | 'rewrite' | 'polish' | 'summarize'
-
-export interface AiAssistRequest {
-  action: AiAssistAction
-  /** 选区文本（改写/润色必填；摘要可省） */
-  selection?: string
-  /** 光标前的文本（续写必填；摘要可省） */
-  before?: string
-  title?: string
-  /** 带 slug 时服务端会额外收紧到"该页可编辑"；不传则只要求全局编辑能力 */
-  slug?: string
-  maxTokens?: number
-}
-
-/**
- * `POST /api/ai/assist` 的响应体。
- *
- * **不变式**：`mode === 'unavailable'` ⇒ `text === null` 且 `degraded` 非空。
- * 前端不得为"不可用"编造任何替代文本（例如拿摘要冒充续写）。
- */
-export interface AiAssistResponse {
-  ok: boolean
-  mode: 'generated' | 'unavailable'
-  action: AiAssistAction
-  text: string | null
-  degraded: Degraded | null
-  elapsedMs: number
-}
-
-/* --------------------------- 流式问答 --------------------------- */
-
-export interface AiStreamOptions {
-  limit?: number
-  extractive?: boolean
-  /** 供组件卸载/切换页面/重新提交时取消。**取消不是失败**，调用方不应渲染成错误 */
-  signal?: AbortSignal
-  onEvent: (ev: AiStreamEvent) => void
-}
-
-/**
- * `POST /api/ai/stream`：**逐帧**流式问答（SSE 文本帧）。
- *
- * 为什么必须用 `fetch` + `getReader()` 而**不用 `EventSource`**：原生 `EventSource` 只能发
- * GET、不能带请求体与自定义头，而问答必然要 POST 一个 JSON body。
- *
- * 错误面（调用方需分别处理）：
- * 1. **流开始前**的非 2xx：后端按普通 JSON 返回（`400` / `404` 插件未启用 / `429` 并发超限 /
- *    `500`），这里统一抛 `ApiError`（含 `status` 与 `code`）——`404` 是**回退到一次性端点**的信号。
- * 2. **流中途**失败：由后端发 `error` 帧（本函数不抛错，交给 `onEvent` 的 `error` 事件）。
- * 3. **取消**：`signal` 触发时 `reader.read()` 会抛 `AbortError`，原样向上抛，由调用方识别。
- */
-export async function aiAskStream(q: string, opts: AiStreamOptions): Promise<void> {
-  const res = await fetch('/api/ai/stream', {
-    method: 'POST',
-    // 与 `request()` 同一套头与凭据：**漏掉 `credentials` 会让这条流永远是匿名的**，
-    // 而且失败是静默的（服务端只会把主体当成 anonymous，不报错）。
-    headers: requestHeaders(true),
-    credentials: 'same-origin',
-    body: JSON.stringify({
-      q,
-      ...(opts.limit === undefined ? {} : { limit: opts.limit }),
-      ...(opts.extractive === undefined ? {} : { extractive: opts.extractive }),
-    }),
-    signal: opts.signal,
-  })
-
-  if (!res.ok) {
-    let data: unknown = null
-    try {
-      data = await res.json()
-    } catch {
-      /* 非 JSON 错误体（例如网关返回 HTML）：退化为状态码 */
-    }
-    const f = (data ?? {}) as Partial<ApiFailure>
-    throw new ApiError(res.status, f.error ?? 'http_' + res.status, f.message ?? `请求失败 (${res.status})`, f.details)
-  }
-
-  const body = res.body
-  if (body === null) throw new ApiError(res.status, 'no_body', '响应没有可读的流')
-  if (typeof TextDecoder === 'undefined') throw new ApiError(res.status, 'no_decoder', '当前环境不支持流式解码')
-
-  const decoder = createAiStreamDecoder()
-  const reader = body.getReader()
-  try {
-    for (;;) {
-      const step = await reader.read()
-      if (step.done) break
-      if (step.value) for (const ev of decoder.push(step.value)) opts.onEvent(ev)
-    }
-    // 收尾：把解码器/解析器里可能残留的最后半个字符与末帧取回
-    for (const ev of decoder.flush()) opts.onEvent(ev)
-  } finally {
-    // 提前退出（取消或异常）时释放底层 reader，避免连接悬挂
-    try {
-      reader.releaseLock()
-    } catch {
-      /* 已释放 */
-    }
-  }
-}
 
 /**
  * `GET /api/plugins/slots` 的响应形状。
@@ -758,12 +709,18 @@ export interface AuthUser {
   lastSeenAt: string | null
 }
 
-/** 服务端下发的能力。**只用于前端隐藏入口**，服务端判定独立进行（前端隐藏不是安全措施）。 */
-export interface AuthCapabilities {
-  editContent: boolean
-  administer: boolean
-  manageVisibility: boolean
-}
+/**
+ * 服务端下发的能力集合。**只用于前端隐藏入口**，服务端判定独立进行（前端隐藏不是安全措施）。
+ *
+ * ★ F9：真源已上移到 `@geewiki/core/domain` 的 `CapabilitySet` —— 原先这里是三键接口、
+ * `plugin-auth` 里还有一份一模一样的，`navPlan.ts` 里还有第三份名字清单。
+ * 现在能力名可扩展（插件用 `a/b` 命名空间声明），前端读的是服务端现算的一张**开放映射**，
+ * 于是"插件新增一个能力"对前端是**零改动**的。
+ *
+ * ⚠️ 消费一律写 `caps?.[key] === true`（**缺失即不具备**）：未登录、加载中、键拼错
+ * 三种情况都必须落到"不显示"，绝不能用 `!== false` 把前两者判成"显示"。
+ */
+export type AuthCapabilities = CapabilitySet
 
 /**
  * SSO 通道的能力下发（P1.5）。
@@ -976,16 +933,67 @@ export const api = {
     request<{ ok: true }>('POST', `/api/plugins/${encodeURIComponent(name)}/disable`),
   pluginConfig: (name: string) =>
     request<PluginConfigResponse>('GET', `/api/plugins/${encodeURIComponent(name)}/config`),
-  updatePluginConfig: (name: string, config: Record<string, unknown>) =>
-    request<ConfigUpdateResult>('PUT', `/api/plugins/${encodeURIComponent(name)}/config`, { config }),
-  persist: () => request<{ ok: true; promoted: string[] }>('POST', '/api/session/persist'),
+  /**
+   * 保存插件配置。
+   *
+   * `clearSecrets` 是要**显式清除**的写一次字段（如 `['apiKey']`）：
+   * 与"留空 = 不修改"区分开 —— 否则用户每改一次别的字段都会顺手删掉已保存的密钥。
+   */
+  updatePluginConfig: (name: string, config: Record<string, unknown>, clearSecrets?: string[]) =>
+    request<ConfigUpdateResult>('PUT', `/api/plugins/${encodeURIComponent(name)}/config`, {
+      config,
+      ...(clearSecrets && clearSecrets.length > 0 ? { clearSecrets } : {}),
+    }),
+  /** 模型服务商列表（配置表单的服务商下拉数据源；未启用任何适配器时为空数组） */
+  llmProviders: () => request<LlmProvidersResponse>('GET', '/api/llm/providers'),
+  /**
+   * 读取服务商支持的模型清单（配置表单的模型下拉）。
+   *
+   * 用 POST：参数里带着表单草稿（可能含尚未保存的密钥），走 query 会进访问日志。
+   * 探测失败也返回 200 + `ok:false`——"上游 401"是有用的诊断，不该被 HTTP 错误外壳吃掉。
+   */
+  llmModels: (input: LlmProbeInput = {}) => request<LlmModelsResponse>('POST', '/api/llm/models', input),
+  /** 连接测试：模型清单 + 一次最小对话，逐步回报（含上游原文，服务端已脱敏） */
+  llmTest: (input: LlmProbeInput = {}) => request<LlmTestResponse>('POST', '/api/llm/test', input),
+  persist: () =>
+    request<{ ok: true; promoted: string[]; disabled?: string[] }>('POST', '/api/session/persist'),
 
   /* Wiki 页面 */
-  pages: () => request<{ ok: true; pages: PageSummary[] }>('GET', '/api/pages'),
-  page: (slug: string) => request<PageDetail & { ok: true }>('GET', `/api/pages/${encodeURIComponent(slug)}`),
+  pages: () =>
+    request<{ ok: true; pages: PageSummary[]; nav_order: NavOrderGroup[] }>('GET', '/api/pages'),
+  page: (slug: string, opts?: { raw?: boolean }) =>
+    request<PageDetail & { ok: true }>(
+      'GET',
+      `/api/pages/${encodeURIComponent(slug)}${opts?.raw === true ? '?content=raw' : ''}`,
+    ),
   savePage: (slug: string, body: { title: string; content: string }) =>
     request<SaveResult>('PUT', `/api/pages/${encodeURIComponent(slug)}`, body),
   deletePage: (slug: string) => request<{ ok: true }>('DELETE', `/api/pages/${encodeURIComponent(slug)}`),
+  /**
+   * 在左侧边栏隐藏 / 取消隐藏（站点级，需要这一页的编辑权）。
+   *
+   * 服务端判定是唯一真源：没登录 401、看不到这一页 404、看得见但不够格 403。
+   * 客户端只在"已登录"这一层做粗门控（与列表页其他写操作一致），被拒时把服务端的
+   * 消息显示在行内，而不是假装成功。
+   */
+  setNavHidden: (slug: string, hidden: boolean) =>
+    request<{ ok: true; slug: string; hidden: boolean }>(
+      'POST',
+      `/api/pages/${encodeURIComponent(slug)}/hidden`,
+      { hidden },
+    ),
+  /**
+   * 把某一层级（`parent` 为 `null` 表示顶层）的顺序整体写成 `slugs` 的顺序。
+   *
+   * 提交的是**这一层的完整新顺序**：服务端按数组下标写 `sort_key`，
+   * 因此顺序自洽、重放安全（见 plugin-wiki 的 `setNavOrder`）。
+   */
+  setNavOrder: (parent: string | null, items: readonly string[]) =>
+    request<{ ok: true; parent: string | null; items: string[]; written: number }>(
+      'POST',
+      '/api/pages/order',
+      { parent, items },
+    ),
   version: (slug: string, id: number) =>
     request<{ ok: true; id: number; content: string; saved_at: string }>(
       'GET',
@@ -1043,30 +1051,12 @@ export const api = {
   links: (slug: string) =>
     request<OutLinksResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/links`),
 
-  /* 检索与 AI 问答（后端插件未启用时这两个端点会 404，调用方须优雅降级） */
+  /* 全文检索（检索插件未启用时这个端点会 404，调用方须优雅降级） */
   search: (q: string, limit?: number) =>
     request<SearchResponse>(
       'GET',
       `/api/search?q=${encodeURIComponent(q)}${limit === undefined ? '' : `&limit=${encodeURIComponent(String(limit))}`}`,
     ),
-  aiAsk: (q: string, opts?: { limit?: number; extractive?: boolean }) =>
-    request<AskResponse>('POST', '/api/ai/ask', {
-      q,
-      ...(opts?.limit === undefined ? {} : { limit: opts.limit }),
-      ...(opts?.extractive === undefined ? {} : { extractive: opts.extractive }),
-    }),
-  aiCapabilities: () => request<AiCapabilitiesResponse>('GET', '/api/ai/capabilities'),
-  /**
-   * AI 辅助写作（编辑器内的续写/改写/润色/摘要）。
-   *
-   * ⚠️ **降级不是错误**：模型不可用时服务端回 **502** 且 `body.mode === 'unavailable'`，
-   * 此时 `request()` 会抛 `ApiError`（`status=502`）——调用方**必须**按"不可用"呈现，
-   * 而不是当成网络故障报错。`text` 在没有模型时恒为 `null`，**不存在**任何兜底文本。
-   */
-  aiAssist: (body: AiAssistRequest) => request<AiAssistResponse>('POST', '/api/ai/assist', body),
-  /** 流式问答（见 `aiAskStream` 的文档：取消与三类错误面） */
-  aiAskStream: (q: string, opts: AiStreamOptions) => aiAskStream(q, opts),
-
   /* 服务健康：「系统状态」面板用产品化方式呈现，不再把裸 JSON 端点做成头部链接 */
   health: () => request<HealthResponse>('GET', '/api/health'),
 
@@ -1353,12 +1343,12 @@ export const api = {
 
 /* ------------------- 可见性与授权（权限治理 M1-M3） ------------------- */
 
-/**
- * 页面档位。与后端 `packages/plugin-wiki/src/index.ts:1724` 的
- * `VISIBILITIES = ['private', 'org', 'public']` **同集合**（白名单，服务端不认识别的值）。
- * 这里的刻度是**宽松度**：private（最窄）< org < public（最宽）。
+/*
+ * ★ F5：`PageVisibility` 的真源已移到 `@geewiki/core/domain`
+ * （浏览器安全子路径，可 `import type`，不拖入 `node:fs`）。
+ * 这里转出以保持 `web/src/api.ts` 的既有导出面不变。
  */
-export type PageVisibility = 'private' | 'org' | 'public'
+export type { PageVisibility } from '@geewiki/core/domain'
 
 /**
  * 块档位。与后端 `packages/plugin-wiki/src/blocks.ts:28` 的

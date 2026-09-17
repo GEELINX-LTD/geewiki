@@ -8,6 +8,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   HOME_SLUG,
+  isUnreachableSlug,
+  isWikiHomeAlias,
   parseWikiRoute,
   WIKI_RESERVED_FIRST_SEGMENTS,
   wikiRouteHash,
@@ -28,12 +30,40 @@ test('HOME_SLUG：约定 slug 不得落在保留段里（否则主页会被自�
   assert.deepEqual(parseWikiRoute(HOME_SLUG), { kind: 'detail', slug: 'home' })
 })
 
-test('parseWikiRoute：保留段 new / search / ask', () => {
+test('parseWikiRoute：保留段 new / search', () => {
   assert.deepEqual(parseWikiRoute('new'), { kind: 'new' })
   assert.deepEqual(parseWikiRoute('search'), { kind: 'search', q: '' })
   assert.deepEqual(parseWikiRoute('search/hello'), { kind: 'search', q: 'hello' })
-  assert.deepEqual(parseWikiRoute('ask'), { kind: 'ask', q: '' })
-  assert.deepEqual(parseWikiRoute('ask/what%20is%20x'), { kind: 'ask', q: 'what is x' })
+})
+
+test('parseWikiRoute：`ask` 已不再是视图，但仍被后端拒为 slug 首段（P8 / 决策 17）', () => {
+  /*
+   * 这条钉的是"拆了视图、没解禁保留段"这个**刻意的不对称**。
+   *
+   * 拆掉解析分支后 `#/wiki/ask` 会落到详情页分支（`detail + slug='ask'`）——但那个页面
+   * **不可能存在**：`'ask'` 仍在后端 `RESERVED_FIRST_SEGMENTS` 里，`ask` 这个 slug 建不出来。
+   * 于是这个分支实际只会渲染"页面不存在"，而这正是想要的：既有的 `#/wiki/ask` 分享链接
+   * 打开后是缺省提示，不会**静默变成一个页面**（解禁才会，且解禁是单向不可回收的）。
+   */
+  assert.ok(WIKI_RESERVED_FIRST_SEGMENTS.includes('ask'), '`ask` 必须留在保留段里（解禁是单向的）')
+  assert.deepEqual(parseWikiRoute('ask'), { kind: 'detail', slug: 'ask' })
+})
+
+test('isUnreachableSlug：保留段开头的 slug 结构上不可能存在（后端拒建）', () => {
+  /*
+   * 这条钉的是 P8 暴露出来的那个"自洽但危险"的中间状态：拆了 `ask` 的视图分支之后，
+   * `#/wiki/ask/foo` 会解析成 `detail + slug='ask/foo'`，而两个下游会把 detail 当成
+   * "用户正看着一篇真实存在的文章"（dock 告诉模型"当前页是它"、命令面板把它记进最近访问）。
+   * 判据收在 wikiRoute 一处，这两个下游共用。
+   */
+  for (const slug of ['ask', 'ask/foo', 'search/x', 'new', 'list']) {
+    assert.equal(isUnreachableSlug(slug), true, `${slug} 不该被当成可访问的页面 slug`)
+  }
+  for (const slug of ['home', 'guide/intro', 'asking', 'listing', 'a/ask']) {
+    assert.equal(isUnreachableSlug(slug), false, `${slug} 不是保留段开头，必须放行`)
+  }
+  // 反空洞：判据必须真的来自保留段集合，而不是一张写死的表
+  assert.ok(WIKI_RESERVED_FIRST_SEGMENTS.length >= 4)
 })
 
 test('parseWikiRoute：检索词的 `/` 被保留（不被当成路径段）', () => {
@@ -85,4 +115,54 @@ test('wikiRouteHash：slug 被编码（`/` 变 %2F），且未编码的斜杠不
 
 test('保留段清单与后端一致（顺序无关，集合相同）', () => {
   assert.deepEqual([...WIKI_RESERVED_FIRST_SEGMENTS].sort(), ['ask', 'list', 'new', 'search'])
+})
+
+/*
+ * 主页别名判据（`isWikiHomeAlias`）。
+ *
+ * 下面第一条用例是**回归测试**，对应 2026-09-14 在 3100 上实测到的缺陷：
+ * `#/wiki/home/`（尾斜杠）冷加载**永久空白** —— 组件里的字符串全等守卫
+ * （`stripHashQuery(hash) !== 'wiki/home'`）判 false ⇒ 不重写 URL；而 `parseWikiRoute` 把
+ * `home/` 解析成 `detail + home` ⇒ 组件 `return null`。两者叠加就是"既不重写也不渲染"。
+ * 判据收进本文件后，组件不再自己拼字符串，这类漂移没有第二个落点。
+ */
+test('isWikiHomeAlias：`#/wiki/home/` 尾斜杠也算别名（回归：曾永久空白）', () => {
+  assert.equal(isWikiHomeAlias('#/wiki/home/'), true)
+  // 多一条尾斜杠同样归一（`parseWikiRoute` 本来就忽略空段）
+  assert.equal(isWikiHomeAlias('#/wiki/home//'), true)
+})
+
+test('isWikiHomeAlias：四种写法都算别名（裸 / 尾斜杠 / ?v= / ?a=）', () => {
+  assert.equal(isWikiHomeAlias('#/wiki/home'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home/'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home?v=68'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home?a=usage'), true)
+  // 空查询串（复制的地址常带一个孤零零的 `?`）同样算
+  assert.equal(isWikiHomeAlias('#/wiki/home?'), true)
+  // 没有 `#` 前缀的写法也要认（`location.hash` 一定有，但函数不该依赖它）
+  assert.equal(isWikiHomeAlias('wiki/home'), true)
+  // 编码过的尾斜杠归一为 `home/`，与上一条同一形态
+  assert.equal(isWikiHomeAlias('#/wiki/home%2F'), true)
+})
+
+test('isWikiHomeAlias：规范地址 `#/wiki` **不是**别名（否则会被反复重写）', () => {
+  // `#/wiki` 解析为 `{kind:'home'}`，是规范落点；把它当别名会造成自我重写
+  assert.equal(isWikiHomeAlias('#/wiki'), false)
+  assert.equal(isWikiHomeAlias('#/wiki/'), false)
+  assert.equal(isWikiHomeAlias('#/'), false)
+  assert.equal(isWikiHomeAlias(''), false)
+})
+
+test('isWikiHomeAlias：只是"名字里带 home"的地址不得被误判（反例）', () => {
+  assert.equal(isWikiHomeAlias('#/wiki/home/edit'), false) // 编辑主页
+  assert.equal(isWikiHomeAlias('#/wiki/homework'), false) // 另一个页面
+  assert.equal(isWikiHomeAlias('#/wiki/guide%2Fhome'), false) // 分层 slug 的第二段
+  assert.equal(isWikiHomeAlias('#/wiki/HOME'), false) // slug 大小写敏感
+  assert.equal(isWikiHomeAlias('#/access/home'), false) // 另一个命名空间
+  assert.equal(isWikiHomeAlias('#/wiki/list'), false)
+})
+
+test('isWikiHomeAlias：坏转义不抛错（调用方在 effect 里跑，抛出去就是整页空白）', () => {
+  assert.equal(isWikiHomeAlias('#/wiki/%E0%A4%A'), false)
+  assert.equal(isWikiHomeAlias('#/wiki/home%'), false)
 })

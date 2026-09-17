@@ -1,0 +1,11 @@
+{
+  "host.app.title": "GeeWiki",
+  "host.app.tagline": "AI-native team knowledge base",
+  "host.nav.wiki": "Wiki",
+  "host.nav.admin": "Admin",
+  "host.locale.label": "Language",
+  "host.notfound.title": "Page not found",
+  "host.notfound.empty.title": "Nothing lives at this address",
+  "host.notfound.empty.hint": "The link may be mistyped, or the feature it pointed at has been removed.",
+  "host.notfound.back": "Back to wiki"
+}

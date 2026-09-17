@@ -1,0 +1,11 @@
+{
+  "host.app.title": "GeeWiki",
+  "host.app.tagline": "AI 原生的团队知识库",
+  "host.nav.wiki": "知识库",
+  "host.nav.admin": "管理台",
+  "host.locale.label": "界面语言",
+  "host.notfound.title": "页面不存在",
+  "host.notfound.empty.title": "这个地址没有对应的页面",
+  "host.notfound.empty.hint": "链接可能拼错了，或者它指向的功能已被移除。",
+  "host.notfound.back": "返回知识库"
+}
