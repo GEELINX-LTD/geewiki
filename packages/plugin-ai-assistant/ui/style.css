@@ -1,0 +1,903 @@
+/**
+ * `app-dock` 输入条的样式。
+ *
+ * ## 两条硬约束（都不是审美问题）
+ * 1. **贴视口底、水平居中、不挡正文**。决策 1 的形态来自用户给的截图：
+ *    约 440×55，水平居中贴底。故容器是 `position: fixed` + `left:50%` + `translateX(-50%)`，
+ *    `z-index` 抬到内容之上但**不铺满整屏**（收起时只有一个 55px 高的条，
+ *    铺满会让整页点击都被它吃掉）。
+ * 2. **展开方向朝上**。面板 `position:absolute; bottom:100%` 挂在输入条**上方**，
+ *    因此输入条本身的视口位置从不移动——展开时它不跳。
+ *
+ * ## 配色：全部走宿主语义变量（2026-09-15 改写，深色模式修复）
+ *
+ * 这里原先写着「插件 bundle 拿不到主题变量，故用 `currentColor` 与半透明黑推导」。
+ * **那个前提是错的**，而且错得只看得见后果、看不见报错：
+ *   · `background: color-mix(in srgb, Canvas 92%, transparent)` —— `Canvas` 是浏览器
+ *     的**系统色**，深色下解出的是 Chrome 自己的中性灰 `rgb(18,18,18)`，与本仓深色底
+ *     （`--gw-bg` = `#0b131d`，带蓝调的近黑）并排就是"没适配"的观感；
+ *   · `var(--color-sunken, #f9fafb)` 这类**浅色回退值**更直接：那份声明在深色主题下
+ *     会渲染成白块（回退值只在变量缺失时生效，而当时它恰好缺失）。
+ *
+ * 关键事实：那些 `--color-*` 变量当时**确实不在产物里**（`@theme inline` 不输出声明），
+ * 但根因是宿主侧缺一份契约，不是"插件拿不到主题"。宿主已在 `tokens.css` 的第 4b 节
+ * 用一段普通 `:root` 把这批名字无条件输出（根因与错路都记在那里）。
+ * 因此本文件的做法改为：**只用宿主语义变量，一个回退值都不写**。
+ *
+ * 为什么不留回退值：回退值会**掩盖**契约断裂——变量在时它不生效，变量不在时它给出
+ * 一个浅色主题的值，于是"深色下变白块"这种故障永远等不到一条会红的测试。宁可让
+ * 声明整条失效（一眼可见），也不要一个只在一种主题下正确的外观。
+ * `packages/web/test/pluginUi.test.ts` 负责保证这些名字真的存在。
+ */
+
+.gw-dock {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 60;
+  width: min(440px, calc(100vw - 32px));
+  font-size: 14px;
+  line-height: 1.5;
+  /* 展开时容器 440 → 680：宽度与面板高度必须一起动，只动其一会显得卡片"被压扁" */
+  /* 大位移（240px 宽 + 184px 高）走 `--ease-move`；`--ease-standard` 是给
+     150ms 的颜色/小位移调的，前段极陡，用在这里就是"一冲一顿"（见 tokens.css 4b 节） */
+  transition: width 240ms var(--ease-move);
+}
+
+/* 展开态：面板更高更宽，但仍然居中且不铺满 */
+.gw-dock-open {
+  width: min(680px, calc(100vw - 32px));
+}
+
+/*
+ * 展开/收起动画（2026-09-15 新增）。
+ *
+ * 起因：面板原来是 `{open && …}` **条件挂载**的，元素一卸载就没有可插值的起点，
+ * 于是展开与收起都是瞬间完成——用户的评价是「展开和收起没有动画，非常生硬」。
+ * 现在面板常驻 DOM，收起态由这里折叠：
+ *
+ *   ① 高度：`grid-template-rows: 0fr auto → 1fr auto`（第一行是裁剪盒，第二行是输入行，
+ *      2026-09-16 第三批拆成两行）。插值的是**轨道尺寸**，终值是"内容自然高度"，
+ *      因此不必猜一个"够大的 max-height"（猜小了截断，猜大了前 80% 的时间看不出在动，
+ *      最后几帧突然窜完——那比没有动画更难看）。
+ *   ② 透明度：纯高度变化看起来像"卡片被压扁"，内容再淡入才像"从输入条后面长出来"。
+ *      高度 240ms、透明度 160ms——两者时长不同是刻意的，同长会显得拖沓。
+ *      （原先还叠了一条 `translateY(6px)`，2026-09-15 第二批删掉了：盒子已经在做几何
+ *      动画，内容再滑一次是"同一件事动两遍"，且两条曲线不同 ⇒ 收尾反而错拍、显抖。）
+ *
+ * ⚠️ 网格项 `.gw-dock-clip` 上不许有 padding / border / margin：它们不受
+ * `min-height: 0` 约束，会让 `0fr` 塌不到 0（留一条 2px 亮线）。
+ *
+ * ⚠️ 折叠 ≠ 卸载：DOM 还在，所以收起态的**裁剪盒**必须 `inert` 挡住 Tab 与读屏
+ * （见 `ui/index.tsx` 里的注释）。`inert` 挂在外壳上是错的——输入行住在外壳里，
+ * 那样会把**唯一**的输入框也冻住（收起态恰恰是它最该能打字的时候）。
+ */
+.gw-dock-shell {
+  display: grid;
+  /*
+   * ⚠️ 轨道**只能有一条**（裁剪盒），输入行**不能**作为第二条 `auto` 轨道参与动画。
+   *
+   * 这里踩过一次（2026-09-16，量出来才知道）：写成 `0fr auto → 1fr auto` 时浏览器会把
+   * **两行一起插值**——逐帧实测第二行（输入行）中途被撑到 **98.5px** 再缩回 55px，
+   * 表现就是输入行在动画里上下移动 43px（`getComputedStyle(shell).gridTemplateRows`
+   * 逐帧打成 `"43.28px 98.5px"` 这种样子）。`fr` 轨道在有 `auto` 兄弟轨道、且容器高度
+   * 由内容决定时，过渡期间多出来的空间会被 `auto` 那条吃掉。
+   *
+   * 所以：网格只留一条被插值的轨道，输入行改为**绝对定位**钉在卡片底边
+   * （`.gw-dock-row`），卡片用 `padding-bottom` 给它留出 55px。
+   * 卡片底边钉在视口底边（根是 `position: fixed; bottom: 16px`），因此卡片向上长、
+   * 输入行一动不动——这才是"收起的输入框与展开的是同一个东西"。
+   */
+  position: relative;
+  grid-template-rows: 0fr;
+  padding-bottom: 55px;
+  /*
+   * 投影挂在这一层（**裁剪盒之外**）：`.gw-dock-clip` 的 `overflow: hidden` 会把面板自己的
+   * `box-shadow` 裁得一干二净（外投影全部画在边框盒之外），卡片会突然没有影子。
+   * 收起态这一层是 0 高：那条缝因此看不见，而投影的基础值必须是**全透明**的——
+   * 0 高盒子配 32px 模糊投影会在输入条上方留一道灰印。
+   */
+  border-radius: 16px;
+  /*
+   * 卡片的表面（描边/底色/模糊/圆角）挂在**这一层**，面板不再自带（2026-09-16 第三批）：
+   * 输入行现在是外壳的第二个网格行，若表面仍画在面板上，收起态就只剩一个没有底的输入框，
+   * 展开态则会看到"面板 + 输入行"两张分离的卡。`overflow: hidden` 让圆角咬住输入行。
+   */
+  border: 1px solid var(--color-line);
+  background: color-mix(in srgb, var(--color-surface) 96%, transparent);
+  backdrop-filter: blur(10px);
+  overflow: hidden;
+  box-shadow: 0 0 0 rgb(0 0 0 / 0%);
+  transition:
+    grid-template-rows 240ms var(--ease-move),
+    box-shadow 200ms var(--ease-standard);
+}
+
+.gw-dock-open .gw-dock-shell {
+  grid-template-rows: 1fr;
+  /* 与卡片同形（同圆角、同几何）：投影从 0 淡入，避免展开第一帧先出现一道灰印 */
+  box-shadow: 0 10px 32px rgb(0 0 0 / 16%);
+}
+
+/* 纯裁剪盒：只负责"能不能塌到 0"与"把内容裁干净"（输入行在它外面，不受影响） */
+.gw-dock-clip {
+  min-height: 0;
+  overflow: hidden;
+  /*
+   * ---------- 揭幕方向：从**下往上** ----------
+   *
+   * 内容锚在裁剪盒**底边**（2026-09-16 第二批，用户反馈："展开时下半部分会先消失再出现"）：
+   * 网格行 `0fr → 1fr` 让裁剪盒的**顶边先出现**，若内容照常锚在顶部，就只有面板上半部分先露出来
+   * （逐帧实测那时 `form=[854,909]` vs `clip=[681,820]`，底部空约 50ms）。
+   * 锚到底边之后，露出顺序变成"对话流的最新内容先出现、上面的历史随后"，人眼读到的是
+   * 卡片**向上长出来**，与输入行在底部的手感一致。
+   *
+   * `justify-content: flex-end` 配 `overflow: hidden` 的溢出方向正好是**上方**（start 侧），
+   * 所以要的是这个组合；而 flex 子项默认会**被压缩**（`flex-shrink: 1`），
+   * 必须让面板 `flex: none`，否则它会被挤成裁剪盒的高度、根本不再"露出来"。
+   */
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.gw-dock-clip > .gw-dock-panel {
+  /* 见上：不许被压缩，否则揭幕变成"整块挤扁" */
+  flex: none;
+}
+
+/*
+ * 面板内容只淡入淡出，**不做位移**（2026-09-15 第二批去掉原先的 `translateY(6px)`）。
+ * 盒子本身（`.gw-dock-shell`/`.gw-dock-clip`）已经在做几何动画了，内容再滑 6px 是
+ * "同一件事动两遍"；更麻烦的是两者曲线不同（几何走 `--ease-move`、位移走
+ * `--ease-standard`，前段更陡）⇒ 收尾时内容早就停住、盒子还在慢慢合，反而显得抖。
+ * 淡入是**跨帧混合**，不构成第二段运动，故保留。
+ */
+.gw-dock-panel {
+  opacity: 0;
+  transition: opacity 160ms var(--ease-standard);
+}
+
+.gw-dock-open .gw-dock-panel {
+  opacity: 1;
+}
+
+/*
+ * 收起态**不需要单独的规则**：`.gw-dock-shell` 的基础值就是收起态
+ * （`grid-template-rows: 0fr` + 全透明投影），展开态才是 `.gw-dock-open` 里的覆盖。
+ * 这样两个方向都只是"同一对值之间的插值"，不必写两套。
+ */
+
+@media (prefers-reduced-motion: reduce) {
+  .gw-dock,
+  .gw-dock-shell,
+  .gw-dock-panel,
+  .gw-dock-icon,
+  .gw-dock-tools-chevron {
+    transition: none;
+  }
+}
+
+/*
+ * ---------- 唯一的输入行（2026-09-16 第三批） ----------
+ *
+ * 用户原话："感觉整体动画的衔接还是有问题，感觉收起的输入框和展开的是两个东西。"
+ * 那句话字面上就是对的：收起态是 `.gw-dock-bar` 里的输入框、展开态是面板底部的
+ * `.gw-dock-form` 里的输入框，连占位文案都不同（「问 AI 助手…」vs「问关于「slug」…」）。
+ * 之前为掩盖这段交接堆了三处补丁：常驻 DOM + 裁剪盒高度插值 + 展开时把输入条抬 19px
+ * 去对齐面板里的那一行（`--dock-row-lift`，已删除）。补丁再多也改不掉"有两个盒子"：
+ * 交接期间两个框一收一放，看起来就是换了一个东西。
+ *
+ * 现在只有这一个盒子：它是卡片（`.gw-dock-shell`）的第二个网格行、**在裁剪盒之外**，
+ * 所以收起/展开时它一动不动，只是卡片在它上方长大或收起。
+ *
+ * 表面（描边/底色/阴影）一律由外壳提供，这里**不能再画一层**——两层描边叠在一起
+ * 正是"两个东西"的视觉来源。展开时加一条上分隔线把输入行与对话流分开；
+ * 收起态那条线必须是 `transparent`，否则会变成悬在卡片顶部的一道横线。
+ */
+.gw-dock-row {
+  /*
+   * 钉在卡片底边：网格里只有裁剪盒一条轨道，所以输入行不能是网格项（否则它会随轨道位移，
+   * 见 `.gw-dock-shell` 里那段实测说明）。`left/right: 0` 让它跟着卡片宽度动画一起变宽。
+   */
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  /*
+   * 55px 是两个状态**共用**的高度。原先是两个盒子各写一份（收起 55px、
+   * 面板里那个 `height: auto` ≈ 45px），展开的瞬间底行会自己缩 10px——动画做得再好也照样跳。
+   */
+  height: 55px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-top: 1px solid transparent;
+}
+
+.gw-dock-open .gw-dock-row {
+  border-top-color: var(--color-line);
+}
+
+/* 中止后的"就地继续"按钮行：与上面那行红字之间留一点，不要贴在一起 */
+.gw-dock-error-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.gw-dock-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 6px 8px;
+}
+
+.gw-dock-btn {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font: inherit;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--color-ink) 10%, transparent);
+  color: inherit;
+}
+
+.gw-dock-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.gw-dock-btn-primary {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+.gw-dock-btn-primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.gw-dock-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  /* 表面（描边/底色/模糊/圆角）在外壳上，见 `.gw-dock-shell`；这里只管内容排布 */
+  max-height: min(60vh, 560px);
+}
+
+.gw-dock-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.gw-dock-title {
+  font-weight: 600;
+}
+
+.gw-dock-meta {
+  opacity: 0.7;
+}
+
+.gw-dock-spacer {
+  flex: 1 1 auto;
+}
+
+/*
+ * 头部三个动作用**图标按钮**（2026-09-15 起；原先是有下划线的文字链接）。
+ *
+ * 为什么不是给 `.gw-dock-link` 加个 padding 了事：文字链接靠"下划线 + 80% 不透明度"
+ * 表达可点，图标没有下划线可依——可点性改由**悬停底色**表达，展开状态（历史面板开着）
+ * 用同一块底色常驻；并且用 `aria-expanded` 让"开着"这件事不止靠颜色表达
+ * （色弱用户看不出一块浅底与另一块浅底的区别）。
+ *
+ * 26×26 是**命中区**，不是图形大小：图形 16×16（与宿主顶栏图标同规格），四周留白让
+ * 鼠标与触控都好点。图形尺寸由 svg 自己的属性给，见 `ui/icons.tsx`。
+ */
+.gw-dock-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: background-color 120ms var(--ease-standard);
+}
+
+.gw-dock-icon:hover,
+.gw-dock-icon-on {
+  background: var(--color-hover);
+}
+
+/*
+ * 历史条数的角标。**只给看得见的人**：可访问名里已经念过条数
+ * （`aria-label="历史（3）"`），所以它自己 `aria-hidden`，否则读屏会念两遍。
+ * 0 条时不渲染（角标写个 0 只是噪音），但可访问名里仍是「历史（0）」。
+ */
+.gw-dock-count {
+  position: absolute;
+  top: -1px;
+  right: -2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  font-size: 10px;
+  line-height: 14px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 历史面板。
+ *
+ * ⚠️ 这里原先是**一个裸的 `<ul>`**（只有 `max-height` + `border-bottom`），两个后果都在
+ * 实测里现形（`data/verify/dock-ui/before-history.png`）：
+ *   ① 它作为 flex 子项被**挤扁** —— `.gw-dock-thread` 有 `min-height`，
+ *      而这个 `ul` 带 `overflow:auto`（`min-height` 自动变 0），于是它只拿到 40px、
+ *      三段历史只看得见**一条**，另外两条要靠它自己那条**内嵌滚动条**去翻；
+ *   ② 没有容器、没有标题、没有元信息，读起来不像"列表"，像页面串行错位的一行。
+ * 现在是一个真面板：`flex: none` 不被挤、有标题、有背景与圆角，条目带时间与条数。
+ */
+.gw-dock-history-panel {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-sunken);
+}
+
+.gw-dock-history-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-muted);
+  padding: 0 4px;
+}
+
+.gw-dock-history-hint {
+  font-weight: 400;
+  /* 这句是**语义**不是装饰：会话只存在这台设备上，换浏览器就没有了 */
+  opacity: 0.85;
+}
+
+.gw-dock-history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 168px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.gw-dock-history-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.gw-dock-history-item:hover {
+  background: var(--color-hover);
+}
+
+/* 当前正在看的那一段 —— 否则用户点进去之后无法确认"我在哪一段里" */
+.gw-dock-history-item-active {
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+
+.gw-dock-history-title {
+  font-size: 13px;
+  color: var(--color-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-dock-history-meta {
+  font-size: 11px;
+  color: var(--color-muted);
+}
+
+/* ============================ 滚动条 ============================ */
+
+/*
+ * 默认滚动条在深色面板里是一整条浅色高对比带（还带上下箭头按钮），
+ * 与这块 UI 的其余部分不是一个时代的东西（改前实测占 **15px** 宽，见 before.json）。
+ * 这里统一收成 8px、轨道透明、滑块用主题自己的语义色，并随主题变化。
+ *
+ * 两套写法都要给：`scrollbar-width`/`scrollbar-color` 是标准属性（Firefox、新版 Chrome），
+ * `::-webkit-scrollbar` 是 Chromium/Safari 的实现。**同时存在时标准属性优先**，
+ * 所以两边的观感是对齐的（都细、都无箭头、都取主题色）。
+ */
+.gw-dock-thread,
+.gw-dock-history {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-ink) 22%, transparent) transparent;
+}
+
+.gw-dock-thread::-webkit-scrollbar,
+.gw-dock-history::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.gw-dock-thread::-webkit-scrollbar-track,
+.gw-dock-history::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.gw-dock-thread::-webkit-scrollbar-thumb,
+.gw-dock-history::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  /* 透明边框 + background-clip 让滑块比轨道窄，两侧留白，不贴边 */
+  border: 2px solid transparent;
+  background-clip: content-box;
+  background-color: color-mix(in srgb, var(--color-ink) 22%, transparent);
+}
+
+.gw-dock-thread::-webkit-scrollbar-thumb:hover,
+.gw-dock-history::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--color-ink) 38%, transparent);
+}
+
+/* 去掉上下箭头按钮（Chromium 老式滚动条的默认件） */
+.gw-dock-thread::-webkit-scrollbar-button,
+.gw-dock-history::-webkit-scrollbar-button {
+  display: none;
+}
+
+.gw-dock-thread {
+  display: flex;
+  flex-direction: column;
+  /*
+   * 间距 8 → 6：一轮回答常常是「工具活动 + 一条正文」两三个节点，
+   * 8px 在每条缝上都出现，叠起来就是用户说的"空白很大、很浪费"。
+   * 真正需要拉开的是**不同轮之间**，那由 `.gw-dock-turn` 的 margin 负责。
+   */
+  gap: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 120px;
+  /* flex 子项要能收缩到内容以下才谈得上滚动；少了这行，长回答会把面板顶高 */
+  flex: 1 1 auto;
+  padding: 2px;
+}
+
+.gw-dock-msg {
+  border-radius: 10px;
+  padding: 8px 10px;
+  max-width: 92%;
+  /*
+   * ⚠️ `pre-wrap` 原先写在 `.gw-dock-msg` 上，于是**继承进了 markdown 正文**：
+   * marked 生成的 `<ul>\n<li>…</li>\n<li>…</li>\n</ul>` 里，标签之间的换行在
+   * `pre-wrap` 下会各自生成一个空的行盒，每个列表项因此白多出约 28px
+   * （改前实测：一条三行的列表 `<ul>` 高 147px，单项 49px 而文字只有 21px）。
+   * 它只对**流式期间的纯文本**有意义（那里确实要保留换行），故下移到 `.gw-dock-text`。
+   */
+  word-break: break-word;
+}
+
+.gw-dock-msg-user {
+  align-self: flex-end;
+  background: color-mix(in srgb, var(--color-ink) 10%, transparent);
+}
+
+.gw-dock-msg-ai {
+  align-self: flex-start;
+  background: transparent;
+  padding-left: 2px;
+}
+
+.gw-dock-msg-tool,
+.gw-dock-tool {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.gw-dock-msg-tool {
+  align-self: flex-start;
+}
+
+/*
+ * 工具摘要（用户原话："回答完后，所有工具的使用都会堆积在下面，感觉不好"）。
+ * 默认只剩一行：`本次用了 N 个工具：a、b`，点开才铺开明细；流式期间由组件直接铺开
+ * （那时它是进度指示器）。收起/展开是受控状态，箭头只做 90° 旋转，不换图标。
+ */
+.gw-dock-tools {
+  margin: 0;
+}
+
+.gw-dock-tools-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-muted);
+  text-align: left;
+  cursor: pointer;
+}
+
+.gw-dock-tools-toggle:hover {
+  color: var(--color-ink);
+}
+
+.gw-dock-tools-toggle-bad {
+  color: var(--color-danger);
+}
+
+.gw-dock-tools-chevron {
+  display: inline-flex;
+  flex: none;
+  transition: transform 150ms var(--ease-standard);
+}
+
+.gw-dock-tools-chevron-open {
+  transform: rotate(90deg);
+}
+
+.gw-dock-tools-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gw-dock-tool {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  border-left: 2px solid var(--color-line-strong);
+  padding-left: 8px;
+}
+
+.gw-dock-tool-bad {
+  border-left-color: var(--color-danger);
+}
+
+.gw-dock-tool-name {
+  font-weight: 600;
+}
+
+.gw-dock-tool-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+  opacity: 0.8;
+}
+
+.gw-dock-empty,
+.gw-dock-thinking {
+  opacity: 0.6;
+  font-size: 13px;
+  margin: 0;
+}
+
+.gw-dock-warn,
+.gw-dock-error {
+  margin: 0;
+  font-size: 13px;
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.gw-dock-warn {
+  background: var(--color-warn-bg);
+  color: var(--color-warn-ink);
+}
+
+.gw-dock-error {
+  background: var(--color-danger-bg);
+  color: var(--color-danger-ink);
+}
+
+/* markdown 渲染结果的基础排版（宿主的消毒管线只保证安全，不保证好看） */
+/*
+ * 只有**它**需要 `pre-wrap`：流式期间正文还没成形，换行就是原文的换行。
+ * markdown 渲染后的 HTML 反过来——标签之间的缩进与换行是**源码噪声**，
+ * 保留它们等于凭空插入空行（这正是"消息之间空白很大"的根因，见 `.gw-dock-msg` 的注释）。
+ */
+.gw-dock-text {
+  white-space: pre-wrap;
+}
+
+.gw-dock-md {
+  white-space: normal;
+}
+
+.gw-dock-md > :first-child {
+  margin-top: 0;
+}
+
+.gw-dock-md > :last-child {
+  margin-bottom: 0;
+}
+
+/*
+ * 块间距：宿主 `.md-body` 那套是给**整页阅读**用的（段落之间要透气），
+ * 这里是面板里的一小块回答，同一套尺度会显得空。
+ * 统一压到 0.6em，并由相邻兄弟选择器去掉重复的上下边距之和。
+ */
+.gw-dock-md p,
+.gw-dock-md ul,
+.gw-dock-md ol,
+.gw-dock-md blockquote,
+.gw-dock-md pre,
+.gw-dock-md table {
+  margin: 0.6em 0;
+}
+
+.gw-dock-md h1,
+.gw-dock-md h2,
+.gw-dock-md h3,
+.gw-dock-md h4 {
+  margin: 0.9em 0 0.45em;
+  font-size: 1em;
+  font-weight: 600;
+}
+
+.gw-dock-md h1,
+.gw-dock-md h2 {
+  font-size: 1.06em;
+}
+
+.gw-dock-md li + li {
+  margin-top: 0.15em;
+}
+
+.gw-dock-md li > p {
+  margin: 0.2em 0;
+}
+
+.gw-dock-md pre {
+  overflow: auto;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--color-sunken);
+  /* 代码块自己会滚动，同样收一下滚动条 */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-ink) 22%, transparent) transparent;
+}
+
+.gw-dock-md pre::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.gw-dock-md pre::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  background-color: color-mix(in srgb, var(--color-ink) 22%, transparent);
+}
+
+.gw-dock-md code {
+  font-size: 0.92em;
+}
+
+.gw-dock-md ul,
+.gw-dock-md ol {
+  padding-left: 1.3em;
+}
+
+/* 表格：模型很爱用它罗列页面，宿主那套 `.md-body table` 在这里不生效，得自己给 */
+.gw-dock-md table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.95em;
+}
+
+.gw-dock-md th,
+.gw-dock-md td {
+  border: 1px solid var(--color-line);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.gw-dock-md th {
+  background: var(--color-sunken);
+  font-weight: 600;
+}
+
+.gw-dock-md blockquote {
+  border-left: 2px solid var(--color-line-strong);
+  padding-left: 8px;
+  color: var(--color-muted);
+}
+
+.gw-dock-md hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 0.8em 0;
+}
+
+/*
+ * 焦点态。
+ *
+ * `.gw-dock-input` 上面刻意写了 `outline: none`（输入框自己的描边会顶掉文字的呼吸感），
+ * 但**去掉原生焦点环必须同时补一个替代品**——否则键盘用户完全看不到焦点在哪
+ * （WCAG 2.4.7）。这个缺口是 P2b 漏掉的：它当时的守卫只覆盖 ai-qa 的样式表，
+ * 直到 P3 把 `@geewiki/ai-assistant` 也纳进 `web/test/pluginUi.test.ts` 的循环才暴露出来。
+ *
+ * 输入框的替代品放在容器上（`:focus-within`），与视觉设计一致；
+ * 按钮与链接各自带环（它们是独立的 Tab 停靠点）。
+ */
+.gw-dock-row:focus-within {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+}
+
+.gw-dock-btn:focus-visible,
+.gw-dock-icon:focus-visible,
+.gw-dock-history-item:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/*
+ * 回退入口（P4）。它是**破坏性操作前的最后一道说明**，所以文案区必须放得下
+ * "哪一处没撤、为什么"——只报成功的回退界面等于说谎。
+ */
+.gw-dock-undo {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-sunken);
+}
+
+.gw-dock-undo-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.gw-dock-undo-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gw-dock-undo-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.gw-dock-undo-what {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.gw-dock-btn-small {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+/* 回退的说明可能有多行（含每一条没撤的原因），故要保留换行 */
+.gw-dock-undo-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  white-space: pre-line;
+  color: var(--color-muted);
+}
+
+/* 新按钮同样是独立的 Tab 停靠点 ⇒ 必须自带焦点环（WCAG 2.4.7） */
+.gw-dock-btn-small:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ============================ 「这不是知识库内容」标注（需求 ⑥） ============================ */
+
+/*
+ * 醒目是**设计目标**，不是装饰：需求 ⑥ 的原文是"必须显著标注"。
+ * 但它不能做成红色告警——红色读作"出错了"，而这条回答可能完全正确，
+ * 我们知道的只是"它没有出处"。故用琥珀系的左框 + 标签块：一眼能看出与正文不同，
+ * 又不暗示"这句话是错的"。
+ */
+.gw-dock-ungrounded {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--color-warn);
+  background: var(--color-sunken);
+  border-radius: var(--radius-sm);
+}
+
+.gw-dock-ungrounded-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-warn-ink);
+}
+
+.gw-dock-ungrounded-text {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-muted);
+}
+
+/* ============================ 「依据的是公开网络资料」标注 ============================ */
+
+/*
+ * 与上面那条**同形不同色**：布局一致（用户不必重新认一个东西），
+ * 但用强调色而不是琥珀色。理由不是装饰——琥珀色在这套界面里读作"没有出处、请当心"，
+ * 而这一档**是有出处的**，只是出处不在本知识库里。用同一个色会把它说成同一个事实。
+ * 蓝色读作"这是一条信息"，与"这条回答没有依据"的警告语气区分得开。
+ */
+.gw-dock-webgrounded {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--color-accent);
+  background: var(--color-sunken);
+  border-radius: var(--radius-sm);
+}
+
+.gw-dock-webgrounded-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+.gw-dock-webgrounded-text {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-muted);
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@geewiki/ai-kb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki AI 知识库工具：把「列页 / 检索 / 读页」三个动作作为工具注册到 AI 工具总线",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/ai-tools": "workspace:*",
+    "@geewiki/core": "workspace:*",
+    "@geewiki/search": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@geewiki/wiki": "workspace:*",
+    "@types/node": "^22.0.0"
+  }
+}

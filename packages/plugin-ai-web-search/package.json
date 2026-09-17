@@ -1,0 +1,23 @@
+{
+  "name": "@geewiki/ai-web-search",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki 联网搜索工具：把「在公开互联网上检索」作为只读工具注册到 AI 工具总线（优先适配 AnySearch）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/ai-tools": "workspace:*",
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10",
+    "schemastery": "3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

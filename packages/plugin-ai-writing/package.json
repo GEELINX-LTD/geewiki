@@ -1,0 +1,22 @@
+{
+  "name": "@geewiki/ai-writing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GeeWiki AI 编辑框工具插件：把读草稿 / 读选区 / 插入 / 替换选区四个动作作为客户端工具提供给 AI 助手（处理器由宿主的 lib/editorTools.ts 实现）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@geewiki/ai-tools": "workspace:*",
+    "@geewiki/core": "workspace:*",
+    "cordis": "^4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

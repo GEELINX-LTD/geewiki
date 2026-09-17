@@ -1,0 +1,41 @@
+-- 0001_ai_mutations.sql —— AI 变更日志（设计文档 §4，决策 3 / 10 / 11 / 14）
+--
+-- 为什么这张表由 @geewiki/ai-journal 自己建、而不是塞进 pages 或某个业务表：
+-- 它记的是**跨域**的写操作（页面正文、编辑器草稿、插件启停、插件配置），
+-- 而"哪些域存在"是会随插件增加而变的。挂在某一个域的表上，等于宣布
+-- 那个域是"主域"——下一个域就得改这张表的宿主，而那时它已经在生产里了。
+--
+-- ## before / after 为什么是文本而不是 JSON diff
+-- 逆操作要的是"把它变回去"，而各域的"变回去"形态完全不同：页面是整篇正文、
+-- 编辑器是一段草稿、插件启停是一个布尔。用文本快照把它们统一起来，
+-- 代价是存储更大，换来的是**这张表不需要理解任何业务域**——而一旦它开始理解业务域，
+-- 它就成了第二个 wiki，两份判据必然漂移。
+
+CREATE TABLE IF NOT EXISTS ai_mutations (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 决策 9 的本地会话 id。服务端**只存 id，不存对话内容**（对话在浏览器里）
+  conversation_id TEXT    NOT NULL,
+  -- ★ 决策 10 的回退粒度：**一次用户提问**，而不是一次 HTTP 回合。
+  -- 无状态轮次协议下一次提问可能横跨多个 HTTP 回合（P3 实测：2 个），
+  -- 而用户心里的"那一轮"是他问的那一句话。故 turn_id 由客户端生成、整段保持不变。
+  turn_id         TEXT    NOT NULL,
+  owner           TEXT    NOT NULL,   -- 哪个插件做的（卸载时按 owner 清理）
+  tool            TEXT    NOT NULL,   -- 工具名（如 page.update / editor.insert_text）
+  domain          TEXT    NOT NULL,   -- 撤销执行体按它挑选（page / editor / plugin …）
+  target          TEXT    NOT NULL,   -- 页面 slug / 编辑器 docId / 插件名
+  before          TEXT,               -- NULL = 此前不存在（撤销就是删除）
+  after           TEXT,               -- NULL = 变更后不存在；冲突检测拿它与当前值比对
+  at              TEXT    NOT NULL,   -- ISO8601
+  undone_at       TEXT                -- 已撤销时刻；NULL = 未撤销（已撤销的不再参与回退）
+);
+
+-- 回退 UI 的主查询是"给我这个会话的所有轮次，最近的在前"。
+-- 它也顺带覆盖了 `WHERE conversation_id = ? AND turn_id = ?`（前缀相同）。
+CREATE INDEX IF NOT EXISTS idx_ai_mutations_conversation
+  ON ai_mutations(conversation_id, turn_id);
+
+-- 部分索引：待回退的记录通常是全表里很小的一部分，而回退路径要反复读它。
+-- `WHERE undone_at IS NULL` 让这个索引只索引"还有效"的行——已撤销的历史
+-- 会随时间无限增长，把它们留在索引里等于让查询随历史变慢。
+CREATE INDEX IF NOT EXISTS idx_ai_mutations_pending
+  ON ai_mutations(conversation_id) WHERE undone_at IS NULL;
