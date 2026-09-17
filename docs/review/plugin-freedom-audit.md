@@ -779,6 +779,102 @@ pnpm run install-plugin --verify [--json]
 
 ---
 
+### 邀请注册模型改造（用户提出并逐条确认；OIDC 明确不动）
+
+用户对现状的判断是「当前的逻辑感觉不是很好」，提出：管理员/owner 签发邀请码、持码者自行注册、
+**不要再绑定邮箱**、注册时自填邮箱/用户名/口令、之后可在账号页修改。逐条确认后定为：
+邀请码**一次性**（与今天一致）、「用户名」= **显示名**（不唯一、不能登录，登录仍用邮箱）、
+**OIDC 本轮一行不改**。
+
+#### 原模型的两个叠加问题（都查实了）
+
+1. **邮箱绑死**：`invitations.email` 是 `NOT NULL`，而 `redeem` 的请求体只有
+   `{token, password, displayName}` —— 邮箱是从邀请里取出来的。也就是说**登录标识符由管理员代填**，
+   被邀请人无法使用自己的邮箱。
+2. **兑换没有界面**：卡片把令牌显示成「邀请链接」并给一个「复制链接」按钮，
+   但全仓 grep 不到任何消费那个令牌的路由（`#/invite` / `invite=` / `redeemInvitation` 全为空），
+   `api.ts` 里连这两个方法都没有定义。实际要开一个本地账号，被邀请人**必须自己发 HTTP 请求**
+   —— `scripts/seed-demo.sh` 与四个 e2e 脚本就是这么做的。这与审计页那四个端点是同一类问题。
+
+#### 落地
+
+- **数据层**：新增 `0022_invitation_open_code.sql`（SQLite + PG 双份），`email` 改为可空。
+  `NULL` = 通用码（持码者自填邮箱）；非 NULL = 定向码（邮箱必须相等）——
+  **定向码这一半必须保留**，因为 OIDC 的 `invite_only` 闸门就是**按邮箱查这张表**的
+  （`plugin-auth` 的 `hasUnconsumedInvite`），删列会让它失去判据。
+  SQLite 没有 `ALTER COLUMN` ⇒ 这是**本仓第一个表重建迁移**（CREATE / INSERT SELECT /
+  DROP / RENAME）。`invitations` 是叶子表（没有任何表引用它），故 `foreign_keys=ON` 下安全。
+- **后端**：签发端点的 `email` 变**可选**（填了仍照常校验格式 —— "可选"不等于"不校验"，
+  否则会签发出永远无法兑换的定向码且管理员看不出来）；`redeem` 接 `email`
+  （定向码以邀请为准、传了不一致就 403；通用码必填，缺失 ⇒ 400 `email_required`）；
+  **新增 `POST /api/auth/profile`**（改邮箱/用户名），必须验当前口令、唯一性对齐
+  `idx_users_org_email`、审计写全 `before`/`after`。
+- **前端**：新增 `#/invite/<token>` 页面（补上那条断链：未登录 ⇒ 开户 + 自动登录；
+  已登录 ⇒ 凭码入伙）；账号页新增「资料」卡片，并把那个**调用者数量为 0** 的
+  `authChangePassword` 也接上（此前这一页只有状态徽标、没有任何操作）；邀请卡片给出
+  **真正的可点链接**。
+
+#### 两处守卫的**有意调整**（都不是绕过）
+
+- `orgPage.test.ts` 原先**一律禁止** `window.location`，理由是"令牌不得进 URL"。
+  该前提已不成立（现在有接受邀请的页面了）。收窄为：禁**写入** location/history、
+  允许**读 origin 拼接**，并把剩余暴露面写清 —— 哈希片段**不发给服务端** ⇒ 不进访问日志、
+  不随 Referer 外泄（`?token=` 两样都会）；残留只有被邀请人自己的浏览器历史。
+- `slug-hierarchy.test.ts` 的迁移可重放性判据原先跑在**原始文本**上，而 0022 的头注释里写了
+  "（0012/0017/0019/0020 全是 ADD COLUMN）" ⇒ 被误判成不可重放，报
+  `Missing expected exception`。改为**剥注释后分类** —— 本仓第 7 次踩这个坑。
+
+#### 顺带修掉一条**既有的**红断言
+
+`e2e-p2-org.sh` 的 E2 断言 member `GET /api/org/members` → 403，但该端点早已刻意放宽为
+`access:'user'`（handler 里有明确注释）。它不在 `pnpm test` 里，所以一直没人发现。
+已改成断言真正的语义：member 读得到列表、**过不了 admin 动作**。
+
+#### 验证读数
+
+- `pnpm run typecheck`：28 个项目 + `scripts/`、`error TS` = 0、exit 0（`data/verify/tc-invitefe.log`）。
+- `pnpm run test`：**2235 例 / 2235 通过 / 0 失败**（`data/verify/test-invitefe.log`）。
+  新增 `packages/db-sqlite/test/migration-0022.test.ts`（**升级路径**：复现 0022 之前的状态 +
+  造三条数据 + 应用迁移，断言逐列不差、`NULL` 可插、索引重建 ——
+  e2e 跑在空库上，证明不了"旧数据不丢"）与 `packages/web/test/invitePage.test.ts`
+  （跨文件比对链接形态 / 路由 / 公开路由表 / 保留清单，以及"开户 → 自动登录"链路）。
+- `bash packages/plugin-org/test/e2e-p2-org.sh`：**73 项全过**（含通用码自选邮箱、
+  不传邮箱报错、定向码不匹配 403、改资料全链路：错误口令 401 / 邮箱被占 409 /
+  新邮箱能登录 / 旧邮箱不能）。
+- **真实库升级实测**：`data/geewiki.db` 的 0022 已应用，7 条既有邀请的邮箱、组织角色、
+  令牌哈希、`accepted_at` **逐字保留**，两个索引均重建。
+- 渲染实测（headless Chrome 挂真实组件 + 打桩 fetch）：邀请页四个字段与提交按钮齐全；
+  账号页邮箱与用户名已预填、含改口令表单。
+
+#### 顺带查实并修掉：**测试在迁移开发者真实的数据库**
+
+排查 0022 迁移"为什么在我还没重启服务时就被应用了"时发现：
+`packages/server/test/route-access-audit.test.ts` 用 `buildRegistry()` 拿的是**完整默认注册表**，
+里面有 `@geewiki/db-sqlite` —— 而它的缺省路径是 `<仓库根>/data/geewiki.db`
+（`process.env.GEEWIKI_DATA_DIR ?? DEFAULT_DATA_DIR`）。于是该文件 3 个用例**每次跑 `pnpm test`
+都会打开并迁移开发者真实的数据库**，而输出里只有一行不起眼的
+`[db-sqlite] 已就绪: …/data/geewiki.db`。
+
+- **定位方式**：往 `db-sqlite` 的 `apply()` 里插一段"解析到真实 data/ 就打一行带调用栈的日志"，
+  跑全量测试 → 命中 **恰好 3 次**，与那个文件的 3 个 `startServer` 用例一一对上。
+- **更坏的一层**：F12 那个用例断言"匿名访问 admin 端点 ⇒ 401"，而闸门在**空库**时返回
+  **503 bootstrap_required**。也就是说它不仅污染真实库、还**依赖真实库里有账号** ——
+  换一台干净的机器/CI 跑就会以 503 失败。隔离之后必须显式建号（已在用例里补上前置）。
+- **修法**：照 `router.test.ts` 的既有做法，把 `GEEWIKI_DATA_DIR` 指向该用例自己的临时目录，
+  用完还原（它是**进程级**的，不还原会漏给同进程的后续测试）。
+- **验证**：删掉真实库里的 0022 记录 → 跑该测试文件 → 记录**保持为 0**（修复前会被重新写回）；
+  同时该文件 8 项全过。
+
+#### 未做（如实记录）
+
+- **OIDC 一行未改**（用户明确要求再想想）。需要注意的耦合点：`user_identities.email_at_link`、
+  OIDC JIT 开户时的邮箱匹配，以及"通用码不限定邮箱 ⇒ 无法为 OIDC 用户放行"这一事实
+  （OIDC 的 `invite_only` 只能匹配**定向码**）。代码里留了说明，等产品决定。
+- 邀请码**多用途**（一码多人）未做 —— 用户选了"一次性"。
+- 改邮箱**不吊销其它会话**（与改口令对应的是不同威胁，理由写在端点注释里）。
+
+---
+
 ## 1. 健康度实测（客观读数）
 
 ### 1.0 最新读数（F1–F21 全部落地 + 优化点 1/2/3/4/6/7/8）

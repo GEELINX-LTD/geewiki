@@ -29,6 +29,21 @@ import { freePort, waitForHealth } from './helpers.js'
 
 test('★ F11：全量默认路由表的每一条都显式声明了访问等级', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gw-route-audit-'))
+  /*
+   * ★ 数据目录也必须隔离到临时目录（2026-09-17 修）。
+   *
+   * 本文件用 `buildRegistry()` 拿的是**完整默认注册表**，里面包含 `@geewiki/db-sqlite`
+   * —— 而它的缺省路径是 `<仓库根>/data/geewiki.db`（`process.env.GEEWIKI_DATA_DIR
+   * ?? DEFAULT_DATA_DIR`）。于是这 3 个用例此前**每次跑测试都会打开并迁移开发者真实的
+   * 数据库**：新写的迁移会被悄悄地应用在真数据上，而测试输出里只有一行不起眼的
+   * `[db-sqlite] 已就绪: …/data/geewiki.db`。
+   *
+   * 症状是"某次 pnpm test 之后真实库的 _migrations 多了一条"——**没有任何测试失败**，
+   * 所以它可以存在很久（本仓上一批 0022 迁移就是这么被发现被提前应用了的）。
+   * `router.test.ts` 早就在做同样的事（设置同名环境变量 8 处），这里照做。
+   */
+  const previousDataDir = process.env.GEEWIKI_DATA_DIR
+  process.env.GEEWIKI_DATA_DIR = join(dir, 'data')
   const port = await freePort()
   let handle: Awaited<ReturnType<typeof startServer>> | undefined
   try {
@@ -75,12 +90,30 @@ test('★ F11：全量默认路由表的每一条都显式声明了访问等级'
     )
   } finally {
     if (handle) await handle.dispose()
+    // 环境变量是**进程级**的：用完必须还原，否则会漏给同一进程里的后续测试
+    if (previousDataDir === undefined) delete process.env.GEEWIKI_DATA_DIR
+    else process.env.GEEWIKI_DATA_DIR = previousDataDir
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
 test('★ F11：多个插件的路由都进了同一张表且顺序 = 激活顺序', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gw-route-audit2-'))
+  /*
+   * ★ 数据目录也必须隔离到临时目录（2026-09-17 修）。
+   *
+   * 本文件用 `buildRegistry()` 拿的是**完整默认注册表**，里面包含 `@geewiki/db-sqlite`
+   * —— 而它的缺省路径是 `<仓库根>/data/geewiki.db`（`process.env.GEEWIKI_DATA_DIR
+   * ?? DEFAULT_DATA_DIR`）。于是这 3 个用例此前**每次跑测试都会打开并迁移开发者真实的
+   * 数据库**：新写的迁移会被悄悄地应用在真数据上，而测试输出里只有一行不起眼的
+   * `[db-sqlite] 已就绪: …/data/geewiki.db`。
+   *
+   * 症状是"某次 pnpm test 之后真实库的 _migrations 多了一条"——**没有任何测试失败**，
+   * 所以它可以存在很久（本仓上一批 0022 迁移就是这么被发现被提前应用了的）。
+   * `router.test.ts` 早就在做同样的事（设置同名环境变量 8 处），这里照做。
+   */
+  const previousDataDir = process.env.GEEWIKI_DATA_DIR
+  process.env.GEEWIKI_DATA_DIR = join(dir, 'data')
   const port = await freePort()
   let handle: Awaited<ReturnType<typeof startServer>> | undefined
   try {
@@ -111,6 +144,9 @@ test('★ F11：多个插件的路由都进了同一张表且顺序 = 激活顺�
     assert.ok(routes.every((r) => typeof r.explicit === 'boolean'))
   } finally {
     if (handle) await handle.dispose()
+    // 环境变量是**进程级**的：用完必须还原，否则会漏给同一进程里的后续测试
+    if (previousDataDir === undefined) delete process.env.GEEWIKI_DATA_DIR
+    else process.env.GEEWIKI_DATA_DIR = previousDataDir
     rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -194,6 +230,21 @@ after(() => {
 
 test('★ F12：owner 请求计数可枚举，且**被闸门拒绝的请求同样计入**', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gw-owner-stats-'))
+  /*
+   * ★ 数据目录也必须隔离到临时目录（2026-09-17 修）。
+   *
+   * 本文件用 `buildRegistry()` 拿的是**完整默认注册表**，里面包含 `@geewiki/db-sqlite`
+   * —— 而它的缺省路径是 `<仓库根>/data/geewiki.db`（`process.env.GEEWIKI_DATA_DIR
+   * ?? DEFAULT_DATA_DIR`）。于是这 3 个用例此前**每次跑测试都会打开并迁移开发者真实的
+   * 数据库**：新写的迁移会被悄悄地应用在真数据上，而测试输出里只有一行不起眼的
+   * `[db-sqlite] 已就绪: …/data/geewiki.db`。
+   *
+   * 症状是"某次 pnpm test 之后真实库的 _migrations 多了一条"——**没有任何测试失败**，
+   * 所以它可以存在很久（本仓上一批 0022 迁移就是这么被发现被提前应用了的）。
+   * `router.test.ts` 早就在做同样的事（设置同名环境变量 8 处），这里照做。
+   */
+  const previousDataDir = process.env.GEEWIKI_DATA_DIR
+  process.env.GEEWIKI_DATA_DIR = join(dir, 'data')
   const port = await freePort()
   let handle: Awaited<ReturnType<typeof startServer>> | undefined
   try {
@@ -206,6 +257,24 @@ test('★ F12：owner 请求计数可枚举，且**被闸门拒绝的请求同�
     writeFileSync(join(dir, 'plugins.session.json'), `${JSON.stringify({ enabled: [] }, null, 2)}\n`, 'utf8')
     handle = await startServer({ registry: built.registry, port, host: '127.0.0.1', configDir: dir, webDist: null })
     await waitForHealth(port)
+
+    /*
+     * ★ 先**初始化实例**（创建首个账号），再断言闸门行为。
+     *
+     * 闸门在"库里一个可登录账号都没有"时返回 **503 bootstrap_required**（引导语义），
+     * 而不是 401。本用例要在下面断言"匿名访问 admin 端点 ⇒ 401"，那需要一个**已初始化**的实例。
+     *
+     * ⚠️ 这条前置此前**不存在**，而断言照样通过 —— 因为它跑在开发者**真实的 data/** 上
+     * （那里有账号）。也就是说这个用例不仅污染真实库，还**依赖真实库的内容**：
+     * 换一台干净的机器/CI 跑，它就会以 503 失败。隔离之后必须显式建号。
+     */
+    const boot = await fetch(`http://127.0.0.1:${port}/api/auth/setup`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-gw-csrf': '1' },
+      body: JSON.stringify({ email: 'owner@example.com', password: 'ownerpass123', displayName: 'Owner' }),
+    })
+    assert.equal(boot.status, 201, '前置：首个账号应能创建（否则下面那条 401 会变成 503）')
+
     const router = handle.app.get('http') as HttpRouterService
 
     // 内置 manager 的路由声明了 owner（F12 的示范用法）⇒ 未发任何请求时也应出现，且 requests=0
@@ -235,6 +304,9 @@ test('★ F12：owner 请求计数可枚举，且**被闸门拒绝的请求同�
     assert.ok(!owners.includes(''), '空字符串不得成为 owner')
   } finally {
     if (handle) await handle.dispose()
+    // 环境变量是**进程级**的：用完必须还原，否则会漏给同一进程里的后续测试
+    if (previousDataDir === undefined) delete process.env.GEEWIKI_DATA_DIR
+    else process.env.GEEWIKI_DATA_DIR = previousDataDir
     rmSync(dir, { recursive: true, force: true })
   }
 })
