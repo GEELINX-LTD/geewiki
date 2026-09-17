@@ -147,18 +147,43 @@ const baseTheme = EditorView.theme({
   '.cm-activeLine': { backgroundColor: 'var(--gw-surface-hover)' },
   '.cm-activeLineGutter': { backgroundColor: 'var(--gw-surface-hover)', color: 'var(--gw-ink-soft)' },
   /*
-   * ★ 选区用**中间调**的 `--gw-accent-soft-line`，不是 `--gw-accent-soft`。
+   * ★ 选区必须画在**内容之上**，而且必须是**半透明**的。
    *
-   * 后者是给"淡色底"（chip / 提示块）设计的 token：浅色模式 `#eff6ff`、深色模式 `#10203a`，
-   * 与编辑区表面的**亮度几乎一致** ⇒ 选中一片文字在屏幕上**看不出来**（用户报的
-   * 「选中文本不会表现出来」）。选区要的是"与底色明确可分辨"，而不是"含蓄的强调底"。
+   * 为什么不能只改颜色：CodeMirror 的 `drawSelection` 把选区放进 `.cm-selectionLayer`，
+   * 并用**行内样式**给它 `z-index: -1`（`layer({ above: false })`）—— 选区是画在正文
+   * **下面**的。库自己的基础主题因此把活跃行写成半透明的 `#cceeff44`，好让选区透出来。
    *
-   * `--gw-accent-soft-line` 在两种模式下都是中间调（浅色 `--gw-blue-200` /
-   * 深色 `--gw-dk-blue-line`），故不需要为深色模式再写一份。
+   * 而本编辑器有多处**不透明**的行/块底纹：活跃行（上面那条）、源码态的代码块与表格
+   * （`gw-live-code-line` / `gw-live-table-line`）、受限区段（`gw-live-gated-line`），
+   * 以及实时渲染的整块 widget —— 它们把下面的选区**整块盖掉**。
+   *
+   * 实测（headless Chrome 逐像素取色，选中 6 个字）：选区内与**同行未选处同为
+   * `#eef2f7`**，即"选了等于没选"。这也解释了上一次只换 token 为何看不出变化 ——
+   * 除了被底纹挡住，那条规则的优先级**本来就低于**库的基础主题
+   * （`.ͼL.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground`
+   * 有 5 个类选择器），实测真正生效的一直是库的 `#d7d4f0`。
+   *
+   * 故这里做两件事，缺一不可：
+   *   1. 把选区层抬到内容之上 —— 行内 `z-index` 只能用 `!important` 覆盖；
+   *   2. 颜色换成**半透明**的 `--gw-selection-bg`，让底下的字仍然可读。
+   * `!important` 同时解决上面那条优先级问题（`--gw-selection-bg` 只是被 `var()` 包着，
+   * 不会让 `!important` 失效）。
+   *
+   * 为什么不反过来把那些底纹都改成半透明：它们（尤其受限区段）本来就是**实底**语义，
+   * 改成半透明既削弱了表达，也挡不住将来新增的不透明装饰 —— 而这一处改完，
+   * 选区在活跃行、代码块、表格、受限区段、渲染块上都可见。
    */
-  '.cm-selectionBackground, ::selection': { backgroundColor: 'var(--gw-accent-soft-line)' },
-  '&.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--gw-accent-soft-line)' },
-  // 高亮"与选区相同的其它匹配"（`highlightSelectionMatches`）——比选区更轻一档，故意不同
+  '.cm-selectionLayer': {
+    zIndex: '1 !important',
+    /* 抬到内容之上后**必须让出鼠标事件**：否则在选区上按下无法重新开始选择 */
+    pointerEvents: 'none',
+  },
+  '.cm-selectionBackground': { backgroundColor: 'var(--gw-selection-bg) !important' },
+  /*
+   * 原生 `::selection` 不用再管：`drawSelection` 自带 `hideNativeSelection`，
+   * 已把编辑区内的原生选区置为 `transparent !important`（见 @codemirror/view 的 baseTheme）。
+   */
+  // 高亮"与选区相同的其它匹配"（`highlightSelectionMatches`）——它画在文字层里，故用实底
   '.cm-selectionMatch': { backgroundColor: 'var(--gw-accent-soft)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--gw-accent)' },
   '.cm-placeholder': { color: 'var(--gw-ink-muted)', fontStyle: 'normal' },
