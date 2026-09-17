@@ -188,13 +188,39 @@ check "I6b ★ 新邮箱能登录（登录标识符真的换了）" 200 "$(req "
 check "I6c ★ 旧邮箱**不能**再登录" 401 "$(req_raw POST /api/auth/login '{"email":"member@example.com","password":"memberpass123"}')"
 
 echo
+echo "=== J. 邀请码换发（随时能拿到一个可用的码，且库里仍不存明文） ==="
+check "J1 签发一条待用邀请" 201 "$(req "$JAR" POST /api/org/invitations '{"orgRole":"member"}')"
+ROT_ID=$(field invitation.id)
+ROT_A=$(field token)
+check "J2 ★ 换发 → 200" 200 "$(req "$JAR" POST "/api/org/invitations/$ROT_ID/rotate")"
+ROT_B=$(field token)
+[[ -n "$ROT_B" && "$ROT_B" != "$ROT_A" ]] && ok "J2b 新令牌与旧的不同（长度 ${#ROT_B}）" || bad "J2b 换发没有产生新令牌"
+check "J3 ★ 旧令牌**已作废**（兑换 → 400）" 400 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$ROT_A\",\"email\":\"rot-old@example.com\",\"password\":\"rotpass12345\"}")"
+check "J4 ★ 新令牌可用（兑换 → 201）" 201 "$(req_raw POST /api/org/invitations/redeem "{\"token\":\"$ROT_B\",\"email\":\"rot-new@example.com\",\"password\":\"rotpass12345\"}")"
+check "J5 ★ 已接受的邀请**不得**换发（否则第二个人也能用它进来）" 409 "$(req "$JAR" POST "/api/org/invitations/$ROT_ID/rotate")"
+check "J5b 错误码 already_accepted" "already_accepted" "$(field error)"
+
+# 造一条已过期的邀请：直接把 expires_at 改到过去（不走时间旅行）
+check "J6 再签一条（用来造过期）" 201 "$(req "$JAR" POST /api/org/invitations '{"orgRole":"member"}')"
+EXP_ID=$(field invitation.id)
+node -e "
+const D=require('$ROOT/packages/db-sqlite/node_modules/better-sqlite3');
+const db=new D('$TMP/data/geewiki.db');
+db.prepare('update invitations set expires_at = ? where id = ?').run('2020-01-01T00:00:00Z', process.argv[1]);
+" "$EXP_ID"
+check "J7 ★ 已过期的邀请 → 409（换发**不**代替续期）" 409 "$(req "$JAR" POST "/api/org/invitations/$EXP_ID/rotate")"
+check "J7b 错误码 invitation_expired" "invitation_expired" "$(field error)"
+check "J8 ★ member 不得换发" 403 "$(req "$JAR3" POST "/api/org/invitations/$ROT_ID/rotate")"
+check "J9 不存在的邀请 → 404" 404 "$(req "$JAR" POST /api/org/invitations/does-not-exist/rotate)"
+
+echo
 echo "=== H. 审计留痕 ==="
 AUD=$(node -e "
 const D=require('$ROOT/packages/db-sqlite/node_modules/better-sqlite3');
 const db=new D('$TMP/data/geewiki.db',{readonly:true});
 const rows=db.prepare('select action, count(*) c from audit_log group by action order by action').all();
 for (const r of rows) console.error('      '+r.action+' x'+r.c);
-const need=['org.invitation.create','org.invitation.redeem','org.group.create','org.member.set_role','org.group.add_member','user.profile.update'];
+const need=['org.invitation.create','org.invitation.redeem','org.group.create','org.member.set_role','org.group.add_member','user.profile.update','org.invitation.rotate'];
 const have=rows.map(r=>r.action);
 console.log(need.every(a=>have.includes(a))?'OK':'MISSING:'+need.filter(a=>!have.includes(a)).join(','));
 const leak=db.prepare(\"select count(*) c from audit_log where coalesce(after_json,'') like ? or coalesce(before_json,'') like ?\").get('%$TOKEN%','%$TOKEN%').c;

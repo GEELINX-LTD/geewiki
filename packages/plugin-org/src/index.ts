@@ -963,6 +963,108 @@ export const OrgPlugin = {
       ),
     )
 
+    /* ==================== POST /api/org/invitations/:id/rotate（admin） ====================
+     *
+     * ## 它解决什么
+     *
+     * 原始令牌**只在签发那一次响应里出现**，库里只有 sha256（与会话 cookie 同一纪律：
+     * DB 泄露不足以让人冒用）。代价是"签发即失联"：管理员关掉那个提示框之后就再也拿不到
+     * 那个码了，只能撤销重发一条邀请 —— 而"撤销 + 重建"会丢掉这条邀请已经带上的
+     * `org_role` / `group_id` 配置，也让列表里平白多出一行已撤销的垃圾。
+     *
+     * 本端点给的是**换发**：为**同一条**邀请生成一个新令牌（旧的立即作废）。
+     * 于是"随时能拿到一个可用的码"与"库里不存明文"两件事可以同时成立 ——
+     * 这正是选择换发而不是"把码明文存起来、列表里直接显示"的理由：
+     * 后者会让一份数据库泄露（备份、只读账号、注入读路径）直接变成**可开号**的凭据。
+     *
+     * ## 三条边界（都是"写错了不会报错"的那类）
+     *
+     * 1. **只能换发"未接受且未过期"的**。已接受的换发等于把一次性的邀请重新变成可用 ——
+     *    会让**第二个人**用同一个邀请进来，直接破坏"一人一码"。
+     * 2. **已过期的拒绝，而不是顺手延长有效期**。延长是另一个决定（"再给他 7 天"），
+     *    混进换发里会让"我只是想再复制一次链接"变成"我悄悄给他续了 7 天"。
+     * 3. **换发 owner 邀请需要 owner**，与签发时同一判据 —— 否则一个 admin 只要找到
+     *    一条 owner 邀请（哪怕是别人签的），换发一下就能自己用掉，绕开
+     *    "admin 不得签发 owner 邀请"那条限制。
+     */
+    cleanups.push(
+      router.register(
+        'POST',
+        '/api/org/invitations/:id/rotate',
+        async (h) => {
+          if (!requireAdmin(h)) return
+          const id = h.params.id ?? ''
+          if (id.length === 0) {
+            h.json(400, { ok: false, error: 'invalid_id', message: '缺少邀请 id' })
+            return
+          }
+          const rows = await db.query<{
+            email: string | null
+            org_role: string | null
+            expires_at: string
+            accepted_at: string | null
+          }>(
+            'SELECT email, org_role, expires_at, accepted_at FROM invitations WHERE id = ? AND org_id = ?',
+            [id, DEFAULT_ORG_ID],
+          )
+          const invite = rows[0]
+          if (!invite) {
+            h.json(404, { ok: false, error: 'invitation_not_found', message: '邀请不存在' })
+            return
+          }
+          const now = new Date().toISOString()
+          if (invite.accepted_at !== null) {
+            h.json(409, {
+              ok: false,
+              error: 'already_accepted',
+              message: '这条邀请已经被使用过了 —— 换发会让另一个人也能凭它进来',
+            })
+            return
+          }
+          if (invite.expires_at <= now) {
+            h.json(409, {
+              ok: false,
+              error: 'invitation_expired',
+              message: '这条邀请已过期，请重新签发一条（换发不会顺带延长有效期）',
+            })
+            return
+          }
+          if (invite.org_role === 'owner' && h.principal?.orgRole !== 'owner') {
+            h.json(403, { ok: false, error: 'forbidden', message: '换发 owner 邀请需要 owner 权限' })
+            return
+          }
+
+          const rawToken = randomBytes(32).toString('base64url')
+          await db.run('UPDATE invitations SET token_hash = ? WHERE id = ? AND org_id = ?', [
+            tokenHashOf(rawToken),
+            id,
+            DEFAULT_ORG_ID,
+          ])
+          audit({
+            action: 'org.invitation.rotate',
+            targetKind: 'invitation',
+            targetId: id,
+            actorId: h.principal?.userId ?? null,
+            actorIpHash: auditIpHash(clientIp(h.req)),
+            // 同样**不记令牌**（审计表是长期留存物）
+            after: { email: invite.email, orgRole: invite.org_role, expiresAt: invite.expires_at },
+          })
+          h.json(200, {
+            ok: true,
+            id,
+            email: invite.email,
+            expiresAt: invite.expires_at,
+            /*
+             * 新令牌**只在这**一次响应里出现，与签发端点同款：旧的那个已经作废，
+             * 库里仍然只有新哈希。
+             */
+            token: rawToken,
+          })
+        },
+        { access: 'admin' },
+      ),
+    )
+
     /* ==================== POST /api/org/invitations/purge（admin） ====================
      *
      * ⚠️ **这不是"让过期邀请失效"的手段** —— 失效在**兑换判定时**就已经发生：

@@ -1266,6 +1266,23 @@ export const api = {
       '/api/org/invitations/redeem',
       body,
     ),
+  /**
+   * **换发**邀请码：为同一条邀请生成一个新令牌（旧的立即作废）。
+   *
+   * 原始令牌只在签发那一次响应里出现，库里只有 sha256（与会话 cookie 同一纪律：
+   * DB 泄露不足以让人冒用）。代价是"签发即失联" —— 本端点就是那个出口：
+   * 随时可以再要一个**新**的，而不必"撤销 + 重建"（后者会丢掉这条邀请的
+   * `orgRole` / `groupId` 配置）。
+   *
+   * 三种情况会被拒（见 `plugin-org` 该端点）：
+   * 已接受的（409 `already_accepted`）、已过期的（409 `invitation_expired`）、
+   * 换发 owner 邀请但不是 owner（403）。
+   */
+  rotateInvitation: (id: string) =>
+    request<{ ok: true; id: string; email: string | null; expiresAt: string; token: string }>(
+      'POST',
+      `/api/org/invitations/${encodeURIComponent(id)}/rotate`,
+    ),
   /** 已登录用户凭邀请码**入伙**（不再开户） */
   acceptInvitation: (token: string) =>
     request<{ ok: true; alreadyMember: boolean; orgRole: OrgRole | null }>(
