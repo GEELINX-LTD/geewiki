@@ -122,10 +122,23 @@ docker compose up -d --force-recreate geewiki-app
 
 详细的挂载、权限、环境变量与备份恢复见 `docs/deployment.md`。
 
-> **首次发布后需手动设置镜像可见性**：GHCR 上的 package 默认是 **private**，
-> 即使仓库是 public 也一样。公开分发需到
-> `https://github.com/orgs/GEELINX-LTD/packages` 打开该 package 的
-> Package settings → Change visibility → Public。
+> **镜像包默认是 private，且只能手动改**：GHCR 上的 package 默认是 **private**，
+> 即使仓库是 public 也一样。**改可见性需要「包级管理员」权限，无法用仓库自带的
+> `GITHUB_TOKEN` 完成**（已实测：GITHUB_TOKEN 能读到 `visibility`，但
+> `PATCH /orgs/{org}/packages/container/{name}` 返回 `404 Not Found`；
+> 细粒度 PAT 若未勾选 Packages 权限，则连包列表都读不到，返回 403）。
+>
+> 修改步骤（约 30 秒）：
+>
+> 1. 打开 `https://github.com/orgs/GEELINX-LTD/packages/container/geewiki/settings`
+> 2. 页面底部 **Danger Zone** → **Change package visibility**
+> 3. 选择 **Public** 并确认
+>
+> 或者：给 PAT 加上 **Packages: Read and write** 权限后，用该 PAT 执行
+> `gh api -X PATCH /orgs/GEELINX-LTD/packages/container/geewiki -f visibility=public`。
+>
+> 发布流水线里有一个**只读巡检**步骤，会把当前可见性打进 Actions 日志；
+> 若仍是 private 会输出一条 notice 提醒。
 
 ---
 
@@ -137,6 +150,13 @@ docker compose up -d --force-recreate geewiki-app
   minor/patch 合并为单个 PR 以降低噪音，major 单独开 PR 便于逐个评估。
 - **github-actions**：`actions/*`、`docker/*` 等 action 版本。
 - **docker**：`Dockerfile` 的基础镜像 `node:22-bookworm-slim`。
+
+  > ⚠️ **Node 大版本升级要留意随镜像内置工具的变化**：Node 26 起官方镜像
+  > **不再内置 corepack**，`corepack enable` 会直接报 `corepack: not found`
+  > （exit 127）。本仓 Dockerfile 已改用 `npm install -g pnpm@<packageManager 版本>`，
+  > 因此不受影响。这也是为什么 PR 阶段的 `docker-build` 作业值得保留 ——
+  > 四个代码门禁跑在 runner 的 Node 22 上，**只有它会真正用新基础镜像构建**，
+  > 从而拦住这类只在升级镜像后才暴露的破坏。
 
 ---
 
@@ -156,17 +176,31 @@ docker compose up -d --force-recreate geewiki-app
   需要重构 UI 才能收敛。当前只启用经典子集：`rules-of-hooks` 报错、
   `exhaustive-deps` 警告（不阻断）。
 
-## 7. 建议：为 main 配置分支保护
+## 7. main 分支保护（已启用）
 
-CI 只有在被强制时才能拦住合入。建议在
-`Settings → Rules → Rulesets` 为 `main` 添加规则，要求以下状态检查通过后再合并：
+仓库已有一个名为 **`main-protection`** 的 ruleset（target: branch，
+enforcement: active，作用于默认分支），包含四条规则：
 
-```
-lint
-typecheck
-test
-build
-```
+| 规则 | 作用 |
+|---|---|
+| `deletion` | 禁止删除 `main` |
+| `non_fast_forward` | 禁止强推（force push） |
+| `pull_request` | 合入必须走 PR（批准人数要求 0） |
+| `required_status_checks` | 必须通过以下检查，且要求分支为最新 |
+
+必需的状态检查：`lint`、`typecheck`、`test`、`build`
+
+**管理员豁免**：ruleset 的 bypass 列表里放了 `RepositoryRole` = admin，
+`bypass_mode: always`，因此仓库管理员仍可直接推 `main`（API 返回的
+`current_user_can_bypass` 为 `always`）。这样做是为了不改变本仓库既有的
+直推习惯，同时对其他贡献者强制走 PR + 门禁。
 
 > 作业名刻意使用 ASCII（而非中文描述），就是为了让这些检查名便于在 ruleset 里填写与维护。
-> **改动 `.github/workflows/ci.yml` 中的 `name:` 时，需同步更新 ruleset。**
+> **改动 `.github/workflows/ci.yml` 中的 `name:` 时，需同步更新 ruleset**，否则检查会一直
+> 处于 pending 而无法合入。
+>
+> 查看 / 修改：`https://github.com/GEELINX-LTD/geewiki/rules/23638645`，
+> 或用 API：`gh api /repos/GEELINX-LTD/geewiki/rulesets`。
+
+> ⚠️ 不要给 PR 加 `paths-ignore`（例如跳过纯文档改动）。一旦某个必需检查因路径过滤而
+> 从未上报，PR 会永久卡在 pending 无法合并。
