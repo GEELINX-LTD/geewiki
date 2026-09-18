@@ -8,6 +8,7 @@ node_modules
 
 # ── 版本控制与编辑器 ───────────────────────────────────────────────────
 .git
+.github
 .gitignore
 .gitattributes
 .vscode
