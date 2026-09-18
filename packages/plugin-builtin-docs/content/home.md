@@ -7,10 +7,10 @@ GeeWiki 是一个 **AI 原生的团队知识库**：页面、权限、检索、�
 
 | 篇目 | 讲什么 |
 | --- | --- |
-| [[guide/architecture|架构]] | 引擎分层、插件机制、权限模型、AI 链路 |
-| [[guide/features|功能介绍]] | 每个功能在哪里、谁能用、怎么开 |
-| [[guide/markdown-demo|Markdown 演示]] | 书写格式支持什么、不支持什么 |
-| [[guide/special-structures|特殊结构]] | 层级 slug、wikilink、受限块、版本、附件 |
+| [[guide/architecture\|架构]] | 引擎分层、插件机制、权限模型、AI 链路 |
+| [[guide/features\|功能介绍]] | 每个功能在哪里、谁能用、怎么开 |
+| [[guide/markdown-demo\|Markdown 演示]] | 书写格式支持什么、不支持什么 |
+| [[guide/special-structures\|特殊结构]] | 层级 slug、wikilink、受限块、版本、附件 |
 
 > 这几篇是**内置文档**：首次部署自动生成，只读、随项目版本自动更新。
 > 管理员可在「插件管理 → 内置文档」里把它们整体隐藏（见 [[guide/special-structures|特殊结构]] 末尾）。
