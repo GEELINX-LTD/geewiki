@@ -90,7 +90,14 @@ CI 只修改 runner 上的工作副本。
 | push `main` | `latest`、`main`、`sha-<短哈希>` |
 | push tag `v1.2.3` | `1.2.3`、`1.2`、`sha-<短哈希>` |
 
-注意：tag 推送**不会**产生 `latest`（`latest` 只跟随默认分支）。
+`latest` **只跟随默认分支**，tag 推送不会产生它。这是显式配置的结果：workflow 里设了
+`flavor: latest=false` 关掉 metadata-action 的自动行为，再用
+`type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}`
+单独控制。
+
+> ⚠️ 不要删掉 `flavor: latest=false`。metadata-action 的 `flavor.latest` 默认是 `auto`，
+> 它会在**默认分支和 semver tag 推送两种情况**下都追加 `latest`（已实测：tag `v0.1.0`
+> 的运行确实产出了 `latest`）。那会使「用旧提交打的 tag」把 `latest` 回退到旧镜像。
 
 ### 4.2 发版流程
 
