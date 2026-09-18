@@ -54,25 +54,37 @@ pnpm --filter @geewiki/web typecheck
 
 ---
 
-## 3. 环境准备的硬约束（重要）
+## 3. store 路径为什么必须是相对路径（重要）
 
-`.github/actions/setup/action.yml` 是所有作业共用的复合 action，其中有一步
-**必须在 `actions/setup-node` 之前执行**：
+`.github/actions/setup/action.yml` 是所有作业共用的复合 action。它曾经包含一步：
 
 ```bash
 sed -i '/^storeDir:/d; /^cacheDir:/d' pnpm-workspace.yaml
 ```
 
-原因：`pnpm-workspace.yaml` 是**入库文件**，其中 `storeDir` / `cacheDir` 指向本机沙箱的
-绝对路径（`/root/dev/geewiki/.pnpm-store`）。pnpm 11 中这两个键的优先级**高于** `.npmrc`，
-且**无法用环境变量覆盖**（`npm_config_store_dir`、`PNPM_STORE_DIR` 均已实测无效）。
-若不删除，CI 会尝试写入 runner 上不存在的 `/root` 而失败。
+用来删掉 `pnpm-workspace.yaml` 里写死的**宿主机绝对路径**。这条 sed 已随根因修复而移除：
+store/cache 现在写成**相对路径**（`.pnpm-store` / `.npm-cache`），相对工作区根解析，
+因此在本地沙箱、CI runner、Docker 构建中间层与 Dependabot 的 checkout 里，
+都会落在各自可写的位置（两个目录已被 `.gitignore` 与 `.dockerignore` 排除）。
 
-顺序不能颠倒：`actions/setup-node` 的 `cache: pnpm` 会调用 `pnpm store path` 来决定
-缓存目录，因此 sed 必须先于它执行，缓存才会指向正确的 store。
+> ⚠️ **不要把这两个键改回绝对路径。** 一旦写死，所有非本机环境都会去写宿主机 `/root`：
+> 本仓 CI 与 `Dockerfile` 曾各自加 sed 兜底（现已一并移除），而 **Dependabot 无法 sed** ——
+> 它要实际执行 `pnpm install` 与 `pnpm update --lockfile-only` 来重算锁文件，读到绝对路径
+> 后会直接失败，表现为 `npm_and_yarn` 更新**全线**报
+> “Dependabot encountered an error performing the update”。
+>
+> 排查线索：`github_actions` 与 `docker` 两个生态**不执行 pnpm**，因此同时段它们成功、
+> 只有 `npm_and_yarn` 失败 —— 这个组合基本就指向本文件里的 store 配置。
 
-同样的 sed 在本仓 `Dockerfile` 第 55、65 行出于同样原因存在。本地开发不受影响——
-CI 只修改 runner 上的工作副本。
+pnpm 11.7.0 实测结论（避免再走弯路）：
+
+| 方式 | 是否生效 |
+|---|---|
+| `.npmrc` 写 `store-dir=` 或 `storeDir=` | ❌ 均无效（pnpm 11 不再从 `.npmrc` 读非 registry 设置） |
+| 环境变量 `npm_config_store_dir` | ❌ 无效（注意这个常见拼写就是错的） |
+| 环境变量 **`PNPM_CONFIG_STORE_DIR`** / `PNPM_CONFIG_CACHE_DIR` | ✅ 有效，且**优先级高于** `pnpm-workspace.yaml` |
+| CLI flag `--config.store-dir=` / `--store-dir=` | ✅ 有效 |
+| `pnpm config set --location project storeDir` | ⚠️ 会写进**入库的** `pnpm-workspace.yaml`，不能用 |
 
 ---
 

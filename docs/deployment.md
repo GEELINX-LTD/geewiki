@@ -71,7 +71,7 @@ docker compose down -v       # 连同 named volume 一并删除（bind mount 的
 
 - **为什么运行期还需要 tsx**：后端各包没有编译产物，`exports` 直接指向 `src/index.ts`，由 tsx 在运行时转译 TypeScript 源码。`--prod` 部署会裁掉 devDependencies，因此在 builder 阶段单独安装一份 `tsx` 到 `/opt/tsx`，版本直接取自 lockfile 中实际安装的那一份（不使用浮动范围，也不会写回 `pnpm-lock.yaml`）。
 - **为什么运行镜像里没有编译器**：`better-sqlite3@13` 自带 `prebuilds/**`（含 `linux-x64`），运行时由 `lib/binding.js` 优先加载预编译产物。不过 pnpm 11 的 legacy deploy 在生成部署树时**仍会执行一次原生安装脚本**（即使设置 `npm_config_ignore_scripts=true` 也会调用 `node-gyp`，已实测），因此 **builder 阶段必须安装 `python3/make/g++`**；这些工具不会进入运行镜像。
-- **为什么 `sed` 要删两次**：本仓库的 `pnpm-workspace.yaml` 写死了宿主机的 `storeDir`/`cacheDir` 绝对路径，镜像内必须删掉；但后面的 `COPY . .` 会把仓库里的原文件覆盖回来，所以删除动作在 `pnpm install` 前后各执行一次，并带 `grep` 断言（见 `Dockerfile`），否则 `deploy` 阶段仍会读到宿主机路径。
+- **为什么这里没有 `storeDir`/`cacheDir` 的处理步骤**：`pnpm-workspace.yaml` 里的 store/cache 曾经写死为宿主机的绝对路径，镜像内必须 `sed` 删两次（`COPY . .` 会把原文件覆盖回来）。现已改为**相对路径**（`.pnpm-store` / `.npm-cache`），在 builder 内解析为 `/src/.pnpm-store`，本地、CI、镜像与 Dependabot 各环境通用，相关 `sed` 已随之移除。
 
 构建产物参考（`docker images geewiki:latest`；**读数时点 HEAD `98b0ddd`（2026-09-17），以实跑为准**）：`DISK USAGE` 约 `386MB`、`CONTENT SIZE` 约 `96.8MB`。两者口径不同 —— `DISK USAGE` 是该镜像层在本地磁盘上的未压缩占用，`CONTENT SIZE` 是压缩后的分发体积；容器实际运行时占用的可写层还会另计。镜像内容为 `node:22-bookworm-slim` 基础层 + 约 28MB 生产部署树 + 运行期 `tsx`。
 
