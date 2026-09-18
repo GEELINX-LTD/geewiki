@@ -127,27 +127,36 @@ tag 推送会先跑四个门禁，全绿后才构建并推送带版本号的镜�
 
 ### 4.3 部署侧拉取
 
+> **当前 `docker-compose.yml` 是本地构建**：它同时写了 `build:` 与
+> `image: geewiki:latest`，而 compose 在两者并存时**只会构建、不会拉取**（`image:`
+> 仅作为构建产物的名字）。因此**镜像可见性不影响本仓自己的部署**，它只决定
+> 「别人能否直接拉取」。要改成拉取 CI 发布的镜像，完整命令见
+> `docs/deployment.md` 第 8 节「用 CI 发布的镜像替代本地构建」。
+
 ```bash
 docker pull ghcr.io/geelinkx-ltd/geewiki:latest
-docker compose up -d --force-recreate geewiki-app
 ```
 
 详细的挂载、权限、环境变量与备份恢复见 `docs/deployment.md`。
 
-> **镜像包默认是 private，且只能手动改**：GHCR 上的 package 默认是 **private**，
-> 即使仓库是 public 也一样。**改可见性需要「包级管理员」权限，无法用仓库自带的
-> `GITHUB_TOKEN` 完成**（已实测：GITHUB_TOKEN 能读到 `visibility`，但
-> `PATCH /orgs/{org}/packages/container/{name}` 返回 `404 Not Found`；
-> 细粒度 PAT 若未勾选 Packages 权限，则连包列表都读不到，返回 403）。
+> **镜像包默认是 private，只能手动改**：GHCR 上的 package 默认是 **private**，即使
+> 仓库是 public 也一样。改可见性需要**包级管理员**权限，用仓库自带的 `GITHUB_TOKEN`
+> 做不到 —— 已实测：GITHUB_TOKEN 能读到 `visibility`，但
+> `PATCH /orgs/{org}/packages/container/{name}` 返回 `404 Not Found`；细粒度 PAT 若未
+> 勾选 Packages 权限，则连包列表都读不到（403）。
 >
-> 修改步骤（约 30 秒）：
+> **⚠️ 改可见性不需要 PAT。** 上面的 404/403 只说明**API 这条路**不通；在浏览器里你是
+> 以组织 owner 身份登录的，UI 用的是你的会话，与 PAT 权限无关：
 >
 > 1. 打开 `https://github.com/orgs/GEELINX-LTD/packages/container/geewiki/settings`
-> 2. 页面底部 **Danger Zone** → **Change package visibility**
-> 3. 选择 **Public** 并确认
+> 2. 页面**最底部** Danger Zone → **Change package visibility**
+> 3. 选 **Public**，并按提示**输入包名确认**（这一步最容易漏掉）
 >
-> 或者：给 PAT 加上 **Packages: Read and write** 权限后，用该 PAT 执行
-> `gh api -X PATCH /orgs/GEELINX-LTD/packages/container/geewiki -f visibility=public`。
+> 若该页看不到 Public 选项、或确认后报错，则是**组织策略**在拦，检查
+> `https://github.com/organizations/GEELINX-LTD/settings/packages`。
+>
+> 改不动也不必阻塞：包保持 private 完全可用，只是拉取方需要先
+> `docker login ghcr.io`（命令见 `docs/deployment.md` 第 8 节）。
 >
 > 发布流水线里有一个**只读巡检**步骤，会把当前可见性打进 Actions 日志；
 > 若仍是 private 会输出一条 notice 提醒。

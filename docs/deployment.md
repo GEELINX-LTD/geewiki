@@ -305,6 +305,29 @@ docker image prune -f                 # 清理悬空镜像（可选）
 docker compose build --no-cache && docker compose up -d
 ```
 
+### 用 CI 发布的镜像替代本地构建（可选）
+
+上面两步都是在服务器上**本地构建**镜像。CI 也会在每次 push `main` 与打 tag 时把镜像
+发布到 GHCR（`ghcr.io/geelinkx-ltd/geewiki`），服务器可以改为直接拉取，省掉构建：
+
+```bash
+# 私有包（默认状态）：需先登录。password 用**具备 read:packages 权限的 token**，
+# 不是账号密码 —— classic PAT 勾 read:packages，或 fine-grained PAT 勾 Packages: Read：
+echo "$CR_PAT" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
+docker pull ghcr.io/geelinkx-ltd/geewiki:latest
+
+# 公开包：无需登录
+docker pull ghcr.io/geelinkx-ltd/geewiki:latest
+```
+
+改用拉取时，把 `docker-compose.yml` 里 `geewiki-app` 服务的 `build:` 段去掉、`image:`
+改为 `ghcr.io/geelinkx-ltd/geewiki:latest`。注意 **`build:` 与 `image:` 同时存在时
+compose 只会构建、不会拉取**（`image:` 仅作为构建产物的名字），这正是当前配置的行为。
+
+> ⚠️ **包的可见性与仓库的可见性是两回事**：仓库是 public 并不代表镜像 public。
+> GHCR 的包默认是 private，且改变可见性需要**包级管理员**权限 —— 仓库自带的
+> `GITHUB_TOKEN` 做不到（已实测 404），需在包设置页手动改。步骤见 `docs/ci-cd.md` 第 4.3 节。
+
 ---
 
 ## 9. 常见问题
