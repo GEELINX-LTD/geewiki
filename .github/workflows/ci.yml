@@ -156,23 +156,24 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # GHCR 的包默认是 private（即使仓库是 public）。这里用本作业已申请的
-      # packages: write 权限尝试把它改为 public。
-      # 用 continue-on-error：改变包可见性还需要包级管理权限，若 token 不具备，
-      # 这里只会在日志里打印原因，不影响镜像发布本身。
-      # 兜底的手动路径：https://github.com/orgs/GEELINX-LTD/packages
-      - name: 尝试将镜像包设为公开
-        continue-on-error: true
+      # GHCR 的包默认是 private（即使仓库是 public）。
+      # 可见性只能在**具备包级管理员权限**的凭据下修改 —— 已实测：
+      #   * GITHUB_TOKEN（本作业已申请 packages: write）能读到 visibility，
+      #     但 `PATCH .../packages/container/<name>` 返回 404 Not Found；
+      #   * 细粒度 PAT 若未勾选 Packages 权限，连包列表都读不到（403）。
+      # 因此这里只做**巡检**并把结果写进日志/注解，不尝试修改；
+      # 修改方式见 docs/ci-cd.md 第 4.3 节。
+      - name: 巡检镜像包可见性
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGE: ${{ github.event.repository.name }}
         run: |
-          echo "包名: ${PACKAGE}（属主 ${GITHUB_REPOSITORY_OWNER}）"
-          echo "--- 当前可见性 ---"
-          gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}" --jq '.visibility'
-          echo "--- 尝试改为 public ---"
-          gh api -X PATCH "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}" \
-            -f visibility=public --jq '.visibility'
+          VIS=$(gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}" \
+                  --jq '.visibility' 2>/dev/null || echo "未知")
+          echo "镜像包 ${GITHUB_REPOSITORY_OWNER}/${PACKAGE} 当前可见性：${VIS}"
+          if [ "$VIS" != "public" ]; then
+            echo "::notice::镜像包当前为 ${VIS}；改为 public 需要包级管理员权限，步骤见 docs/ci-cd.md 第 4.3 节。"
+          fi
 
       # tag 推送时额外创建 GitHub Release，变更说明由 GitHub 自动生成。
       # 使用 runner 预装的 gh CLI，避免引入第三方 action；
