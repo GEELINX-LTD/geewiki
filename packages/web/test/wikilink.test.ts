@@ -12,7 +12,6 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import '../src/lib/wikilink.ts'
 import { WIKILINK_ATTR, WIKILINK_AUTO_ATTR } from '../src/lib/wikilink'
 import { activeMarked } from '../src/lib/markdownExt'
 
