@@ -29,9 +29,6 @@ ENV CI=true \
     PNPM_HOME=/pnpm \
     PATH=/pnpm:$PATH
 
-# 与根 package.json 的 packageManager 字段保持一致，避免 pnpm 版本漂移
-RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
-
 # 原生模块编译工具链：pnpm 的 legacy deploy 会为 better-sqlite3 调用 node-gyp（见下方 deploy 步骤），
 # 因此这里必须安装；它只存在于 builder 阶段，不会进入最终镜像。
 RUN apt-get update \
@@ -49,6 +46,18 @@ COPY packages/server/package.json ./packages/server/
 COPY packages/web/package.json ./packages/web/
 COPY packages/plugin-wiki/package.json ./packages/plugin-wiki/
 COPY packages/plugin-echo/package.json ./packages/plugin-echo/
+
+# 安装 pnpm：**不使用 corepack**。
+# Node 26 起官方镜像已不再内置 corepack —— 在 node:26-bookworm-slim 上执行
+# `corepack enable` 会直接报 `/bin/sh: 1: corepack: not found`（exit 127，已实测），
+# 这曾使 Dependabot 的 node 22→26 升级 PR 的镜像构建卡住。
+# 改用 npm 全局安装（npm 仍随 Node 发布）；版本从 package.json 的 packageManager
+# 字段解析，与仓库保持一致，避免像原先那样在两处硬编码 11.7.0 而漂移。
+# 必须放在 COPY 清单之后：读取 packageManager 需要 package.json 已就位。
+RUN PNPM_VERSION="$(node -p "require('./package.json').packageManager.replace(/^pnpm@/, '')")" \
+    && echo "pnpm version: ${PNPM_VERSION}" \
+    && npm install -g --no-audit --no-fund "pnpm@${PNPM_VERSION}" \
+    && pnpm --version
 
 # 删除沙箱专用的宿主机绝对路径（只改镜像内的副本，不动仓库文件）。
 # 放在 install 之前：pnpm 需要先用这份干净的 workspace 配置解析依赖。
