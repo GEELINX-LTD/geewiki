@@ -6,6 +6,19 @@ allowBuilds:
   better-sqlite3: true
   esbuild: true
 
-# 沙箱环境：store/cache 置于仓库内（已被 .gitignore 排除），避免写工作区外路径
-storeDir: /root/dev/geewiki/.pnpm-store
-cacheDir: /root/dev/geewiki/.npm-cache
+# store/cache 放在仓库内（两个目录都已被 .gitignore 与 .dockerignore 排除）。
+#
+# 必须是**相对路径**：它相对于工作区根解析，因此在本地沙箱、CI runner、
+# Docker 构建中间层，以及 Dependabot 的 checkout 里，都会落在各自可写的位置。
+#
+# 不要改回绝对路径（如 /root/dev/geewiki/.pnpm-store）：那会让所有环境都去写
+# 宿主机的 /root，本地之外一律失败。已付出的代价：
+#   * CI 与 Dockerfile 都不得不加 sed 删掉这两行；
+#   * Dependabot 无法 sed —— 它要执行 pnpm install 与 pnpm update --lockfile-only
+#     重算锁文件，读到绝对路径后直接报
+#     "Dependabot encountered an error performing the update"，npm 依赖更新全线失效。
+#
+# 如需在个别环境覆盖：环境变量 PNPM_CONFIG_STORE_DIR / PNPM_CONFIG_CACHE_DIR
+# 的优先级高于本文件（也已实测）。注意 npm_config_store_dir 这个拼写**无效**。
+storeDir: .pnpm-store
+cacheDir: .npm-cache

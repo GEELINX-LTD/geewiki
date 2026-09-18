@@ -1,5 +1,17 @@
 version: 2
 
+# ⚠️ 排查线索：**npm 生态的更新会真的执行 pnpm**（`pnpm install` 与
+# `pnpm update --lockfile-only -r`）来重算锁文件，因此它受 `pnpm-workspace.yaml`
+# 里的配置影响。若该文件的 `storeDir`/`cacheDir` 是**绝对路径**，pnpm 会去写宿主机
+# `/root/...`，在 Dependabot 的容器里必然失败，表现为 `npm_and_yarn` 更新**全线**报
+# “Dependabot encountered an error performing the update”。
+#
+# 与 CI/Dockerfile 不同，Dependabot **无法用 sed 兜底**（它不会执行我们的工作流步骤），
+# 所以那两个键必须是相对路径。详见 docs/ci-cd.md 第 3 节。
+#
+# 识别技巧：`github_actions` 与 `docker` 两个生态不执行 pnpm，因此常出现
+# 「这两个成功、只有 npm_and_yarn 失败」的组合 —— 见到该组合就先查 store 配置。
+
 updates:
   # pnpm monorepo：Dependabot 在仓库根目录即可识别 pnpm-workspace.yaml 的全部工作区包
   - package-ecosystem: npm

@@ -13,9 +13,8 @@
 #   * better-sqlite3 13.x 自带 prebuilds/**（linux-x64 / linuxmusl-x64 等），运行时优先加载；
 #     但 pnpm 11 的 legacy deploy 仍会触发一次原生构建，故 builder 阶段装有
 #     python3/make/g++（仅 builder，不进入运行镜像）。
-#   * pnpm-workspace.yaml 在本仓库沙箱里写死了绝对路径的 storeDir/cacheDir，
-#     构建时在镜像副本中删除这两行（不改动仓库文件）；由于后面还会执行
-#     `COPY . .` 覆盖回原文件，删除动作需要执行两次（见 step 2/step 4 的说明）。
+#   * pnpm-workspace.yaml 里的 storeDir/cacheDir 是相对路径，在 builder 内解析为
+#     /src/.pnpm-store，无需任何改写（见该文件内的说明）。
 #
 # 构建：docker build -t geewiki:latest .
 # 运行：docker compose up -d --build   （见 docker-compose.yml 与 docs/deployment.md）
@@ -59,21 +58,10 @@ RUN PNPM_VERSION="$(node -p "require('./package.json').packageManager.replace(/^
     && npm install -g --no-audit --no-fund "pnpm@${PNPM_VERSION}" \
     && pnpm --version
 
-# 删除沙箱专用的宿主机绝对路径（只改镜像内的副本，不动仓库文件）。
-# 放在 install 之前：pnpm 需要先用这份干净的 workspace 配置解析依赖。
-RUN sed -i '/^storeDir:/d; /^cacheDir:/d' pnpm-workspace.yaml
-
 RUN pnpm install --frozen-lockfile
 
 # 复制源码并构建前端（vite build → packages/web/dist）
 COPY . .
-
-# 再次删除同样的两行：上面的 `COPY . .` 会把仓库中的原始 pnpm-workspace.yaml
-# 覆盖回来（此前的删除随之失效），若不在此处补删，后续 build/deploy 仍会读到
-# 指向宿主机的绝对路径。断言确保删除真实生效。
-RUN sed -i '/^storeDir:/d; /^cacheDir:/d' pnpm-workspace.yaml \
-    && ! grep -qE '^(storeDir|cacheDir):' pnpm-workspace.yaml \
-    && echo "pnpm-workspace.yaml: 已移除 storeDir/cacheDir"
 
 RUN pnpm -r --if-present run build \
     && test -f packages/web/dist/index.html
