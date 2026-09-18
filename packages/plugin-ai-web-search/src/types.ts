@@ -108,6 +108,7 @@ export function sanitizeText(value: string, options: { readonly keepNewlines?: b
      * 它折叠成空格、`keepNewlines` 形态会保留成段落，两种形态都保住了词边界。
      */
     .replace(/[\u2028\u2029]/gu, '\n')
+    // eslint-disable-next-line no-control-regex -- 需要剔除控制字符，见上方说明
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '')
     .replace(/\r\n?/gu, '\n')
   const collapsed = options.keepNewlines === true

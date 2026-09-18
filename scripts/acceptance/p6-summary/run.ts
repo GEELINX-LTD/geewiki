@@ -188,7 +188,7 @@ try {
   const call = session.call
   const json = async <T,>(method: string, path: string, body?: unknown): Promise<{ status: number; body: T }> => {
     const r = await call(method, path, body)
-    let parsed: unknown = null
+    let parsed: unknown
     try {
       parsed = JSON.parse(r.text)
     } catch {

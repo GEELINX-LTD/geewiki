@@ -38,7 +38,7 @@
  *    故这里用进程内缓存，setup 成功后立即置真。
  */
 import type { IncomingMessage } from 'node:http'
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
 import {
@@ -78,7 +78,6 @@ import {
   verifyLinkTicket,
   type OidcClaims,
   type OidcProvider,
-  type OidcProviderInfo,
 } from './oidc.js'
 
 export type { OidcClaims, OidcProvider, OidcProviderInfo } from './oidc.js'

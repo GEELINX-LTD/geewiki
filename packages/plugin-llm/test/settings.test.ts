@@ -11,10 +11,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from 'cordis'
 import {
-  LLM_MODELS_PATH,
   LLM_PROVIDERS_PATH,
   LLM_SERVICE_KEY,
-  LLM_TEST_PATH,
   LlmConfigSchema,
   LlmPlugin,
   REASONING_EFFORT_PRESETS,
@@ -270,7 +268,7 @@ test(`插件挂载 ${LLM_PROVIDERS_PATH}（admin 级）：只报来源与默认�
   service.register({
     route: descriptor.route,
     descriptor,
-    // eslint-disable-next-line @typescript-eslint/require-await -- 契约要求 AsyncIterable
+    // 契约要求 AsyncIterable
     async *stream() {
       yield { type: 'error' as const, code: 'NO_ADAPTER' as const }
     },

@@ -21,7 +21,6 @@ import assert from 'node:assert/strict'
 import { Context } from 'cordis'
 import { LlmConfigSchema, LlmPlugin } from '../src/index.js'
 import { resolveCredential } from '../src/credentials.js'
-import type { LlmService } from '../src/types.js'
 
 /** cordis 的 fork 状态常量（`FiberState` 是 const enum，isolatedModules 下无运行时导出） */
 const FIBER_ACTIVE = 2

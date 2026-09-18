@@ -150,7 +150,6 @@ export function projectForAudience(markdown: string, audience: PreviewAudience):
     // 不把未闭合区段的内容当成可见正文吐出去。
     invalid.push('unclosed')
     gatedRun += countBlocks(region.body)
-    region = null
   }
   flushGated()
 

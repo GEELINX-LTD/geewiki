@@ -55,7 +55,7 @@ function execCommandCopy(text: string): boolean {
   ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0'
   document.body.appendChild(ta)
 
-  let ok = false
+  let ok: boolean
   try {
     ta.select()
     ta.setSelectionRange(0, text.length)

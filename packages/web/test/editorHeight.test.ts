@@ -35,7 +35,7 @@ const read = (rel: string): string => stripComments(readFileSync(join(SRC, rel),
 
 test('★ 编辑面必须撑满宿主（min-height: inherit），否则下方留下点不动的死区', () => {
   const ts = read('components/MarkdownEditor.tsx')
-  const amp = /\n  '&':\s*\{([\s\S]*?)\n  '&\.cm-focused'/.exec(ts)
+  const amp = /\n {2}'&':\s*\{([\s\S]*?)\n {2}'&\.cm-focused'/.exec(ts)
   assert.ok(amp, '未能在 baseTheme 里定位到 `&` 规则（判据失效即红，不要当成通过）')
   assert.match(
     amp[1] as string,

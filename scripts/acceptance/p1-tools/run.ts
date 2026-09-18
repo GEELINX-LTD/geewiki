@@ -246,7 +246,7 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
       messages.push({ role: 'tool', content: out, toolCallId: call.id })
       continue
     }
-    let parsed: unknown = {}
+    let parsed: unknown
     try {
       parsed = JSON.parse(call.arguments)
     } catch {

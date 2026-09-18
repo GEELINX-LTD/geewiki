@@ -108,7 +108,7 @@ export const NULL_PROVIDER: LlmProvider = {
     model: 'n/a',
     available: () => false,
   },
-  // eslint-disable-next-line @typescript-eslint/require-await -- 契约要求 AsyncIterable，此处只有一个同步产出的终止 chunk
+  // 契约要求 AsyncIterable，此处只有一个同步产出的终止 chunk
   async *stream(): AsyncIterable<LlmChunk> {
     yield { type: 'error', code: 'MISSING_CREDENTIAL' }
   },

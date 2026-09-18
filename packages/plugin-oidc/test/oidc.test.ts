@@ -42,7 +42,6 @@ import {
 } from '@geewiki/core'
 import { AuthPlugin, LINK_COOKIE, type AuthService } from '@geewiki/auth'
 import { OidcPlugin, sanitizeRedirect, validateIssuer } from '../src/index.js'
-import { OidcClient } from '../src/client.js'
 
 /* ============================== 夹具 ============================== */
 

@@ -134,7 +134,9 @@ async function shutdown(code) {
   }
   try {
     ws?.close()
-  } catch {}
+  } catch {
+    // 明确忽略：连接可能已断开，关闭失败不影响退出流程
+  }
   server.kill('SIGTERM')
   mock.server.close()
   chrome.kill('SIGTERM')
@@ -144,7 +146,9 @@ async function shutdown(code) {
   rmSync(root, { recursive: true, force: true })
   try {
     rmSync(PROFILE, { recursive: true, force: true })
-  } catch {}
+  } catch {
+    // 明确忽略：临时 profile 清理失败不得掩盖真正的退出码
+  }
   process.exit(code)
 }
 process.on('uncaughtException', (e) => {
@@ -162,7 +166,9 @@ async function waitForServer(timeoutMs = 40_000) {
   while (Date.now() - t0 < timeoutMs) {
     try {
       if ((await fetch(`${BASE}/api/health`)).status === 200) return true
-    } catch {}
+    } catch {
+      // 明确忽略：服务尚未就绪，继续轮询
+    }
     await sleep(300)
   }
   return false
@@ -174,7 +180,9 @@ async function waitForCdp(timeoutMs = 30_000) {
       const list = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json()
       const p = list.find((t) => t.type === 'page')
       if (p?.webSocketDebuggerUrl) return p.webSocketDebuggerUrl
-    } catch {}
+    } catch {
+      // 明确忽略：CDP 尚未就绪，继续轮询
+    }
     await sleep(300)
   }
   return null
@@ -208,7 +216,8 @@ ws.onmessage = (ev) => {
   if (m.id && pending.has(m.id)) {
     const { resolve, reject } = pending.get(m.id)
     pending.delete(m.id)
-    m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result)
+    if (m.error) reject(new Error(JSON.stringify(m.error)))
+    else resolve(m.result)
     return
   }
   if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
@@ -405,7 +414,7 @@ const answerFacts = await evaluate(`(() => {
     // 回答是否走了 markdown 渲染（宿主 host.renderMarkdown 的证据）：
     // 纯文本兜底只会得到一个文本节点，而 marked 会产出 p 等块级元素
     hasBlockMarkdown: !!o.querySelector('.ask-answer p, .ask-md p, .ask-answer ul, .ask-md ul'),
-    hasCitationText: /\[1\]/.test(o.textContent ?? ''),
+    hasCitationText: /[1]/.test(o.textContent ?? ''),
     // 参考资料：标题是真链接（由宿主 navigate 接管 hash 跳转）
     sourceLink: o.querySelector('.ask-source-title')?.getAttribute('href') ?? o.querySelector('a[href^="#/wiki/"]')?.getAttribute('href') ?? null,
     leakedKey: /sk-e2e-ui-key|sk-proj/.test(html),

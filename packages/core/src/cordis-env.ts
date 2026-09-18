@@ -49,6 +49,7 @@ declare module 'cordis' {
     /** 运行时加载插件，await 后获得 Fiber 句柄（可 dispose 动态卸载）。 */
     plugin(plugin: unknown, config?: unknown): FiberLike & PromiseLike<FiberLike>
     /** 注册事件监听，返回解绑函数。 */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- 与 cordis 上游签名保持一致
     on(name: string, listener: (...args: any[]) => any): () => boolean
     /** 同步派发事件（无 per-listener 保护：一个监听器抛错会跳过其余监听器）。 */
     emit(name: string, ...args: unknown[]): void

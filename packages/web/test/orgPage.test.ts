@@ -551,7 +551,7 @@ test('★ 邀请码管理：待用的邀请必须有「获取邀请码」入口�
     '只有"还能用"的邀请才给换发入口 —— 已接受/已过期的换发会被服务端 409 拒掉，不该渲染必然失败的按钮',
   )
   // 换发会作废上一个码：必须在确认框里说清，否则管理员会把两个码都发出去
-  const ro = /const rotate = useCallback\(([\s\S]*?)\n  \)/.exec(code)
+  const ro = /const rotate = useCallback\(([\s\S]*?)\n {2}\)/.exec(code)
   assert.ok(ro, '未能抽出 rotate 的函数体（判据失效即红）')
   assert.match(ro[1] as string, /立即作废上一个邀请码/, '确认框必须点明"会作废上一个"')
   assert.match(ro[1] as string, /onConfirm/, '换发必须经确认再执行')

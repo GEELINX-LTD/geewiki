@@ -52,7 +52,7 @@ async function j(method, path, body, extraHeaders) {
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const text = await res.text()
-  let parsed = null
+  let parsed
   try {
     parsed = JSON.parse(text)
   } catch {
@@ -78,7 +78,7 @@ async function sse(path, body) {
     const name = /^event: (.+)$/m.exec(block)?.[1]
     const data = /^data: (.*)$/m.exec(block)?.[1]
     if (!name) continue
-    let parsed = null
+    let parsed
     try {
       parsed = JSON.parse(data ?? 'null')
     } catch {

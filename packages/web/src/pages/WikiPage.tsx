@@ -4,7 +4,7 @@ import { hashQueryOf } from '../lib/hashAnchor'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { onContentChanged } from '../lib/contentEvents'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
-import { ArrowDown, ArrowUp, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, GripVertical, History, List as ListIcon, LogIn, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, GripVertical, List as ListIcon, LogIn, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
 /*
  * 相对/绝对时间的唯一真源（`lib/timePlan.ts`）：右栏「本页信息」与版本下拉共用同一套口径，
  * 避免"11小时前"与"2026/9/12 15:56:59"两种写法在同一个页面里各说各的。
@@ -27,7 +27,6 @@ import {
   PREVIEW_INVALID_TEXT,
   canRestoreVersion,
   parsePreviewParam,
-  pickerTriggerText,
   previewBarText,
   previewRoute,
   restoreConfirmBody,
@@ -35,7 +34,6 @@ import {
   restoreErrorText,
   versionNumberOf,
 } from '../lib/versionPlan'
-import { Tooltip } from '../ui/Tooltip'
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { DEFAULT_EDITOR_MIN_HEIGHT } from '../lib/editorHeightPlan'
@@ -102,10 +100,8 @@ import { useDocumentTitle } from '../lib/useDocumentTitle'
 import { useHashAnchor } from '../lib/useHashAnchor'
 import { useUnsavedGuard } from '../lib/useUnsavedGuard'
 import {
-  Badge,
   Button,
   Card,
-  CardBody,
   CardHeader,
   ConfirmDialog,
   Dialog,
@@ -734,7 +730,7 @@ function WikiList(props: {
   const rows = useMemo(() => navRows(tree, collapsed), [tree, collapsed])
   /** 正在提交的行（path 或 `__root__`）——提交期间禁用控件，避免连点产生两次顺序写入 */
   const [navBusy, setNavBusy] = useState<string | null>(null)
-  const [navNotice, setNavNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
+  const [_navNotice, setNavNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
   /** 拖动中的行（含它所在的层，用于判"只能同层"） */
   const [drag, setDrag] = useState<{ path: string; parent: string } | null>(null)
   const [dropAt, setDropAt] = useState<string | null>(null)
@@ -2341,7 +2337,7 @@ function WikiDetail(props: {
 }
 
 /** 历史快照预览：只要 HTML，不要复制按钮（只读小窗里按钮是噪声） */
-function renderMarkdownBodyForPreview(
+function _renderMarkdownBodyForPreview(
   markdown: string,
   route: string,
   pages: ReadonlyMap<string, string> | null,

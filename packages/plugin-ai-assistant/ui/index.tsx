@@ -36,7 +36,6 @@ import {
   errorLine,
   groundingAfterDone,
   runClientTools,
-  conversationsKey,
   defaultTransport,
   initialDockState,
   isAtBottom,

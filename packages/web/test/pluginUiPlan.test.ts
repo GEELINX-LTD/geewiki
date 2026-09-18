@@ -28,7 +28,6 @@ import {
 import {
   PLUGIN_UI_PREFIX as CORE_PLUGIN_UI_PREFIX,
   PLUGIN_UI_FILE_SEGMENT as CORE_PLUGIN_UI_FILE_SEGMENT,
-  isPluginUiEntryPath,
 } from '@geewiki/core/domain'
 
 const ORIGIN = 'http://127.0.0.1:3000'

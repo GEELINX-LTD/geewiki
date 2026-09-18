@@ -1260,10 +1260,9 @@ function PluginDetailDialog(props: {
   llmTest?: { running: boolean; result?: LlmTestResponse; error?: string } | null
   onLlmTest?: () => void
 }): ReactNode {
-  const { p, rowBusy, globalBusy, configText, editor, configErrors, labelOf, onConfigText, onEditorChange, onClose, onEnable, onSaveConfig, onDisable, clearSecrets, onToggleClearSecret, providerOptions, llm, llmTest, onLlmTest } = props
+  const { p, rowBusy, globalBusy, configText, editor, configErrors, labelOf: _labelOf, onConfigText, onEditorChange, onClose, onEnable, onSaveConfig, onDisable, clearSecrets, onToggleClearSecret, providerOptions, llm, llmTest, onLlmTest } = props
   // 只禁用"正在忙的那一行"；全局操作（刷新/持久化）在途时也一并禁用，避免与整体刷新交错
   const rowDisabled = rowBusy !== null || globalBusy
-  const busy = rowBusy !== null
   const name = displayNameOf(p)
   const desc = descriptionOf(p)
 

@@ -71,7 +71,7 @@ test('详情页的订阅规则：当前页或"不知道是哪一页" ⇒ 重取�
   assert.match(wikiPage, /if \(mine\) \{\s*\n\s*load\(\)/, '命中当前页时要重取正文')
   assert.match(wikiPage, /void invalidatePages\(\)/, '无论改的是不是这一页，列表缓存都要失效')
   // 退订：effect 必须把 onContentChanged 的返回值当 cleanup 返回（否则卸载后仍在监听）
-  assert.match(wikiPage, /\n  \}, \[slug, load\]\)/, 'effect 依赖要被钉住（slug 变了要重新订阅）')
+  assert.match(wikiPage, /\n {2}\}, \[slug, load\]\)/, 'effect 依赖要被钉住（slug 变了要重新订阅）')
 })
 
 test('lib 自身：订阅返回退订函数，且监听器在门口就用 parse 过滤畸形事件', () => {

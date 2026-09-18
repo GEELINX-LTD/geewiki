@@ -36,7 +36,6 @@ import {
   Users,
 } from 'lucide-react'
 import { cn } from '../ui/cn'
-import { focusRing } from '../ui/a11y'
 import { usePages } from '../lib/pagesStore'
 import { useAuth } from '../lib/authStore'
 import { visibleDests, type NavDest } from '../lib/navPlan'

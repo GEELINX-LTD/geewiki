@@ -52,6 +52,6 @@ export const BUILTIN_DOCS: readonly BuiltinDoc[] = ENTRIES.map(({ slug, title })
   try {
     return { slug, title, content: readFileSync(file, 'utf8') }
   } catch (err) {
-    throw new Error(`内置文档正文读取失败: ${file}（${(err as Error).message}）`)
+    throw new Error(`内置文档正文读取失败: ${file}（${(err as Error).message}）`, { cause: err })
   }
 })

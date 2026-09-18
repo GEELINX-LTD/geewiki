@@ -326,7 +326,7 @@ export function App(): ReactNode {
    * 那会把"插件坏了"误导成"这个地址不存在"，用户会去检查 URL 而不是去检查插件。
    */
   const declaredRoutes = useSyncExternalStore(subscribePluginUiState, pluginUiRoutes, pluginUiRoutes)
-  const registeredRoutes = useRouteEntries()
+  const _registeredRoutes = useRouteEntries()
   const known =
     [WIKI_ITEM, ...ADMIN_NAV, ...LEGACY_ROUTES].some((t) => t.id === root) ||
     isAuthRoute(root) ||

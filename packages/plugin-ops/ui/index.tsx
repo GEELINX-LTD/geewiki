@@ -505,6 +505,7 @@ function SessionsSection(props: {
       <div className="gw-ops-card-head">
         <h2 className="gw-ops-card-title">会话</h2>
         <span className="gw-ops-card-desc">
+          {/* eslint-disable-next-line no-irregular-whitespace -- 全角空格是中文排版需要，不可替换为半角 */}
           {rows === null ? '加载中…' : `${rows.length} 条`}　ip 列是**哈希**不是原文，不应当作 IP 使用
         </span>
       </div>

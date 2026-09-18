@@ -1,8 +1,8 @@
 /**
  * 降级词汇与可用性投影（`src/degrade.ts` + `src/availability.ts`）的守卫测试。
  *
- * 这两份词汇是刚从 `@geewiki/ai` **上移**到本包的（设计契约 `docs/design/ai-plugin-split.md` §5：
- * 映射表只要出现在第二个插件里就是两份真源）。`@geewiki/ai-assistant` 是仅有的消费方
+ * 这两份词汇是从 `@geewiki/ai` **上移**到本包的（契约：映射表只要出现在第二个插件里就是两份真源；
+ * 详见 `docs/design/ai-plugin-architecture.md` 的「AI 失败语义与降级词汇」）。`@geewiki/ai-assistant` 是仅有的消费方
  * （P8 前是它与 `@geewiki/ai-qa` 两个，ai-qa 已随 `wiki-ask` 拆除），
  * 要防的失败模式全是"看起来正常、语义已错位"那一类：
  *
@@ -75,7 +75,7 @@ function stubProvider(route: string, ok: boolean, label = `Stub-${route}`): LlmP
       // ⚠️ `available` 是**函数**（降级契约的唯一入口），不是布尔字段。
       available: () => ok,
     },
-    // eslint-disable-next-line @typescript-eslint/require-await -- 契约要求 AsyncIterable
+    // 契约要求 AsyncIterable
     async *stream(): AsyncIterable<LlmChunk> {
       yield { type: 'error', code: 'PROVIDER_ERROR' }
     },
@@ -231,7 +231,7 @@ test('listRouteInfos：listProviders 抛错 ⇒ 空列表；单条路由 availab
         throw new Error('available 内部炸了')
       },
     },
-    // eslint-disable-next-line @typescript-eslint/require-await -- 契约要求 AsyncIterable
+    // 契约要求 AsyncIterable
     async *stream(): AsyncIterable<LlmChunk> {
       yield { type: 'error', code: 'PROVIDER_ERROR' }
     },
@@ -269,7 +269,7 @@ test('listRouteInfos：label/model 里的形似密钥片段必须被脱敏（cap
       model: 'DeepSeek V4 Flash',
       available: () => true,
     },
-    // eslint-disable-next-line @typescript-eslint/require-await -- 契约要求 AsyncIterable
+    // 契约要求 AsyncIterable
     async *stream(): AsyncIterable<LlmChunk> {
       yield { type: 'error', code: 'PROVIDER_ERROR' }
     },

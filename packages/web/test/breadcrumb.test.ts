@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { BREADCRUMB_ROOT_HREF, BREADCRUMB_ROOT_LABEL, BREADCRUMB_SEP, breadcrumbTokens, buildBreadcrumb, buildNavTree, hasSeparatorBefore, intermediateCrumbCount, navLabelOf } from '../src/lib/navTree'
+import { BREADCRUMB_ROOT_HREF, BREADCRUMB_SEP, breadcrumbTokens, buildBreadcrumb, buildNavTree, hasSeparatorBefore, intermediateCrumbCount, navLabelOf } from '../src/lib/navTree'
 
 /** 朴素 href 构造器：单测不 import 组件模块，只注入等价实现 */
 const hrefOf = (slug: string): string => `#/wiki/${encodeURIComponent(slug)}`

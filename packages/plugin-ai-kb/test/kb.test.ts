@@ -151,11 +151,6 @@ async function mount(
   }
 }
 
-/** 从工具结果里取回 JSON（工具结果一律是 JSON 字符串，这是本层的约定） */
-function json<T = Record<string, unknown>>(content: string): T {
-  return JSON.parse(content) as T
-}
-
 /** 跑一次工具并把它的 content 解析成 JSON——本文件里绝大多数断言都用它 */
 async function runJson<T = Record<string, unknown>>(
   tool: ResolvedTool,
