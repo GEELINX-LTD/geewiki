@@ -156,6 +156,24 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # GHCR 的包默认是 private（即使仓库是 public）。这里用本作业已申请的
+      # packages: write 权限尝试把它改为 public。
+      # 用 continue-on-error：改变包可见性还需要包级管理权限，若 token 不具备，
+      # 这里只会在日志里打印原因，不影响镜像发布本身。
+      # 兜底的手动路径：https://github.com/orgs/GEELINX-LTD/packages
+      - name: 尝试将镜像包设为公开
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE: ${{ github.event.repository.name }}
+        run: |
+          echo "包名: ${PACKAGE}（属主 ${GITHUB_REPOSITORY_OWNER}）"
+          echo "--- 当前可见性 ---"
+          gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}" --jq '.visibility'
+          echo "--- 尝试改为 public ---"
+          gh api -X PATCH "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}" \
+            -f visibility=public --jq '.visibility'
+
       # tag 推送时额外创建 GitHub Release，变更说明由 GitHub 自动生成。
       # 使用 runner 预装的 gh CLI，避免引入第三方 action；
       # 先 view 再 create 以保证幂等（重跑同一 tag 不会失败）。
