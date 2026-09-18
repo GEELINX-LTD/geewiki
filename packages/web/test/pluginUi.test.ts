@@ -450,7 +450,7 @@ test('宿主样式表里若还留着 `.ask-*`，只是过渡期的重复（不�
   // 的反向条件：宿主表里的 `.ask-` 规则不得引用插件自己的 `gw-assist` 类（两张表必须互不依赖）。
   assert.ok(!hostCss.includes('gw-assist'), '宿主样式表不该引用插件私有类：两张表必须互不依赖')
   const lines = hostCss.split('\n').filter((l) => /\.ask-/.test(l)).length
-  assert.ok(lines < 60, `宿主里残留了 ${lines} 行 .ask-* 规则，插件产物已自带 ⇒ 应删除（见 docs/design/ai-plugin-split.md §4.5）`)
+  assert.ok(lines < 60, `宿主里残留了 ${lines} 行 .ask-* 规则，插件产物已自带 ⇒ 应删除（见 docs/design/ai-plugin-architecture.md）`)
 })
 
 /** 顺带钉住一条容易忽略的事实：ui 目录里不该混进 node 端代码（会被打进浏览器产物） */

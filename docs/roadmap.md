@@ -1,14 +1,31 @@
 # GeeWiki 开发路线图
 
-> 阶段按依赖顺序推进。任务清单中的"清单文件"指 `plugins.base.json` / `plugins.session.json`，"双层状态"指基础层（Base Layer）与会话层（Session Layer）。设计细节见 [architecture.md](./architecture.md)。
+> 本文档只回答"**接下来做什么**"。**已完成且形态未被推翻的事项不在此复述**——逐批历史见
+> [changelog/implementation-log.md](./changelog/implementation-log.md)，当前实现口径见
+> [architecture.md](./architecture.md)。凡数量口径（内置插件数、启用条数、插槽、端点数）一律以
+> `defaultRegistry()`（`packages/server/src/index.ts`）与 `config/plugins.base.json` 为真源。
+> 任务清单中的"清单文件"指 `plugins.base.json` / `plugins.session.json`，"双层状态"指基础层（Base Layer）与会话层（Session Layer）。
 
-| 阶段 | 主题 | 里程碑 | 状态 |
-| --- | --- | --- | --- |
-| Phase 0 | 基础骨架 | monorepo + core 类型 + db-sqlite + server 宿主 | ✅ 完成（07bb411） |
-| Phase 1 | 插件管理器 | 依赖图/双层状态/迁移控制器/看门狗/REST | ✅ 完成（e97ce6b） |
-| Phase 2 | 前端可视化 + Wiki MVP | React 19 管理台 + React Flow + Wiki CRUD/版本 | ✅ 完成（本次提交） |
-| Phase 3 | AI 原生能力 | Slots 插槽、LLM/RAG、编辑器组插件 | 🟡 部分落地：配置系统、外部插件发现、**宿主侧** Slot 已完成；**检索地基（`@geewiki/search`，默认启用）与问答检索-only（`@geewiki/ai`）已落地**；**SSE 长连接出口已与优雅排空共存**（提交 `2273006`，**仅为地基，真实流式输出仍未接线**）；**厂商 LLM adapter、真实流式输出、向量检索**未做（分别属后续批次 / 有意未做 / 有意后置）；编辑器组插件、后端 `ctx.slot()` 注册链路仍为候选。**修正（本批，2026-09-14）**：本行三处过时——① **后端 `ctx.slot()` 注册链路已落地**（`SlotService` 契约 + `SlotRegistry` + `GET /api/plugins/slots` 只读端点，见下条候选项的修正块），插槽白名单也**不再是两个**（现为 `app-header` / `app-footer` / `editor` / `editor-toolbar` / `wiki-ask`）；② **`@geewiki/ai` 已拆分为 `@geewiki/ai-writing`（AI 辅助写作，贡献 `editor-toolbar`）+ `@geewiki/ai-qa`（AI 问答，贡献 `wiki-ask`）**，问答的"检索-only + 抽取式摘要"形态**被删除**并改写为真实模型问答（缺模型即显式不可用），两套 AI 前端**从 web 迁进插件自带 bundle**；③ **真实流式输出已接线**（`POST /api/ai/stream` 逐帧 `status → delta* → done|error`，含硬/idle 超时与 `close` 取消上游）。逐条见 Phase 3 各候选项的修正块与 `docs/plugin-platform-plan.md` 批次 G、`docs/design/ai-plugin-split.md`、`scripts/acceptance/ai-split-e2e/README.md`；**测试与包数量口径本批不填**（见上文读数段） |
-| Phase 4 | 稳定性加固 | PG 适配、配置热更新表单（容器镜像与 Compose 部署已提前完成，见 [deployment.md](deployment.md)） | 🟢 主体落地：配置热更新表单**已完成**；**PG 适配已落地**（真 PG 15 端到端验证通过，见 [review/plugin-freedom-audit.md](review/plugin-freedom-audit.md) 的 F19）；容器镜像与 Compose 部署已提前完成 |
+## 阶段总览
+
+| 阶段 | 主题 | 状态 |
+| --- | --- | --- |
+| Phase 0 | 基础骨架 | ✅ 完成（`07bb411`） |
+| Phase 1 | 插件管理器 | ✅ 完成（`e97ce6b`） |
+| Phase 2 | 前端可视化 + Wiki MVP | ✅ 完成（`75a634b`） |
+| Phase 3 | AI 原生能力（Slots / LLM 契约层 / 检索地基 / 工具与会话层） | ✅ 主体完成（P0–P8）；剩余项见下文 |
+| Phase 4 | 稳定性加固（PostgreSQL 适配、配置热更新表单、容器与 Compose） | ✅ 主体完成；剩余项见下文 |
+
+## 当前读数（本文唯一一处当前读数）
+
+- **`pnpm test`：exit 0，全绿。** **`pnpm typecheck`：exit 0，0 个 `error TS`。**
+- **取数命令**（根目录）：`pnpm test`、`pnpm typecheck`；包总数 `ls -d packages/*/`；
+  有 `test` 脚本的包数 `node -e "…"` 或逐包 `pnpm --filter <pkg> test` 现取。
+- **本文刻意不写死包数与用例数**：它们随每次提交漂移，写死必然过期（历史上同一份文档里曾同时存在
+  15/15、35/35、242/242、251/251、266/266、308/308、1416/1416、1453/1453、1696/1696、1715/1715、
+  1774/1774、1817/1817 十二个互相矛盾的读数）。历史时点读数见文末「历史读数台账」。
+
+---
 
 ## Phase 0：基础骨架 ✅
 
@@ -18,15 +35,15 @@
 
 ## Phase 1：插件管理器 ✅
 
-**交付**：`packages/manager`（600 行核心）——
+**交付**：`packages/manager`——
 
-- 依赖解析 `resolveDependency`（按插件名或 provides）/ `directDependencies` / `topologicalOrder`（字母序稳定 + 环检测抛错）/ `collectDependents`（反向依赖）/ `collectDependentsClosure`（传递依赖方闭包，供冲突组替换）/ `findUncoveredRequires`（替换的提供者覆盖校验，供冲突组替换）/ `findConflict`（conflictGroup 同组互斥）/ `checkHotChain`（热插件依赖未激活冷依赖即违规）——纯函数，单元测试全绿（`packages/manager/test/deps.test.ts`，10 例）。
+- 依赖解析 `resolveDependency`（按插件名或 provides）/ `directDependencies` / `topologicalOrder`（字母序稳定 + 环检测抛错）/ `collectDependents`（反向依赖）/ `collectDependentsClosure`（传递依赖方闭包，供冲突组替换）/ `findUncoveredRequires`（替换的提供者覆盖校验）/ `findConflict`（conflictGroup 同组互斥）/ `checkHotChain`（热插件依赖未激活冷依赖即违规）——纯函数，单测见 `packages/manager/test/deps.test.ts`。
 - Session/Base 双层清单（`plugins.base.json` + `plugins.session.json`）合并去重装配；boot 逐个拓扑激活、失败记 `bootErrors` 继续。
 - `enable()`：会话层热操作——热授权（`supportsHotReload !== true` → 409 `hot_reload_not_supported`）、热链检查、未激活依赖递归启用、激活后写 session 文件。
-- `disable()`：基础层插件 → 409 `base_layer`；存在依赖者 → 409 `has_dependents`；卸载（`fiber.dispose()`）并清 session 记录。
+- `disable()`：存在依赖者 → 409 `has_dependents`；**基础层插件可临时停用**（只登记在内存、不落盘，重启即恢复，见 architecture §5.3）；卸载（`fiber.dispose()`）并清 session 记录。
 - `persistSession()`：会话合并进 base 清单（"应用并持久化"），重启后以 base 层激活。
 - 迁移控制器：entry 声明 `migrationsDir` 且 db 可用时，激活前 `db.migrate(dir)`，失败阻止加载。
-- 看门狗：5s 探针——session 插件 5s 试用期内健康检查连续失败 → 自动 disable 回滚；连续失败 ≥3 且会话非空 → 熔断（清 session 文件 + `process.exit(1)`，容器自愈联动占位）。
+- 看门狗：5s 探针——session 插件试用期内健康检查连续失败 → 自动 disable 回滚；连续失败 ≥3 且会话非空 → 熔断（清 session 文件 + `process.exit(1)`，容器自愈联动）。
 - REST：`GET /api/plugins`（snapshot：state/layer/hotReloadable/provides/requires/conflictGroup/migrations/config/error）、`GET /api/plugins/graph`（React Flow DAG：nodes+edges）、`GET /api/session`、`POST /api/plugins/:name/enable|disable`、`POST /api/plugins/:name/replace`（冲突组顶替）、`POST /api/session/persist`。错误 → HTTP 映射（404/409/400/500）。
 
 **验收**：enable/disable/persist/重启持久化/409 校验/看门狗回滚全链路实测通过。
@@ -35,90 +52,92 @@
 
 **交付**：
 
-- `packages/web`（React 19 + Vite 6 + @xyflow/react + marked，零 UI 框架依赖，中文界面）：
+- `packages/web`（React 19 + Vite + @xyflow/react + marked，零 UI 框架依赖，中文界面）：
   - `#/wiki` 知识库：页面列表 / 详情（Markdown 渲染）/ 编辑与实时预览 / 新建（slug 校验）/ 删除 / 版本历史时间线（查看快照、一键恢复旧版本）。
-  - `#/plugins` 插件管理：状态统计条、插件表（状态/层/热冷徽章/提供与依赖 chip）、会话层热"启用"（行内 JSON 配置编辑）、"停用"、异常重试、基础层清单托管提示、会话变更面板 + "应用并持久化"、bootErrors 展示。
-  - `#/graph` 依赖图：React Flow 渲染插件 DAG（内置分层布局：被依赖方居左，无 dagre 依赖），状态着色节点 + 图例 + 缩放控件。
+  - `#/plugins` **插件管理（含依赖图）**：状态统计条、插件表（状态/层/热冷徽章/提供与依赖 chip）、会话层热"启用"（行内 JSON 配置编辑）、"停用"、异常重试、基础层清单托管提示、会话变更面板 + "应用并持久化"、bootErrors 展示，以及 React Flow 渲染的插件 DAG（内置分层布局：被依赖方居左，无 dagre 依赖）、状态着色节点 + 图例 + 缩放控件。
+    **「插件管理」与「依赖图」原本是两个路由/两个页面，现已合并为同一页 `GraphPage.tsx`**；**主路由是 `#/plugins`**，老链接 `#/graph` 在路由解析处改写成 `#/plugins`（`packages/web/src/App.tsx:316`）。
 - `packages/plugin-wiki`（`@geewiki/wiki` 核心业务插件，requires http+db，热授权）：
   - `GET/PUT/DELETE /api/pages(/:slug)` + `GET /api/pages/:slug/versions/:id`；upsert 幂等（内容未变不产生版本）；每次保存先快照旧正文至 `page_versions`；删除显式事务级联清历史；body 大小/形状校验。
-- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。**后续批次补充**：`/plugins-ui/**` 走**独立分支**（按名查根、**绝不 SPA fallback**，缺失即 404 `application/json`；其"内置根"由 `GEEWIKI_PLUGIN_UI_DIST` 指定、**缺省 = `webDist`**——app shell 产物根与内置插件 UI 资产根已拆为两个独立配置项，见 architecture §6 与 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 9 节），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
+- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。**后续批次补充**：`/plugins-ui/**` 走**独立分支**（按名查根、**绝不 SPA fallback**，缺失即 404 `application/json`；其"内置根"由 `GEEWIKI_PLUGIN_UI_DIST` 指定、**缺省 = `webDist`**——app shell 产物根与内置插件 UI 资产根已拆为两个独立配置项，见 architecture §6 与 [plugin-platform.md](./plugin-platform.md)），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
 
-**验收**：headless Chrome（playwright chromium 1228）真实渲染三路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、单测 15/15（`packages/manager/test/deps.test.ts` 8 例 + `manager.test.ts` 7 例）、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
+**验收**：headless Chrome（playwright chromium 1228）真实渲染路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。当时的单测读数见文末台账。
 
-> 后续治理批次（同一实现期）在 `manager.test.ts` 增补崩溃自愈、persist 跳过失败条目、enable 事务性、看门狗决策、卸载排空与缓存清理等用例，并新增 `repo-paths.test.ts`（3 例，路径解析与进程工作目录解耦）与 `packages/server/test/router.test.ts`（11 例，覆盖 HTTP 路由排空/413/端口选项）；该批累计单测 **35/35**（deps 8 + manager 13 + repo-paths 3 + server 11）。
->
-> **当前口径（SSE 出口与管理台批次落地后实跑）：两个读数，差别只来自一个并行批次未提交的新包，二者都是真读数。**
->
-> **✅ 读数 C（已提交状态 HEAD `3bdcf4b`，取值时刻 `2026-09-11T00:29 +08:00`）：266/266**（fail 0 / skipped 0，**7 个包**）= `packages/manager` **91**（`config` 36 + `deps` 10 + `discovery` 13 + `manager` 14 + `plugin-ui` 15 + `repo-paths` 3）+ `packages/web` **47**（`pluginUiPlan` **28** + `searchPlan` **19**）+ `packages/plugin-llm` **33**（`service` 24 + `redact` 9）+ `packages/plugin-search` **32**（`search` 32）+ `packages/server` **30**（`router` **11** + `plugin-ui-static` **10** + `registry` **3** + `sse-drain` **6**）+ `packages/plugin-ai` **25**（`ai` 25）+ `packages/plugin-wiki` **8**（`service` 8）。
->
-> **读数 D（工作树含并行批次未提交的 `packages/plugin-openai/**`，取值时刻 `2026-09-11T00:38 +08:00`）：308/308**（**8 个包**）= 读数 C 的七包**逐包完全相同**，唯一新增 `packages/plugin-openai` **42**（`errors` 7 + `plugin` 8 + `provider` 16 + `sse` 11）。**⚠️ `packages/plugin-openai` 尚未提交**，**不得据此认为厂商 adapter 已落地**。
->
-> **命令**（两个读数相同）：`pnpm -r --no-bail --if-present run test` 与 `pnpm -r --if-present run typecheck`；逐文件计数用 `node --import tsx --test <单文件>` 在各包目录下复跑核对。**`pnpm typecheck`**：读数 D 时刻**全量通过，11 个包全部 `Done`、0 个 `error TS`**；读数 C 时刻同一命令曾**整体失败**，唯一原因是并行批次**当时**尚不完整的 `packages/plugin-openai`（`tsconfig.json` 的 `include` 含 `test` 而该目录尚未创建 → `error TS18003: No inputs were found in config file '/root/dev/geewiki/packages/plugin-openai/tsconfig.json'. Specified 'include' paths were '["src","test"]' and 'exclude' paths were '[]'.`，pnpm 以 `[ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL] @geewiki/openai@0.1.0 typecheck` 中止），以 `--filter '!@geewiki/openai'` 复跑得 10 个包 0 错误——**该错误随并行批次补齐 `test/` 自行消失，属"读工作树"的中间态，不是已提交代码的缺陷**。**教训：报告读数必须同时给出 HEAD 与取数时刻。**
->
-> **历史读数（已过时，保留备查）**：**读数 B（工作树含并行批次对 `packages/plugin-search/**`、`packages/plugin-ai/**` 的改动，`2026-09-10T23:35 +08:00`）：251/251** = `plugin-search` **32**、`plugin-ai` **25**，其余五包同读数 A。**读数 A（HEAD `585dbac`，`2026-09-10T23:24 +08:00`）：242/242** = `packages/manager` **91** + `packages/web` **38**（`pluginUiPlan` 19 + `searchPlan` 19）+ `packages/plugin-llm` **33** + `packages/plugin-search` **25** + `packages/server` **24**（`router` 11 + `plugin-ui-static` 10 + `registry` 3）+ `packages/plugin-ai` **23** + `packages/plugin-wiki` **8**。**两个读数都曾是"真读数"，差别来自一个并行批次的未提交改动；该批次的检索召回修复已落为提交 `04c45c3`**，故读数 B 的 `plugin-search` 32 / `plugin-ai` 25 已被当前口径继承为**稳定值**，不再是"待复核"读数。相对读数 B 的 **251 → 266（+15）** 全部来自本批两个提交：`packages/server` **+6**（`sse-drain`，`2273006`）与 `packages/web` **+9**（`pluginUiPlan` 19→28，`3bdcf4b`）。
->
-> **⚠️ 与更早口径的差别有三处，勿混用**：① 测试**现在跑到 7 个包**（此前只 web / manager / server 三包）——`packages/plugin-search`、`packages/plugin-llm`、`packages/plugin-ai`、`packages/plugin-wiki` 四个包**本轮起拥有单测**；② 根 `package.json` 的 `test` 脚本**新加了 `--no-bail`**——此前 `pnpm -r` 在**首个失败包处即中止**、后续包根本不执行，故"全量绿"读数可能是**部分**读数；③ `packages/core` / `packages/db-sqlite` / `packages/plugin-echo` / `plugins/hello-geewiki` **没有 `test` 脚本**，`--if-present` 跳过（`typecheck` 在**已提交状态**是 10 个包；若工作树含并行批次未提交的 `packages/plugin-openai` 则为 11 个包，`plugins/hello-geewiki` 始终无该脚本）。
->
-> 因此上文 Phase 2 验收里的 15/15 与曾经的 35/35、72/72、81/81、87/87、132/132、134/134、242/242、251/251 均为**历史时点口径**，不代表当前工作树；契约迁移（`layer` = 持久化层、无 schema 插件接受原始 JSON）已完成、两条旧断言已随新契约更新，逐条记录见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 6 节与第 9 节。
+---
 
-## Phase 3（候选）：AI 原生能力
+## Phase 3：AI 原生能力 —— 已完成部分（P0–P8）
 
-- [x] Slots 插槽机制（**宿主侧**已落地）：宿主经 `window.__GEEWIKI_HOST__` 暴露 `registerSlot(name, component)` / `unregisterSlot`（`packages/web/src/lib/slots.tsx`、`packages/web/src/lib/hostSdk.ts`，SDK 版本 `0.1.0`）；插件 UI bundle 由加载器（`packages/web/src/lib/pluginUi.ts`）按**后端下发的入口表**（`GET /api/plugins/ui`）动态加载后调用 `register(host)` 注册。**插槽名是白名单，当前仅 `app-header` 与 `app-footer` 两个**，未知插槽名告警并忽略；`SlotOutlet` 外层包 ErrorBoundary——插件组件抛错只丢该插槽内容，主界面不白屏。**修正（本批，2026-09-14）**：本行两处过时。① **白名单现有 5 个**：`app-header` / `app-footer` / `editor` / `editor-toolbar` / `wiki-ask`——真源 `packages/core/src/index.ts:797`（`SLOT_NAMES` `:800`、基数表 `SLOT_CARDINALITY` `:821`：`editor` 与 `wiki-ask` 单占用，`app-header` / `app-footer` / `editor-toolbar` 多占用），浏览器侧镜像 `packages/web/src/lib/slots.tsx:49`（`SLOT_NAMES` `:52`、`SINGLE_OCCUPANCY_SLOTS` `:157`）。镜像是**被迫的**（core 顶层 `import 'node:fs'`，进不了浏览器 bundle），一致性由源级守卫钉住：`packages/manager/test/slots.test.ts`（解析 web 侧 `SLOT_NAMES` 字面量比对）+ `packages/web/test/slotPropsMirror.test.ts`（core / `slots.tsx` / `pluginUiPlan.ts` 三处逐元素含顺序比对、props 字段逐字段比对）。`editor` 随提交 `084dab4` 落地，`editor-toolbar` / `wiki-ask` 是本批为"AI 界面归插件"新增的。**零属性裁决只适用于 `app-header` / `app-footer`**（`ZeroPropsSlotName`，`slots.tsx:61`），新插槽走**具名窄契约** props（`EditorToolbarSlotProps` `core:887`——`mode` / `slug` / `docText` / `selection` / `readOnly?` / **可选** `insertAtCursor?` / `replaceSelection?`；`WikiAskSlotProps` `core:910`——`query` / `onAsk` / `openPage`，**路由真源仍在宿主**）。② **SDK 版本已是 `0.2.0`**（`packages/web/src/lib/hostSdk.ts:22`），新增 `renderMarkdown(markdown): string`（`:43`，实现即 `lib/sanitize` 的 `mdToHtml`）——**消毒白名单仍是宿主一处实现**，插件只 `dangerouslySetInnerHTML`，且插件侧必须**特性探测**而不是比版本字符串（`hostSdk.ts:18-19`）。**新增的宿主侧判据**：功能入口该不该显示，按入口表的**声明 × 仲裁生效集**判（`pluginUiDeclaredFor()`，`packages/web/src/lib/pluginUi.ts:190`），**不按"已注册的组件"判**（懒加载插槽下会自锁，本批实测踩过）、**也不按硬编码插件名判**（旧 `stateOf('@geewiki/ai')` 已删）
-- [ ] 后端注册链路与更多扩展点：`ctx.slot(name, component)`、`editor-toolbar-slots`、`admin-page-slots`（**尚未提供**）**修正（本批，2026-09-14）**：本项**大半已落地，复选框按剩余部分保持未勾**。① **插槽贡献的后端链路已落地**，但**形态与这行设想的不同**——不是 `ctx.slot(name, component)` 这样的方法糖，而是"**清单声明 + 服务查询**"两种形态：插件在 manifest 写 `geewiki.slots: SlotName[]`（`packages/core/src/index.ts:142`，注释 `:131` 说清了两层声明的分工：`client` 声明"我有 UI 产物"、`slots` 声明"我要占用哪些位置"），由**管理器在激活时登记**（`packages/manager/src/index.ts:1343` 的 `slots.contributeFromManifest(name, slot)`）、**卸载时按 owner 回收**（`:1434` 的 `slots.release(name)`）；运行期若要动态贡献，走 `ctx.get('slot').contribute(owner, slot, meta?)`（`SlotService` 契约在 `packages/core/src/index.ts:960`：`contribute` / `list` / `ownersOf` / `release`，实现 `SlotRegistry` 在 `packages/manager/src/slots.ts:157`）。② **单占用的冲突裁决已落地**：纯函数 `resolveSlots(contributions, activationOrder)`（同文件）按**最早激活优先**定出生效者，其余进 `suppressed` 并记为冲突，经只读端点 **`GET /api/plugins/slots`** 对外可见（`packages/manager/src/index.ts:1743`，返回 `{ slots: assignments, conflicts }`；读端点刻意保持 public，见 `:1714-1720` 的访问等级注释）。**实测裁决**：`editor-toolbar:multi effective=[@geewiki/ai-writing]`、`wiki-ask:single effective=[@geewiki/ai-qa]`、`conflicts: []`（`data/verify/ai-split-e2e/result-backend.json` 的 `C_slots`）。③ **一条注册顺序的实测教训**（`packages/manager/src/slot-plugin.ts` 文件头记档）：提供者必须是**排在管理器之前的独立插件 `@geewiki/slot`**（`packages/server/src/index.ts:1571`）——"管理器在自己的 `apply` 里 provide 再 boot"会让子插件 `ctx.get('slot')` 拿到 `undefined` 并**静默跳过**自己的运行期贡献，机制是"一个插件 `apply` 未结算时 provide 的服务，对它在此期间创建的子插件不可见"。✅ **该矛盾已清理（优化点 2，本批复核）**：`packages/core/src/index.ts` 的 `SlotService` 注释、`packages/manager/src/slot-plugin.ts` 文件头、`packages/manager/src/slots.ts` 文件头现已**同一口径**——core 记「归属曾经写错过，别再改回去」并指向 slot-plugin.ts；`slots.ts` 文件头原先那句站在反面的「为什么放在 manager 而不是单独一个插件……多出一个谁先谁后的启动顺序问题」**已推翻**，改为只回答「**注册表实现**放哪」并显式声明「顺序问题不是回避独立插件的理由，而是必须正面解决的约束」。ⓘ 上面这句所引的 `core/src/index.ts:949-953` 行号与原文均已随之后的重构失效，勿按旧行号检索。④ **`editor-toolbar-slots` / `admin-page-slots` 这两个名字从未存在过**，白名单里落地的是 `editor-toolbar`（本批新增，多占用）；**`admin-page-slots` 仍未提供**
-- [ ] Suspense + use Hook 懒加载远端插件 JS Bundle —— 远端 bundle 目前仍由加载器显式 `import()`（"不白屏"靠 ErrorBoundary 而非 Suspense Fallback）；**加载时机已不再是问题**（见下一项：入口表由后端下发 + 生命周期自动同步），本项剩下的只是"改用 Suspense / use Hook 的加载表现"这一件事
-- [x] 插件 UI 入口表由后端下发 + 跟随插件生命周期自动同步（**已完成**）：入口表不再是静态 JSON（`/plugins-ui/registry.json` **已停用**），改由 `GET /api/plugins/ui` 从**活状态**现算（注册表 × 激活集合 × 产物 stat → `{ ok, version: 1, revision, plugins: { <name>: { entry, css?, rev } }, skipped }`；`skipped` 记 `inactive` / `no_client` / `entry_missing` / `invalid_name`），响应带 `cache-control: no-store` + `ETag`，`If-None-Match` 命中即 **304**（**空表仍 200**，永不 404）；前端 `syncPluginUi()`（幂等 + 单飞）按整表 `revision` 与逐插件 `rev` 的差集**先卸后装**，`startPluginUiSync({ intervalMs: 15000 })` 立即同步一次 + `visibilitychange` + 可见期轮询 → **UI 随插件启停自动出现/消失**（管理台动作即时，外部变更收敛上界 ≤15s）。**本批补充（提交 `3bdcf4b`）**：`skipped` 现已**在管理台分级展示**——`classifyUiSkips()`（`packages/web/src/lib/pluginUiPlan.ts:226`）把 `entry_missing` / `invalid_name` 归为红系显著告警块 `.ui-skips-attention`，`inactive` / `no_client` 归为可折叠 `<details>` `.ui-skips-normal`（`packages/web/src/pages/AdminPage.tsx:385-421`）；注意它与 `GET /api/plugins` 的发现期 `issues` **语义不同**（前者 = 插件在、界面缺；后者 = 整个插件没加载进来）。**同时修掉一个真实交互缺陷**：`revision` 只对 `{version, plugins}` 求 sha1（`packages/manager/src/plugin-ui.ts:255`）**不含 `skipped`**，故"未启用/无界面插件集合"的变化不改 `revision` → 304 短路会让管理台**永远看不到**这类变化；修法是给 `syncPluginUi` 加 `force` 参数（**管理台走 force、不使用 `If-None-Match`**，15s 可见期轮询仍走 304 短路）。**仍成立的边界**：**ESM 模块实例不回收**——`rev` 变化走 unload → load，同 URL 命中模块缓存，故**产物更新需整页刷新才生效**（见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 5 节 L-6）
-- [x] **检索地基**：`@geewiki/search` 全文检索插件（SQLite FTS5 + **`trigram`** 中文分词 + 短词 LIKE 兜底），自带迁移 `migrations/0001_search.sql`，端点 `GET /api/search?q=&limit=&mode=`，**默认部署即启用**（`config/plugins.base.json` 第 4 条）——**已落地**（提交 `e6ddfbd`）。FTS5 预编译可用性、`unicode61` 中文失效、`trigram` 解药与 **<3 字符硬缺口**的实测见 [architecture.md](./architecture.md) §9.3
-- [x] **检索召回缺陷修复（已完成）**——**曾经的已知缺陷**：`mode` 缺省 `phrase` 把**整串**当 FTS5 字面短语（搜索框语义），而**自然语言问句**几乎不可能逐字连续出现在正文里 ⇒ **恒为 0 命中**，问答的检索地基实际不可用。**修复**：新增 `mode: 'terms'`（词元 OR；CJK 取 **3-gram 滑窗**、ASCII 按空白/标点切词且只保留 **≥3 字符**者；每个词元仍各自加引号当字面量），并让 `@geewiki/ai` 一律走 `terms`（`packages/plugin-ai/src/index.ts:361`）；`terms` 切不出词元时回退 LIKE。**状态：已落地并提交 `04c45c3`**（`packages/plugin-search/src/index.ts` +141、`packages/plugin-ai/src/index.ts` +6，两包测试 +173 / +45）。**已知代价（提交说明原文）**：terms 召回更宽，精确率天然低于短语检索，建议纳入后续检索质量评估；**`mode=terms` 未接入 Web UI**（搜索框保持 `phrase` 语义，`queryMode` 随响应下发备用）。**未验证项**：端到端召回质量未经本文档作者复跑（无真实问答链路）。见 [architecture.md](./architecture.md) §9.3。**修正（本批，2026-09-14）**：判据未变（问答侧一律走 `mode: 'terms'`），但**调用点的包名与行号都换了**——现在是 `packages/plugin-ai-qa/src/index.ts:431` 的 `search.search(principal, query, { limit, mode: 'terms' })`，本行原先写的 `packages/plugin-ai/src/index.ts:361` 随拆分失效（`packages/plugin-ai/` 目录已不存在）。**另一处签名变更**：`search-service` 的 `search` / `contents` 现在都以**主体为首参**（`packages/plugin-search/src/index.ts:191` / `:223`），旧签名不带主体。"`mode=terms` 未接入 Web UI（搜索框保持短语语义）"这一条**仍然成立**
-- [x] **LLM 服务契约层**：`@geewiki/llm`（route→provider 注册表 + 稳定错误码枚举 + 终止 chunk 保证 + **绝不重试** + 密钥只存**环境变量名** + 日志/响应脱敏）——**已落地**（提交 `e6ddfbd`，**已注册未启用**）。**有意不含任何厂商 adapter**，故当前无可用 provider。见 [architecture.md](./architecture.md) §9.4
-- [x] **RAG 检索管线（检索-only 形态）**：`@geewiki/ai` 检索增强问答——**核心承诺"没有 API key 时也完整可用"**（`200` 一律正常，降级为 `mode: 'retrieval-only'` + 抽取式摘要，`sources` 永远完整返回；截断放不下则**整条丢弃**、`used:false` / `n:null`）——**已落地**（提交 `585dbac`，**已注册未启用**）；前端界面走宿主原生 UI（`#/wiki/search/<q>`、`#/wiki/ask/<q>`，提交 `dc5885e`）。见 [architecture.md](./architecture.md) §9.5、§9.6。**修正（本批，2026-09-14）——本项描述的形态已被本批推翻，保留原文以记录当初的取舍**：① **插件一分为二**：`@geewiki/ai` → `@geewiki/ai-writing`（`displayName: 'AI 辅助写作'`，`provides: 'ai-assist-service'`，`requires: ['http-service','llm-service','policy-service']`，贡献 `editor-toolbar`）+ `@geewiki/ai-qa`（`displayName: 'AI 问答'`，`provides: 'ai-qa-service'`，`requires: ['http-service','search-service','llm-service']`，贡献 `wiki-ask`）；两者现在**都在默认基础层清单里**（`config/plugins.base.json` 末两条），"已注册未启用"的旧状态作废。② **"没有 key 也完整可用"这条承诺在问答侧被主动放弃**：`extract.ts` 与 `mode:'retrieval-only'` **已删除**——没有模型时它返回的其实是带 `<mark>` 的检索片段拼接，用户读到的是"像是答案"的东西。新口径：**宁可不出，也不能冒充**：缺模型 ⇒ **503 `model_unavailable`**（且**不跑检索**、实测一次上游调用都没有）、检索服务缺失 ⇒ **503 `search_unavailable`**、调用了模型而它失败 ⇒ **502 `generation_failed`**（带 `degraded.code`）。`mode` 只剩 `rag` / `rag-partial` / `no-context`；**检索 0 命中仍不是错误**（`200 mode:'no-context'` + `answer:null` + **不调用模型**）。"截断放不下则整条丢弃、`used:false` / `n:null`、`n` 只对 `used:true` 连续编号"三条**原样保留**（`packages/plugin-ai-qa/src/select.ts:79`），并按访问控制设计补齐**块对齐截断**（`accumulateBlocks()` `select.ts:58`，整块累加、绝不跨可见性不同的块切字符）。③ **前端不再是宿主原生 UI**：`#/wiki/ask/<q>` 路由仍在宿主，但面板 DOM 全部来自插件自带 bundle（`packages/plugin-ai-qa/ui/`、`packages/plugin-ai-writing/ui/`）；web 里的 `AskPanel.tsx` / `components/ai/AssistToolbar.tsx` / `lib/aiStreamPlan.ts` / `lib/assistPlan.ts` 与 `api.ts` 的 AI 类型已删除。`#/wiki/search/<q>` 仍是宿主原生（检索不是插件界面）。④ **配置项形状变更**：`AiQaConfigSchema` 只有 `retrievalLimit` 8(1..50) / `maxSourcesInContext` 6(1..20) / `perSourceChars` 1200(100..10000) / `totalContextChars` 0(0..60000，0=按「模型接入」自动推导)，**`extractive` 开关已删**（留着它等于留一条"可以退回冒充答案"的路）；`AiAssistConfigSchema` 是**空对象**（`ASSIST_TEXT_MAX = 4000` 与各动作 token 预算仍是代码常量）。**没有改动的**：检索地基 `@geewiki/search` 本身、`sources` 永远完整返回、`packages/web` 的搜索页
-- [ ] **厂商 LLM adapter**（OpenAI / Anthropic 等真实 provider，`configSchema` 含密码字段）——**未做**：`llm-service` 当前**无任何可用 provider**，问答**恒走 `retrieval-only`**；`rag` / `rag-partial` 两条路径**仅有"假 provider"的单测覆盖**。唯一接线点是 `packages/plugin-ai/src/index.ts:261` 的 `generate()`。**⚠️ 并行情况（截至本批取数时刻 `2026-09-11T00:38 +08:00`）**：另有一批并行工作正在新增 OpenAI 兼容 adapter 包 `packages/plugin-openai`，**尚未提交**——该包已有 `src/{index,provider,sse,errors}.ts` + `test/{plugin,provider,sse,errors}.test.ts`（自带 **42** 例单测：`errors` 7 + `plugin` 8 + `provider` 16 + `sse` 11），且 `packages/server/src/index.ts` 的 `defaultRegistry()` 已在**未提交**的工作树里登记 `@geewiki/openai`（无 `provides`、`requires` 点名 `llm-service`、`conflictGroup: 'llm-provider'`、只登记不入默认基础层清单）。**不得据此认为厂商 adapter 已落地**，以最终提交为准。**修正（本批，2026-09-14）**：本行末尾“尚未提交”已作废——`packages/plugin-openai` 现在**在 HEAD 里**（`git ls-tree -r HEAD packages/plugin-openai` 可列出 `src/{index,provider,sse,errors}.ts` 与 `test/{plugin,provider,sse,errors}.test.ts`），并已登记进 `defaultRegistry()`（`packages/server/src/index.ts:1473`）与 `config/plugins.base.json` 的默认启用清单。**本行上半段的两条后果因此同时失效**：“`llm-service` 当前**无任何可用 provider**，问答**恒走 `retrieval-only`**”——provider 已存在，而 `retrieval-only` 这一档也随 AI 拆分被删除（缺模型现在是 503 显式不可用）。**“唯一接线点是 `packages/plugin-ai/src/index.ts:261` 的 `generate()`”一并作废**：该目录与函数均不存在；接 adapter 的正确位置是**向 `llm-service` 注册一条 route→provider**，消费者只有两处、都走 `llm.stream()`（问答 `packages/plugin-ai-qa/src/index.ts`，辅助写作 `packages/plugin-ai-writing/src/assist.ts`，后者还按统一配置的 `maxOutputTokens` 收敛输出预算）。**adapter 自身的完成度不由本批判定**（属并行批次；其测试与包数量口径由读数批次回填）
-- [ ] **流式（SSE）输出——有意未做（但出口地基已就绪）**：**为什么有意**：SSE 出口必须与宿主排空（`drain`）语义一起设计，否则长连接会在途计数常驻，使卸载/关停的 `drain` 空转满 `drainTimeout` 并打印**假的排空超时告警**（见第 5 节 L-1）。**本批（提交 `2273006`）已把这件事做完**：`RouteHandlerContext.noteStatus?(status)`（**只记指标、不结束响应**）、`HttpRouterService.trackStream?(res)`（登记长连接、返回幂等注销函数；**该集合不参与排空计数**）、`HttpRouter.closeStreams()`（**注意：不在 `HttpRouterService` 接口上，是具体类方法**），以及 `HttpPlugin.apply` 的五步 teardown（`unprovide()` → `closeStreams()` → `await drain()` → `server.closeIdleConnections?.()` → `server.close()`，**刻意不用 `closeAllConnections()`**）。**仍未接线的部分**：真实流式输出本身——尚无任何插件向客户端持续写帧，检索与问答均为**一次成型返回**；**硬超时 / idle 超时**与 **`res.on('close')` 即取消上游**两件亦未做。**一条务必记档的实测证伪**：**不要**用"先 `writeHead(200, {'content-type':'text/event-stream'})` 再 `h.json(200, null)`"去"只记指标"——`writeHead` 后 `res.headersSent` 立即为 `true` 而 `writableEnded` 仍为 `false`，`json()` 会跳过 `writeHead` 却**仍无条件执行 `res.end(JSON.stringify(body))`**，给事件流追加字面 `null` **并立即终结流**（实测客户端正文 `event: status\ndata: {"type":"status"}\n\nnull`）；正解是 `noteStatus()`。见 [architecture.md](./architecture.md) §5.1.1。**修正（本批，2026-09-14）——本项的“有意未做”已结束，真实流式输出已接线**：`@geewiki/ai-qa` 的 `POST /api/ai/stream`（注册在 `packages/plugin-ai-qa/src/index.ts:931`，实现层 `packages/plugin-ai-qa/src/sse.ts`）逐帧写 `status → delta* → done | error`，**终止帧恰一次且在末位**；实测帧序列见 `data/verify/ai-split-e2e/result-backend.json`（正常 `status, delta×3, done`；检索 0 命中 `status, done` 且 `answer:null`、**不发 `error`**；中途上游失败 `status, error`）。上面点名“两件亦未做”的**都已落地**：**硬超时 120s / idle 30s**（`STREAM_HARD_TIMEOUT_MS = 120_000` 在 `sse.ts:30`、`STREAM_IDLE_TIMEOUT_MS = 30_000` 在 `:38`、并发上限 `MAX_CONCURRENT_STREAMS = 4` 在 `:46`，三者刻意不进 `configSchema`）与 **客户端断连即取消上游**（`packages/plugin-ai-qa/src/index.ts:784-786`：响应 `close` 事件里 `ac.abort()`；超时同样 abort，插件卸载时**先 `abort()` 上游再收连接**；`AbortSignal` 经 `llm.stream({ signal })` 透传）。**仍然成立的两条**：① 上面那条 `writeHead` + `h.json(200, null)` 的实测证伪（会把字面 `null` 写进事件流并立即终结流）——正解仍是 `noteStatus()`；② 出口地基没有被绕过：流式处理器**同步返回非 thenable**，长连接仍不进排空在途计数。见 [plugin-platform-plan.md](./plugin-platform-plan.md) L-16 的修正块
-- [x] **AI 变更日志与回退（P4，已完成）**：新增 `@geewiki/ai-journal`（`provides: 'ai-journal-service'`，自带迁移 `0001_ai_mutations.sql`，四个要求登录主体的端点）与 `@geewiki/ai-pages`（本仓**第一条 `mutating: true`** 的工具 `page.update`），两条都进默认基础层（启用 14 → **16**）。**三条验收判据的落点**：① 回退到某轮之前 = `planRollback()` + `rollbackTo(principal, …)`，粒度 `turnId` = **一次用户提问**（客户端生成并透传，不是 HTTP 回合）；② 他人改过即拒绝 = 冲突分支，且 `currentOf` 返回 `undefined`（"没拿到"）时**按冲突处理而不按"一致"处理**——猜"一致"是拿别人的编辑赌一次静默覆盖；③ 自锁护栏 = `checkSelfLock()` + `PROTECTED_AI_NODES`（`ai-assistant`/`ai-tools`/`llm`/`ai-journal`），**硬编码常量不是配置项**（它保护的是"AI 还有没有下一次机会"），且**在工具层不在提示层**。**实现期暴露的两个缺口**：工具执行体原来不知道自己在哪一轮 ⇒ `AiToolHandler` 加必填第三参 `AiToolContext`（只读工具显式忽略）；`wiki-service.save()` **不带主体** ⇒ 写工具必须自己向 `policy-service` 要 `canEdit`（**已知竞态窗口，修法是给 wiki-service 加 `saveAs(principal,…)`，未做**）。**读数**：1656/1656 绿（20 个包）、typecheck 23 projects 全 Done。**⚠️ 仍未做**：页面管理其余工具（建页/删页/改可见性，归 P5 的 `ai-admin`）。设计真源见 [design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md) §8.8；**上文"AI 能力"各条中凡提到 `@geewiki/ai-assist` 的，均已随 P3 改名 `ai-writing` 而失效**。
-  - **✅ P4 尾已完成（回退 UI + 可见性红线 + 端到端验收，2026-09-14）**：① **回退入口**每轮一个，只列未撤干净的轮次，结果逐条列出没撤的原因；写操作的判定权在服务端（`done` 帧新增 `mutatingTools`，按描述符的 `mutating` 算），草稿的记录是**观察式**的（调用前后各读一次正文，真变了才记）。② **冲突检测改为"探针优先于客户端自报"**：新增 `MutationProbe`（按域注册），`page` 域由 `@geewiki/ai-pages` 注册、走**带编辑权判据的原文读路径**；`editor` 域没有探针，调用方自报是唯一来源，不自报即按**冲突**处理（"不知道" ≠ "没变过"）。第一版把"现在是什么"完全交给浏览器，而回退请求也来自浏览器——一份过期快照就能静默覆盖别人的编辑。③ **一条权限红线**：AI 的"读-改-写"会把 `<!--gated:org-->` 受限段落**静默变成公开**（投影吃掉标记 ⇒ 整篇写回时标记没了 ⇒ `blocks` 重算成 public）；修法是判据收进 `wiki-service` 内部（`wantRaw` 同时看 `opts` **与** `canEdit`）+ `gatedRewriteRefusal()` 的**结构护栏**（比结构不比内容）。④ **一个单测全绿、端到端才抓到的真缺陷**：`svc.get` 包装层只转两个参数 ⇒ 跨插件调用方永远拿投影正文（HTTP 路径却拿原文），两条路径行为不一致**且不报错**；守卫 `packages/plugin-wiki/test/rawContentGuard.test.ts`。⑤ 端到端验收 `scripts/acceptance/p4-undo/run.ts`（**不需要模型密钥，故不 SKIP**）**33 条判据全过**。**读数**：全仓 **1696/1696 绿**（20 个包全部 `# fail 0`）、typecheck **23** projects 全 Done。
-- [ ] **向量 / 语义检索**——**有意后置**：离线 + 零重依赖前提下不现实（本地 ONNX 需预烤模型与 ORT WASM 运行时），只留接口位；当前检索是**纯字面**匹配（FTS5 trigram + LIKE），同义改写 / 跨语言 / 模糊表述均搜不到
-- [ ] 编辑器组插件（Milkdown / TipTap 示例）替换 textarea
-- [ ] 插件级静态资源注入（每插件可携带前端资源目录，随激活挂载）——**部分落地**：插件 UI 已有"自带产物根"（`<插件目录>/dist` 优先于内置根 `<GEEWIKI_PLUGIN_UI_DIST>/plugins-ui/<名>`，见 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`；该内置根**缺省 = `GEEWIKI_WEB_DIST`**，两者已拆为独立配置项，见 [plugin-platform-plan.md](./plugin-platform-plan.md) 第 9 节），但**只覆盖 UI 入口与样式两个单段文件名**（`entry` / `css`），**不支持任意资源目录、也不支持子目录资源**（字体/图片需内联进 bundle）
+以下事项**均已完成**，这里只保留结论与真源位置；形态细节见
+[design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md)。
 
-- [x] **AI 工具调用（P0）**：`@geewiki/llm` 与 `@geewiki/openai` 补上 tools 透传——`LlmRequest.tools` / `toolChoice`、`LlmMessage.role: 'tool'` 与 `toolCalls` / `toolCallId`、`LlmChunk` 的 `tool-call-delta` 变体、`done.finishReason`，拼装收敛到**全仓唯一一份** `assembleToolCalls()`（`packages/plugin-llm/src/tools.ts`）。**已落地并验收**：真实上游一次工具调用往返（3 轮 / 3 次调用），全仓 1416/1416；读数见 [design/ai-plugin-architecture.md](design/ai-plugin-architecture.md) §8.3
-- [x] **AI 工具总线与知识库工具（P1）**：新增 `@geewiki/ai-tools`（`provides: ai-tool-service`，**纯注册表**）与 `@geewiki/ai-kb`（贡献 `list_pages` / `search_kb` / `read_page` 三条只读工具），两者都进默认基础层清单。**验收读数**：「主页上怎么新建内容？」在真实例 + 真实工具表 + 真实上游上 **3 轮 / 3 次工具调用，其中检索 0～1 次**（对照只有字面检索时的基线 **5 轮 / 15 次**）——`list_pages` 这类"地图工具"把"盲猜措辞"换成了"先看地图"。全仓 **1453/1453**。设计、契约与两处实现期修正见 [design/ai-plugin-architecture.md](design/ai-plugin-architecture.md) §8.4
-  - **仍待做**：会话核心 `ai-assistant`（agent loop + `app-dock` 输入条）、mutation journal 与回退、摘要插件与折叠摘要卡、拆除旧 `wiki-ask` UI。分期表见该文档 §8.2（P2–P8）
-- [ ] **AI 会话核心与常驻输入条（P2）**：新插槽 `app-dock` + `@geewiki/ai-writingant` 的 agent loop
-  - **宿主侧（P2a）已完成**：`app-dock` 进三处镜像与两份守卫（`single` 占用）；`AppDockSlotProps`
-    四个字段；`ON_DEMAND_SLOTS` 三→四；宿主侧纯逻辑 `lib/dockPlan.ts`（路由 → 页面上下文，
-    **`page.kind` 收窄到 `'view' | 'edit'`**：列表/新建/检索/图谱/管理台一律 `null`，不留"空 slug
-    冒充当前页"的口子）；客户端工具注册表 `lib/clientTools.ts`；挂载组件 `components/AppDock.tsx`
-    （登录判定 + 按需加载 + props 组装，三者同生同死——见该文件头）；`App.tsx` 的渲染点在 `<main>`
-    **之外**（切页不重挂 = 会话存活）；宿主 SDK `0.2.0 → 0.3.0`（新增 `registerTool` /
-    `unregisterTools` / `invokeTool` / `clientTools`）。全仓 **1478/1478**，读数见
-    [design/ai-plugin-architecture.md](design/ai-plugin-architecture.md) §8.5
-  - **仍待做（P2b）**：`@geewiki/ai-writingant` 插件本体——`POST /api/ai/turn`（无状态轮次）、
-    系统提示与预算、`app-dock` 的 UI bundle（输入条 → 向上展开对话区）、会话历史（浏览器本地
-    近 10 段，决策 9/12）、`out-of-scope` 标注（决策 4）
+- [x] **LLM 契约层**：`@geewiki/llm`（route→provider 注册表 + 稳定错误码枚举 + 终止 chunk 保证 + **绝不重试** + 密钥只存 secret 字段或环境变量名 + 日志/响应脱敏）。**有意不含任何厂商 adapter**——adapter 在 `@geewiki/openai`。见 architecture §9.4。
+- [x] **检索地基**：`@geewiki/search`（SQLite FTS5 + **`trigram`** 中文分词 + 短词 LIKE 兜底），端点 `GET /api/search?q=&limit=&mode=`，**默认部署即启用**（`config/plugins.base.json` 第 9 条）。中文检索的实测事实见 architecture §9.3。
+- [x] **检索召回缺陷修复**：`mode` 缺省 `phrase` 曾使自然语言问句**恒为 0 命中**；修复为 `mode: 'terms'`（CJK 取 3-gram 滑窗、ASCII 只保留 ≥3 字符词元），**已提交 `04c45c3`**。**仍成立的边界**：`mode=terms` **未接入 Web UI**（搜索框保持 `phrase` 语义）；terms 召回更宽、精确率低于短语检索。
+- [x] **AI 工具调用（P0）**：tools 透传（`LlmRequest.tools` / `toolChoice`、`role: 'tool'` 消息、`tool-call-delta` chunk、`done.finishReason`），拼装收敛到全仓唯一一份 `assembleToolCalls()`（`packages/plugin-llm/src/tools.ts`）。
+- [x] **AI 工具总线与知识库工具（P1）**：`@geewiki/ai-tools`（`provides: 'ai-tool-service'`，纯注册表）与 `@geewiki/ai-kb`（`list_pages` / `search_kb` / `read_page` 三条只读工具），都进默认基础层清单。
+- [x] **AI 变更日志与回退（P4）**：`@geewiki/ai-journal`（`ai-journal-service`，四个要求登录主体的端点，迁移按方言分家）+ `@geewiki/ai-pages`（本仓**第一条 `mutating: true`** 的工具 `page.update`）。回退粒度 `turnId` = 一次用户提问；**他人改过即拒绝**（"没拿到当前值"按冲突处理，不按"一致"处理）；自锁护栏 `checkSelfLock()` + `PROTECTED_AI_NODES` **在工具层不在提示层**。**已知竞态窗口（未做）**：`wiki-service.save()` 不带主体，写工具只能自己向 `policy-service` 要 `canEdit`；正解是给 wiki-service 加 `saveAs(principal, …)`。回退 UI、探针优先于客户端自报、`gatedRewriteRefusal()` 结构护栏均已落地。
+- [x] **AI 插件化重构 P5**：`@geewiki/ai-nav`（`open_page` / `scroll_to`，处理器在宿主 `packages/web/src/lib/navTools.ts`）与 `@geewiki/ai-admin`（`plugin.list` / `read_config` / `set_enabled` / `set_config`，仅所有者/管理员可用，护栏在**调用管理器之前**生效）；跨知识库结果带 `grounding` 显著标注；`ai-assistant` 声明 `REQUIRED_TOOL_NAMES = ['search_kb']`，缺席时 `/api/ai/turn` 以 **503 `tools_unavailable`** 拒绝（**不偷偷降级成通用聊天机器人**）；自锁名单扩到五个。验收 `scripts/acceptance/p5-nav-admin/run.ts`。
+- [x] **AI 插件化重构 P6**：`@geewiki/ai-summary` + 折叠摘要卡——平台层新增第七个插槽 `article-summary`（单占用）与第二个平台事件 `PAGE_SAVED_EVENT`（`@geewiki/wiki` 在**事务提交之后**用 `ctx.emit` 同步广播，`unchanged` 不广播、负载不含正文）。摘要只对 public/org 两档写；过期用**内容哈希**判而非时间戳；按摘要检索**有意不走 FTS5**（`LIKE` 粗筛 + JS 精排 ⇒ 方言中立，PG 上也能跑）。折叠卡渲染在 `<h1>` **之后**、正文之前（`packages/web/src/pages/WikiPage.tsx:2228` 是 `<h1>`、`:2240` 是 `ArticleSummarySlotOutlet`；2026-09-17 用户要求从"标题之前"调整过来）；`available === false` ⇒ **整张卡片不渲染**（源码守卫钉住）。验收 `scripts/acceptance/p6-summary/run.ts`。
+- [x] **AI 插件化重构 P8（已完成）**：拆除旧 UI（决策 17）+ 删除 `@geewiki/ai-qa`（决策 22）——`wiki-ask` 从 `SlotName` 与三处镜像中消失、`#/wiki/ask/<q>` 路由拆除、三个旧端点（`/api/ai/ask`、`/api/ai/stream`、`/api/ai/capabilities`）与旧产物全部 404、`PUT /api/pages/ask` 仍 **400 `invalid_slug`**（保留段未解禁）。验收读数（隔离实例 `GEEWIKI_PORT=3931`）：入口表恰两键（`ai-assistant: ['app-dock']`、`ai-summary: ['article-summary']`）、`GET /api/plugins/slots` 已无 `wiki-ask`。详见 [design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md) §0 决策 22 / §7.1 / §8.12 / §9.0。
+- [x] **AI 会话核心与常驻输入条（P2）**：插槽 `app-dock` + `@geewiki/ai-assistant` 的 agent loop。宿主侧纯逻辑 `lib/dockPlan.ts`（路由 → 页面上下文，`page.kind` 收窄到 `'view' | 'edit'`，列表/新建/检索/图谱/管理台一律 `null`）、客户端工具注册表 `lib/clientTools.ts`、挂载组件 `components/AppDock.tsx`（登录判定 + 按需加载 + props 组装同生同死），渲染点在 `<main>` **之外**（切页不重挂 = 会话存活）。**`POST /api/ai/turn`（无状态回合，SSE）已落地**（`packages/plugin-ai-assistant/src/index.ts:51` 的 `TURN_PATH`）：系统提示与预算、`app-dock` 的 UI bundle、会话历史（浏览器本地近 10 段，决策 9/12）、`out-of-scope` 标注（决策 4）均已接线。
 
-- [x] **AI 插件化重构 P5（已完成）**：`@geewiki/ai-nav`（`open_page` / `scroll_to`，
-  处理器在宿主 `packages/web/src/lib/navTools.ts`）、`@geewiki/ai-admin`
-  （`plugin.list` / `read_config` / `set_enabled` / `set_config`，仅所有者/管理员可用，
-  受自锁护栏约束且护栏在**调用管理器之前**生效）、以及**知识库之外的显著标注**
-  （`AiToolResult.grounding` → `LoopOutcome.grounded` → `done.grounded` → 界面标注，
-  跨 HTTP 回合取或）。同时把 §0.2 的判据落地：`ai-assistant` 声明
-  `REQUIRED_TOOL_NAMES = ['search_kb']`，缺席时 `capabilities.available=false` 且
-  `/api/ai/turn` 以 `503 tools_unavailable` 拒绝（**不偷偷降级成通用聊天机器人**）。
-  自锁名单从四个扩到五个（补 `@geewiki/ai-admin`：停了它 AI 就失去了纠错能力）。
-  **顺带修掉一个 P4 遗留真缺陷**：`DoneData.mutatingTools` 声明了却从未被
-  `parseTurnEvent` 解析 ⇒ 编辑框改动从来没进过日志、从来不可回退。
-  读数：全仓 `pnpm test` **1774/1774 绿 / 22 个包**、typecheck **作用域 25 个项目全部 Done、0 个 `error TS`**、
-  `scripts/acceptance/p5-nav-admin/run.ts` **全部通过（含真实上游）**。
-  设计真源 [design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md) §8.10。
-- [x] **AI 插件化重构 P6（已完成）**：`ai-summary` + 折叠摘要卡（需求 ③④）。
-  平台层新增第七个插槽 `article-summary`（单占用，`{slug,title}`）与第二个平台事件
-  `PAGE_SAVED_EVENT`（`@geewiki/wiki` 在事务提交后用 `ctx.emit` 同步广播、不等待订阅者；
-  `unchanged` 不广播；负载不含正文）。摘要**按页面自身档位**对应的投影写，只对 public/org 两档写
-  （`private` / 仅逐人授权不生成——理由见设计文档 §8.11.2 与 §9.0.1）。
-  过期用**内容哈希**判而非时间戳；按摘要检索**有意不走 FTS5**（`LIKE` 粗筛 + JS 精排，
-  2-gram 切片 ⇒ 方言中立，PG 上也能跑）。折叠卡渲染在 `<h1>` 之前，
-  `available === false` ⇒ **整张卡片不渲染**（由源码守卫钉住）。
-  读数：全仓 `pnpm test` **1817/1817 绿 / 23 个包**、typecheck 作用域 **26 个**项目全 Done、
-  `scripts/acceptance/p6-summary/run.ts` **全部通过（含真实上游）**。
-  设计真源 [design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md) §8.11。
-- [x] **AI 插件化重构 P8（已完成）**：拆除旧 UI（决策 17）+ 删除 `@geewiki/ai-qa`（决策 22）——`wiki-ask` 从 `SlotName` 与三处镜像中消失、
-  **验收读数（隔离实例 `GEEWIKI_PORT=3931`）**：入口表恰两键（`ai-assistant: ['app-dock']`、`ai-summary: ['article-summary']`）、`GET /api/plugins/slots` 已无 `wiki-ask`、三个旧端点（`/api/ai/ask`、`/api/ai/stream`、`/api/ai/capabilities`）全部 **404**、旧产物 `/plugins-ui/@geewiki/ai-qa/client.js` **404**、`packages/web/dist` 与 `plugins-ui/` 全量 grep 四处关键词 **0 命中**、`PUT /api/pages/ask` 仍 **400 `invalid_slug`**（保留段未解禁）。全仓 `pnpm test` **1715/1715**（22 个包 0 fail）、`pnpm typecheck` **25** 个 project 全 Done。详见 [design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md) §0 决策 22 / §7.1 / §8.12 / §9.0
+---
+
+## 接下来做什么
+
+### 1. `admin-page-slots` 扩展点
+
+后端 `SlotService` 已支持插件用 `define(owner, slot, meta?)` **自开扩展点**（含声明/贡献分离、`undeclared` 诊断），宿主自带的白名单稳定在 7 个内置槽；**宿主侧的 `admin-page-slots` 仍是候选、尚未提供**。（`editor-toolbar-slots` 这个候选名**从未存在过**——白名单里落地的是 `editor-toolbar`。）见 architecture §6 已知边界第 1 条。
+
+### 2. 第三方编辑器插件（Milkdown / TipTap）
+
+`editor` 插槽与 `EditorSlotProps` 已就绪（含附件上传、段落档位、段落授权、选区/写回等**可选**通道，与内置编辑器走同一实现），但**仓库内从未实现任何厂商编辑器**，内置编辑器仍是宿主自带的 textarea。这是"编辑器组"这个名字目前唯一的落点。
+
+### 3. 其它厂商 LLM adapter（Anthropic 等）
+
+当前只有 `@geewiki/openai` 一条 OpenAI 兼容路由（默认启用但 `apiKeyEnv` 为空串 ⇒ **默认无可用 provider，AI 功能明确 503**）。新增厂商 = 新增 adapter 包，向 `llm-service` 注册一条 route→provider；**多个 adapter 并列共存是正常需求**，不进冲突组。
+
+### 4. 向量 / 语义检索
+
+**有意后置**：离线 + 零重依赖前提下不现实（本地 ONNX 需预烤模型与 ORT WASM 运行时），只留接口位。当前检索是**纯字面**匹配（FTS5 trigram + LIKE），同义改写、跨语言、模糊表述都搜不到。
+
+### 5. F10 进程内隔离模式 / F18 检索查询接线
+
+**有意后置**。（`F10` 的 `permissions` 清单已落地，缺的是"进程内隔离"这一执行模式；`F18` 的查询接线同理。）
+
+### 6. 外部插件签名
+
+现状只有**完整性校验**——相对"写入基线"回答"这个插件被改过吗"（`ok` / `drift` / `unsigned`），**没有发布者签名与公钥信任链**，本轮也不冒充它。`unsigned`（无基线 ⇒ 无法判断）刻意与 `ok` 分开。
+
+### 7. 插件级静态资源注入
+
+**部分落地**：插件 UI 已有"自带产物根"（`<插件目录>/dist` 优先于内置根 `<GEEWIKI_PLUGIN_UI_DIST>/plugins-ui/<名>`，真源 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`；该内置根**缺省 = `GEEWIKI_WEB_DIST`**，两者已拆为独立配置项）。**边界以实际行为为准**：`client.entry` / `client.css` 仍是**单段文件名**（`PLUGIN_UI_FILE_SEGMENT`，契约依赖"单段"语义），而**其它资源可以放子目录**——`PLUGIN_UI_ASSET_PATH` 允许 `assets/logo.svg`、`js/chunks/chunk-abc.js` 这类嵌套路径（段数上限 `PLUGIN_UI_ASSET_MAX_DEPTH = 16`，段必须以字母或数字开头，故 `..`、`.env`、绝对路径、百分号编码天然非法）。仍缺的是"插件自带任意资源目录、随激活挂载到任意位置"这一更宽的形态（字体/图片若不走 `/plugins-ui/**` 就仍需内联进 bundle）。
+
+### 8. 插件平台仍成立的已知限制
+
+样式无隔离（无 Shadow DOM、无前缀改写）、**ESM 模块实例不回收**（产物更新需整页刷新）、无版本协商与完整性之外的信任机制、`on-demand` 插槽的若干踩坑边界、"插件产物更新需整页刷新"等——完整清单见 [plugin-platform.md](./plugin-platform.md)。
+
+---
+
+## 历史读数台账
+
+**仅为备查**。这些读数是**历史时点**且互相不可比（口径、包数、是否含未提交工作树都不同）；标"HEAD 未记录"者原稿未记，不可复现。
+**当前读数只有上文那一处**。
+
+| 时点 / HEAD | 读数 | 备注 |
+| --- | --- | --- |
+| Phase 2 验收（HEAD `75a634b`） | 15/15 | `deps.test.ts` 8 + `manager.test.ts` 7；同批 typecheck 全绿、`vite build` 通过 |
+| 后续治理批次（同一实现期，HEAD 未记录） | 35/35 | deps 8 + manager 13 + repo-paths 3 + server 11 |
+| 读数 A：HEAD `585dbac`（2026-09-10T23:24 +08:00） | 242/242 | 7 个包 |
+| 读数 B（工作树含并行批次未提交改动，2026-09-10T23:35 +08:00） | 251/251 | 较 A 多 `plugin-search` 32 / `plugin-ai` 25；该批次已落为 `04c45c3` |
+| 读数 C：HEAD `3bdcf4b`（2026-09-11T00:29 +08:00） | 266/266 | 7 个包，fail 0 / skipped 0 |
+| 读数 D（工作树含未提交的 `packages/plugin-openai/**`，2026-09-11T00:38 +08:00） | 308/308 | 8 个包；该包现已入库 |
+| P0 AI 工具调用（HEAD 未记录） | 1416/1416 | 真实上游一次工具调用往返（3 轮 / 3 次调用） |
+| P1 工具总线与知识库工具（HEAD 未记录） | 1453/1453 | 真实例 + 真实工具表 + 真实上游 3 轮 / 3 次调用（基线 5 轮 / 15 次） |
+| P4 变更日志与回退（2026-09-14，HEAD 未记录） | 1696/1696，typecheck 23 | 20 个包全部 `# fail 0` |
+| P5 导航与管理工具（HEAD 未记录） | 1774/1774，typecheck 25 | 22 个包；`scripts/acceptance/p5-nav-admin/run.ts` 全过（含真实上游） |
+| P6 摘要与折叠卡（HEAD 未记录） | 1817/1817，typecheck 26 | 23 个包；`scripts/acceptance/p6-summary/run.ts` 全过（含真实上游） |
+| P8 拆除旧 UI + 删除 `ai-qa`（HEAD 未记录） | 1715/1715，typecheck 25 | 22 个包 0 fail；隔离实例 `GEEWIKI_PORT=3931` |
+| **当前：HEAD `98b0ddd`（2026-09-17）** | **`pnpm test` exit 0 全绿 / `pnpm typecheck` exit 0、0 个 `error TS`** | 以实跑为准 |
+
+> **一条教训**：报告读数**必须同时给出 HEAD 与取数时刻**，并说明是否含未提交的工作树。缺少这三样，
+> 读数既不可复现也不可比——上表里同一实现期的读数互相矛盾，全部是这一个原因。

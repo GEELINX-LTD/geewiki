@@ -5,7 +5,7 @@
       插件客户端 bundle 把 `react` / `react/jsx-runtime` 声明为 external，
       靠这张 import map 解析到宿主单例（public/host-sdk/*.js）。
       必须是 head 的第一个元素：import map 只对"解析时尚未加载"的 module script 生效，
-      Vite 构建时还会把它前移到第一个 module script 之前（见 docs/plugin-platform-plan.md D-8）。
+      Vite 构建时还会把它前移到第一个 module script 之前（见 docs/plugin-platform.md）。
       注意：映射的目标必须是**真实存在**的 shim。
       `react-dom` / `react-dom/client` 在 F6 加入（SDK 0.6.0）：插件**仍然不得自带框架**，
       映射的目的是让它们共用**宿主这一个** react-dom 实例——两份实例会让 portal 出去的元素
