@@ -11,7 +11,7 @@
 //   createRoot(mount).render(<MyPage />)
 //
 // 这直接绕开了既有的"插件 CSS 全局注入、只靠 `.gw-fixture-*` 前缀约定"这条限制
-// （见 `docs/plugin-platform-plan.md` 的"有意不做：样式隔离"）。
+// （见 `docs/plugin-platform.md` 的"有意不做：样式隔离"）。
 //
 // ## 边界（如实记录）
 // 宿主**不会**替你管这个根的生命周期：插件必须在自己被卸载时 `root.unmount()`

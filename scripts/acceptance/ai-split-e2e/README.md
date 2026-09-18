@@ -1,8 +1,21 @@
 # `ai-split-e2e`：AI 拆分为「AI 辅助写作」+「AI 问答」的端到端验收
 
+> ## ⚠️ 历史验收留痕——当前不可运行
+>
+> **本目录是历史留痕，不是可回归的资产。** 它验收的是**已被 P8 拆除**的形态：`@geewiki/ai` 单体一分为二为 `@geewiki/ai-assist`（贡献 `editor-toolbar`）与 **`@geewiki/ai-qa`**（贡献 **`wiki-ask`**）。这两个包、`wiki-ask` 插槽与 `#/wiki/ask/<q>` 子路由现均已整包 / 整体删除（P8 决策 22 / 决策 17）；AI 能力现由 `@geewiki/ai-assistant` 等插件提供，对话入口是 `app-dock` 插槽，端点为 `/api/ai/turn`。
+>
+> **脚本可用性判断（按当前源码 grep 核对，结论：当前不可运行，保留为决策与坑的记录）**：
+> - `run.mjs` —— **不可运行**。仍直接调用已删除的端点：`GET /api/ai/capabilities`、`POST /api/ai/ask`、`POST /api/ai/stream`、`POST /api/ai/assist`（现均 404），并以 `@geewiki/ai-qa` / `@geewiki/ai-assist` 作为启停对象。
+> - `cdp-ui.mjs` —— **不可运行**。断言 `[data-slot="wiki-ask"]` 内的 `.ask-card`，并请求 `plugins-ui/@geewiki/ai-qa/client.js` / `@geewiki/ai-assist/client.js`（产物已不再生成）。
+> - `mock-upstream.mjs` —— **本身仍可用**：它是通用的假 OpenAI 兼容上游（`POST /v1/chat/completions`，SSE 分帧，`ok`/`429`/`empty` 三模式），与已删除对象无耦合。
+>
+> 保留它们的价值在于**记录当时的判据与踩过的坑**（隔离手法、端口变量名必须是 `GEEWIKI_PORT`、实例根必须放 `instance/` 子目录、`PUT .../config` 是整份替换语义），**不要当作当前验收使用**。下文提到的源级守卫路径 `packages/plugin-ai-assist/test/assist.test.ts` 也已随包删除。
+>
+> **位置与状态更正（与下文若干旧口径段落冲突，以本条为准）**：本目录实际位于 `scripts/acceptance/ai-split-e2e/`，**四个文件都已入库**（`git ls-files` 可见）；下文提到的两份读数快照 `result-backend.json` / `result-ui.json` **并不存在于本目录**，也不在版本库里。下文凡自称"本目录在 `data/verify/`"或"本目录整体不在版本库"的段落，都是写作当时的旧口径。
+
 **本批**（2026-09-14）把 `@geewiki/ai` 一分为二 —— `@geewiki/ai-assist`（贡献 `editor-toolbar`）与 `@geewiki/ai-qa`（贡献 `wiki-ask`），并把两套 AI 前端从 `packages/web` 迁进插件自带 bundle。本目录的两个脚本验的就是这件事在**真实进程**里成立：后端契约（状态码 / SSE 帧 / 提示词 / 密钥安全）与浏览器侧（插槽里真的是插件的 DOM、宿主一个 AI 节点都不产）。
 
-设计契约见 [`docs/design/ai-plugin-split.md`](../../../docs/design/ai-plugin-split.md)（含 §7「落地补充」——实现期对该设计的五处改写，其中三条正是这里的阶段 A/B 钉住的）。
+设计契约现指向 [`docs/design/ai-plugin-architecture.md`](../../../docs/design/ai-plugin-architecture.md)（该文档保留，是 AI 能力架构的权威记录；下文写作时引用的 `docs/design/ai-plugin-split.md` 已删除，其 §7「落地补充」等小节亦随之消失）。
 
 > **位置为什么在 `scripts/acceptance/` 而不是 `data/verify/`**：本仓库的约定是——**可复跑的验收脚本入库**（与 `scripts/acceptance/plugin-ui-cdp.mjs` 同等待遇），**跑出来的残留不入库**（`data/` 已被 `.gitignore` 排除）。因此：脚本与本 README 在版本库里；实例目录 `instance/`、Chrome profile、以及两份读数快照（`data/verify/ai-split-e2e/result-backend.json`、`result-ui.json`）**不在**。读数被 `README.md` 与 `docs/` 引用时按"某次实测的留痕"理解，不当作可回归的资产；**要回归请重跑脚本**（确定性假上游 ⇒ 读数应逐字段复现，不复现即是缺陷）。
 
@@ -16,7 +29,7 @@
 | `result-backend.json` | `run.mjs` 的**定版读数**（本批最后一次跑的 stdout 副本；重跑请看 stdout 或另存新名，不要就地覆盖） |
 | `result-ui.json` | `cdp-ui.mjs` 的**定版读数**（19 条 checks + notes；同上） |
 
-> 为什么用 mock 而不是真密钥：本批要钉的是**边界行为**——缺模型、上游限流、"上游正常结束但一个 token 都没给"。真实上游给不给 429 是不可控的，用真模型跑验收只会得到"今天通了明天红"的抖动读数。**本目录从未调用真实厂商端点**：`docs/design/ai-plugin-split.md` §8 明确记着"真实厂商"这一条本批**未实测**，这里验的是"我们这一侧的契约与状态机"，不是厂商行为。
+> 为什么用 mock 而不是真密钥：本批要钉的是**边界行为**——缺模型、上游限流、"上游正常结束但一个 token 都没给"。真实上游给不给 429 是不可控的，用真模型跑验收只会得到"今天通了明天红"的抖动读数。**本目录从未调用真实厂商端点**：原 `docs/design/ai-plugin-split.md` §8 明确记着"真实厂商"这一条本批**未实测**（该文档已删除，权威记录现见 [`docs/design/ai-plugin-architecture.md`](../../../docs/design/ai-plugin-architecture.md)），这里验的是"我们这一侧的契约与状态机"，不是厂商行为。
 
 ## 前置与用法
 
@@ -90,7 +103,7 @@ CHROME=/usr/bin/google-chrome node scripts/acceptance/ai-split-e2e/cdp-ui.mjs
 ## 本目录**没有**覆盖什么（别把它当成全量证明）
 
 - **权限红线不在这里验**。`run.mjs` 测的是"有没有模型"这条线，用的是 owner 会话；辅助写作的"匿名/无编辑权 ⇒ 403"与"slug 只用于一次权限判定、绝不取正文"由源级守卫守：`packages/plugin-ai-assist/test/assist.test.ts` 的 `守卫：assist.ts 不得出现任何"取正文/检索"的调用点` 与 `守卫：slug 在 assist.ts 里只能出现在解析与编辑权判定路径上`。理由见 `docs/design/access-control.md` §4.5 末尾的修正。
-- **检索召回质量**不在这里判（`mode:'terms'` 的召回/精确率权衡见 `docs/architecture.md` §9.3 与本仓库 `plugin-platform-plan.md` 批次 G）。本目录只保证"问答确实走了 `terms` 且命中数如实回传"。
+- **检索召回质量**不在这里判（`mode:'terms'` 的召回/精确率权衡见 `docs/architecture.md` §9.3 与本仓库 [`docs/plugin-platform.md`](../../../docs/plugin-platform.md)）。本目录只保证"问答确实走了 `terms` 且命中数如实回传"。
 - **真实模型链路**不在这里（见上文的 mock 理由）。
 - **PostgreSQL 部署**不在这里：`@geewiki/search` 的 FTS 形态仅支持 SQLite，PG 下该插件显式拒绝激活（`docs/design/access-control.md` §4.3 的方言裁决），届时问答会以 `search_unavailable` 显式不可用——这条路径**未在本目录实测**。
 - `result-backend.json` / `result-ui.json` 是**历史快照**：它们记录的是本批取数时刻（`2026-09-14T17:59 +08:00`，工作树含本批未提交改动）的行为，**不代表当前工作树**，也不参与 `pnpm test`。

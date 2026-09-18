@@ -6,7 +6,8 @@
 > **★ 仍未做（v1.1 核实，明确保留）**：附件 **GC / 孤儿回收端点**（`DELETE` 只删元数据行，磁盘文件留给 GC —— `grep -c "orphan\|purge" packages/plugin-wiki/src/index.ts` 的命中只有既有的 `block_grant_orphan` 注释）、**全库配额 `repoQuotaBytes`**、**Range 请求**、**上传限流 / 并发闸门**、**HTTP 层仍无任何请求体/头超时**（`packages/server/src/index.ts:501` 是唯一 `setTimeout`）⇒ 慢速上传无既有防线、**正文里的 `data:` URI 图片旁路**（U16）、**附件管理 UI**、**降级 textarea 与插件编辑器插槽不支持上传**、**`GET /api/attachments/<非数字>` 仍原样回显参数**（非法输入分支，非存在性预言机）、**U21 的两表守卫测试与 `effectiveMime` 回退分支**（`packages/plugin-wiki/src/attachments.ts:201-207` 未改）。详见 **§10.0** 的状态总览。
 > **★ 与 `access-control.md` 的性质差别**：那份文档的 v6–v8 是**实现反馈驱动**的订正；本文 v1 是**前置设计**，**v1.1 起追加了实现回写**（性质与它的 v6–v8 相同：**不是**新的用户决策）。
 > **读者**：项目所有者（非权限系统专家）+ 实现者 + 评审者。专业术语首次出现时用一句白话解释。
-> **素材来源**：① 对仓库当前源码的逐处核对（本文所有标 **「已核实」** 的条目都带 `路径:行号`，可直接 grep 复核）；② `docs/design/access-control.md`（**v8**，2437 行）与 `docs/design/access-control-handoff.md`（351 行）确立的权限模型、块级模型与工程约定；③ 仓库既有文档（`README.md`、`docs/deployment.md`、`docs/architecture.md`）。
+> **⚠️ 行号时效（必读）**：本文所有 `路径:行号` 均为**书写时的快照**，实现此后已前移（例如上传端点标注 `:3124`，实际已在 `:4397` 附近）。**定位一律以符号名为准**（如 `createHash('sha256')`、`MIME_BY_EXT`、`ATTACHMENT_EXT_WHITELIST`、`WikiConfigSchema`），**不要把行号当判据**；标「已核实」也不代表行号仍然对得上。
+> **素材来源**：① 对仓库当前源码的逐处核对（本文所有标 **「已核实」** 的条目都带 `路径:行号`，可直接 grep 复核）；② `docs/design/access-control.md`（**v8**，2437 行）确立的权限模型与块级模型，以及 `docs/development.md`（**工程约定与教训的唯一真源**：沙箱、迁移、PG 方言、验收纪律等）；③ 仓库既有文档（`README.md`、`docs/deployment.md`、`docs/architecture.md`）。
 > **标注约定（本文严格三分，不要混读）**：
 > - **「已核实」** = 我**实际读过**这段源码 / 跑过这条命令，结论就是该处代码的字面行为；
 > - **「设计决策」** = 本文拍板、实现按此执行（**不是现状**）；
@@ -67,7 +68,7 @@
 | 既有文档 | 关系 |
 |---|---|
 | `docs/design/access-control.md`（v8） | **权限模型的唯一真源**。本文 §4.3 的判定算法是它的**消费方**：页面档位走 §2.3 的继承与冲突裁决，块级走 §2.2 的三档（`public` / `org` / `granted`）与 §4.6 的跨阶段不变量 |
-| `docs/design/access-control-handoff.md` | **工程约束的唯一真源**（沙箱、worktree、验证基线、PG 配方等）。本文的实现交付必须遵守它"环境约束与教训"一节的**全部**条目 |
+| `docs/development.md` | **工程约束的唯一真源**（沙箱、迁移、PG 方言、验证基线、验收纪律等）。本文的实现交付必须遵守其**全部**条目 |
 | `docs/deployment.md` §5 | 备份与持久化的既有承诺；附件目录必须被纳入（§2.6） |
 
 ---
@@ -121,7 +122,7 @@ $GEEWIKI_DATA_DIR/            # 默认 ./data（packages/core/src/index.ts:373 �
 
 **两级分片（`aa/bb/<sha256><ext>`）的理由**：单目录放十万个文件时，`readdir` 与许多文件系统（含 ext4 的 htree、overlayfs）都会退化。两级各取 2 个十六进制字符 ⇒ 每级最多 256 个目录、最坏 65536 个叶子目录，均匀且不会出现"某一级过热"。（**「设计决策」**；备选是单层 `aa/` 或不分片，取舍见 U10。）
 
-**`tmp/` 必须与正式对象同文件系统**：上传完成后用 `rename()` **原子**落到正式路径。跨越文件系统的 `rename` 会 `EXDEV` 失败；因此**不要**把 `tmp/` 放到 `/tmp`（容器的 `/tmp` 常是 tmpfs，是本沙箱里的一条既有教训：`access-control-handoff.md:254` 记录了"`/tmp` 在本沙箱跨 bash 调用不保留"）。
+**`tmp/` 必须与正式对象同文件系统**：上传完成后用 `rename()` **原子**落到正式路径。跨越文件系统的 `rename` 会 `EXDEV` 失败；因此**不要**把 `tmp/` 放到 `/tmp`（容器的 `/tmp` 常是 tmpfs，是本沙箱里的一条既有教训；工程约定见 `docs/development.md`「环境、沙箱与运行约束」："`/tmp` 在本沙箱跨 bash 调用不保留"）。
 
 **扩展名来自白名单、写在文件名尾部**，但**物理身份是 sha256 前缀部分** —— 扩展名只服务于两件事：① 让运维 `ls` 时能认出类型；② 让 `content-type` 有**单一真源**（§4.6）。**同一份字节不可能有两种扩展名**：扩展名由"服务端从内容推导的白名单类型"决定（§4.2 的 `kind`），不是由用户文件名决定。
 
@@ -179,8 +180,8 @@ $GEEWIKI_DATA_DIR/            # 默认 ./data（packages/core/src/index.ts:373 �
    ⚠️ **该目录里的 SQL 必须双方言都能跑**（因为它不分方言）。`0002` 就是范例：一条 `CREATE INDEX IF NOT EXISTS`，并在头注释里写清"**实测该索引已存在**（`packages/db-sqlite/src/migrations/0001_init.sql:21` / `packages/db-postgres/migrations/0001_init.sql:37`），本文件是幂等空操作"，以及"**不写 `BEGIN`/`COMMIT`**（`db.migrate()` 已把每个文件包在事务里，脚本内再开事务会嵌套报错）"。
 3. **反过来，注册表路径的声明是"只声明了 sqlite"**：`packages/server/src/index.ts:1405` `migrationsDirs: builtinMigrations(wikiManifest as GeeWikiManifest, { sqlite: WIKI_MIGRATIONS_DIR })`。历史教训（`packages/db-sqlite/src/migrations/0015_blocks.sql:8-14` 的头注释）：**照 `access-control.md` §3.6 把 `blocks` 写进 `plugin-wiki/migrations/` 会让 PG 部署下这张表根本不被建出来** ⇒ 最终落在 db 包、两侧成对。**⇒ 本设计选落点时必须显式回答"PG 上会不会被建出来"。**
 4. **守卫测试会强制这件事**：`packages/server/test/builtin-migrations.test.ts` 的判据 A/B/C/D —— 其中 `MANIFEST_MIGRATION_FALLBACKS = { '@geewiki/postgres': ['postgres'], '@geewiki/wiki': ['sqlite'] }`（`:44-48`），且判据 C 要求"manifest 补上声明后必须把回退项删掉"，判据 A 还要求"注册表里至少覆盖 4 个迁移目录"（`:104-110`）。
-5. **幂等与重放的硬约束**：SQLite **没有** `ADD COLUMN IF NOT EXISTS` ⇒ 给既有表加列的迁移**无法重放**（`access-control-handoff.md:252` 记录用过守卫测试钉死，**不要放宽**）；新表用 `CREATE TABLE IF NOT EXISTS` 则安全。**并且**：既有守卫测试用**文本启发**（如 `/\bADD\s+COLUMN\b/i`）判断可重放 ⇒ **注释里写这几个词会被误判**（`access-control-handoff.md:253`）。
-6. **两条方言差异**：PG 的 `COUNT(*)` 返回**字符串**（必须 `Number()` 强转，`access-control-handoff.md:170-171`）；PG 下 `RETURNING id` 是插入自增主键的**唯一**可行方式（缺它 PG 报 `violates foreign key constraint`，见 `access-control-handoff.md:215-216`）。
+5. **幂等与重放的硬约束**：SQLite **没有** `ADD COLUMN IF NOT EXISTS` ⇒ 给既有表加列的迁移**无法重放**（工程约定见 `docs/development.md`「数据库与迁移约定」，守卫测试已钉死，**不要放宽**）；新表用 `CREATE TABLE IF NOT EXISTS` 则安全。**并且**：既有守卫测试用**文本启发**（如 `/\bADD\s+COLUMN\b/i`）判断可重放 ⇒ **注释里写这几个词会被误判**（工程约定见 `docs/development.md`「数据库与迁移约定」）。
+6. **两条方言差异**：PG 的 `COUNT(*)` 返回**字符串**（必须 `Number()` 强转，工程约定见 `docs/development.md`「PostgreSQL 方言差异」）；PG 下 `RETURNING id` 是插入自增主键的**唯一**可行方式（缺它 PG 报 `violates foreign key constraint`，工程约定见 `docs/development.md`「PostgreSQL 方言差异」）。
 
 ### 3.1 附件元数据表 `attachments`（「设计决策」D6 —— ★ v1.1：**以实际落地的表为准**）
 
@@ -608,7 +609,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON attachments(sha256);
 | `content-disposition` | 光栅图片（`png/jpeg/gif/webp/avif`）：`inline`；**其余一律 `attachment`**；文件名用 RFC 5987 形态 `filename*=UTF-8''<pct-encoded>` + ASCII 回退 | `inline` 是 `<img src>` 能内嵌显示的前提（见下"为什么图片必须 inline"）；非图片一律强制下载，**顺带覆盖 SVG 与所有文档类型**。**M1 已实现且与本文一致（「已核实」）**：`formatDisposition(kind, name)`（`packages/plugin-wiki/src/attachments.ts:175-187`）= `filename="<ASCII 回退>"` + `filename*=UTF-8''<pct>`，其中回退值把非可见 ASCII 与 `"`/`\` 一律换成 `_`、截断 200 字符，并把 `'()*` 手工百分号编码（RFC 5987 的 attr-char 不含它们，而 `encodeURIComponent` 不转义）。⇒ **这正是本文要求的"必须清洗"**。补充一条 Node 侧实测：v22.23.2 下 `res.setHeader('content-disposition', 'x\r\ny')` **会抛 `ERR_INVALID_CHAR`**（实测）—— 因此不清洗不是"注入成功"，而是**稳定 500**；仍然必须清洗 |
 | `content-length` | 物理文件字节数（`stat` 结果） | 与 `bytes` 列交叉核对（§8.1 探针） |
 | `etag` | 强验证器：`"<sha256>"`（内容寻址 ⇒ 内容永不改变） | 让读者的浏览器可**条件请求**（`If-None-Match` ⇒ 304）。**注意**：304 只在**判定通过后**才可能发生 ⇒ 权限收紧后客户端重新验证会拿到 404，**不会**靠 304 继续用旧内容 |
-| `cache-control` | **成功：`private, no-cache, no-transform`**（下载，`packages/plugin-wiki/src/index.ts:3520`）；**错误：`no-store`**（四个端点的入口默认值，成功分支显式覆盖）。★ v1.1 | 三条理由：① **不许共享缓存**（CDN / 反代）—— 响应随身份变化，`public` 会造成 `access-control.md` 里的 web cache deception；② **必须每次回源判定** —— 仓库有**明文禁令**"不要给判定层加 TTL 缓存"（`access-control.md` §9 R10 第 3 条与 §13.6 第 11 条，handoff:277）⇒ `no-cache`（允许存、**复用前必须回源校验**）正是这条禁令在客户端缓存上的对应物；③ `no-cache` + `etag` 在"同一读者、短时间多次打开同一页"的实际场景下仍然省流（304 无响应体）。**为什么不是 `no-store`（实现方的说明，v1.1 采纳）**：内容寻址 + sha256 ETag ⇒ 304 复用**不可能复用错内容**，要禁止的只是"**不校验就复用**"；`no-store` 关掉的是性能，`no-cache` 关掉的才是"撤销后仍可见"那个窗口（`:3512-3517`）。**错误响应为什么必须 `no-store`**：`h.json` 不带 `cache-control`，而 404 这类错误响应浏览器是**可以启发式缓存**的 ⇒ 会把"授权前拿到的 404"在授权后继续复用（`:3038-3050`）。⚠️ **`no-transform` 只用在下载**（它在传字节流，代理压缩/改写会破坏 ETag 语义）；列表/删除/上传的成功响应不需要它 |
+| `cache-control` | **成功：`private, no-cache, no-transform`**（下载，`packages/plugin-wiki/src/index.ts:3520`）；**错误：`no-store`**（四个端点的入口默认值，成功分支显式覆盖）。★ v1.1 | 三条理由：① **不许共享缓存**（CDN / 反代）—— 响应随身份变化，`public` 会造成 `access-control.md` 里的 web cache deception；② **必须每次回源判定** —— 仓库有**明文禁令**"不要给判定层加 TTL 缓存"（`access-control.md` §9 R10 第 3 条与 §13.6 第 11 条；工程约定见 `docs/development.md`「PostgreSQL 方言差异」）⇒ `no-cache`（允许存、**复用前必须回源校验**）正是这条禁令在客户端缓存上的对应物；③ `no-cache` + `etag` 在"同一读者、短时间多次打开同一页"的实际场景下仍然省流（304 无响应体）。**为什么不是 `no-store`（实现方的说明，v1.1 采纳）**：内容寻址 + sha256 ETag ⇒ 304 复用**不可能复用错内容**，要禁止的只是"**不校验就复用**"；`no-store` 关掉的是性能，`no-cache` 关掉的才是"撤销后仍可见"那个窗口（`:3512-3517`）。**错误响应为什么必须 `no-store`**：`h.json` 不带 `cache-control`，而 404 这类错误响应浏览器是**可以启发式缓存**的 ⇒ 会把"授权前拿到的 404"在授权后继续复用（`:3038-3050`）。⚠️ **`no-transform` 只用在下载**（它在传字节流，代理压缩/改写会破坏 ETag 语义）；列表/删除/上传的成功响应不需要它 |
 | `content-security-policy` | **`default-src 'none'; sandbox`** | **专治 SVG / 被直接导航打开的活动内容**（§5.3）：即使某个 `image/svg+xml` 被用户直接打开（顶层导航），CSP `sandbox` 会把它放进唯一源（unique origin）、禁脚本执行；`default-src 'none'` 阻断其子资源加载。**零依赖**，是本设计拒绝"引入 SVG 消毒库"的前提。★ **M1 的对应物**：`.svg` 必须走 `attachment`（下载）而不是内联 —— `dispositionKindOf(ext, { inlineSvg })` 默认返回 `attachment`，只有配置 `attachmentInlineSvg=true` 才允许内联（`packages/plugin-wiki/src/attachments.ts:162-165`），且注释明写"打开它需要运维**同时**配上 CSP"（`:159-161`）。⇒ **与本文同向，但把"是否内联 SVG"变成了配置项**（本文 U3 建议的是"不进白名单"）—— 见 §12.2 分歧 3 |
 | `accept-ranges` | **不发送**（不支持 Range） | 见 N7 与 U6：不支持就**不要**声明。收到 `Range` 请求时按规范**忽略**并返回完整 200 |
 | `vary` | `cookie`（保守起见） | 判定随会话变化；虽然 `cache-control: private` 已经限制到私有缓存，`vary: cookie` 让"同一 URL、不同会话"在私有缓存里也不会串味 |
@@ -622,7 +623,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON attachments(sha256);
 
 M1 把"**哪些扩展名允许**"（`ATTACHMENT_EXT_WHITELIST`，`packages/plugin-wiki/src/attachments.ts:38-55`）与"**扩展名 → MIME**"（`MIME_BY_EXT`，同文件 `:73-90`）写成了**两张独立的表**。我实测比对过：**今天两张表的键集合逐项相同（各 16 项：`.png .jpg .jpeg .gif .webp .avif .svg .pdf .txt .md .csv .json .zip .docx .xlsx .pptx`）**，因此那条"回退到客户端声明"的分支**当前不可达**。
 
-**但它一旦漂移就是一个存储型 XSS**：假设将来有人往白名单加一项（例如 `.odt`）却忘了给 `MIME_BY_EXT` 补条目 —— 此时 `effectiveMime('.odt', 'text/html')` 的表查找落空、回退分支命中，而 `MIME_LITERAL_RE`（`:190`）**允许 `text/html`**（它只校验 `type/subtype` 的字面形态，不管它危不危险）⇒ 攻击者上传一个声明 `text/html` 的文件，响应就以 `text/html` 下发，配 `inline` 或直接导航即**同源脚本执行**。这与本仓库反复记录的失效形态是同一个（`access-control-handoff.md:264-265`：*"文档注释会成为错误的传播媒介"*、两个真源迟早漂移）。
+**但它一旦漂移就是一个存储型 XSS**：假设将来有人往白名单加一项（例如 `.odt`）却忘了给 `MIME_BY_EXT` 补条目 —— 此时 `effectiveMime('.odt', 'text/html')` 的表查找落空、回退分支命中，而 `MIME_LITERAL_RE`（`:190`）**允许 `text/html`**（它只校验 `type/subtype` 的字面形态，不管它危不危险）⇒ 攻击者上传一个声明 `text/html` 的文件，响应就以 `text/html` 下发，配 `inline` 或直接导航即**同源脚本执行**。这与本仓库反复记录的失效形态是同一个（工程约定见 `docs/development.md`「文档纪律：注释与真源」：*"文档注释会成为错误的传播媒介"*、两个真源迟早漂移）。
 
 **两条零成本修法（任选其一，建议两条都做）**：
 
@@ -669,7 +670,7 @@ M1 把"**哪些扩展名允许**"（`ATTACHMENT_EXT_WHITELIST`，`packages/plugi
 
 - **攻击者能做什么**：① 反复上传 1 GiB 把磁盘打满；② 用极慢的 body（每 30 秒 1 字节）占住连接与 `tmp` 文件（slowloris 变体）；③ 并发 200 个上传把 fd / 句柄耗尽。
 - **对策**：① 单文件上限（默认 10 MiB）+ 每页/全库配额（§6.3）+ **边读边计数**（不信任 `Content-Length`）；② 上传超时 `req.setTimeout(uploadTimeoutMs)`（**必须显式请求，因为 HTTP 层没有任何超时** —— §0.1 事实 6）+ 超时/异常时**必须删 `tmp` 文件**（`finally` 里删，且 `unlink` 失败只记日志）；③ 并发上传闸门：进程内计数器（`Map<owner, count>` 或单个 `let inflight`），超限返回 **429 `too_many_uploads`**（或 503，见 U8）。
-- **残余风险**：① **多实例部署下进程内计数器无效**（但仓库既有的"多实例必然失败"结论已存在 —— handoff:343 记录 OIDC 状态存进程内，方向是失败关闭；附件同理，**在部署文档里写明"附件能力不支持多实例共享目录"**）；② 配额是**软约束**：并发上传可在配额检查与落盘之间超发（§5.11、U5）。
+- **残余风险**：① **多实例部署下进程内计数器无效**（但仓库既有的"多实例必然失败"结论已存在 —— 工程约定见 `docs/development.md`「环境、沙箱与运行约束」：OIDC 状态存进程内，方向是失败关闭；附件同理，**在部署文档里写明"附件能力不支持多实例共享目录"**）；② 配额是**软约束**：并发上传可在配额检查与落盘之间超发（§5.11、U5）。
 
 ### T5 multipart 解析边界（[P0]，**本设计的对策是"不引入"**）
 
@@ -740,7 +741,7 @@ export const WikiConfigSchema = Schema.object({
 
 并在 `manifest.geewiki.configSchema` 上声明（`:300`）。管理台按 schema 渲染表单（`packages/web/src/api.ts` 的 `ConfigSchemaPayload` 等即为此）。
 
-**附件配置面（★★ v1.1：**四项已落地**，见 `packages/plugin-wiki/src/index.ts:145-180` 的 `WikiConfigSchema`）**：
+**附件配置面（★★ v1.2：**五项已落地**，见 `packages/plugin-wiki/src/index.ts` 的 `WikiConfigSchema`；定位以符号名为准，行号见文首说明）**：
 
 | 配置键 | Schema | 默认值 | 状态 |
 |---|---|---|---|
@@ -748,6 +749,7 @@ export const WikiConfigSchema = Schema.object({
 | `attachmentPageQuotaBytes` | `Schema.number().min(1)` | **200 MiB** | ✅ **已落地**（`:159-162`）。★ 这就是"每页配额"（初稿叫 `pageQuotaBytes`/100 MiB，**以实现的键名与默认值为准**）。上传端点在读体**之前**用声明长度预检（`packages/plugin-wiki/src/index.ts:3191-3207`，超限 ⇒ **413 `page_quota_exceeded`**），权威判定在写入事务里（`:3074-3079`） |
 | `attachmentAllowedExt` | `Schema.array(Schema.string())` | `[...ATTACHMENT_EXT_WHITELIST]`（16 项） | ✅ **已落地**（`:163-172`）。★ **只能收窄、不能放宽**：`apply` 里取**交集**（`:628-632`），"放宽会让 `.html` 这类同源可执行内容进得来，而落盘路径的 `attachmentRelPath` 断言仍按内置白名单校验 ⇒ 要么静默失败、要么（更糟）被绕过"；**收窄只影响新的上传**（已收录附件的**下载不查这个集合**，否则一改配置历史附件会集体 404）。⇒ 这条配置**不违反** §6.2 的"白名单是安全边界"原则（它只能收紧），**已验证的 schemastery 数组写法是 `Schema.array(Schema.string())`** |
 | `attachmentInlineSvg` | `Schema.boolean()` | `false` | ✅ **已落地**（`:173-176`，描述里写明"默认关闭：同源内联 SVG 可执行脚本 = 存储型 XSS，除非另配 CSP"）。语义在 `dispositionKindOf(ext, { inlineSvg })`（`packages/plugin-wiki/src/attachments.ts:162-165`，**尚未被下载端点接上**，见下） |
+| `attachmentProvider` | `Schema.union([Schema.const('builtin'), Schema.const('none')])` | `'builtin'` | ✅ **已落地**（★ v1.2 补记，此前漏记）：附件**字节存储**由谁提供。`'builtin'` = 本插件自带的本地实现（内容寻址，向后兼容）；`'none'` = 本插件**不再注册**内置实现，改用别处 `ctx.provide('attachment-service', …)` 提供的实现（换 S3/WebDAV 不必改 wiki 源码）。**为什么不自动探测"别人提供了没有"**：cordis 服务在提供者的 `apply()` 结算前对其它插件不可见（`ctx.get` 返回 undefined 且**静默**）⇒ 自动探测会在激活顺序变化时悄悄退回内置实现或悄悄拿不到服务；显式配置让这件事在配置里可见 |
 | `repoQuotaBytes`（全库配额） | —— | —— | ❌ **未实现**（本文建议；见 §6.3 与 U5） |
 | `maxConcurrentUploads` | —— | —— | ❌ **未实现**（本文建议；T4） |
 | `uploadTimeoutMs` | —— | —— | ❌ **未实现**（本文建议；注意 HTTP 层**没有任何超时**，§0.1 事实 6） |
@@ -787,7 +789,7 @@ export const WikiConfigSchema = Schema.object({
 - **求和口径**：`SELECT COALESCE(SUM(bytes),0) FROM attachments WHERE page_id = ? AND deleted_at IS NULL`（走 `idx_attachments_page`）；全库同理（**全库求和是 O(行数)** ⇒ 用 `idx_attachments_sha` 也不行；建议对全库配额做**进程内缓存 + TTL**（例如 30 秒）或**只在写入前抽查**，并在 U5 里给出取舍）。
 - **判定时机**：**读体之前**用 `Content-Length` 预检（413 `page_quota_exceeded`；★ `repo_quota_exceeded` **未实现** —— 全库配额不存在，见 §10.0），**落盘之前/写入事务里**再核一次（防并发超发；实现是 `writeAttachmentRow` 里的 `SELECT COALESCE(SUM(byte_size),0) …`，`packages/plugin-wiki/src/index.ts:3107`）。
 - **并发**：进程内计数（`maxConcurrentUploads`），超限 429。**不引入锁表 / 分布式信号量**（多实例不在本能力承诺内，见 T4）。
-- ⚠️ **PG 的坑**：`SELECT SUM(bytes)` 在 PG 下**可能返回字符串**（`bigint` 的既有坑，`access-control-handoff.md:170-171`）⇒ **必须 `Number()` 强转**。
+- ⚠️ **PG 的坑**：`SELECT SUM(bytes)` 在 PG 下**可能返回字符串**（`bigint` 的既有坑，工程约定见 `docs/development.md`「PostgreSQL 方言差异」）⇒ **必须 `Number()` 强转**。
 
 ---
 
@@ -891,7 +893,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | **目标尺寸** | 工具栏按钮热区 ≥ 24×24 CSS px（WCAG 2.2 SC 2.5.8 最低 24px；建议与既有按钮一致，取 32px 高） | 仓库没有专门的目标尺寸规范 ⇒ 建议按既有按钮组件尺寸（`text-note` 级按钮） |
 | **图片的 `alt`** | 插入 Markdown 时**默认填** `original_name`；`alt` 为空时（作者删掉了）前端失败态仍要有文字占位 | 见 §7.3 |
 | **对比度** | 失败态的提示文案用既有 token（`text-warn-ink` 一类），不要引入新颜色 | `packages/web/src/pages/WikiPage.tsx:534` 的 `text-note text-warn-ink` 是既有用法 |
-| **真浏览器验证** | 上述每一条都**必须**在真实浏览器里用键盘 + 读屏验证（§9.3）—— 仓库既有诚实声明："**真实浏览器交互从未验证**"（`access-control-handoff.md:342`） | — |
+| **真浏览器验证** | 上述每一条都**必须**在真实浏览器里用键盘 + 读屏验证（§9.3）—— 仓库既有诚实声明："**真实浏览器交互从未验证**"（工程约定见 `docs/development.md`「验收与验证纪律」） | — |
 
 ---
 
@@ -941,11 +943,11 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | `attachment.purge` | ❌ **未实现**（GC 未做） | `attachment` / `attachments` | `{ removed, freed_bytes, remaining, at }` | 运维回收**真删了东西**时（§8.2） |
 | `access.denied` | ✅ **已实现**（复用既有 `recordAccessDenied`） | **`page`** / `<slug>`（⚠️ **不是** `attachment`） | `{ reason, principalKind }`（`reason` ∈ `no_read_access` / `attachment_gated` / `no_edit_access`） | 下载与删除的越权分支（`packages/plugin-wiki/src/index.ts:3429`、`:3469`、`:3681`、`:3698`）。★ **与本文初稿的差别**：`target_kind` 是 **`page`** 而非 `attachment` —— 因为复用的是既有函数（**不造第二个真源**，这比"字段更贴切"更重要）；附件特有的原因已由 `after.reason` 分出 |
 
-**为什么复用而不新表**：① `audit_log` 已经是"ACL 与安全事件"的统一去处（`0013_audit.sql` 的表注释定义了 action / target_kind 约定）；② 新表会让 `GET /api/admin/audit` 的两视图（`acl` / `security`，handoff:136-139）看不到附件动作 ⇒ 运维要在两个地方查；③ **分类要显式**：`attachment.upload` / `attachment.delete` 属 `acl` 视图（合规记录），`access.denied` 属 `security` 视图（越权尝试要告警）。⚠️ 该端点用**显式白名单**而非排除法（handoff:138-139 记录的理由："白名单让未分类的动作只出现在 `all` 里，漏分类是**可见的**"）⇒ **必须把新动作加进白名单**，否则它们只在 `all` 视图可见（这是**刻意的可见失败**，但实现时要记得加）。
+**为什么复用而不新表**：① `audit_log` 已经是"ACL 与安全事件"的统一去处（`0013_audit.sql` 的表注释定义了 action / target_kind 约定）；② 新表会让 `GET /api/admin/audit` 的两视图（`acl` / `security`，工程约定见 `docs/development.md`「验收与验证纪律」）看不到附件动作 ⇒ 运维要在两个地方查；③ **分类要显式**：`attachment.upload` / `attachment.delete` 属 `acl` 视图（合规记录），`access.denied` 属 `security` 视图（越权尝试要告警）。⚠️ 该端点用**显式白名单**而非排除法（工程约定见 `docs/development.md`「验收与验证纪律」记录的理由："白名单让未分类的动作只出现在 `all` 里，漏分类是**可见的**"）⇒ **必须把新动作加进白名单**，否则它们只在 `all` 视图可见（这是**刻意的可见失败**，但实现时要记得加）。
 
 **不要记进审计的东西**：附件**字节**绝不入审计；`original_name` 只记清洗后的摘要（§T10 的坑）；**不要**用 `content`/`body`/`hash`/`token` 作键名（`redactForAudit` 会静默吞掉，`packages/core/src/audit.ts:45-59`）。
 
-**★ v1.1 已核实的一处缺口（**建议补**）**：`GET /api/admin/audit` 的**显式白名单**里**没有** `attachment.upload` —— `ACL_ACTIONS`（`packages/plugin-authz/src/index.ts:715-746`）与 `SECURITY_ACTIONS`（`:708-714`，含 `access.denied`）都不含它。⇒ **上传动作目前只在 `all` 视图可见，`acl` 视图看不到**。这正是 handoff:138-139 说的"用显式白名单而非排除法 ⇒ 漏分类是**可见的**"那种失败：**不会报错，但要有人去加**（补法是往 `ACL_ACTIONS` 里加一行 `'attachment.upload'`；若将来补上删除审计，`'attachment.delete'` 与 `'attachment.purge'` 同处理）。⇒ 这一条**属于本轮回写发现的新待办**，已记入 §10.0 的"仍未做"。
+**★ v1.1 已核实的一处缺口（**建议补**）**：`GET /api/admin/audit` 的**显式白名单**里**没有** `attachment.upload` —— `ACL_ACTIONS`（`packages/plugin-authz/src/index.ts:715-746`）与 `SECURITY_ACTIONS`（`:708-714`，含 `access.denied`）都不含它。⇒ **上传动作目前只在 `all` 视图可见，`acl` 视图看不到**。这正是 `docs/development.md`「验收与验证纪律」说的"用显式白名单而非排除法 ⇒ 漏分类是**可见的**"那种失败：**不会报错，但要有人去加**（补法是往 `ACL_ACTIONS` 里加一行 `'attachment.upload'`；若将来补上删除审计，`'attachment.delete'` 与 `'attachment.purge'` 同处理）。⇒ 这一条**属于本轮回写发现的新待办**，已记入 §10.0 的"仍未做"。
 
 ### 8.4 与"只做空间回收"哲学的一致性检查表（「设计决策」D27）
 
@@ -971,7 +973,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | 2 | **`original_name` 清洗**（纯函数） | 含 `\r\n` / `\0` / `../` / 超长 / 空 ⇒ 清洗结果不含控制字符与路径分隔符；空 ⇒ 回退 `<sha256前8位><ext>` |
 | 3 | **扩展名白名单判定**（纯函数） | 大小写归一（`A.PNG` ⇒ `.png`）；取**最后一个 `.` 之后**（`evil.php.png` ⇒ `.png` **接受**；`a.png.html` ⇒ `.html` ⇒ 拒）；无扩展名 / 以点开头 / 以点结尾 ⇒ 拒；`.svg` / `.json` 按 §6.2 的最终清单断言 |
 | 4 | **上限判定**（纯函数） | `Content-Length` 预检、计数器上限、`实际 < 声明`、缺 `Content-Length` |
-| 5 | **配额求和口径**（纯函数 + 桩） | `Number()` 强转（PG 返回字符串的既有坑，`access-control-handoff.md:170-171`） |
+| 5 | **配额求和口径**（纯函数 + 桩） | `Number()` 强转（PG 返回字符串的既有坑，工程约定见 `docs/development.md`「PostgreSQL 方言差异」） |
 | 6 | ★ **下载判定纯函数**（`§4.3.1` 的六步） | 表驱动，至少覆盖：页面 `none` ⇒ 404；`public` 页 + 引用点 `org` 块 + 匿名 ⇒ 404；`org` 页 + 引用点 `granted` 块 + 被授予者 ⇒ 放行；引用点全为 `granted` + 未被授予 ⇒ 404；`refs` 为空 + `last_gate='org'` + 匿名 ⇒ 404；`refs` 为空 + `last_gate='granted'` ⇒ **任何人都不放行**；`refs` 为空 + `last_gate=NULL` + 页面 public ⇒ 放行；**块行不存在** ⇒ 该引用点不可见（失败关闭） |
 | 7 | **引用点提取正则**（纯函数） | 只认 `/api/attachments/<22 位 base64url>` 与绝对 URL 形态；不误抓 `![](other)`；**不误抓代码块里的示例**（U12） |
 | 8 | ★ **`img[src]` 不被链接改写碰到**（前端守卫） | 断言 `packages/web/src/lib/markdownRender.ts` 的 `rewriteBodyLinks` **只**遍历 `a[href]`（现状是巧合，需钉住 —— §7.3） |
@@ -979,15 +981,15 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | 10 | ★ **源码级守卫：物理文件只有一条删除路径** | 照 `packages/plugin-authz/test/audit-appendonly.test.ts` 的做法（正则扫源码，钉住唯一写入/删除点） |
 | 11 | ★ **源码级守卫：白名单常量不外泄** | `.html` / `.js` / `.wasm` 不得出现在白名单常量里；**`.svg` 的 `inline` 判据默认必须为 `false`**（U3/§6.2） |
 | 11b | ★★ **源码级守卫：两张表的键集合相等**（U21） | 断言 `new Set(ATTACHMENT_EXT_WHITELIST)` 与 `Object.keys(MIME_BY_EXT)` **集合相等**（M1 今天恰好相等，各 16 项 —— 这条守卫把"加白名单忘了加 MIME"变成**可见的失败**，堵住 §4.6 那条不可达但致命的回退分支） |
-| 12 | **迁移幂等** | 两个 `0018_*` 各跑两次不报错；**不得**出现 `ADD COLUMN`（文本启发守卫会误判注释，`access-control-handoff.md:253`）；`packages/server/test/builtin-migrations.test.ts` 全绿 |
+| 12 | **迁移幂等** | 两个 `0018_*` 各跑两次不报错；**不得**出现 `ADD COLUMN`（文本启发守卫会误判注释，工程约定见 `docs/development.md`「数据库与迁移约定」）；`packages/server/test/builtin-migrations.test.ts` 全绿 |
 
 ### 9.2 e2e（真实起服务 + 真实 `curl`，与既有六条 e2e 同款）
 
 > **★ v1.1 状态**：脚本已落地 —— `packages/plugin-wiki/test/e2e-attachments.sh`。**我没有运行它**（只读了它的断言），因此"全绿"是**转述实现方的说法**，不是我的实测。**它的负向断言比我初稿设计的更严**，两条值得单独指出：
-> ① **状态码 404 + 与"不存在"响应体 `cmp` 逐字节相同**（`e2e-attachments.sh:129`、`:363-366`），并且有 **D8a 标定用例**：先用**真实的** not-found 响应标定比对模板 —— 防的是"比对恒真"这种假绿（正是 `access-control-handoff.md:155-159` 记的三类"断言自己会骗人"之一）；
+> ① **状态码 404 + 与"不存在"响应体 `cmp` 逐字节相同**（`e2e-attachments.sh:129`、`:363-366`），并且有 **D8a 标定用例**：先用**真实的** not-found 响应标定比对模板 —— 防的是"比对恒真"这种假绿（正是 `docs/development.md`「验收与验证纪律」记的三类"断言自己会骗人"之一）；
 > ② 响应头断言用**真实 GET 的 `-D`**（`:93`、`:102`），因为**路由服务按 method 精确匹配、方法联合类型里没有 `HEAD`**（`packages/core/src/index.ts:692`）⇒ `curl -I` 会落到 `/api` 的 404（脚本头 `:22-23` 把这个实测结论写成了注释）。
 > 另有：`cmp` 断言"下载字节与上传字节逐字节一致"（`:327` D1b）、删除侧同款 `cmp`（`:480`、`:491`）、`cache-control` **不含 `max-age`**（`:338-339`）。
-> **⚠️ 一条必须遵守的纪律（来自 handoff:299-301）**：**凡"靠直读 SQLite 文件断言"的 e2e 阶段，都要同时给出方言中立（纯 HTTP）的替代断言** —— 否则该阶段在 PG 下被整体跳过时**不会有任何信号**。请核对 `e2e-attachments.sh` 是否有靠直读库文件的阶段（我未逐行核对）。
+> **⚠️ 一条必须遵守的纪律（工程约定见 `docs/development.md`「验收与验证纪律」）**：**凡"靠直读 SQLite 文件断言"的 e2e 阶段，都要同时给出方言中立（纯 HTTP）的替代断言** —— 否则该阶段在 PG 下被整体跳过时**不会有任何信号**。请核对 `e2e-attachments.sh` 是否有靠直读库文件的阶段（我未逐行核对）。
 
 **必须包含的负向断言（越权下载）—— 这是本能力的验收核心**：
 
@@ -1009,10 +1011,10 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | E14 | 配额：超每页配额 ⇒ 413 `page_quota_exceeded`（**已实现**）；超全库 ⇒ 413 `repo_quota_exceeded`（**未实现**，待做） |
 | E15 | ★ v1.1 订正（**GC 未实现**，本行是待做验收）：`DELETE` ⇒ 行消失、**下载立即 404**（判定与列表都查不到它，**磁盘文件仍在**）；将来 `purge` 落地后 ⇒ 物理文件消失、`{removed, freed_bytes, remaining}` 形状正确、`removed=0` 时**不写审计**、`removed>0` 时审计里出现 `attachment.purge` |
 | E16 | `tmp` 残留：中途断开上传 ⇒ **不留** `tmp` 文件、**不留**元数据行 |
-| E17 | ★ **方言中立（纯 HTTP）**：E2/E4/E6/E9 必须在真实 PostgreSQL 上也跑（教训见 `access-control-handoff.md:269-271`："靠直读 SQLite 文件断言的阶段在 PG 下整体跳过，而且不会告诉你"） |
+| E17 | ★ **方言中立（纯 HTTP）**：E2/E4/E6/E9 必须在真实 PostgreSQL 上也跑（教训见 `docs/development.md`「验收与验证纪律」："靠直读 SQLite 文件断言的阶段在 PG 下整体跳过，而且不会告诉你"） |
 | E18 | 反向假绿断言（照阶段 K 的做法）：先证明**前置状态可读**（有权者能下到 200），再断言无权者 404 —— 否则"上传根本没成功"也会让"404"通过（假绿） |
 
-**e2e 必须避免的三类"断言自己会骗人"**（`access-control-handoff.md:155-159` 的三个实例）：① 把多个计数**拼成字符串**再比较；② 造了会被 upsert 覆盖的夹具（导致"过期"场景实际不存在）；③ 前置步骤（如批量吊销会话）让后续请求以"看起来对"的方式失败。
+**e2e 必须避免的三类"断言自己会骗人"**（`docs/development.md`「验收与验证纪律」的三个实例）：① 把多个计数**拼成字符串**再比较；② 造了会被 upsert 覆盖的夹具（导致"过期"场景实际不存在）；③ 前置步骤（如批量吊销会话）让后续请求以"看起来对"的方式失败。
 
 ### 9.3 必须真实浏览器验证的项（**不能**用 curl 代替）
 
@@ -1023,7 +1025,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | B3 | **`<img>` 真的显示出来**（`content-disposition: inline` + cookie 自动携带） | 浏览器行为 |
 | B4 | ★ **失败态是占位文案而不是破图**（`onError` 委托确实命中 `innerHTML` 注入的子树） | React 管不到这棵子树（`packages/web/src/components/MarkdownBody.tsx:86-99` 的注释说明"命令式注入"是刻意的） |
 | B5 | **SVG 直接打开时不执行脚本**（若 U3 允许 SVG：`content-disposition: attachment` 是否会触发下载而非导航；CSP sandbox 是否生效） | 只能真浏览器验证；**这是 U3 的判据** |
-| B6 | **键盘走完三条路径** + 读屏播报（`role="status"`） | 无障碍只能实测（仓库明确记录"真实浏览器交互从未验证"，`access-control-handoff.md:342`） |
+| B6 | **键盘走完三条路径** + 读屏播报（`role="status"`） | 无障碍只能实测（仓库明确记录"真实浏览器交互从未验证"，工程约定见 `docs/development.md`「验收与验证纪律」） |
 | B7 | **大文件上传时的进度/挂起观感**（占位是否及时出现） | 时序与观感 |
 | B8 | `nosniff` 生效（改名成 `.png` 的 HTML 直接打开是破图而不是渲染） | 浏览器行为 |
 
@@ -1097,7 +1099,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 ### ★ U7 附件是否进入 `page_versions` 快照
 
 - **候选**：A. **不进**（本文：版本只存正文；附件是内容寻址、按行归属）；B. 进（把引用到的 `public_id` 列表一并存进版本的 `blocks_json`/`acl_json` 旁边）。
-- **取舍**：A 简单；但"恢复旧版本"后，旧版本里引用的附件若已被回收 ⇒ 破图（需要 §7.4 的失败态表现）。B 能在恢复时提示"该版本引用了 N 个已不在的附件"（照既有 `warnings: ['block_acls_not_restored']` 的做法，handoff:119-121）。
+- **取舍**：A 简单；但"恢复旧版本"后，旧版本里引用的附件若已被回收 ⇒ 破图（需要 §7.4 的失败态表现）。B 能在恢复时提示"该版本引用了 N 个已不在的附件"（照既有 `warnings: ['block_acls_not_restored']` 的做法，语义见 `docs/design/access-control.md` §4.4「版本与恢复语义」）。
 - **建议**：**A + 一条警告**：恢复路径若检测到"旧版本里引用的 `public_id` 已不在"，在响应的 `warnings` 里加 `attachments_missing`（**零迁移成本**：恢复时对旧正文跑一次 §7.3 的正则即可，不需要存快照）。
 
 ### U8 慢速上传的超时与并发闸门归属
@@ -1268,8 +1270,8 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 - **本文的未验证项（诚实清单，★ v1.1 更新）**：
   1. ~~没有实现代码~~ ⇒ **v1.1：实现已完成**（未提交），本文已按最终代码回写；但**我没有逐行读完** `packages/plugin-wiki/src/index.ts` 的附件全部代码（约 600 行），凡我读过的都带了行号，"未逐字核对"的地方已就地标明（如 §6.1 末尾 `attachmentInlineSvg` 的接线、§9.2 的 e2e 阶段构成）；
   2. ~~没有跑测试~~ ⇒ **v1.1：我实跑了两条单测** —— `packages/plugin-wiki/test/attachments.test.ts` **16/16 通过**、`packages/web/test/attachmentUploadPlan.test.ts` **19/19 通过**；**但我没有跑** `pnpm test`（全量）、`pnpm typecheck`、`pnpm build` 与**任何 e2e**（含 `e2e-attachments.sh` 与其它六条既有 e2e）。⇒ "实现完成、测试全绿"这句话里，**全量绿是转述实现方的说法**，不是我的实测；
-  3. **没有在真实浏览器里验证**任何前端行为（拖拽/粘贴/`onError` 委托/CSP sandbox 对 SVG 的效果）—— 仓库既有声明也承认"真实浏览器交互从未验证"（`access-control-handoff.md:342`）；
-  4. **没有在真实 PostgreSQL 上验证**任何 SQL：`0018_attachments.sql`（PG 版）我**只做了静态核对**（`id INTEGER GENERATED BY DEFAULT AS IDENTITY`、两侧成对、无 `BEGIN`/`COMMIT`），**未实跑**；`SUM(byte_size)` 的字符串返回、`JOIN` 现值 slug 等**必须在真方言上实跑**（教训见 `access-control-handoff.md:269-271`）；
+  3. **没有在真实浏览器里验证**任何前端行为（拖拽/粘贴/`onError` 委托/CSP sandbox 对 SVG 的效果）—— 仓库既有声明也承认"真实浏览器交互从未验证"（工程约定见 `docs/development.md`「验收与验证纪律」）；
+  4. **没有在真实 PostgreSQL 上验证**任何 SQL：`0018_attachments.sql`（PG 版）我**只做了静态核对**（`id INTEGER GENERATED BY DEFAULT AS IDENTITY`、两侧成对、无 `BEGIN`/`COMMIT`），**未实跑**；`SUM(byte_size)` 的字符串返回、`JOIN` 现值 slug 等**必须在真方言上实跑**（教训见 `docs/development.md`「验收与验证纪律」）；
   5. ~~`schemastery` 的数组写法未核对~~ ⇒ **v1.1 已核实**：数组写法是 `Schema.array(Schema.string())`（`packages/plugin-wiki/src/index.ts:163-166`），与 `Schema.number().default().min().max().description()` 同批；
   6. **`fs.statfs` 的可用性未实测**（只核对 Node 版本 v22.23.2，理论上 Node 18.15+ 支持）—— 若将来做 GC/健康检查的磁盘水位，需实测；
   7. ~~`attachments` 的 DDL 未在两方言上实跑~~ ⇒ v1.1 已按迁移文件回写实际结构（§3.1），但**仍未实跑**（同第 4 条）；
@@ -1279,7 +1281,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
   1. ★ **补「磁盘只增不减」这一项**：附件 GC（`packages/plugin-wiki/src/index.ts` 里新增 `GET /api/admin/attachments/orphans` + `POST /api/admin/attachments/purge`，规格见 §8.1/§8.2，判据只用"文件系统 ↔ 表"两个方向）——这是当前**最大的运维缺口**；
   2. ★ **补上传面的防护**：上传超时（`req.setTimeout`）+ 并发闸门（两者目前**完全空缺**，T4）+ 全库配额 `repoQuotaBytes`；
   3. **补 U21**（两表守卫测试 + `effectiveMime` 回退分支改成恒 `application/octet-stream`）—— 最便宜、挡住一整类失效；
-  4. 若资源允许：Range（U6）、限流（U14）、附件管理 UI、`data:` URI 旁路（U16）；并**在真 PostgreSQL 上实跑** `0018_attachments.sql` 与附件四个端点的端到端（`access-control-handoff.md:269-271` 的教训：靠直读 SQLite 断言的阶段在 PG 下会整体跳过且**不给信号**）；
+  4. 若资源允许：Range（U6）、限流（U14）、附件管理 UI、`data:` URI 旁路（U16）；并**在真 PostgreSQL 上实跑** `0018_attachments.sql` 与附件四个端点的端到端（`docs/development.md`「验收与验证纪律」的教训：靠直读 SQLite 断言的阶段在 PG 下会整体跳过且**不给信号**）；
   5. **真浏览器验证**（§9.3 B1–B8，尤其 B4 失败态是占位而非破图、B5 SVG 的 CSP/disposition 行为）；
   6. **回写本文为 v2**：把后续实现反馈（PG 上的真实行为、CSP sandbox 的真实效果、GC 与配额的实际表现）写进本节，**并保留原文留痕**（照 `access-control.md` §13.4–§13.6 的做法）。
 
@@ -1415,7 +1417,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | 4 | **U22 决议** | ✅ 采纳"**重跑投影**"：`projectPageContentFor`（`packages/plugin-wiki/src/blocks.ts:840`；调用点 `packages/plugin-wiki/src/index.ts:3447`）⇒ §3.2/§3.3 **标为未采用**，`blockVisibleTo` 抽取**不再需要** |
 | 5 | **实现确认的事实回写** | ✅ 全仓**无页面改名路径**（§3.4）；`acl_revision` 只覆盖 ACL 变更、块可见性随正文编辑与 `expires_at` 变 ⇒ **不做投影缓存**（§3.2/U22）；迁移**两侧成对**落 `0018_attachments.sql`、PG 用 **`INTEGER GENERATED BY DEFAULT AS IDENTITY`**（§3.5）；去重**靠 rename 前 `exists`**（POSIX rename 静默覆盖）（§2.4/§4.2）；存储层**任何失败 ⇒ 503 `storage_unavailable`**，含**只读挂载下 `mkdir({recursive:true})` 返回 `ENOENT` 而非 `EROFS`** 这条实测（§5 T9）；审计键名用 `sha256`（§8.3）；**路由无 `HEAD` ⇒ `curl -I` 404**（§10.0） |
 | 6 | **数据模型章节按实际结构重写** | ✅ §3.1（实际 `attachments` 表 + 逐条差异表）、§3.4（`ON DELETE CASCADE`）、§3.5（已落地）、§3.6（实际两条索引）、§4.4（列表要求 `canEdit`）、§4.5（硬删行、无软删、无 409） |
-| 7 | **未做项如实保留** | ✅ 新建 **§10.0 状态总览**；§8.1/§8.2 标为"未实现"（GC）；§6.1 标出四项已落地与三项未落地 |
+| 7 | **未做项如实保留** | ✅ 新建 **§10.0 状态总览**；§8.1/§8.2 标为"未实现"（GC）；§6.1 标出已落地与未落地（★ v1.2 订正：实为**五项已落地**——当时漏记 `attachmentProvider`，见 §6.1） |
 
 **二、本轮就地订正清单（正文位置 → 改了什么）**
 
@@ -1434,7 +1436,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | §4.5 | 删除 = **硬删元数据行**（磁盘留给 GC）；越权**一律 404**；**无 409**；权限 = `canEdit` **或**上传者本人 |
 | §4.6 | `nosniff` 全覆盖 + 成功/错误两套缓存策略（含"为什么不是 `no-store`"） |
 | §5 T9 | 存储失败**一律 503**（不再按 errno 白名单）+ `ENOENT` 实测 |
-| §6.1 | 配置表按 schema 重写（四项已落地、上界 200MB 硬编码、`attachmentAllowedExt` 只能收窄、`Schema.array(Schema.string())` 的写法已核实） |
+| §6.1 | 配置表按 schema 重写（上界 200MB 硬编码、`attachmentAllowedExt` 只能收窄、`Schema.array(Schema.string())` 的写法已核实）；★ v1.2 订正：实为**五项已落地**（补 `attachmentProvider`） |
 | §8.1 / §8.2 | 标为"**GC 未实现**"；判据收敛为"文件系统 ↔ 表"两个方向；"无引用行"判据**失去持久化载体**（因不建 `attachment_refs`）并给出建议（先不做） |
 | §9.1 / §9.2 | 补实际测试文件与**我实跑的通过数**；e2e 的 D8a 标定与 `curl -I` 实测结论；E5/E8/E15 按最终语义改写 |
 | §10 | 新建 **§10.0 状态总览**；U22 改"已决"、U23/U24 改"已修"；U1/U2 标为已决 |

@@ -14,7 +14,7 @@
  * - `slots.ts` 是**浏览器安全**的（零 node/cordis 依赖），因为前端要 `import type` 它；
  * - 本文件**不是**（`AuthService` 要 `IncomingMessage` 等 node 类型），只服务后端。
  *   前端**不要**从这里取类型 —— core 的根 `index.ts` 在 web 的 tsconfig（DOM lib）下会炸
- *   （cordis 的全局 `Context` 与 DOM 撞名，详见 `docs/review/plugin-freedom-audit.md` §0.5）。
+ *   （cordis 的全局 `Context` 与 DOM 的 `Context` 撞名）。
  *
  * 实现包的既有导出**保持可用**：它们改为从本文件 `export type` 转出，故既有 import 不破。
  */
