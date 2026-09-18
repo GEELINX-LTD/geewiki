@@ -1,0 +1,47 @@
+version: 2
+
+updates:
+  # pnpm monorepo：Dependabot 在仓库根目录即可识别 pnpm-workspace.yaml 的全部工作区包
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    commit-message:
+      prefix: "chore(deps)"
+    # 把非破坏性更新打包成单个 PR，降低 28 个包带来的 PR 噪音；
+    # major 版本仍会单独开 PR，便于逐个评估破坏性变更。
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Dockerfile 基于 node:22-bookworm-slim，跟踪基础镜像更新
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    commit-message:
+      prefix: "chore(docker)"

@@ -1,0 +1,30 @@
+name: 环境准备（pnpm + Node + 依赖）
+description: 安装 pnpm 与 Node、中和仓库内写死的沙箱路径、按锁文件安装依赖
+
+runs:
+  using: composite
+  steps:
+    # 不显式指定 version：pnpm/action-setup 会读取 package.json 的
+    # packageManager 字段（当前为 pnpm@11.7.0），避免两处版本号漂移。
+    - name: 安装 pnpm
+      uses: pnpm/action-setup@v6
+
+    # pnpm-workspace.yaml 是入库文件，其中 storeDir / cacheDir 指向本机沙箱的绝对路径
+    # （/root/dev/geewiki/.pnpm-store）。pnpm 11 中这两个键的优先级高于 .npmrc，且
+    # 环境变量无法覆盖（npm_config_store_dir / PNPM_STORE_DIR 均已实测无效），
+    # 必须删除——否则 CI 会尝试写入不存在的 /root 而失败。
+    # 本仓 Dockerfile 第 55、65 行出于同样原因也做了这个 sed。
+    # 本地沙箱不受影响：CI 只改 runner 上的这份工作副本。
+    - name: 中和沙箱专属的 store / cache 绝对路径
+      shell: bash
+      run: sed -i '/^storeDir:/d; /^cacheDir:/d' pnpm-workspace.yaml
+
+    - name: 安装 Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: 22
+        cache: pnpm
+
+    - name: 安装依赖
+      shell: bash
+      run: pnpm install --frozen-lockfile

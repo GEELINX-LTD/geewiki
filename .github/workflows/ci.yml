@@ -1,0 +1,162 @@
+name: CI/CD
+
+# 触发时机：
+#   - push 到 main：跑全部质量门禁，通过后构建并推送镜像到 GHCR（:latest）
+#   - push tag v*：跑全部质量门禁，通过后构建并推送带语义化版本号的镜像
+#   - pull request：只跑质量门禁与一次「镜像能否构建」的验证（不推送）
+#   - 手动：可在 Actions 页面点 Run workflow
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一 PR 上新的推送会取消仍在跑的旧任务，避免浪费 runner 时间。
+# 发往 main 的运行**不取消**：main 上的 publish 作业可能正在推送镜像，
+# 中途取消会留下不完整的发布，因此 main 的多次推送改为串行排队。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# 默认最小权限；只有 publish 作业单独提权到 packages: write
+permissions:
+  contents: read
+
+# 注意：下方各作业的 name（lint / typecheck / test / build）会被分支保护
+# 规则引用为「必需状态检查」。改名需同步更新仓库的 ruleset 配置。
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: ESLint 代码风格检查
+        run: pnpm lint
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: 类型检查（28 个包 + scripts）
+        run: pnpm typecheck
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: 单元测试（node:test，177 个测试文件）
+        run: pnpm test
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: 构建全部产物（vite build）
+        run: pnpm build
+
+  # PR 阶段验证 Dockerfile 仍可构建，避免破坏部署路径的改动被合入。
+  # 只构建不推送，并用 gha 缓存复用 main 分支已构建的层。
+  docker-build:
+    name: docker-build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: 构建镜像（验证用，不推送）
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # CD：构建多阶段镜像并推送到 GitHub Container Registry。
+  # needs 使其严格依赖上方全部门禁——任何一个门禁失败都不会产出镜像，
+  # 因此不会把未通过测试的提交发布出去。
+  publish:
+    name: publish
+    needs: [lint, typecheck, test, build]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # 创建 GitHub Release（仅 tag 推送时触发）
+      packages: write # 推送镜像到 GHCR
+    steps:
+      - uses: actions/checkout@v7
+
+      # GHCR 要求镜像路径全小写，而仓库属主是 GEELINX-LTD（含大写），必须转换。
+      # ${VAR,,} 是 bash 4+ 的小写展开，GitHub runner 默认 shell 支持。
+      - name: 计算镜像名
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签与 OCI 元数据
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出本次推送的标签
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo
+            echo "本次推送的标签（任选其一拉取）："
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # tag 推送时额外创建 GitHub Release，变更说明由 GitHub 自动生成。
+      # 使用 runner 预装的 gh CLI，避免引入第三方 action；
+      # 先 view 再 create 以保证幂等（重跑同一 tag 不会失败）。
+      - name: 创建 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
