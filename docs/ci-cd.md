@@ -92,7 +92,7 @@ pnpm 11.7.0 实测结论（避免再走弯路）：
 
 ### 4.1 镜像位置与标签
 
-推送目标：`ghcr.io/geelinkx-ltd/geewiki`
+推送目标：`ghcr.io/geelinx-ltd/geewiki`
 
 > 仓库属主 `GEELINX-LTD` 含大写字母，而 GHCR 要求路径**全小写**，
 > 故 workflow 中用 `${GITHUB_REPOSITORY,,}` 做小写转换。
@@ -134,14 +134,17 @@ tag 推送会先跑四个门禁，全绿后才构建并推送带版本号的镜�
 > `docs/deployment.md` 第 8 节「用 CI 发布的镜像替代本地构建」。
 
 ```bash
-docker pull ghcr.io/geelinkx-ltd/geewiki:latest
+docker pull ghcr.io/geelinx-ltd/geewiki:latest
 ```
 
 详细的挂载、权限、环境变量与备份恢复见 `docs/deployment.md`。
 
-> **镜像包默认是 private，只能手动改**：GHCR 上的 package 默认是 **private**，即使
-> 仓库是 public 也一样。改可见性需要**包级管理员**权限，用仓库自带的 `GITHUB_TOKEN`
-> 做不到 —— 已实测：GITHUB_TOKEN 能读到 `visibility`，但
+> **当前状态：包已设为 public**，因此拉取无需登录（已实测：匿名 token 可直接取到
+> manifest，匿名 `docker pull` 成功）。
+>
+> 但要知道：GHCR 上的 package **默认是 private**，即使仓库是 public 也一样。若将来它
+> 又变回 private，改回来需要**包级管理员**权限，仓库自带的 `GITHUB_TOKEN` 做不到 ——
+> 已实测：GITHUB_TOKEN 能读到 `visibility`，但
 > `PATCH /orgs/{org}/packages/container/{name}` 返回 `404 Not Found`；细粒度 PAT 若未
 > 勾选 Packages 权限，则连包列表都读不到（403）。
 >
@@ -152,14 +155,15 @@ docker pull ghcr.io/geelinkx-ltd/geewiki:latest
 > 2. 页面**最底部** Danger Zone → **Change package visibility**
 > 3. 选 **Public**，并按提示**输入包名确认**（这一步最容易漏掉）
 >
+> **排查提示（本次踩过）**：匿名申请 token 被拒（`DENIED`）**无法区分「包是私有」与
+> 「包压根不存在」**——对不存在的包，registry 返回的同样是 `DENIED`。本次就因此误判过
+> 一次。要区分：先用有读权限的凭据确认包确实存在（发布流水线里的**只读巡检**步骤会打印
+> `visibility`），再据其判断；并且务必核对**属主小写化后的拼写**
+> （`GEELINX-LTD` → `geelinx-ltd`，别多字母）。
+>
 > 若该页看不到 Public 选项、或确认后报错，则是**组织策略**在拦，检查
-> `https://github.com/organizations/GEELINX-LTD/settings/packages`。
->
-> 改不动也不必阻塞：包保持 private 完全可用，只是拉取方需要先
-> `docker login ghcr.io`（命令见 `docs/deployment.md` 第 8 节）。
->
-> 发布流水线里有一个**只读巡检**步骤，会把当前可见性打进 Actions 日志；
-> 若仍是 private 会输出一条 notice 提醒。
+> `https://github.com/organizations/GEELINX-LTD/settings/packages`。包保持 private 也
+> 完全可用，只是拉取方需要先 `docker login ghcr.io`（命令见 `docs/deployment.md` 第 8 节）。
 
 ---
 
