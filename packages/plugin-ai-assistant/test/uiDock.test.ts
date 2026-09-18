@@ -51,20 +51,6 @@ const frame = (event: string, data: unknown): string => `event: ${event}\ndata: 
 const statusFrame = (tools: readonly string[] = ['search_kb']): string =>
   frame('status', { round: 0, tools, clientToolsAccepted: [] })
 
-const doneFrame = (over: Record<string, unknown> = {}): string =>
-  frame('done', {
-    messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }],
-    answer: 'a',
-    finishReason: 'stop',
-    toolCalls: null,
-    toolResults: [],
-    usage: null,
-    partial: false,
-    rounds: 1,
-    elapsedMs: 5,
-    ...over,
-  })
-
 /* ============================== 解码器 ============================== */
 
 test('解码器：一整帧解出一个事件', () => {

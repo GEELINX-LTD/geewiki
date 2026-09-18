@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { changedSections, diffLines, diffStats, statsLabel } from '../src/lib/textDiff'
-import { absoluteTime, relativeTime } from '../src/lib/timePlan'
+import { relativeTime } from '../src/lib/timePlan'
 import { authorText, HIDDEN_AUTHOR, UNKNOWN_AUTHOR } from '../src/lib/authorText'
 
 const here = dirname(fileURLToPath(import.meta.url))

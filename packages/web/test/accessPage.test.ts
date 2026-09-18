@@ -69,7 +69,6 @@ const wiki = readSrc('pages', 'WikiPage.tsx')
 const app = readSrc('App.tsx')
 const palette = readSrc('components', 'CommandPalette.tsx')
 const plan = readSrc('lib', 'accessPlan.ts')
-const wikiRoute = readSrc('lib', 'wikiRoute.ts')
 
 /* ------------------------------ 反空洞 ------------------------------ */
 

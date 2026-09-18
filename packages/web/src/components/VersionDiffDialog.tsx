@@ -56,7 +56,7 @@ interface DiffTarget {
 export function VersionDiffDialog({
   slug,
   page,
-  versions,
+  versions: _versions,
   target,
   onClose,
   onRestore,

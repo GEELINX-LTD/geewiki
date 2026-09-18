@@ -117,7 +117,8 @@ ws.onmessage = (ev) => {
   if (msg.id && pending.has(msg.id)) {
     const { resolve: res, reject: rej } = pending.get(msg.id)
     pending.delete(msg.id)
-    msg.error ? rej(new Error(JSON.stringify(msg.error))) : res(msg.result)
+    if (msg.error) rej(new Error(JSON.stringify(msg.error)))
+    else res(msg.result)
     return
   }
   if (msg.method === 'Runtime.consoleAPICalled' && ['error', 'warning'].includes(msg.params.type)) {

@@ -57,7 +57,7 @@ test('send() 必须**强制**恢复跟随：用户翻上去时发消息，答案
    * 签名带了可选参数（`preset?`，给"中止后点继续"那个按钮用），所以正则不能写死 `()`；
    * 但**下面要钉的语义没变**：一进来就强制置回贴底。
    */
-  const send = /const send = useCallback\(\(preset\?: string\) => \{[\s\S]*?\n  \}, \[/.exec(component)?.[0] ?? ''
+  const send = /const send = useCallback\(\(preset\?: string\) => \{[\s\S]*?\n {2}\}, \[/.exec(component)?.[0] ?? ''
   assert.ok(send.length > 100, '应能读到 send()（签名：useCallback((preset?: string) => {…})）')
   assert.match(send, /pinnedRef\.current = true/, 'send() 必须强制置回贴底')
 })

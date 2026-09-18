@@ -63,7 +63,7 @@ test('gated 标记的分布：special-structures 有且仅有一个**活的** or
 test('wikilink 纪律：目标里不得带 #锚点；home 链向其余全部目录页', () => {
   const targets: string[] = []
   for (const doc of BUILTIN_DOCS) {
-    for (const m of doc.content.matchAll(/\[\[([^\[\]\n|]+)(?:\|[^\[\]\n]+)?\]\]/g)) {
+    for (const m of doc.content.matchAll(/\[\[([^[\]\n|]+)(?:\|[^[\]\n]+)?\]\]/g)) {
       assert.ok(m[1] && !m[1].includes('#'), `${doc.slug} 里的 [[${m[1]}]] 带锚点——前端会渲染成红链`)
       targets.push(m[1]!)
     }

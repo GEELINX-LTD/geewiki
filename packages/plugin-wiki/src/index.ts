@@ -72,7 +72,6 @@ import {
   tierFor,
   type BlockKind,
   type BlockReader,
-  type BlockTier,
   type BlockVisibility,
   type ParsedBlock,
   type PageLevel,

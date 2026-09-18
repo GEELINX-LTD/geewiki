@@ -20,7 +20,6 @@ import {
   pluginUiRootsFor,
   resolvePluginUiHit,
   resolvePluginUiRoots,
-  statFileSync,
   type UiStatFile,
 } from '../src/plugin-ui.js'
 import type { RegisteredPlugin } from '../src/deps.js'

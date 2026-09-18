@@ -206,12 +206,12 @@ export const AuthzPlugin = {
     try {
       await db.query('SELECT slug, visibility, inherit, published_at FROM pages WHERE 1 = 0')
     } catch (err) {
-      throw new Error(`@geewiki/authz: pages 缺少 P2 的可见性列 —— 请确认 0012_page_acl.sql 已应用（${(err as Error).message}）`)
+      throw new Error(`@geewiki/authz: pages 缺少 P2 的可见性列 —— 请确认 0012_page_acl.sql 已应用（${(err as Error).message}）`, { cause: err })
     }
     try {
       await db.query('SELECT page_slug, subject_kind, subject_id, role FROM page_grants WHERE 1 = 0')
     } catch (err) {
-      throw new Error(`@geewiki/authz: 缺少表 page_grants —— 请确认 0012_page_acl.sql 已应用（${(err as Error).message}）`)
+      throw new Error(`@geewiki/authz: 缺少表 page_grants —— 请确认 0012_page_acl.sql 已应用（${(err as Error).message}）`, { cause: err })
     }
     /*
      * ★ P3b：块级授权表。
@@ -226,6 +226,7 @@ export const AuthzPlugin = {
     } catch (err) {
       throw new Error(
         `@geewiki/authz: 缺少表 block_grants —— 请确认 0016_block_grants.sql 已应用（${(err as Error).message}）`,
+        { cause: err },
       )
     }
 

@@ -225,7 +225,7 @@ let totalCalls = 0
 let answer = ''
 let rounds = 0
 let firstRound: TurnResult | undefined
-let unknownTools: string[] = []
+const unknownTools: string[] = []
 let badJson = 0
 
 for (let round = 1; round <= MAX_ROUNDS; round++) {

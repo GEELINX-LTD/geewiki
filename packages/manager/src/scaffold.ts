@@ -257,7 +257,7 @@ function clientCss(spec: ScaffoldSpec): string {
 /** README：把"抄模板时最容易踩的坑"写进作者第一眼会看到的地方 */
 function readme(spec: ScaffoldSpec): string {
   const pkg = packageNameOf(spec.name)
-  const uiBlock = spec.withUi
+  const _uiBlock = spec.withUi
     ? `
 ## 前端
 
@@ -324,7 +324,7 @@ curl -s localhost:3000/api/${spec.name}
 
 ## 已知边界
 
-- **后端改代码要重启进程**：ESM 模块实例不回收（\`docs/plugin-platform-plan.md\` L-6），
+- **后端改代码要重启进程**：ESM 模块实例不回收（\`docs/plugin-platform.md\` L-6），
   热插拔能让插件启停立即生效，但改的是**源码**时旧实例仍在内存里；
 - **前端产物更新要整页刷新**：同 URL 命中模块缓存，\`rev\` 变化会重新加载但取的还是缓存里那份；
 - 插件与宿主**同进程同权限**（无隔离），坏插件能拖垮整站——故 \`runtime.supportsHotReload\`
@@ -333,7 +333,7 @@ curl -s localhost:3000/api/${spec.name}
 ## 更多
 
 - 宿主 SDK：\`packages/web/src/lib/hostSdk.ts\`
-- 插件平台机制与全部已知限制：\`docs/plugin-platform.md\` / \`docs/plugin-platform-plan.md\`
+- 插件平台机制与全部已知限制：\`docs/plugin-platform.md\`
 - 一个更完整的后端示例：\`plugins/hello-geewiki/\`；带前端构建的示例：\`plugins/ui-demo/\`
 `
 }

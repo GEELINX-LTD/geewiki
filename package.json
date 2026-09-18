@@ -13,6 +13,8 @@
     "start": "tsx packages/server/src/index.ts",
     "typecheck": "pnpm -r --no-bail --if-present run typecheck && tsc --noEmit -p tsconfig.scripts.json",
     "test": "pnpm -r --no-bail --if-present run test",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "new:plugin": "tsx scripts/create-plugin.ts",
     "clean:tmp": "tsx scripts/clean-tmp.ts",
     "backup": "tsx scripts/backup.ts",
@@ -23,8 +25,13 @@
     "node": ">=22"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^26.5.0",
+    "eslint": "^10.10.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.12.0",
     "tsx": "^4.23.13",
-    "typescript": "~5.9.3"
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.70.0"
   }
 }

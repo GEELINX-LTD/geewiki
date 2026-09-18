@@ -42,7 +42,7 @@ export function readSecretFile(file: string): SecretStore {
   try {
     raw = readFileSync(file, 'utf8')
   } catch (err) {
-    throw new Error(`密钥文件读取失败 ${file}: ${(err as Error).message}`)
+    throw new Error(`密钥文件读取失败 ${file}: ${(err as Error).message}`, { cause: err })
   }
   let parsed: unknown
   try {
@@ -51,6 +51,7 @@ export function readSecretFile(file: string): SecretStore {
     throw new Error(
       `密钥文件不是合法 JSON（${file}）：${(err as Error).message}。` +
         '该文件由管理器写入，正常不会被手工编辑；如确认内容已损坏，可删除它并重新填写密钥。',
+      { cause: err },
     )
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -114,7 +115,7 @@ export function writeSecretFile(file: string, store: SecretStore): void {
         // 清理失败不得掩盖原始错误
       }
     }
-    throw new Error(`密钥文件写入失败 ${file}: ${(err as Error).message}`)
+    throw new Error(`密钥文件写入失败 ${file}: ${(err as Error).message}`, { cause: err })
   }
 }
 

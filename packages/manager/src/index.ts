@@ -33,7 +33,6 @@ import {
   PLUGIN_DEACTIVATED_EVENT,
   asAsync,
   closeAfterResponse,
-  isBuiltinSlotName,
   SLOT_PROPS_SCHEMA,
   normalizeRuntime,
   type AnyDatabaseAdapter,

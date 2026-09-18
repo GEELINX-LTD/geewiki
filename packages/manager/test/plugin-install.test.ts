@@ -208,7 +208,7 @@ test('★ F17：从压缩包安装；包内多一层顶层目录时也能定位�
   const env = sandbox()
   try {
     const plugins = join(env.root, 'plugins')
-    const src = makePlugin(join(env.root, 'src'), 'demo')
+    makePlugin(join(env.root, 'src'), 'demo')
     const tarball = join(env.root, 'demo.tgz')
     tar(['-czf', tarball, '-C', join(env.root, 'src'), 'demo'])
 

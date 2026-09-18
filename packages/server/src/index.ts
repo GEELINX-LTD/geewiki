@@ -38,7 +38,6 @@ import {
   type HttpRouterStats,
   type Principal,
   type RequestHook,
-  type RequestVerdict,
   type CapabilityName,
   type HttpRouteInfo,
   type RouteOwnerStats,
@@ -620,7 +619,6 @@ class HttpRouter implements HttpRouterService {
     if (!(timeoutMs > 0)) return Promise.resolve(false)
     return new Promise<boolean>((resolveDrain) => {
       let settled = false
-      let timer: NodeJS.Timeout | undefined
       const waiter: DrainWaiter = {
         check: () => pending() <= 0,
         finish: (drained: boolean): void => {
@@ -631,7 +629,7 @@ class HttpRouter implements HttpRouterService {
           resolveDrain(drained)
         },
       }
-      timer = setTimeout(() => waiter.finish(false), timeoutMs)
+      const timer = setTimeout(() => waiter.finish(false), timeoutMs)
       timer.unref()
       this.drainWaiters.add(waiter)
     })
@@ -1616,7 +1614,7 @@ export function defaultRegistry(
     // requires 只点名 http-service（配置表单的服务商下拉走 `GET /api/llm/providers`）；
     // **不进 conflictGroup**：它是注册表而非某个厂商的实现，多家 provider 应共存。
     // **本批起写进默认基础层清单**：出厂即让用户在「插件管理 → 模型接入」里填一次就能接上模型
-    // （不填密钥时问答与辅助写作**明确报不可用**——`retrieval-only` 抽取式摘要那条冒充答案的路已随本批删除，见 `docs/design/ai-plugin-split.md`）；需要 LLM 的插件仍应在 requires 里点名它。
+    // （不填密钥时问答与辅助写作**明确报不可用**——`retrieval-only` 抽取式摘要那条冒充答案的路已随本批删除，见 `docs/design/ai-plugin-architecture.md`）；需要 LLM 的插件仍应在 requires 里点名它。
     { name: '@geewiki/llm', manifest: llmManifest as GeeWikiManifest, module: LlmPlugin, source: 'builtin' },
     // 全文检索：索引表由插件自带迁移建立（按方言声明——只有 SQLite 有 FTS5；
     // 该插件在其它方言下会在 apply 里显式拒绝，见其源码的能力守卫）。

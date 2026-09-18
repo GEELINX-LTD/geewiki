@@ -31,7 +31,6 @@ import {
  * 这里按字面量断言并注明来源：packages/../cordis/lib/fiber.d.ts:28-35。
  */
 const FIBER_ACTIVE = 2
-const FIBER_FAILED = 3
 
 /** 造一个可控 provider：`chunks` 依次产出；`throwAfter` 命中时抛错；`hold` 时不产出任何 chunk */
 function makeProvider(

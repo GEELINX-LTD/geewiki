@@ -235,6 +235,7 @@ export const OrgPlugin = {
       } catch (err) {
         throw new Error(
           `@geewiki/org: 缺少表 ${table} —— 请确认 db 插件的 0011_org_team.sql 已应用（${(err as Error).message}）`,
+          { cause: err },
         )
       }
     }
@@ -281,7 +282,7 @@ export const OrgPlugin = {
     }
 
     /** 参与者必须是 owner；用于"授予/撤销 owner"这类高危动作 */
-    const requireOwner = (h: RouteHandlerContext): boolean => {
+    const _requireOwner = (h: RouteHandlerContext): boolean => {
       if (h.principal?.orgRole === 'owner') return true
       h.json(403, { ok: false, error: 'forbidden', message: '该操作需要 owner 权限' })
       return false

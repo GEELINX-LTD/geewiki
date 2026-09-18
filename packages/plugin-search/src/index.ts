@@ -33,7 +33,6 @@ import {
   type Principal,
   type RouteHandlerContext,
   type SearchBlockRef,
-  type SearchHit,
   type SearchMode,
   type SearchPerformedEvent,
   type SearchResult,

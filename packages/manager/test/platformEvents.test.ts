@@ -125,7 +125,7 @@ test('平台事件：负载不含正文/凭据类字段（事件是广播，订�
    */
   const src = readFileSync(CORE_FILE, 'utf8')
   const forbidden = ['content', 'token', 'password', 'secret', 'cookie', 'rawToken']
-  for (const event of declaredEvents()) {
+  for (const _event of declaredEvents()) {
     // 找到该事件负载接口（以事件名派生的 Interface 命名，如 UserLoginEvent）
     const ifaceMatch = new RegExp(`export interface (\\w*Event) \\{([\\s\\S]*?)\\n\\}`).exec(src)
     assert.ok(ifaceMatch, '未能解析出示例事件接口（结构变化即红）')

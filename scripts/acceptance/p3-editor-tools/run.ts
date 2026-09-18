@@ -412,7 +412,7 @@ async function runUntilSettled(initial: Message[], clientTools: readonly string[
         })
         continue
       }
-      let args: unknown = {}
+      let args: unknown
       try {
         args = call.arguments === '' ? {} : (JSON.parse(call.arguments) as unknown)
       } catch {

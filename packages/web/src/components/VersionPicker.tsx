@@ -23,7 +23,7 @@
  * 大文档上这是开菜单就卡一下的来源。所以：时间线只给"何时 / 谁"（本地已有数据），
  * **行数统计在打开对比弹窗时才算**（那时只需要相邻两版）。
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { History, RotateCcw } from 'lucide-react'
 import { api, type PageDetail, type VersionMeta, type VersionPageItem } from '../api'
 import { Badge } from '../ui/Badge'
@@ -404,7 +404,6 @@ export function TimelineDialog({
 }): ReactNode {
   const versions = page.versions
   const total = page.version - 1
-  const truncated = total > versions.length
   /*
    * 弹窗是"我主动翻历史"的场景 ⇒ 这里**值得**拉全量（含更早的条目）。拉不到就退回页内
    * 那 N 条，并在下方如实说明"更早的未列出"——现状文案已经这么写了，不额外编造。

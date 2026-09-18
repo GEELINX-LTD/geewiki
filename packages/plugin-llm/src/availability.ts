@@ -57,7 +57,7 @@ export function safeAvailable(available: (() => boolean) | undefined): boolean {
 
 /** 全部已注册路由（含不可用者）→ 可安全外发的描述列表 */
 export function listRouteInfos(llm: LlmService | undefined): ModelRouteInfo[] {
-  let routes: readonly LlmRouteDescriptor[] = []
+  let routes: readonly LlmRouteDescriptor[]
   try {
     routes = llm?.listProviders() ?? []
   } catch {

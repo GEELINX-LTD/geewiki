@@ -58,13 +58,14 @@ function assertPluginNameMatchesEntry(entryPath: string, outName: string): void 
   for (let i = 0; i < 8; i++) {
     const pkgPath = join(dir, 'package.json')
     if (existsSync(pkgPath)) {
-      let name = ''
+      let name: string
       try {
         const parsed = JSON.parse(readFileSync(pkgPath, 'utf8')) as { name?: unknown }
         name = typeof parsed.name === 'string' ? parsed.name : ''
       } catch (err) {
         throw new Error(
           `[plugin-ui] 无法解析 ${pkgPath}（入口 ${entryPath} 所属包）：${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
         )
       }
       if (name !== outName) {

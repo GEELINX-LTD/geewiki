@@ -97,7 +97,7 @@ function registerVendor(
       ...(opts.probe ? { probe: opts.probe } : {}),
       available: () => opts.available ?? true,
     },
-    // eslint-disable-next-line @typescript-eslint/require-await -- 契约要求 AsyncIterable
+    // 契约要求 AsyncIterable
     async *stream() {
       yield { type: 'error' as const, code: 'NO_ADAPTER' as const }
     },

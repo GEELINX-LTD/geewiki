@@ -303,7 +303,7 @@ export interface PluginGraphProps {
   onSelect: (id: string) => void
 }
 
-export function PluginGraph({ graph, labelOf, selectedId, onSelect }: PluginGraphProps): ReactNode {
+export function PluginGraph({ graph, labelOf, selectedId: _selectedId, onSelect }: PluginGraphProps): ReactNode {
   /** 当前悬停的节点；`null` = 没有高亮（一切原样，谁也不压暗） */
   const [hovered, setHovered] = useState<string | null>(null)
 

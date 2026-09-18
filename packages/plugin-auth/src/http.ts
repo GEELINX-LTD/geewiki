@@ -115,7 +115,7 @@ export function checkCsrf(req: IncomingMessage, hasSessionCookie: boolean): Csrf
   const origin = req.headers.origin
   if (typeof origin === 'string' && origin.length > 0) {
     const host = req.headers.host
-    let originHost: string | null = null
+    let originHost: string
     try {
       originHost = new URL(origin).host
     } catch {

@@ -204,7 +204,7 @@ test('★ 按操作者筛选必须接上（按钮 → 查询串 → 筛选条可
    * "按钮看起来没反应"；少回第 1 页的症状是筛完之后停在越界页，返回空数组 ——
    * 而那读起来像"这个人没做过任何事"。
    */
-  const body = /const filterByActor = \(actorId: AuditActorFilter\): void => \{([\s\S]*?)\n  \}/.exec(ui)
+  const body = /const filterByActor = \(actorId: AuditActorFilter\): void => \{([\s\S]*?)\n {2}\}/.exec(ui)
   assert.ok(body, '未能抽出 filterByActor 的函数体（判据失效即红）')
   for (const call of ['setFilters(', 'setApplied(', 'setPage(1)']) {
     assert.ok((body[1] as string).includes(call), `filterByActor 必须调用 ${call}`)
