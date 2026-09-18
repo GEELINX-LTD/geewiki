@@ -31,6 +31,88 @@ const blocks = (await import(
 
 const EXPECTED_SLUGS = ['home', 'guide/architecture', 'guide/features', 'guide/markdown-demo', 'guide/special-structures']
 
+/* ------------------------------ 表格扫描：复现真渲染器的切列规则 ------------------------------ */
+
+/**
+ * 围栏开/闭行。**必须按"同字符且不短于开栏"判闭合**，不能见到反引号就取反：
+ * 本仓的对照页用 4 个反引号包住 3 个反引号的示例（markdown-demo 的 ````md 段），
+ * 取反式判断在嵌套处会把自己算回"不在围栏里"，于是把演示源码当成真表格来查。
+ */
+const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/
+
+/** 表格分隔行（`:---:` / `---` / `:---`）；调用方还要求该行**含 `|`** —— 否则 `---` 分隔线与 Setext 下划线都会误判 */
+const DELIMITER_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/
+
+/**
+ * 按 GFM 规则切分一行表格：`\|` 是转义（字面 `|`），首尾的裸 `|` 是边框而非单元格。
+ *
+ * 与 marked 的 `splitCells` 同语义 —— 本用例要复现的正是"渲染器怎么切，我们就怎么查"。
+ */
+function splitTableRow(line: string): string[] {
+  let s = line.trim()
+  if (s.startsWith('|')) s = s.slice(1)
+  if (s.endsWith('|') && s[s.length - 2] !== '\\') s = s.slice(0, -1)
+  const cells: string[] = []
+  let cur = ''
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i]
+    if (ch === '\\' && s[i + 1] === '|') {
+      cur += '|'
+      i += 1
+      continue
+    }
+    if (ch === '|') {
+      cells.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  cells.push(cur.trim())
+  return cells
+}
+
+interface TableRow {
+  /** 1 起算的行号：报错要能直接跳过去改 */
+  readonly line: number
+  readonly cells: readonly string[]
+}
+
+/** 正文里所有**活的**表格（跳过围栏代码块里的演示源码），按表头 → 数据行返回 */
+function tablesOf(md: string): TableRow[][] {
+  const lines = md.split('\n')
+  const tables: TableRow[][] = []
+  let fence: { char: string; len: number } | null = null
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!
+    const fenceMatch = FENCE_RE.exec(line)
+    if (fenceMatch !== null) {
+      const char = fenceMatch[1]![0]!
+      const len = fenceMatch[1]!.length
+      if (fence === null) fence = { char, len }
+      else if (char === fence.char && len >= fence.len) fence = null
+      continue
+    }
+    if (fence !== null) continue
+    if (!line.includes('|') || !DELIMITER_RE.test(line)) continue
+    const header = lines[i - 1]
+    if (header === undefined || !header.includes('|')) continue
+    const rows: TableRow[] = [
+      { line: i, cells: splitTableRow(header) },
+      { line: i + 1, cells: splitTableRow(line) },
+    ]
+    let j = i + 2
+    while (j < lines.length && lines[j]!.trim() !== '' && lines[j]!.includes('|')) {
+      if (FENCE_RE.test(lines[j]!)) break
+      rows.push({ line: j + 1, cells: splitTableRow(lines[j]!) })
+      j += 1
+    }
+    tables.push(rows)
+    i = j - 1
+  }
+  return tables
+}
+
 test('目录构成：恰好这 5 篇，slug 全部合法且互不重复', () => {
   assert.deepEqual(
     [...BUILTIN_DOCS.map((d) => d.slug)].sort(),
@@ -64,8 +146,11 @@ test('wikilink 纪律：目标里不得带 #锚点；home 链向其余全部目�
   const targets: string[] = []
   for (const doc of BUILTIN_DOCS) {
     for (const m of doc.content.matchAll(/\[\[([^[\]\n|]+)(?:\|[^[\]\n]+)?\]\]/g)) {
-      assert.ok(m[1] && !m[1].includes('#'), `${doc.slug} 里的 [[${m[1]}]] 带锚点——前端会渲染成红链`)
-      targets.push(m[1]!)
+      // 表格单元格里的 `[[slug\|别名]]`：那个 `\` 是 Markdown 对 `|` 的转义（渲染时被 marked 的
+      // splitCells 还原，wikilink 扩展收到的仍是裸 `|`），**不是 slug 的一部分**——判据要的是转义前的目标。
+      const target = m[1]!.replace(/\\/g, '')
+      assert.ok(target !== '' && !target.includes('#'), `${doc.slug} 里的 [[${target}]] 带锚点——前端会渲染成红链`)
+      targets.push(target)
     }
   }
   const home = BUILTIN_DOCS.find((d) => d.slug === 'home')!.content
@@ -83,4 +168,37 @@ test('wikilink 纪律：目标里不得带 #锚点；home 链向其余全部目�
 test('DOCS_VERSION 是日期式整数戳（它不参与比较语义，只回答"变没变"）', () => {
   assert.equal(typeof DOCS_VERSION, 'number')
   assert.ok(Number.isInteger(DOCS_VERSION) && DOCS_VERSION >= 20250101 && DOCS_VERSION <= 20991231)
+})
+
+/**
+ * 表格列数纪律。
+ *
+ * ## 为什么要有这条（真实缺陷）
+ *
+ * `home` 的目录表曾把 wikilink 写成 `| [[guide/architecture|架构]] | 引擎分层… |` ——
+ * 单元格里的**裸 `|`** 被 marked 当成列分隔符，那一行被撕成 3 个单元格；而 marked 的
+ * `splitCells` 只按表头列数（2）截断，**后面整整一列（"讲什么"）静默消失**：
+ * 页面上既没有报错、也没有错位提示，只是那四句话不见了。
+ *
+ * 判据不看"有没有写 `\|`"这种表面特征，而是**用渲染器同一套规则切列、再比对列数** ——
+ * 于是行内代码里的裸 `|`（markdown-demo 专门警告过的第二处）同样会被抓出来。
+ */
+test('表格纪律：每张表每行的列数必须与表头一致（单元格里的裸 `|` 会撕列并静默吞掉整列）', () => {
+  let tables = 0
+  for (const doc of BUILTIN_DOCS) {
+    for (const rows of tablesOf(doc.content)) {
+      tables += 1
+      const header = rows[0]!
+      for (const row of rows) {
+        assert.equal(
+          row.cells.length,
+          header.cells.length,
+          `${doc.slug}:${row.line} 切出 ${row.cells.length} 列，表头是 ${header.cells.length} 列 —— ` +
+            '单元格里的 `|` 必须写成 `\\|`（`[[page\\|别名]]` 与行内代码同理，见 guide/markdown-demo「三条最常踩的坑」②）',
+        )
+      }
+    }
+  }
+  // 判据写坏时不得靠"一张表都没扫到"空集通过（与库内其它守卫同款要求）
+  assert.ok(tables >= 5, `至少应扫到 5 张表，实际 ${tables} —— 扫描逻辑可能已经失效`)
 })

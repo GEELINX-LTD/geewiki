@@ -23,7 +23,7 @@ export const PLUGIN_NAME = '@geewiki/builtin-docs'
  * 用日期式整数（`20260731` 风格）而不是语义版本：它不参与任何比较语义，
  * 只是一个"变没变"的戳，日期还能让人一眼看出文档上次随项目更新是什么时候。
  */
-export const DOCS_VERSION = 20260916
+export const DOCS_VERSION = 20260918
 
 /** 状态表里版本戳的 key */
 export const STATE_KEY_VERSION = 'docs_version'
