@@ -22,7 +22,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # 阶段 1：builder
 # ─────────────────────────────────────────────────────────────────────────────
-FROM node:22-bookworm-slim AS builder
+FROM node:26-bookworm-slim AS builder
 
 ENV CI=true \
     PNPM_HOME=/pnpm \
@@ -84,7 +84,7 @@ RUN TSX_VERSION="$(node -p "require('/src/node_modules/tsx/package.json').versio
 # ─────────────────────────────────────────────────────────────────────────────
 # 阶段 2：runtime
 # ─────────────────────────────────────────────────────────────────────────────
-FROM node:22-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 
 # 运行期默认值。注意 GEEWIKI_PLUGINS_DIR 必须是**绝对路径**：部署树里没有
 # pnpm-workspace.yaml，resolveProjectPath() 找不到仓库根时会回退到 process.cwd()，
