@@ -30,7 +30,6 @@
     "noEmit": true,
     "useDefineForClassFields": true,
     "types": ["vite/client"],
-    "baseUrl": ".",
     "paths": {
       "react": ["./node_modules/@types/react"],
       "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"]
