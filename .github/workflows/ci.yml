@@ -121,8 +121,14 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
+          # 关闭 metadata-action 的自动 latest。其 flavor 默认值是 latest=auto，
+          # 会在「默认分支」和「semver tag 推送」两种情况下都追加 latest —— 后者已实测
+          # 确认（tag v0.1.0 的运行产出了 latest），这会让「用旧提交打的 tag」把 latest
+          # 回退到旧镜像。改由下方 raw 规则显式控制：latest 只跟随默认分支。
+          flavor: |
+            latest=false
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
