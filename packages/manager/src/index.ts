@@ -182,7 +182,13 @@ export interface PluginListFile {
 export interface ManagerConfig {
   /** 已注册插件（实现 + Manifest + 迁移目录） */
   registry: RegisteredPlugin[]
-  /** 基础层清单路径（plugins.base.json） */
+  /**
+   * 基础层清单路径（**本机** live 文件 `plugins.base.json`）。
+   *
+   * 它不是版本库里的文件（`.gitignore` 默认拒绝整个 `config/`）：保存一次配置就会重写它。
+   * 随版本发布的默认值在同目录的 `plugins.base.example.json`，live 文件缺失时由
+   * {@link readBaseList} 回退读它；写入永远只写这里。
+   */
   baseFile: string
   /** 会话层清单路径（plugins.session.json） */
   sessionFile: string
@@ -382,6 +388,45 @@ function readList(file: string): PluginListFile {
   } catch (err) {
     throw new ManagerError('invalid_list_file', `插件清单解析失败: ${file}: ${(err as Error).message}`)
   }
+}
+
+/**
+ * 随版本发布的默认清单的文件名：`plugins.base.json` → `plugins.base.example.json`。
+ *
+ * ## 为什么基础层要有"example + live"两份，而会话层只有一份
+ * `plugins.base.json` 是**运行期可写**文件：在管理台保存一次插件配置就会重写它。它一旦入库，
+ * 后果有两个，都不是理论上的：① 每个人的本机设置（模型端点、开关、超时）会以"改动"的形式
+ * 出现在别人的 `git status` 里，并随时可能被 `git add -A` 提交；② "随版本发布的默认启用清单"
+ * 与"我这台机器的现状"变成同一个文件，升级时无法区分该保留谁的。
+ *
+ * 但默认清单本身**必须**随版本发布：缺了它，未挂载 `config/` 的容器会读到「空清单」→
+ * 没有任何插件被激活 → HTTP 不监听 → 进程退出码 0 结束被反复拉起（挂载场景的静默重启循环，
+ * 已实测）。所以拆成两份：
+ *   - `plugins.base.example.json`：**入库、只读**，随版本发布的默认值；
+ *   - `plugins.base.json`：**不入库、可写**，本机现状（首次写入时生成）。
+ * live 文件缺失时读 example（虚拟下发默认值，**不在启动时偷偷写盘**——启动写盘会在只读挂载的
+ * 部署上直接变成启动失败）；写入永远只写 live 文件，example 不会被进程改写。
+ *
+ * ## 为什么用文件名派生，而不是给 `ManagerConfig` 加一个字段
+ * `ManagerConfig` 的构造点遍布测试与宿主；加一个必填字段等于要求每个构造点都知道这条约定，
+ * 而派生让"同目录、同主名、不同后缀"成为唯一口径（守卫测试见 `test/base-manifest.test.ts`）。
+ */
+export function exampleManifestPathOf(liveFile: string): string | null {
+  return liveFile.endsWith('.json') ? `${liveFile.slice(0, -'.json'.length)}.example.json` : null
+}
+
+/** 读取**基础层**清单：live 文件不存在时回退到随版本发布的默认值模板（见 {@link exampleManifestPathOf}） */
+function readBaseList(liveFile: string): PluginListFile {
+  if (existsSync(liveFile)) return readList(liveFile)
+  const example = exampleManifestPathOf(liveFile)
+  if (example !== null && existsSync(example)) {
+    console.log(
+      `[manager] 未找到 ${basename(liveFile)}：按随版本发布的默认值 ${basename(example)} 装配` +
+        '（本机清单会在首次保存配置/启用插件时生成）',
+    )
+    return readList(example)
+  }
+  return readList(liveFile)
 }
 
 function writeList(file: string, list: PluginListFile): void {
@@ -1225,7 +1270,7 @@ export class GeeWikiManager {
   /** 启动装配：读取双层清单并按依赖拓扑激活（单个失败不阻断整体，错误可查询） */
   async boot(): Promise<void> {
     try {
-      this.base = readList(this.config.baseFile)
+      this.base = readBaseList(this.config.baseFile)
     } catch (err) {
       this.bootErrors.push((err as Error).message)
       this.base = { enabled: [] }

@@ -1539,7 +1539,7 @@ allowed_email_domains?: string[]                     // 额外门禁（如 ['exa
 | 层面 | 设计 |
 |---|---|
 | 依赖 | **零新依赖**：`node:crypto`（JWKS→公钥、签名校验）+ 全局 `fetch`（token 端点、发现文档）。与既有 `@geewiki/openai`（同样只用 fetch）一致 |
-| 开关 | `@geewiki/oidc` **只登记、不写进 `config/plugins.base.json`** —— 与 `@geewiki/echo`/`@geewiki/llm`/`@geewiki/ai`/`@geewiki/openai` **完全同形态**（`packages/server/src/index.ts:973-1017` 的注释反复说明这个模式："只登记、不写进默认基础层清单，即'已注册但未启用'，由使用者在管理台按需热启用"） |
+| 开关 | `@geewiki/oidc` **只登记、不写进随版本发布的默认清单 `config/plugins.base.example.json`** —— 与 `@geewiki/echo`/`@geewiki/llm`/`@geewiki/ai`/`@geewiki/openai` **完全同形态**（`packages/server/src/index.ts:973-1017` 的注释反复说明这个模式："只登记、不写进默认基础层清单，即'已注册但未启用'，由使用者在管理台按需热启用"） |
 | 未启用时 | **`/api/auth/oidc/*` 端点不存在（404）**，登录页不渲染 SSO 按钮（前端通过 `GET /api/auth/capabilities` 探测，形态照抄 `packages/web/src/pages/WikiPage.tsx:249-287` 既有的"插件是否 active"两路探测法） |
 | 离线可用 | ① 未启用 ⇒ 零影响；② 已启用但 IdP 不可达 ⇒ **前端不渲染 SSO 按钮**（`capabilities` 里带 `oidc: {available:false, reason:'unreachable'}`），本地密码通道**不受任何影响**；③ 已有会话与已建立的 SSE 连接**不依赖 IdP**（我们自己的 cookie session）⇒ **IdP 挂掉不会导致任何人掉线** |
 | 配置校验 | schemastery `Config`：`issuer` 必填且必须 HTTPS（`http://localhost` 例外）；缺 `issuer` ⇒ 插件拒绝激活（`packages/plugin-auth` 侧留出 provider 注册表，形态照抄 `llm-service` 的路由注册表 + "无 provider 也能装载并给出可迭代的降级流"） |

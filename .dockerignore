@@ -34,7 +34,17 @@ logs
 *.db-journal
 *.db-shm
 *.db-wal
-config/plugins.session.json
+
+# ── 配置目录：**默认全部忽略**，只放行"随版本发布的默认值"模板 ────────────
+# 这里装的是本机状态，而 Dockerfile 会把构建上下文里的 config/ COPY 进镜像层：
+#   secrets.json          模型 API key —— 打进去等于**把密钥连同镜像一起分发**
+#   plugins.base.json     本机基础层清单（含你本地的模型/端点/开关）
+#   plugins.session.json  本机会话层清单
+# 为什么是默认拒绝而不是逐个拉黑：逐个拉黑意味着"下次新增一个本机配置文件时，
+# 默认后果是打进镜像"。曾经就是逐个拉黑的，于是 secrets.json 一直躺在上下文里
+# （已实测：探测构建里 /cfg/secrets.json 存在）。
+config/*
+!config/plugins.base.example.json
 
 # ── 本地环境配置 ──────────────────────────────────────────────────────
 # .npmrc 内含指向宿主机绝对路径的 store-dir/cache-dir，进入镜像会污染容器内 pnpm

@@ -18,11 +18,12 @@
  *
  * 用法：node --import tsx scripts/acceptance/p6-summary/run.ts
  */
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'node:net'
+import { readBaseList } from '../../lib/base-list.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repo = resolve(here, '../../..')
@@ -78,9 +79,9 @@ async function boot(withModel: boolean, summaryConfig: Record<string, unknown>):
   mkdirSync(dataDir)
   cpSync(join(repo, 'config'), configDir, { recursive: true })
 
-  const base = JSON.parse(readFileSync(join(configDir, 'plugins.base.json'), 'utf8')) as {
-    enabled: { name: string; config?: unknown }[]
-  }
+  // 隔离副本与本机 config/ 同形状：live 文件缺失时回退读同目录的 example
+  // （live 文件不入库，干净检出只有 example —— 回退口径见 scripts/lib/base-list.ts）
+  const base = readBaseList(configDir)
   const names = withModel ? [...NEEDED, ...WITH_MODEL] : NEEDED
   base.enabled = base.enabled.filter((e) => names.includes(e.name))
   for (const name of names) {

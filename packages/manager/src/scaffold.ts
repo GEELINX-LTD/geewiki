@@ -299,8 +299,12 @@ plugins/${spec.name}/
 
 外部插件**不会**自动启用，需要写进配置清单。两种方式：
 
-- **持久化（基础层）**：把 \`{ "name": "${pkg}" }\` 加进 \`config/plugins.base.json\` 的 \`enabled\`；
+- **本机持久化（基础层 live 清单）**：把 \`{ "name": "${pkg}" }\` 加进 \`config/plugins.base.json\` 的 \`enabled\`
+  （该文件是**本机**状态、不入库；若本机还没有它，从 \`config/plugins.base.example.json\` 复制一份）；
 - **临时（会话层）**：在管理台里启用（重启后按基础层决定是否回来）。
+
+> 想让某个外部插件成为**随版本发布的默认值**（例如自建分发），改的是入库的
+> \`config/plugins.base.example.json\`，而不是本机那份 live 清单。
 
 ## 验证
 

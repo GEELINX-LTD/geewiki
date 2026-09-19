@@ -195,7 +195,7 @@ export const LlmConfigSchema = Schema.object({
    * 这条 pattern 是阻止密钥落盘的**主闸门**（对"走环境变量"这条路径而言）：
    * `Manager.updateConfig` 与激活前校验都走 `validateConfig(schema, …)`，因此
    * **启动与热更新两条路径**都在 schema 层被拦下，不会走到 `persistConfig`
-   * 写进入库的 `config/plugins.base.json`。
+   * 写进 `config/plugins.base.json`（本机清单，见 manager 的 `readBaseList`）。
    *
    * 为什么是白名单而非"像不像密钥"的黑名单：`a1b2c3…`（32 位 hex）、
    * `ABCDEF1234…`（全大写 32 位）、`Xk9mQ2pL7vR4tN8w`（16 字符混合）在语法上都是

@@ -110,13 +110,20 @@ COPY --from=builder /src/packages/web/dist /app/packages/web/dist
 # 运行期 tsx（含 esbuild 平台二进制）
 COPY --from=builder /opt/tsx /opt/tsx
 
-# 默认插件清单：把仓库的 config/ 打进镜像。构建上下文里只有 plugins.base.json
-# （plugins.session.json 已被 .dockerignore 排除），这正是我们要的默认基础层清单。
-# 缺了它，未挂载 ./config 的容器会读到「空清单」→ 没有任何插件被激活 → HTTP 不监听，
-# 进程随即以退出码 0 结束，并被 restart 策略反复拉起，形成静默重启循环、对外完全不服务
-# （已实测：日志仅剩「http 路由服务不可用：REST API 未挂载」，端口无监听）。
+# 默认插件清单：**只把"随版本发布的默认值"模板打进镜像**，绝不 COPY 整个 config/。
+#
+# 为什么不是 `COPY /src/config /app/config`（曾经的写法）：构建上下文里的 config/ 是**开发者
+# 本机目录**，里面有 secrets.json（模型 API key）与 plugins.base.json（本机的模型/端点/开关）。
+# 整个 COPY 进去 = 把密钥连同镜像一起分发，而且不会有任何测试或报错提示。
+# 已实测那一版：探测构建的 /cfg 里确实躺着 secrets.json（.dockerignore 当时只排除了 session）。
+# 现在 .dockerignore 对 config/ 是**默认拒绝**，只放行这一个模板。
+#
+# 为什么镜像里必须有它：缺了默认清单，未挂载 ./config 的容器会读到「空清单」→ 没有任何插件
+# 被激活 → HTTP 不监听，进程随即以退出码 0 结束，并被 restart 策略反复拉起，形成静默重启循环、
+# 对外完全不服务（已实测：日志仅剩「http 路由服务不可用：REST API 未挂载」，端口无监听）。
+# 模板与 live 清单的读取回退见 packages/manager/src/index.ts 的 readBaseList。
 # 放在下面的权限归一化之前，以便一并 chown/chmod。
-COPY --from=builder /src/config /app/config
+COPY --from=builder /src/config/plugins.base.example.json /app/config/plugins.base.example.json
 
 # 权限归一化：
 #   * pnpm deploy 生成的部署树里，少量文件权限为 600（root:root），非 root 运行时会被

@@ -14,6 +14,96 @@
 
 **当前实现状态**
 
+- **本机配置不再进 git，也不再进镜像（2026-09-19）**：用户看到工作树里 `config/plugins.base.json` 的
+  `reasoningEffort` 被改过（那是他在设置页设的 `xhigh`），原话「这部分配置项不应该上传到git啊，
+  你再检查一下其他插件的配置项有没有给上传到git了，这是很危险的行为」。
+  - **审计结论（先回答"有没有"）**：**没有任何密钥进过 git**——工作树与历史都没有。被跟踪的配置清单
+    **全库只有 `config/plugins.base.json` 一个**；`config/secrets.json`（模型 API key 的真实落盘位置，
+    权限 0600）与 `config/plugins.session.json` 一直都被 `.gitignore` 排除；`git log --diff-filter=A`
+    里从未出现过 `secrets.json` / `.env` / 任何本地覆盖层；被跟踪文件里的"密钥形状"命中全是占位符与
+    测试夹具（README 的 `sk-REPLACE_WITH_YOUR_KEY`、测试里的 `sk-x`）。
+  - **但同一轮查出一个真问题，比 base.json 严重**：`Dockerfile` 用
+    `COPY --from=builder /src/config /app/config` 把**整个 `config/` 目录**打进镜像，而 `.dockerignore`
+    当时**只排除了 `plugins.session.json`**。构建上下文是**开发者的本机目录**，里面有 `secrets.json`。
+    已用探测构建实测：修复前 `/cfg/secrets.json` 确实躺在上下文里（`-rw-------`，70 字节）
+    ⇒ **`docker compose up -d --build` 会把模型 API key 打进镜像层随镜像一起分发**，而 Dockerfile 里
+    那句"构建上下文里只有 plugins.base.json"的注释是**假的**。（现存镜像侥幸没中：`geewiki:bc` /
+    `geewiki:latest` 构建于 9/10，早于 `secrets.json` 的创建时间 9/14；`ghcr.io/geelinx-ltd/geewiki`
+    是 CI 从干净检出构建的。三者的 `/app/config` 均已实测确认无 `secrets.json`。）
+  - **根因**：`plugins.base.json` 同时是"随版本发布的默认值"和"运行期可写文件"。
+    `Manager.persistConfig()` 按插件所在层选目标文件（`layerOf()`：不在会话层就写 base），
+    内置插件全在 base 层 ⇒ **在设置页改任何已有插件的配置都会重写这个被跟踪的文件**（不需要点"持久化"）。
+  - **做法**：`config/plugins.base.example.json`（**入库**）= 随版本发布的默认值（逐字等于原先 HEAD 的内容）；
+    `config/plugins.base.json`（**不入库**）= 本机 live 文件，首次写入时生成。
+    `packages/manager/src/index.ts` 新增 `exampleManifestPathOf()` / `readBaseList()`：live 缺失时读
+    example 装配，**启动不写盘**（启动写盘会让只读挂载的部署直接启动失败）；写入永远只写 live 文件。
+    文件名走**派生**而不是新增配置项——`ManagerConfig` 的构造点遍布测试与宿主，加一个必填字段
+    等于要求每个构造点都知道这条约定。`.gitignore` 与 `.dockerignore` 都改成**默认拒绝 `config/*`**、
+    只放行模板（逐个拉黑意味着"下次新增一个本机配置文件时默认泄漏"，这次就是被它咬的）；
+    `Dockerfile` 改成只 COPY 那一个模板文件。
+  - **验证**：探测构建（用真 `.dockerignore`）：修复前 `/cfg` 含 `secrets.json`；修复后只含
+    `plugins.base.example.json`，三个本机文件全部被排除。**容器场景实测**：用一个只放模板的配置目录起
+    真服务 ⇒ 日志 `[manager] 未找到 plugins.base.json：按随版本发布的默认值 plugins.base.example.json 装配`，
+    21 条内置插件照常激活、HTTP 正常监听，且**启动后该目录里仍只有模板**（"启动不写盘"不是嘴上说的）。
+  - **守卫 6 条**（`packages/manager/test/base-manifest.test.ts`）：文件名派生；live 缺失 ⇒ 按模板装配
+    且不写盘；live 存在 ⇒ 以它为准（本机改动不被模板盖掉）；首次写入 ⇒ 生成 live 且模板逐字不变；
+    `git ls-files` 事实断言（三个本机文件不得被跟踪、模板必须入库）；按语义求值 `.gitignore` /
+    `.dockerignore`（每个本机文件都必须被排除、模板必须放行）。**后两条不只查 `git ls-files` 是有意的**：
+    规则被删掉时索引仍然绿，直到有人 `git add -A` 才变红——那时已经晚了。守卫已做**反向验证**：
+    临时在 `.dockerignore` 追加一条 `!config/secrets.json`，该用例立刻变红并点名"会进入构建上下文"；
+    移除后文件校验和与实验前逐字一致。
+  - **顺带订正两处过时口径**：实施日志下面那条"`@geewiki/postgres` 的 `password` 会明文落进清单"
+    **已不成立**（`packages/db-postgres/src/index.ts` 的 schema 现在只有 `connectionStringEnv` /
+    `passwordEnv`，文件头注写明"不提供任何明文字段"）；`docs/plugin-platform.md` 的 L-12 描述的
+    `COPY /src/config` 已改。`docs/README.md`、`docs/architecture.md`、`docs/roadmap.md` 的"真源"口径
+    与 `README.md` 的目录说明一并从 live 文件改成模板。
+  - **同一批的收尾：`scripts/` 里的验收脚本也要能读"干净检出"**。它们原先是直接
+    `readFileSync(config/plugins.base.json)`；live 文件不入库后，**最需要它们能跑的环境（CI、新克隆、
+    Docker 构建）恰好只有 example**，会 ENOENT。新增 `scripts/lib/base-list.ts`
+    （`resolveBaseListPath()` / `readBaseListText()` / `readBaseList()`，与 manager 的
+    `exampleManifestPathOf` **同口径**：同目录、同主名、`.example.json`），9 个验收脚本 +
+    `scripts/create-plugin.ts` 生成文案改用它；隔离模式（`cpSync(config → 临时目录)` → 改副本 →
+    用副本起实例）一字未动。两个 `.mjs` 经核对只读写**自己刚写的**临时夹具，不读仓库清单，故未改。
+  - **读数**：`pnpm test` **2284/2284**（26 个测试包，0 fail；`packages/manager` 270 → **276**）；
+    `pnpm typecheck` **exit 0**（含 `tsc -p tsconfig.scripts.json` 这一段——`pnpm -r typecheck`
+    **不覆盖 `scripts/`**，只跑前者会漏掉它）；`eslint` 改动文件与 `scripts/` 均 0 error。
+
+- **模型的思考过程进了对话面板，默认折起（2026-09-19）**：用户原话「我想优化一下，把模型思考过程放进去，当然要折叠起来」。
+  - **问题不是"没显示"，是"在适配器那层就被丢了"**：统一配置里 `reasoningEffort: 'xhigh'` 早就在下发
+    `reasoning_effort`，上游（DeepSeek V4 Flash）**一直在吐 `reasoning_content`**，而
+    `plugin-openai` 的 `deltaOf()` 只读 `choices[0].delta.content` ⇒ 思考内容一个字节都没往上走。
+    用户在界面上看到的代价是一段几十秒的静默期，只有一句"正在思考…"。
+  - **做法（一条链，每一段都有它非如此不可的理由）**：
+    - `LlmChunk` 新增 `reasoning-delta`，**与 `text-delta` 并列而不复用它**：正文要进
+      `LlmMessage[]` 回传给上游，思考**不该**进（多数网关拒收带 `reasoning_content` 的 assistant 消息，
+      个别会把上一轮的思考当成新指令）。复用一条流就只能在"喂给模型"和"不喂给模型"之间二选一。
+    - 适配器认两个字段名（`reasoning_content` / `reasoning`，与探测路径 `probe.ts` 的 `reasoningOf()`
+      同一组）；`null`/空串**不产 chunk**（流式中间帧的常态是"字段在、值为 null"，那不是空思考）。
+    - `plugin-llm` 的 `sanitizeNonTerminal` 是**白名单**——必须显式放行。漏写这一行**不会报错、
+      不会有测试变红**，只会让"模型明明在思考、界面一个字都不显示"，所以补了一条专测它的用例。
+    - `loop.ts` 把思考**只往外发、不入账**（只有 `text` 拼进转录）；服务端那侧它同样算"进展"
+      （`watchdog.kick()` 在它之前执行）——这一点要紧：一个正常思考很久的回合**不会**被空闲计时器砍掉。
+    - 服务端发**新中间帧** `thinking`（`SSE_EVENT_THINKING`，与 `tool` 一样**刻意不进 core**）。
+      **不能复用 `delta` 加个字段**：帧名是客户端唯一的分流依据，复用会让没更新过的界面
+      **把思考当正文渲染成答案**；而新帧名对旧界面就是一条 `invalid` 帧，按既有约定静默忽略。
+    - 界面：`DockState.thinking` + 一个默认折起的块（复用工具行的样式语言与同一个 chevron 类）。
+      `status` 帧**刻意不清它**——一次提问可能跨多个 HTTP 回合，在那里清空等于把第一轮的思考整段抹掉；
+      清空只发生在"新的提问"（`withUserMessage`）。
+  - **验证**：单测 **+5**（`@geewiki/ai-assistant` 236 → **241**；另在 `plugin-openai` 加了一条覆盖
+    "两个字段名 + null 帧 + 先思考后正文"的用例）；真 LLM 打 `POST /api/ai/turn` 的帧名统计是
+    `thinking×20 / delta×15 / tool×2 / status×1 / done×1`，`done.messages` 里**没有**任何思考内容。
+  - **真浏览器验收 7/7**（`node data/verify/ai-thinking/run.mjs`，真 LLM，Chrome `--remote-debugging-port=9481`）：
+    流式期间思考块出现（摘要「正在思考…（11 字）」）⇒ **默认折起**（`.gw-dock-think-body` 不存在）
+    ⇒ 点开确有正文（287 字）⇒ 再点收回 ⇒ 回合结束后摘要变「思考过程（841 字）」⇒ 答案照常渲染。
+  - **踩坑记录（给下一次）**：`app-dock` 在 `ON_DEMAND_SLOTS` 里、且**只有登录态才渲染**
+    （`AppDock.tsx` 的决策 5）。而登录若用页面里的 `fetch` 完成，`location` 没变、React 的登录 store
+    不会自己重取 ⇒ **只改 hash 的导航不会重新加载文档**，面板一秒都不出现（我第一次跑就卡在这里，
+    报的却是"面板没出现"这种看起来像功能没做好的症状）。验收脚本必须先过 `about:blank` 再进目标页——
+    `data/verify/ai-refresh/undo-turn.mjs` 早就这么写了。
+  - **读数**：`pnpm test` **2278/2278**（26 个测试包，0 fail；`packages/web` 890、`@geewiki/ai-assistant` 241、
+    `@geewiki/openai` 73、`@geewiki/llm` 94、`core` 68）、`pnpm -r typecheck` **27 Done / 0 error TS**、
+    改动文件 `eslint` **0 error**（3 条既有 warning 与本次无关）。
+
 - **SSO 的界面归还给提供者插件（本批，2026-09-16）**：用户原话「此页面有sso的内容，sso相关插件是没启动的，
   这部分前端应该属于扩展内容，应当由这部分的插件来提供」。
   - **问题**：账号页把「外部身份（SSO）」的界面（绑定确认卡片、"在登录页选择企业 SSO…"的空态、解绑列表）

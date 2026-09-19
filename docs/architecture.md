@@ -1,6 +1,7 @@
 # GeeWiki 系统设计文档
 
-> 本文档是 GeeWiki 的系统设计说明。**事实来源是当前源码与 `config/plugins.base.json`**——凡数量、端点、
+> 本文档是 GeeWiki 的系统设计说明。**事实来源是当前源码与 `config/plugins.base.example.json`**
+> （随版本发布的默认值模板；本机 live 文件 `config/plugins.base.json` 不入库、不是口径）——凡数量、端点、
 > 插槽与行号口径一律以这两份真源为准。本文只写**现状**，不复述历史；变更流水见
 > [changelog/implementation-log.md](./changelog/implementation-log.md)，未来计划见 [roadmap.md](./roadmap.md)。
 
@@ -60,7 +61,8 @@ Plugin Manager（核心大脑）：热加载引擎、依赖图/冲突组、会�
         ai-summary / ai-assistant（会话核心，贡献 app-dock）/ ai-writing / ai-nav / ai-admin
 ```
 
-> 上图的清单以 `defaultRegistry()`（`packages/server/src/index.ts`）与 `config/plugins.base.json` 为真源。
+> 上图的清单以 `defaultRegistry()`（`packages/server/src/index.ts`）与 `config/plugins.base.example.json`
+> （随版本发布的默认值；本机 live 文件 `config/plugins.base.json` 不入库）为真源。
 > 注意 **`@geewiki/http` 不是独立包目录**：它的 manifest 定义在 `packages/server/src/index.ts` 的
 > `httpRegistryEntry` 里。AI 端点与状态码口径见 §9。
 各层职责：
@@ -421,7 +423,7 @@ Tailwind 下会把自定义色工具类**一起弄没**（`.text-ink` 直接不�
 
 > 现状说明：**外部插件目录发现已落地**（见 5.8）：宿主启动时扫描 `<仓库根>/plugins/<name>/`，按子目录 `package.json` 的 `geewiki` 键或独立 `geewiki.manifest.json` 读取清单并加载；内置插件由代码内置注册表静态登记（`packages/server/src/index.ts` 的 `defaultRegistry()`），`@geewiki/http` **不是独立包目录**（其 manifest 定义在同文件的 `httpRegistryEntry` 里），两者并入同一注册表。**数量口径以 `defaultRegistry()` 与 `config/plugins.base.json` 两份真源为准，不要在正文里写死例数。**
 >
-> 本文档取数于 HEAD `98b0ddd`（2026-09-17）。**取数命令**：`grep -c "source: 'builtin'" packages/server/src/index.ts` 与 `python3 -c "import json;print(len(json.load(open('config/plugins.base.json'))['enabled']))"`。
+> 本文档取数于 HEAD `98b0ddd`（2026-09-17）。**取数命令**：`grep -c "source: 'builtin'" packages/server/src/index.ts` 与 `python3 -c "import json;print(len(json.load(open('config/plugins.base.example.json'))['enabled']))"`（**模板**才算口径；本机 live 文件 `config/plugins.base.json` 不入库、随时可能含本机增删）。
 >
 > | 读数 | 值 | 明细 |
 > | --- | --- | --- |
@@ -608,7 +610,7 @@ Tailwind 下会把自定义色工具类**一起弄没**（`.text-ink` 直接不�
 
 **密钥安全**（结构性而非纪律性）：
 
-- **密钥有两条路，主路不是环境变量名**：**① `apiKey` = 写一次、不可回读的 secret 字段**（`packages/plugin-llm/src/index.ts:138` 的 `.role('secret')`），落**独立的 `config/secrets.json`**（`packages/manager/src/secrets.ts`；实测 `-rw-------` 即 0600，且在 `.gitignore` 里 `:34`），**绝不进入库的 `config/plugins.*.json`**，任何 HTTP 响应也不回显（`GET /config` 该字段回空串 + `secrets.apiKey: true`）；**② `apiKeyEnv` = 环境变量名**（`:200`，校验必须是全大写+下划线，`:245`）仍支持，给"密钥由部署环境持有"的部署方式。两条都结构上杜绝密钥进入**会落盘入库**的 `config/plugins.base.json`。
+- **密钥有两条路，主路不是环境变量名**：**① `apiKey` = 写一次、不可回读的 secret 字段**（`packages/plugin-llm/src/index.ts:138` 的 `.role('secret')`），落**独立的 `config/secrets.json`**（`packages/manager/src/secrets.ts`；实测 `-rw-------` 即 0600，且在 `.gitignore` 里 `:34`），**绝不进 `config/plugins.*.json`**（清单是会被复制出去的文件：模板由它派生、备份打包它、镜像构建也读它），任何 HTTP 响应也不回显（`GET /config` 该字段回空串 + `secrets.apiKey: true`）；**② `apiKeyEnv` = 环境变量名**（`:200`，校验必须是全大写+下划线，`:245`）仍支持，给"密钥由部署环境持有"的部署方式。两条都结构上杜绝了密钥成为**清单文件里的一个字段**。
 - **激活期的闸门是 `isEnvVarName()`，不是密钥启发式**（`packages/plugin-llm/src/credentials.ts:57`，调用点 `packages/plugin-llm/src/index.ts:243-250`）：`apiKeyEnv` 必须是全大写 + 下划线的**环境变量名**，命中"看起来像密钥值"的输入直接**让激活失败**并给出可执行提示（要填密钥请用 `apiKey` 那个 secret 字段）。空串必须放行——那是"未配置"的降级路径。**`detectSuspiciousCredential()` 已不用于配置校验**（`packages/plugin-llm/src/redact.ts:4` 明写），它是黑名单启发式、永远补不全（32 位 hex、被 `UPPER_SNAKE_NAME` 主动豁免的全大写串都漏判），而"漏判"在配置校验语境下的后果正是**静默失败**；它现在只服务于脱敏相关判断。**用白名单式语法校验而不是黑名单识别**，是本节最该记住的一条（throw 而非 `process.exit(1)`——后者会把一个可恢复的配置问题升级成整站不可用）。**保守优先**：全大写 SNAKE 命名（`DEEPSEEK_API_KEY`）一律放行，因为把变量名误判成密钥会让插件无法激活，而漏判只是少脱敏一处日志。
 - `redact()`：日志/错误文本脱敏，与检测**共用同一组正则源**（`SECRET_PATTERN_SOURCES`，单一事实来源），并遮蔽 `authorization` / `proxy-authorization` / `x-api-key` / `api-key` 等头名后面的值（保留原有引号，避免把 JSON 日志改成非法 JSON）。
 - `status.message` 经 `redact` 后输出；**`text-delta`（模型输出）刻意不脱敏**——脱敏会篡改模型输出内容。

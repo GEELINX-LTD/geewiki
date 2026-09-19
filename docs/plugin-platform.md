@@ -493,8 +493,8 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 **L-11 外部插件的加载期故障不会阻断宿主启动。**
 `loadExternalPlugins` 的设计原则是"加载失败 / 清单缺失 / 重名 / 路径越界只记为 issue 并跳过，绝不阻断宿主启动"。**列目录这唯一一处例外已收敛**（现记 `invalid_plugin_dir` 并跳过，见 §4.6）。此条保留用于强调"例外只应有一处"的边界：后续修复应保持该边界而不是顺带扩大。
 
-**L-12 容器内默认基础层清单是构建期快照，不是运行期同步。**
-`COPY --from=builder /src/config /app/config` 把**构建时**的 `config/plugins.base.json` 打进镜像。未挂载 `./config` 时，运行期对基础层的修改（如通过 REST 启停插件）写在容器可写层里，**容器重建即丢失并回退到构建期快照**；挂了卷则卷内容完全覆盖快照。**该取舍本身不是缺陷**，但排障时必须先分辨"当前看的是镜像快照还是卷内容"。
+**L-12 容器里的默认基础层是"镜像内的模板"，运行期现状另行落在可写层或卷上。**
+镜像只打进**随版本发布的默认值模板** `config/plugins.base.example.json`（`COPY --from=builder /src/config/plugins.base.example.json …`）——**不再整个 COPY `config/`**：那是开发者本机目录，里面有 `secrets.json`（模型 API key）与本机的模型/端点/开关，整目录 COPY 等于把密钥打进镜像层随镜像分发（已用探测构建实测到 `/cfg/secrets.json`）。未挂载 `./config` 时，运行期对基础层的修改写在容器可写层里；挂了卷则卷内容优先。**排障时必须先分辨"当前看的是镜像模板、容器可写层，还是卷内容"。**
 
 **L-13 schemastery `bitset` 暂保留降级为 JSON 编辑（裁决）。**
 `packages/web/src/lib/configSchema.ts:218` 的 `case 'bitset':` 与其它无控件类型一起回落 `kind: 'json'`（配置表单对该类型回落到 JSON 文本编辑，附注「bitset 类型改以 JSON 编辑」）。理由：`bitset` 在当前两个内置插件（`packages/plugin-wiki` / `packages/plugin-echo`）的 `configSchema` 中**均未使用**；载荷侧信息（`bits` 名字→数字字面量映射）已在 §2.2 记录，未来实现时无需重新勘察。**影响面**：仅表现为该类型的配置项需要手工写数字，不产生错误数据（服务端仍按 schemastery 校验）。

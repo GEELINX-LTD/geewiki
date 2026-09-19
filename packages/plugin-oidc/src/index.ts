@@ -6,8 +6,9 @@
  * 往 `llm-service` 注册一条路由完全一致。声明 `conflictGroup: 'oidc-provider'`：
  * 同组互斥，使"将来接第二个 IdP adapter"这件事由既有的冲突组机制保证，而不是靠约定。
  *
- * **只登记、不写进 `config/plugins.base.json`**（与 `@geewiki/echo`/`llm`/`ai`/`openai` 同形态：
- * "已注册但未启用"）。这是"无外部依赖 / 离线可用"承诺的落地方式（设计文档 §7.5）：
+ * **只登记、不写进随版本发布的默认清单 `config/plugins.base.example.json`**（与
+ * `@geewiki/echo`/`llm`/`ai`/`openai` 同形态："已注册但未启用"）。这是"无外部依赖 / 离线可用"
+ * 承诺的落地方式（设计文档 §7.5）：
  * - 未启用 ⇒ `/api/auth/oidc/*` 这两条路由**根本不存在**（404），前端不渲染 SSO 按钮；
  * - 已启用但 IdP 不可达 ⇒ `capabilities.oidc.available=false`，**本地密码通道完全不受影响**；
  * - 已有会话与已建立的 SSE 连接不依赖 IdP（我们自己的 cookie session）⇒ IdP 挂掉不掉线。
