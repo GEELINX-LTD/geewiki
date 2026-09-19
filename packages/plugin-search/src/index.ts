@@ -293,6 +293,36 @@ export function buildTermQuery(q: string): string[] {
 }
 
 /**
+ * 两种查询语义是否会落到**同一条检索路径**（因而必然给出逐字段相同的结果）。
+ *
+ * ## 为什么需要它
+ *
+ * 界面上有一个「改用分词匹配」的引导按钮，但它对相当多的查询是**死路**：点了之后
+ * 重新请求，拿回一模一样的 0 命中，且界面不给任何解释。根因在 {@link searchImpl} 的
+ * `useFts` 表达式：
+ *
+ * - `q.length < MIN_TRIGRAM_LENGTH` → **两种模式都回退 LIKE**（同一条 SQL）；
+ * - `q.length === MIN_TRIGRAM_LENGTH` 且无空白 → `buildTermQuery` 只切出原串本身
+ *   一个词元，`toFtsPhrase(t) OR` 与 `toFtsPhrase(q)` **是同一个 MATCH 表达式**。
+ *
+ * 判据必须与真实检索路径**共用同一批原语**（`buildTermQuery` / `toFtsPhrase`），
+ * 否则就是第二份镜像：切词规则一改，界面就会重新开始骗人。故本函数刻意放在
+ * 服务端、与 `useFts` 相邻，并由端点回传给界面。
+ *
+ * **只回答"换过去会不会不同"，不回答"换过去能不能搜到"**——后者需要真跑一遍查询，
+ * 而引导的价值恰恰在于"搜不到时"。
+ */
+export function modesConverge(q: string): boolean {
+  // 短查询：两条路都是 LIKE（`useFts` 在两个分支下同为 false）
+  if (q.length < MIN_TRIGRAM_LENGTH) return true
+  // 长查询：terms 的词元 OR 与 phrase 的整串短语是不同的 MATCH 表达式
+  const terms = buildTermQuery(q)
+  if (terms.length === 0) return true // 切不出词元 ⇒ terms 也回退 LIKE
+  // 恰有一个词元且与整串相同 ⇒ 两个 MATCH 表达式字面一致
+  return terms.length === 1 && terms[0] === q
+}
+
+/**
  * 自实现高亮片段（不用 FTS5 的 `snippet()`：trigram 下它上限约 64 token ≈ 中文 64 字，
  * 太短且会把片段切得很碎）。
  *
@@ -455,7 +485,7 @@ export const SearchPlugin = {
       // 空查询在这里返回空结果：空串传给 MATCH 会抛
       // `SqliteError: fts5: syntax error near ""`（FTS5 不接受空表达式）。
       // 端点另在解析阶段用 400 invalid_query 拦下（HTTP 语义），此处是服务层兜底。
-      if (!q) return { mode: 'like', total: 0, hits: [] }
+      if (!q) return { mode: 'like', total: 0, modesConverge: true, hits: [] }
       // 长度护栏（服务层）：直接调用 search-service 的消费方不受 REST 的请求行上限保护，
       // 可传入任意长度（例如把整篇正文当查询）→ 词元数与 MATCH 表达式随之膨胀。
       // 这里抛错而不是静默截断：截断会给出"看起来正常但只搜了一部分"的结果。
@@ -603,6 +633,8 @@ export const SearchPlugin = {
       return {
         mode,
         total,
+        // 与 `useFts` 同源：算的是"两个语义会不会落到同一条路"，故必须传**原始查询串**
+        modesConverge: modesConverge(q),
         hits: pages.map((row) => {
           const blocks = blocksByPage.get(row.page_id) ?? []
           return {
@@ -781,6 +813,8 @@ export const SearchPlugin = {
           query: q,
           mode: result.mode,
           queryMode,
+          // 界面据此决定"改用分词匹配"按钮是不是死路（服务端算，界面不重复推导切词规则）
+          modesConverge: result.modesConverge,
           total: result.total,
           hits: result.hits,
         })

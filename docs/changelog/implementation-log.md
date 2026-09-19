@@ -14,6 +14,41 @@
 
 **当前实现状态**
 
+- **修掉上一批自己引入的「死路按钮」（2026-09-19）**：用户原话「修掉」，指的是上一轮"还有什么可加强的点"
+  里实测出的**我自己的回归**——上一批刚加的「改用分词匹配」引导按钮，对相当多的查询点了等于没点。
+  - **症状**：短查询 0 命中时界面给出「改用分词匹配」按钮，用户点了 → 重新请求 → 拿回**一模一样**的
+    0 命中，且界面不给任何解释。连带那句空结果文案也在最需要它的时候骗人：原文写「换「分词」再试一次，
+    或缩短到 2–4 个字走短查询兜底」，但查询已经 ≤3 字时**两条建议都无效**。
+  - **根因**（`packages/plugin-search/src/index.ts:482`）：
+    `const useFts = queryMode === 'terms' ? terms.length > 0 : q.length >= MIN_TRIGRAM_LENGTH`
+    —— `q.length < 3` 时两种模式**都回退 LIKE**（同一条 SQL）；`q.length === 3` 且无空白时
+    `buildTermQuery` 只切出原串本身一个词元，`toFtsPhrase(t) OR` 与 `toFtsPhrase(q)` **是同一个 MATCH 表达式**。
+    实测：`架 / 架构 / 功能 / 特殊 / 演示 / 欢迎 / 功能介 / 特殊结 / 演示站 / 快速开` 两种模式**逐字段完全相同**；
+    单个拉丁词同理（`markdown / wiki / OIDC / demo / architecture`）。我测的 10 个查询里 **9 个**是这种情况。
+  - **做法（判据放服务端，界面不重复推导切词规则）**：新增 `modesConverge(q)` 纯函数
+    （`packages/plugin-search/src/index.ts`，紧邻 `useFts`），与真实检索路径**共用同一批原语**
+    （`buildTermQuery` / `MIN_TRIGRAM_LENGTH`）。若让前端自己镜像切词规则，规则一改界面就会重新开始骗人
+    且**没有任何测试会失败**。契约 `SearchResult` 增 `modesConverge: boolean`
+    （`packages/core/src/services.ts`），端点回传该字段（`GET /api/search` 响应体）。
+    前端把原先的 `suggestTermsOnEmpty(mode, total)` 换成 `emptySearchPlan(mode, total, modesConverge)`
+    → `'switch-terms' | 'no-match'`，并新增 `emptySearchHint(plan, mode)`：**按钮与文案从同一个 plan 派生**
+    （先前是两处各判一次，判据一变就会出现"给了按钮却说了反话"的自相矛盾界面）。
+  - **删掉一条错建议**：`缩短到 2–4 个字走短查询兜底` 整句移除。实测缩短**不会**增加命中：
+    `版本管理权`→`版本`(like,4) 但 `版本管`(fts,0)；`插件热插拔`→`插件`(like,3) 但 `插件热`(fts,0)。
+  - **验证读数**：`packages/plugin-search` **46/46**（新增 4 条 `modesConverge` 用例：同路 / 分叉 /
+    **与 `buildTermQuery` 同源**（钉住"判据不是另写一份切词规则"）/ 端点回传）、`@geewiki/web` **905/905**、
+    `@geewiki/ai-kb` **23/23**、全仓 `pnpm test` 无失败、`pnpm typecheck` exit 0、改动文件 eslint 0 error。
+    浏览器端到端 `scripts/acceptance/search-mode/run.ts` **26/26**（新增 4 项死路防线用例：
+    短查询 0 命中不给按钮、文案不提 2–4 个字、文案不提"分词"、手动切换条仍在）。
+  - **两处连带修复（都是既有断言被新字段打到）**：① `packages/plugin-search/test/search.test.ts:718`
+    对空查询返回值的 `deepEqual` 必须补 `modesConverge: true`（**这正是上一批记录里预告过的那个断言**）；
+    ② `packages/plugin-ai-kb/test/kb.test.ts` 的 `searchStub` 需补该字段。两处都是类型系统与断言
+    各自抓到的，说明"契约加字段"的影响面确实被这两层覆盖住了。
+  - **遗留（本轮未动，待定）**：① 检索响应 **96.8% 是没人读的 `blocks`**（实测 `q=架构&limit=100`
+    完整 21688 字节、去掉 blocks 489 字节），且响应头**无 `Content-Encoding`**（全仓无响应压缩中间件）；
+    ② `GET /api/search` **匿名可打、无限流**（连打 30 次无节流），短查询走 `blocks JOIN pages` 全表 LIKE。
+    两项都涉及取舍（契约裁剪 vs 压缩、限流阈值），未擅自动手。
+
 - **检索界面的「匹配方式」开关（2026-09-19）**：用户原话「好的把这部分优化一下」，指的是上一轮
   咨询里"还缺什么功能"的回答——本轮落地的不是新功能，而是**把后端已有、界面没接的查询语义接出来**。
   - **要修的症状**：同一句话，**AI 助手搜得到、人在搜索框里敲却 0 命中**。根因不是检索坏了，而是

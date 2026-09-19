@@ -257,16 +257,51 @@ export function queryModeNote(mode: SearchQueryMode): string {
 }
 
 /**
- * 0 命中时是否该引导用户换用 `terms`。
+ * 0 命中时该给用户什么（空结果区的按钮与文案**同源**，不各写一份判断）。
  *
- * 只在**精确匹配且一条都没有**时给这条引导：这正是本轮要修的症状——用户把问句粘进搜索框，
- * phrase 要求整串逐字出现，于是"明明写过却搜不到"。反向不成立：`terms` 已经是最宽的一侧，
- * 它 0 命中时换成 `phrase` 只会更少，给按钮等于骗人。
+ * `'switch-terms'`：给「改用分词匹配」按钮 —— 仅当换过去**真的会换一条检索路径**。
+ * `'no-match'`：只给"换个词"的普通建议，**不给按钮**。
+ */
+export type EmptySearchPlan = 'switch-terms' | 'no-match'
+
+/**
+ * 0 命中时该不该引导用户换用 `terms`。
+ *
+ * 三个条件缺一不可：
+ * 1. **当前是精确匹配**（`terms` 已是最宽的一侧，它 0 命中时换 `phrase` 只会更少，
+ *    给按钮等于骗人）；
+ * 2. **一条都没命中**（有结果时不打扰）；
+ * 3. **换过去确实会走另一条检索路径**（`!modesConverge`）。
+ *
+ * 第 3 条是后补的，它修的是本函数先前的一个真实缺陷：短查询（<3 字符）下 `phrase` 与
+ * `terms` **都回退 LIKE**，3 字符无空白时两者的 MATCH 表达式又字面一致 —— 此时点按钮会
+ * 重新请求并拿回**一模一样**的 0 命中，界面却什么也不说，是最典型的"死路按钮"。
+ *
+ * `modesConverge` **必须来自服务端响应**，界面不得自己推导切词规则：切词规则一旦调整，
+ * 前端镜像就会重新开始骗人（且没有任何测试会失败）。
  *
  * **只引导、不自动重试**：静默换模式会让用户以为自己搜的就是原串（也违背本仓"失败语义诚实"）。
  */
-export function suggestTermsOnEmpty(mode: SearchQueryMode, total: number): boolean {
-  return mode === 'phrase' && total === 0
+export function emptySearchPlan(
+  mode: SearchQueryMode,
+  total: number,
+  modesConverge: boolean,
+): EmptySearchPlan {
+  if (mode !== 'phrase' || total > 0) return 'no-match'
+  return modesConverge ? 'no-match' : 'switch-terms'
+}
+
+/** 空结果区的提示文案（与 {@link emptySearchPlan} 同源，避免"给了按钮却说了反话"） */
+export function emptySearchHint(plan: EmptySearchPlan, mode: SearchQueryMode): string {
+  if (plan === 'switch-terms') {
+    return '当前是「精确」匹配——它要求正文里逐字连着出现这串文字，问句几乎不可能命中。换「分词」再试一次。'
+  }
+  if (mode === 'phrase') {
+    // 精确匹配且换了也没用（短查询两条路相同）：**不能再建议"换分词"**，那是死路。
+    // 也别再建议"缩短到 2–4 个字"——短查询本就走 LIKE 兜底，缩短不会增加命中。
+    return '换个关键词试试，或先把这个主题写进知识库。'
+  }
+  return '换个关键词试试，或先把这个主题写进知识库。'
 }
 
 /** 前端预检查询串：空/超长在本地就拦下并给出明确文案（同时仍容忍后端 400） */

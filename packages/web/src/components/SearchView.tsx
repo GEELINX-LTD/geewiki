@@ -24,11 +24,12 @@ import {
   QUERY_MODE_OPTIONS,
   checkQuery,
   detectQueryMode,
+  emptySearchHint,
+  emptySearchPlan,
   queryModeNote,
   queryModeOption,
   scoreBadges,
   snippetToHtml,
-  suggestTermsOnEmpty,
   type SearchQueryMode,
 } from '../lib/searchPlan'
 import { SearchX } from 'lucide-react'
@@ -148,6 +149,16 @@ export function SearchView(props: {
   // 输入框打字会触发重渲染，故这里 memo 一次，避免每次都重算。
   const badges = useMemo(() => scoreBadges(data?.hits ?? []), [data])
 
+  /*
+   * 空结果区的按钮与文案**同源**：都从这一个 plan 派生。
+   * 先前是两处各判一次（hint 与按钮分别调 suggestTermsOnEmpty），一旦判据变化就会
+   * 出现"给了按钮却说了反话"这类自相矛盾的界面。
+   *
+   * `modesConverge` 缺省按 `false` 兜底（老响应/异常形状）：宁可多给一个按钮，
+   * 也不要在能换的时候把入口藏掉。
+   */
+  const emptyPlan = emptySearchPlan(mode, data?.total ?? 0, data?.modesConverge ?? false)
+
   return (
     <div className="page">
       <div className="page-head">
@@ -229,14 +240,10 @@ export function SearchView(props: {
             <EmptyState
               icon={<SearchX className="size-8" />}
               title={`没有找到与「${data.query}」相关的内容`}
-              hint={
-                suggestTermsOnEmpty(mode, data.total)
-                  ? '当前是「精确」匹配——它要求正文里逐字连着出现这串文字，问句几乎不可能命中。换「分词」再试一次，或缩短到 2–4 个字走短查询兜底。'
-                  : '换个关键词，或缩短到 2–4 个字试试短查询兜底。也可以先把这个主题写进知识库。'
-              }
+              hint={emptySearchHint(emptyPlan, mode)}
               action={
                 <div className="flex flex-wrap items-center gap-2">
-                  {suggestTermsOnEmpty(mode, data.total) && (
+                  {emptyPlan === 'switch-terms' && (
                     <Button variant="primary" size="sm" onClick={() => setMode('terms')}>
                       改用分词匹配
                     </Button>

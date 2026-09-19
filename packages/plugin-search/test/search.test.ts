@@ -28,6 +28,7 @@ import {
   SearchPlugin,
   buildSnippet,
   buildTermQuery,
+  modesConverge,
   escapeHtml,
   escapeLike,
   toFtsPhrase,
@@ -715,7 +716,12 @@ test('search-service：svc.search 与 REST 端点结果逐字段一致（单一�
     assert.equal(defSvc.hits.length, 4, '默认 limit 20 应返回全部 4 条')
 
     // 空查询：服务层返回空结果（端点层另用 400 invalid_query 表达 HTTP 语义）
-    assert.deepEqual(await svc.search(h.principal, '   '), { mode: 'like', total: 0, hits: [] })
+    assert.deepEqual(await svc.search(h.principal, '   '), {
+      mode: 'like',
+      total: 0,
+      modesConverge: true,
+      hits: [],
+    })
     // 非法 limit：服务层抛错（与端点的 400 对应）。
     // ★ P2：`search` 改为异步后，同步抛错变成**拒绝的 Promise**，故必须用 `assert.rejects`
     // 而不是 `assert.throws` —— 用错会让这条断言恒真（`assert.throws` 对返回 Promise 的
@@ -1143,6 +1149,72 @@ test('纯函数：buildTermQuery（CJK 3-gram / ASCII 切词 / 去重 / 空输�
   // 每个词元都能被 toFtsPhrase 安全转义（含引号）
   for (const t of buildTermQuery('知识库"OR"x')) {
     assert.match(toFtsPhrase(t), /^".*"$/, `词元应被包成字面短语: ${t}`)
+  }
+})
+
+/* ============ 两种查询语义是否同路（界面「改用分词匹配」按钮的死路防线） ============ */
+
+/*
+  这组钉住的是一个**界面缺陷的服务端判据**：短查询下 phrase 与 terms 会落到同一条
+  检索路径（都回退 LIKE，或 MATCH 表达式字面一致），此时界面那个「改用分词匹配」按钮
+  点了等于重新问一遍同一个问题，却拿回一模一样的 0 命中且不作解释。
+
+  判据必须与真实检索路径共用原语（buildTermQuery / MIN_TRIGRAM_LENGTH），故这里
+  同时断言"同路"与"分叉"两侧——只测一侧的话，把函数写成 `return true` 也能过。
+*/
+test('纯函数：modesConverge（短查询/单表达式同路 → true）', () => {
+  // <3 字符：useFts 在两个分支下同为 false ⇒ 两条路都是同一段 LIKE SQL
+  assert.equal(modesConverge('检索'), true, '2 字中文：两种模式都回退 LIKE')
+  assert.equal(modesConverge('架'), true, '1 字')
+  assert.equal(modesConverge('ab'), true, '2 字符 ASCII')
+  // 恰好 3 字且无空白：buildTermQuery 只切出原串本身 ⇒ MATCH 表达式字面一致
+  assert.equal(modesConverge('知识库'), true, '3 字：terms=[原串]，与 phrase 同表达式')
+  assert.equal(modesConverge('2024'), true, '4 字符 ASCII 单词：单 token')
+  assert.equal(modesConverge('markdown'), true, '单个英文词：terms=[原串]')
+  // 切不出词元 ⇒ terms 也回退 LIKE（纯标点）
+  assert.equal(modesConverge('。。。'), true, '纯标点切不出词元')
+})
+
+test('纯函数：modesConverge（多词元/含空白 → false，换过去真的不同）', () => {
+  // ≥4 字中文：滑窗切出多个 3-gram ⇒ OR 表达式 ≠ 整串短语
+  assert.equal(modesConverge('版本管理权'), false, '5 字：多个 3-gram')
+  assert.equal(modesConverge('段落级阅读权限'), false)
+  // 含空白：splitCjkRuns 切成多段/多词
+  assert.equal(modesConverge('OIDC 配置'), false, '含空白 ⇒ 多词元')
+  assert.equal(modesConverge('版本 管理权'), false)
+  // 长英文多词
+  assert.equal(modesConverge('full text search'), false)
+})
+
+test('modesConverge 与 buildTermQuery 同源：判据不是另写一份切词规则', () => {
+  // 这正是"同路"的定义：恰好一个词元且等于原串（或切不出词元）
+  for (const q of ['知识库', 'markdown', '2024', '检索', '版本管理权', 'full text search', 'OIDC 配置']) {
+    const terms = buildTermQuery(q)
+    const sameExpr = terms.length === 0 || (terms.length === 1 && terms[0] === q)
+    const shortLike = q.length < MIN_TRIGRAM_LENGTH
+    assert.equal(
+      modesConverge(q),
+      shortLike || sameExpr,
+      `判据必须等于 useFts 的实际分叉条件：${q}（terms=${JSON.stringify(terms)}）`,
+    )
+  }
+})
+
+test('modesConverge：端点把该字段回传给界面（界面不得自己推导）', async () => {
+  const h = makeHarness()
+  try {
+    h.putPage('p1', '知识库', '知识库的正文内容足够长以便命中检索')
+    // 短查询：同路 → true
+    const short = await h.search('q=知识库')
+    assert.equal(short.body['modesConverge'], true, '3 字查询：按钮是死路')
+    // 长查询：分叉 → false
+    const long = await h.search('q=知识库的正文内容')
+    assert.equal(long.body['modesConverge'], false, '长查询：换分词真的会不同')
+    // 服务层与端点必须一致（单一实现）
+    const svc = h.ctx.get('search-service') as SearchService
+    assert.equal((await svc.search(h.principal, '知识库')).modesConverge, true)
+  } finally {
+    h.dispose()
   }
 })
 
