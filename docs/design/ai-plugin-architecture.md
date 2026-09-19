@@ -1,16 +1,12 @@
 # AI 插件化重构：能力贡献架构（方案 · 决策已定稿）
 
-> 本文件是**方案与分期记录**，不是已落地事实清单。§0 的 15 条决策来自两轮问答，**已定稿**；
-> §9 列的 3 项仍未定。实测读数见 `data/verify/ai-native-probe/`。
->
-> ⚠️ **历史口径提示**：本文写于 AI 插件化重构**进行中**，正文保留原文以存史。其中描述的
+> 实测读数见 `data/verify/ai-native-probe/`。本文描述的
 > `@geewiki/ai`、`@geewiki/ai-qa`、`@geewiki/ai-assist`、`wiki-ask` 插槽、`POST /api/ai/stream`
-> 等对象**已在 P8 拆除**（决策 22；AI 侧只剩 `@geewiki/ai-assistant` 经 `app-dock` 提供的
+> 等对象**已拆除**（决策 22；AI 侧只剩 `@geewiki/ai-assistant` 经 `app-dock` 提供的
 > 唯一对话入口）。**当前口径见 [../../README.md](../../README.md)、[../architecture.md](../architecture.md)
-> 与 [../plugin-platform.md](../plugin-platform.md)**；本文只作为「当时为什么这么决定」的记录。
+> 与 [../plugin-platform.md](../plugin-platform.md)**。
 >
-> 本文**部分取代**了早期的 `ai-native-qa.md`（草稿 · 待评审，**已废弃删除**）的 §5.5：那里写的是
-> 「给问答加一个检索工具」，本文把**全部能力**都变成工具。§1.2 / §1.3 两条实测诊断仍然有效且仍是前置。
+> 本文把**全部能力**都变成工具，而不是只给问答加一个检索工具。
 
 ---
 
@@ -111,7 +107,7 @@ vllm-0.1.dev20073+g8e685d198-tp2-7c7fcbeb`），支持前缀缓存——只要**
 └─────────────────────────────────────────────────────────┘
 ┌─ L1 会话核心 ────────────────────────────────────────────┐
 │  ai-assistant：agent loop + SSE + 系统提示 + 预算          │
-│  ★ 不含任何检索逻辑（检索是 L2 的一个工具）                 │
+│  不含任何检索逻辑（检索是 L2 的一个工具）                   │
 └─────────────────────────────────────────────────────────┘
 ┌─ L0 平台 ────────────────────────────────────────────────┐
 │  @geewiki/ai-tools  provides: ai-tool-service（纯注册表）  │
@@ -168,7 +164,7 @@ export interface AiToolDescriptor {
 export interface AiToolService {
   /** 重复 name 必须抛错，不得静默覆盖（照 llm 路由注册表先例） */
   contribute(owner: string, tool: AiToolContribution): () => void
-  /** ★ 带主体：无权使用的工具不该进模型的工具表（§3.2） */
+  /** 带主体：无权使用的工具不该进模型的工具表（§3.2） */
   list(principal: Principal): readonly ResolvedTool[]
   release(owner: string): void
 }
@@ -248,7 +244,7 @@ export interface AppDockSlotProps {
 （`packages/web/src/lib/hostSdk.ts:22`）`0.2.0` → `0.3.0`。
 插件侧仍须**特性探测**而不是比版本字符串（既有约定，见 `hostSdk.ts:18-19`）。
 
-#### 3.4.1 实现期的两处修正（P2a，均已落地）
+#### 3.4.1 两处契约细节（P2a 落地）
 
 **① `page.kind` 从六个值收窄到两个：`'view' | 'edit'`。**
 
@@ -307,7 +303,7 @@ P2 阶段这张表是空的（`editor.*` 要等 P3 的编辑器句柄），现�
 interface MutationRecord {
   readonly id: number
   readonly conversationId: string   // 决策 9 的本地会话 id（服务端只存 id，不存内容）
-  readonly turnId: string           // ★ 决策 10 的回退粒度就是它
+  readonly turnId: string           // 决策 10 的回退粒度就是它
   readonly owner: string            // 哪个插件做的
   readonly tool: string
   readonly target: string           // 如页面 slug / 编辑器 docId / 插件名
@@ -421,51 +417,18 @@ manager 的生命周期与权限模型。
 
 ### 7.1 拆除清单（决策 17 / 18 的落地面）
 
-> **执行状态（P8，2026-09-15）：本清单已全部执行完毕，实测读数见 §8.12。**
-> 两处与本清单原计划的**偏离**，都记在 §8.12 里：
-> ① 本清单在 `packages/plugin-ai-qa` 里只列了两条**注释**——那是 P0 时写的，当时 `ai-kb`
-> 还没有把检索接过去；到 P8 时它的 `ui/`、`ai-qa-service`、两个端点全部无家可归，
-> 故按**决策 22** 整包删除（清单写"改注释"是因为那时它还该活着）。
-> ② 删除解析分支之后暴露出"保留段 `ask` 能解析、却不可能存在"这个中间状态，
-> 需要新增 `isUnreachableSlug` 收口——本清单没有预见，因为它是**两个分期叠加**才出现的。
+旧问答 UI 的拆除已执行完毕：`wiki-ask` 插槽与 `#/wiki/ask/<q>` 路由都已删除，
+`@geewiki/ai-qa` 整包删除（实测读数见 §8.12）。
 
-`grep -rn "wiki-ask|WikiAsk|wikiAsk"` 的实测分布（不含 `node_modules`）：
-
-**权威与镜像（必须同步改，否则守卫测试红）**
-
-| 文件 | 位置 |
-| --- | --- |
-| `packages/core/src/index.ts` | `SlotName` 联合 `:797`、`SLOT_NAMES` `:800`、`SLOT_CARDINALITY` `:821`、`WikiAskSlotProps` `:910`、注释 `:790` `:908` `:911` |
-| `packages/web/src/lib/slots.tsx` | `SLOT_NAMES` 镜像 `:49`/`:52`、注释 `:124`、`wikiAskEntry` `:391`、`wikiAskEntrySnapshot` `:396`、`useWikiAskSlot` `:401`、`useWikiAskSlotState` `:434`、`WikiAskSlotOutlet` `:447`（共 30 处） |
-| `packages/web/src/lib/pluginUiPlan.ts` | `SLOT_NAMES` 第三份镜像 `:71`、`ON_DEMAND_SLOTS` `:110`、注释 `:105` |
-| `packages/manager/test/slots.test.ts` / `packages/web/test/slotPropsMirror.test.ts` | 守卫，逐元素含顺序比对 |
-
-**路由与宿主**
-
-- `packages/web/src/lib/wikiRoute.ts`：`{ kind: 'ask'; q: string }` `:35`、解析分支 `:91`、`WIKI_RESERVED_FIRST_SEGMENTS` `:27`
-- `packages/web/src/pages/WikiPage.tsx`：`if (route.kind !== 'ask') return` `:318`、`if (route.kind === 'ask')` `:391`、`onAsk` 两处 `:374` `:410`、注释 `:309`
-- `packages/web/src/lib/pluginUi.ts`（2 处）、`packages/web/src/styles.css`（1 处）、`packages/server/src/index.ts`（1 处）、`packages/plugin-ai-qa/src/index.ts:35`（注释）、`packages/plugin-ai-qa/ui/index.tsx:17`（注释）
-
-**⚠️ 一处不能顺手删的：`RESERVED_FIRST_SEGMENTS` 里的 `'ask'`**
-
-它在四处是同一份事实：`packages/web/src/lib/wikiRoute.ts:27`、
-`packages/web/src/lib/slugRules.ts:33`、`packages/plugin-wiki/src/index.ts:535`，
-文案 `slugRules.ts:61` / `plugin-wiki/src/index.ts:567`。
-
-**建议保留 `'ask'` 为保留段**，只删路由解析分支。理由：一旦解禁，
+**仍有效的禁令：`'ask'` 继续留在保留段里**，只删路由解析分支。理由：一旦解禁，
 历史上被拒的 slug 变成合法，而**既有的 `#/wiki/ask` 分享链接会静默变成一个页面**。
 保留段不占位、不影响任何东西；解禁是单向且不可回收的。
 
-**测试**：`packages/web/test/{slotPropsMirror,pluginUi,pageMeta,wikiRoute}.test.ts`
-（`pageMeta.test.ts:42` 断言 `titleForRoute('wiki/ask/…')`、`wikiRoute.test.ts:36,37,88`）、
-`packages/manager/test/slots.test.ts`、`packages/plugin-wiki/test/slug-hierarchy.test.ts:305,307`、
-`packages/plugin-ai-assist/test/{uiToolbar,plugin}.test.ts`。
-
-**文档**：`README.md`(9)、`docs/plugin-platform-plan.md`(11)、`docs/architecture.md`(6)、
-`docs/roadmap.md`(4)、`scripts/acceptance/ai-split-e2e/README.md`(5)、`docs/design/ai-native-qa.md`(6)。
+`RESERVED_FIRST_SEGMENTS` 里的 `'ask'` 在四处是同一份事实：
+`packages/web/src/lib/wikiRoute.ts:27`、`packages/web/src/lib/slugRules.ts:33`、
+`packages/plugin-wiki/src/index.ts:535`，文案 `slugRules.ts:61` / `plugin-wiki/src/index.ts:567`。
 
 **不用动**（历史快照）：`data/verify/**`、`tmp/ai-refactor/*.json`、`data/a11y-scratch/*.json`。
-验收脚本 `scripts/acceptance/ai-split-e2e/` 里的 `.ask-card` 选择器要改或标记失效。
 
 ---
 
@@ -536,7 +499,7 @@ manager 的生命周期与权限模型。
 `search_kb` 返回的 **60 字符 snippet**，而不是 `read_page` 的全文——
 即 snippet 本身常常够用。这对成本是好消息，但也意味着 **snippet 的取法直接决定答案质量**。
 
-**测试**：全仓 `1416/1416` 绿（本批 +19），typecheck 18 projects 全 Done。
+**测试**：全仓 `1416/1416` 绿，typecheck 18 projects 全 Done。
 其中一条做了**红-绿验证**：把 `service.ts` 里放行 `tool-call-delta` 的那一行删掉，
 `packages/plugin-llm/test/service.test.ts` 恰好那一条变红（1 fail），恢复即 28/28 ——
 那句 `return undefined`（丢弃契约外类型）是本链路最容易**静默失败**的地方：
@@ -765,8 +728,8 @@ manager **135**、ai-tools **17**、ai-kb **20**。
 UI 产物 `packages/web/public/plugins-ui/@geewiki/ai-assistant/client.js`
 **21.10 kB（gzip 6.38 kB）** + `client.css` 3.52 kB——这就是"匿名不加载"的那份东西。
 
-> **P3 之后的读数更正**：全仓 `pnpm test` 是 **1590/1590 绿**（18 个包全部 `# fail 0`），
-> typecheck **21** 个 project 全 Done。**用例数比上一批少 24**，是因为决策 18 把
+> **P3 读数**：全仓 `pnpm test` 是 **1590/1590 绿**（18 个包全部 `# fail 0`），
+> typecheck **21** 个 project 全 Done。**用例数比 P2b 少 24**，是因为决策 18 把
 > `@geewiki/ai-assist` 的整份前端与端点删掉了（`ui/index.tsx` 399 行、`assistPlan.ts` 248 行、
 > `assist.test.ts` / `uiToolbar.test.ts` 整份、旧的 `plugin.test.ts`），
 > 同期新增的是 `plugin-ai-writing` 15 例 + `web/test/editorTools.test.ts` 13 例。
@@ -851,7 +814,7 @@ P4 的验收判据（§8.2）：**回退到某轮之前；他人改过即拒绝�
    `rollbackTo` **必填 `principal`**：回退本身是一次写操作，能回退的前提是"他现在有写权限"，
    而不是"他曾经有"（一个被吊权的用户点回退应当失败——那不是 bug）。
 2. **他人改过即拒绝** = `planRollback` 的冲突分支。判据是"记录的 `after` ≠ 当前值"。
-   ★ 关键细节：`currentOf` 返回 **`undefined`（"没拿到"）时按冲突处理，不按"一致"处理**。
+   关键细节：`currentOf` 返回 **`undefined`（"没拿到"）时按冲突处理，不按"一致"处理**。
    猜"一致"就是拿别人的编辑去赌一次静默覆盖，而猜错的代价不可逆。
    冲突只拒绝**那一条**，其余照撤，且调用方必须把 `conflicts` 一并呈现（只报"回退成功"是"静默跳过"的另一种写法）。
 3. **自锁护栏** = `checkSelfLock()` + `PROTECTED_AI_NODES`（`ai-assistant` / `ai-tools` / `llm` / `ai-journal`）。
@@ -859,7 +822,7 @@ P4 的验收判据（§8.2）：**回退到某轮之前；他人改过即拒绝�
    执行成功的后果是助手从此不能说话，用户也没法再命令它开回来。一个可以关掉的护栏等于没有护栏。
    护栏**在工具层、不在提示层**：提示里写"请不要停用 llm"不算护栏，模型可以不听。
    它已在 journal 的记录路径上生效（受保护节点 ⇒ **403 `protected_node`**，不是 400：这是"不允许"，不是"格式不对"）。
-   ⚠️ **启停工具本身要到 P5（`ai-admin`）才存在**，届时 `targetsOf(args)` 由那个工具交出目标名。
+   启停工具本身在 P5（`ai-admin`）落地，`targetsOf(args)` 由那个工具交出目标名。
 
 #### 两个在设计期没看见、实现期才暴露的缺口（都已修）
 
@@ -879,9 +842,9 @@ P4 的验收判据（§8.2）：**回退到某轮之前；他人改过即拒绝�
    ——`policy-service` 就是那份判据的**唯一出口**，HTTP 路径用的是同一个它，
    这不是"又写了一份判据"。本包因此 `requires: ['policy-service']`：
    拿不到判据就不能激活，而不是"没有判据也照样写"。
-   **⚠️ 结构性风险（记档，未修）**：判据与写入是两次先后调用，中间有竞态窗口。
+   **结构性风险（记档，未修）**：判据与写入是两次先后调用，中间有竞态窗口。
    彻底修法是给 `wiki-service` 加一个接主体的写方法（`saveAs(principal, slug, input)`），
-   让授权与写入在同一个服务调用里。那是一次触及 wiki 核心的契约变更，不属本批。
+   让授权与写入在同一个服务调用里。那是一次触及 wiki 核心的契约变更，属独立一批。
 
 #### 测试抓出的两个真缺陷（红-绿已做）
 
@@ -921,7 +884,7 @@ P4 的验收判据（§8.2）：**回退到某轮之前；他人改过即拒绝�
 > 应急令牌的真源是 `packages/server/src/index.ts:162` 的 **`x-gw-admin-token`**（或 `Authorization: Bearer <token>`），
 > 而 `/api/plugins` 那个读端点是 `access: 'public'` —— 带错头也照样 200，
 > 于是"头名写错"这件事在前一步完全不暴露，直到打第一个**要求主体**的端点才现形。
-> 这与本批的主题同源：**权限判据生效的地方，才是错误会暴露的地方**。
+> 这与 P4 的主题同源：**权限判据生效的地方，才是错误会暴露的地方**。
 
 #### 读数
 
@@ -975,7 +938,7 @@ page.update→ wiki.save(slug, { content })            ⇒ 把**投影结果**�
 **逐字相同**：两份对"什么算标记"的看法一旦分叉，护栏会在解析器认得、它认不得的形态上
 **静默放行**（比误报糟得多，因为它看起来还在检查）。守卫：`gatedGuard.test.ts` 直接读两侧源码比对字面量。
 
-#### 8.9.2 ★ 一个单测全绿、端到端才抓到的真缺陷：包装层漏转发一个参数
+#### 8.9.2 一个单测全绿、端到端才抓到的真缺陷：包装层漏转发一个参数
 
 `svc.get` 是 `ctx.get('wiki-service')` 真正拿到的东西，而它长这样：
 
@@ -1048,7 +1011,7 @@ get: async (slug, principal) => { assertLive(); return getPage(slug, principal) 
    服务端回 `400 invalid_body: owner 必须是字符串`，表现是"编辑框的改动没进日志"——
    又一个只会静默少东西的失败。owner 用宿主包的规范名 `@geewiki/web`。
 
-#### 8.9.6 ★ 一条与读者有关的机件事实（验收脚本踩到才明白）
+#### 8.9.6 一条与读者有关的机件事实（验收脚本踩到才明白）
 
 **读者看到的正文来自 `blocks` 表，不是 `pages.content`**：
 `projectPageContentFor` 优先用块（`SELECT … FROM blocks WHERE page_id = ? ORDER BY ordinal`），
@@ -1143,9 +1106,8 @@ get: async (slug, principal) => { assertLive(); return getPage(slug, principal) 
 
 **③ `grounding` → `grounded` / `groundingSources` → 界面标注（需求 ⑥ / 决策 4）**
 
-> **本批修正（2026-09-15 · 联网搜索）**：`AiToolGrounding` 已由 `'kb'` 扩成 `'kb' | 'web'`，
-> 取值由真正产生它的插件（`@geewiki/ai-web-search`）**连同界面标注一起定义**——这正是
-> 下文"刻意不为将来的 `web_search` 预留取值"那句话的兑现。链路因此多了一条**并列的量**。
+> `AiToolGrounding` 是 `'kb' | 'web'`，取值由真正产生它的插件（`@geewiki/ai-web-search`）
+> **连同界面标注一起定义**。链路因此有一条**并列的量**。
 
 链路：`AiToolResult.grounding?: 'kb' | 'web'`（`packages/plugin-ai-tools/src/types.ts`）
 → `runAgentLoop` 累加成 `LoopOutcome.grounded`（**只认 `'kb'`**：它问的是"有没有知识库依据"）
@@ -1270,7 +1232,7 @@ core 的常量注释里，每一条失效的方式都是静默的：
 **负载里刻意没有正文**：事件是广播，所有订阅者都收得到，包括那些本不该看到这一页的插件。
 需要正文的订阅者应当拿 `slug` 经 `wiki-service` **带主体**去读（读路径只有一条）。
 
-#### 8.11.2 摘要按哪一份正文写（本批最需要说清的裁决）
+#### 8.11.2 摘要按哪一份正文写（P6 最需要说清的裁决）
 
 摘要是**生成一次、所有人共用**的东西，而页面的可见性是**按人**算的。这两件事碰在一起
 就是一条泄漏路径。定下的规则是：
@@ -1399,7 +1361,7 @@ core 的常量注释里，每一条失效的方式都是静默的：
 **决策 17 的执行**：`wiki-ask` 插槽与 `#/wiki/ask/<q>` 路由一起拆除，AI 对话的唯一入口是常驻的
 `app-dock`。**决策 22 的执行**：`@geewiki/ai-qa` 整包删除（理由见 §0 决策表第 22 行）。
 
-#### 拆除面（与 §7.1 的清单逐条对照）
+#### 拆除面
 
 | 文件 | 改动 |
 | --- | --- |
@@ -1473,8 +1435,6 @@ core 的常量注释里，每一条失效的方式都是静默的：
 
 ## 9. 遗留问题
 
-§9 原有 3 项已全部定稿（决策 16 / 17 / 18）。**拆除清单见 §7.1。**
-
 ### 9.0.1 P6 留下的一条**有意**边界：private 页面没有摘要
 
 `visibility='private'` 或仅靠逐人授权可见的页面**不生成摘要**（`effectiveIndexLevel` 为 `null`）。
@@ -1486,7 +1446,7 @@ core 的常量注释里，每一条失效的方式都是静默的：
 "这份摘要按哪一档读者写"的选项——把决定权交回给知道这一页在讲什么的人，
 而不是让平台替它猜一个档位。
 
-### 9.0 P4 尾新留的三项 —— **P8 时逐条给出结论**（原文保留在下方以存史）
+### 9.0 P4 尾留下的三项与结论
 
 | # | 项 | 结论 | 理由 |
 | --- | --- | --- | --- |
@@ -1497,29 +1457,11 @@ core 的常量注释里，每一条失效的方式都是静默的：
 **三条的共同口径**：它们的收益都是"把已经很窄的窗口再窄一点"，而 P8 是一次**拆除**。
 拆除批次里顺手改权限模型，会让"拆坏了"与"改坏了"在排查时无法区分。
 
----
-
-#### 以下为 §9.0 的原文（P4 尾写的，保留以存史）
-
-1. **`wiki-service.save()` 不带主体**（§8.8 已记档）。`page.update` 与 `undoPage` 都是
-   "先问 `policy-service` 能不能编辑、再调 `save()`"，两次调用之间有竞态窗口。
-   彻底修法是加一个接主体的写方法 `saveAs(principal, slug, input)`，
-   让授权与写入落在同一次服务调用里。那是一次触及 wiki 核心的契约变更，属独立一批。
-2. **`rawContent` 的口径靠字符串字段自述**（`contentMode: 'raw'`）。
-   本轮把它当成了"服务端与调用方之间的握手"，够用；但如果将来出现第三个口径
-   （如"部分投影"），字符串比联合类型更容易被写错。届时应收成可判别联合。
-3. **日志的 `conversationId` 是一枚能力令牌**：`GET /api/ai/journal?conversationId=X` 与
-   `POST …/undo` 只要求"登录主体"，不要求"这段对话是你的"。会话 id 由浏览器本地生成、
-   只存在本机，所以实际风险有限；而**撤销执行体本身仍然强制目标权限**
-   （判据 4 的端到端用例证明了这一点）。真要收紧就得让 journal 记 ownerUserId 并在读路径上比对
-   —— 那会让"换个浏览器还能回退"变成不可能，是一次产品取舍，不是纯技术修补。
-
 ### 9.1 编辑框工具由谁登记 —— **已定稿（P3）**：取 (a) 宿主登记处理器
 
-> 本节标题原为「一个**仍然没定**的岔路」。**P3 已定稿**，结论与理由见本节末尾的
-> 「P3 定稿」引用块：取 **(a) 宿主登记处理器**，且原表里"取 (a) ⇒ `ai-writing` 就没有
-> 存在理由了"那句**推理是错的**——工具的**两半**（服务端声明描述符 + 宿主登记处理器）
-> 必须由两边各持一半，`ai-writing` 是**契约的持有者**。下方原文保留以存史。
+结论与理由见本节末尾的「P3 定稿」引用块：取 **(a) 宿主登记处理器**；原表里"取 (a) ⇒
+`ai-writing` 就没有存在理由了"那句**推理是错的**——工具的**两半**（服务端声明描述符 +
+宿主登记处理器）必须由两边各持一半，`ai-writing` 是**契约的持有者**。
 
 决策 18 丢了四个按钮、保留了插件，但**留下一个新的岔路**：`editor.*` 这些客户端工具
 由谁向宿主登记？
@@ -1556,9 +1498,6 @@ core 的常量注释里，每一条失效的方式都是静默的：
 
 ## 附录：AI 失败语义与降级词汇
 
-> 本节承接已删除的 `ai-plugin-split.md`（实施契约，其描述的对象已被 P8 拆除）中**仍然有效**的
-> 实现期结论。这些是当前口径，不是历史。
-
 ### 降级词汇的唯一归属：`@geewiki/llm`
 
 `Degraded` / `DegradedReason` / `degradedFromCode` / `makeDegraded` 四份词汇**上移到
@@ -1594,8 +1533,7 @@ core 的常量注释里，每一条失效的方式都是静默的：
 
 ## 附录 B：检索质量的已识别缺口
 
-> `ai-native-qa.md`（草稿 · 待评审）在设计口径上已被本文与代码取代，**已删除**。但它做过的一轮
-> **实测诊断**仍然成立，其中三项改进**至今未落地**——下面把这部分固化下来，免得随文档一起丢掉。
+> 以下诊断经实测得出、仍然成立，其中三项改进**至今未落地**。
 
 ### 仍然成立的诊断：命中的是"页"，喂给模型的却是页头
 

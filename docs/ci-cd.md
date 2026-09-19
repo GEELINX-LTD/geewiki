@@ -56,21 +56,14 @@ pnpm --filter @geewiki/web typecheck
 
 ## 3. store 路径为什么必须是相对路径（重要）
 
-`.github/actions/setup/action.yml` 是所有作业共用的复合 action。它曾经包含一步：
-
-```bash
-sed -i '/^storeDir:/d; /^cacheDir:/d' pnpm-workspace.yaml
-```
-
-用来删掉 `pnpm-workspace.yaml` 里写死的**宿主机绝对路径**。这条 sed 已随根因修复而移除：
-store/cache 现在写成**相对路径**（`.pnpm-store` / `.npm-cache`），相对工作区根解析，
+`.github/actions/setup/action.yml` 是所有作业共用的复合 action。`pnpm-workspace.yaml` 里的
+store/cache 写成**相对路径**（`.pnpm-store` / `.npm-cache`），相对工作区根解析，
 因此在本地沙箱、CI runner、Docker 构建中间层与 Dependabot 的 checkout 里，
 都会落在各自可写的位置（两个目录已被 `.gitignore` 与 `.dockerignore` 排除）。
 
-> ⚠️ **不要把这两个键改回绝对路径。** 一旦写死，所有非本机环境都会去写宿主机 `/root`：
-> 本仓 CI 与 `Dockerfile` 曾各自加 sed 兜底（现已一并移除），而 **Dependabot 无法 sed** ——
-> 它要实际执行 `pnpm install` 与 `pnpm update --lockfile-only` 来重算锁文件，读到绝对路径
-> 后会直接失败，表现为 `npm_and_yarn` 更新**全线**报
+> **不要把这两个键改回绝对路径。** 一旦写死，所有非本机环境都会去写宿主机 `/root`：
+> **Dependabot 无法 sed** —— 它要实际执行 `pnpm install` 与 `pnpm update --lockfile-only`
+> 来重算锁文件，读到绝对路径后会直接失败，表现为 `npm_and_yarn` 更新**全线**报
 > “Dependabot encountered an error performing the update”。
 >
 > 排查线索：`github_actions` 与 `docker` 两个生态**不执行 pnpm**，因此同时段它们成功、
@@ -84,7 +77,7 @@ pnpm 11.7.0 实测结论（避免再走弯路）：
 | 环境变量 `npm_config_store_dir` | ❌ 无效（注意这个常见拼写就是错的） |
 | 环境变量 **`PNPM_CONFIG_STORE_DIR`** / `PNPM_CONFIG_CACHE_DIR` | ✅ 有效，且**优先级高于** `pnpm-workspace.yaml` |
 | CLI flag `--config.store-dir=` / `--store-dir=` | ✅ 有效 |
-| `pnpm config set --location project storeDir` | ⚠️ 会写进**入库的** `pnpm-workspace.yaml`，不能用 |
+| `pnpm config set --location project storeDir` | 会写进**入库的** `pnpm-workspace.yaml`，不能用 |
 
 ---
 
@@ -107,7 +100,7 @@ pnpm 11.7.0 实测结论（避免再走弯路）：
 `type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}`
 单独控制。
 
-> ⚠️ 不要删掉 `flavor: latest=false`。metadata-action 的 `flavor.latest` 默认是 `auto`，
+> 不要删掉 `flavor: latest=false`。metadata-action 的 `flavor.latest` 默认是 `auto`，
 > 它会在**默认分支和 semver tag 推送两种情况**下都追加 `latest`（已实测：tag `v0.1.0`
 > 的运行确实产出了 `latest`）。那会使「用旧提交打的 tag」把 `latest` 回退到旧镜像。
 
@@ -148,7 +141,7 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
 > `PATCH /orgs/{org}/packages/container/{name}` 返回 `404 Not Found`；细粒度 PAT 若未
 > 勾选 Packages 权限，则连包列表都读不到（403）。
 >
-> **⚠️ 改可见性不需要 PAT。** 上面的 404/403 只说明**API 这条路**不通；在浏览器里你是
+> **改可见性不需要 PAT。** 上面的 404/403 只说明**API 这条路**不通；在浏览器里你是
 > 以组织 owner 身份登录的，UI 用的是你的会话，与 PAT 权限无关：
 >
 > 1. 打开 `https://github.com/orgs/GEELINX-LTD/packages/container/geewiki/settings`
@@ -174,9 +167,9 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
 - **npm**：仓库根的 pnpm workspace（Dependabot 在根目录即可识别全部工作区包）；
   minor/patch 合并为单个 PR 以降低噪音，major 单独开 PR 便于逐个评估。
 - **github-actions**：`actions/*`、`docker/*` 等 action 版本。
-- **docker**：`Dockerfile` 的基础镜像 `node:22-bookworm-slim`。
+- **docker**：`Dockerfile` 的基础镜像 `node:26-bookworm-slim`。
 
-  > ⚠️ **Node 大版本升级要留意随镜像内置工具的变化**：Node 26 起官方镜像
+  > **Node 大版本升级要留意随镜像内置工具的变化**：Node 26 起官方镜像
   > **不再内置 corepack**，`corepack enable` 会直接报 `corepack: not found`
   > （exit 127）。本仓 Dockerfile 已改用 `npm install -g pnpm@<packageManager 版本>`，
   > 因此不受影响。这也是为什么 PR 阶段的 `docker-build` 作业值得保留 ——
@@ -227,5 +220,5 @@ enforcement: active，作用于默认分支），包含四条规则：
 > 查看 / 修改：`https://github.com/GEELINX-LTD/geewiki/rules/23638645`，
 > 或用 API：`gh api /repos/GEELINX-LTD/geewiki/rulesets`。
 
-> ⚠️ 不要给 PR 加 `paths-ignore`（例如跳过纯文档改动）。一旦某个必需检查因路径过滤而
+> 不要给 PR 加 `paths-ignore`（例如跳过纯文档改动）。一旦某个必需检查因路径过滤而
 > 从未上报，PR 会永久卡在 pending 无法合并。

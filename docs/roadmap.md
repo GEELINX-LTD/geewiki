@@ -21,9 +21,7 @@
 - **`pnpm test`：exit 0，全绿。** **`pnpm typecheck`：exit 0，0 个 `error TS`。**
 - **取数命令**（根目录）：`pnpm test`、`pnpm typecheck`；包总数 `ls -d packages/*/`；
   有 `test` 脚本的包数 `node -e "…"` 或逐包 `pnpm --filter <pkg> test` 现取。
-- **本文刻意不写死包数与用例数**：它们随每次提交漂移，写死必然过期（历史上同一份文档里曾同时存在
-  15/15、35/35、242/242、251/251、266/266、308/308、1416/1416、1453/1453、1696/1696、1715/1715、
-  1774/1774、1817/1817 十二个互相矛盾的读数）。历史时点读数见文末「历史读数台账」。
+- **本文刻意不写死包数与用例数**：它们随每次提交漂移，写死必然过期。
 
 ---
 
@@ -55,12 +53,12 @@
 - `packages/web`（React 19 + Vite + @xyflow/react + marked，零 UI 框架依赖，中文界面）：
   - `#/wiki` 知识库：页面列表 / 详情（Markdown 渲染）/ 编辑与实时预览 / 新建（slug 校验）/ 删除 / 版本历史时间线（查看快照、一键恢复旧版本）。
   - `#/plugins` **插件管理（含依赖图）**：状态统计条、插件表（状态/层/热冷徽章/提供与依赖 chip）、会话层热"启用"（行内 JSON 配置编辑）、"停用"、异常重试、基础层清单托管提示、会话变更面板 + "应用并持久化"、bootErrors 展示，以及 React Flow 渲染的插件 DAG（内置分层布局：被依赖方居左，无 dagre 依赖）、状态着色节点 + 图例 + 缩放控件。
-    **「插件管理」与「依赖图」原本是两个路由/两个页面，现已合并为同一页 `GraphPage.tsx`**；**主路由是 `#/plugins`**，老链接 `#/graph` 在路由解析处改写成 `#/plugins`（`packages/web/src/App.tsx:316`）。
+    **「插件管理」与「依赖图」是同一页 `GraphPage.tsx`**；**主路由是 `#/plugins`**，老链接 `#/graph` 在路由解析处改写成 `#/plugins`（`packages/web/src/App.tsx:316`）。
 - `packages/plugin-wiki`（`@geewiki/wiki` 核心业务插件，requires http+db，热授权）：
   - `GET/PUT/DELETE /api/pages(/:slug)` + `GET /api/pages/:slug/versions/:id`；upsert 幂等（内容未变不产生版本）；每次保存先快照旧正文至 `page_versions`；删除显式事务级联清历史；body 大小/形状校验。
-- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。**后续批次补充**：`/plugins-ui/**` 走**独立分支**（按名查根、**绝不 SPA fallback**，缺失即 404 `application/json`；其"内置根"由 `GEEWIKI_PLUGIN_UI_DIST` 指定、**缺省 = `webDist`**——app shell 产物根与内置插件 UI 资产根已拆为两个独立配置项，见 architecture §6 与 [plugin-platform.md](./plugin-platform.md)），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
+- `packages/server`：静态文件服务（`packages/web/dist` 或 `GEEWIKI_WEB_DIST`）——扩展名 MIME、hash asset 永久缓存、SPA fallback（无扩展名路径）、`/api/*` 404 与静态互不干扰；`dispatch()` 返回接管语义；204/304 无响应体。`/plugins-ui/**` 走**独立分支**（按名查根、**绝不 SPA fallback**，缺失即 404 `application/json`；其"内置根"由 `GEEWIKI_PLUGIN_UI_DIST` 指定、**缺省 = `webDist`**——app shell 产物根与内置插件 UI 资产根已拆为两个独立配置项，见 architecture §6 与 [plugin-platform.md](./plugin-platform.md)），其根表由 `pluginUiRootsFor()` **每请求现算**（禁止缓存，见 architecture §6）。`@geewiki/wiki` 纳入 default registry 与默认 base 清单。
 
-**验收**：headless Chrome（playwright chromium 1228）真实渲染路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。当时的单测读数见文末台账。
+**验收**：headless Chrome（playwright chromium 1228）真实渲染路由——列表含 API 数据、插件表状态正确、React Flow 画布出节点、详情页 Markdown 渲染与版本历史齐全；全仓 typecheck 全绿、`vite build` 通过；REST 冒烟（创建/幂等/版本/历史读取/删除/409）全过。
 
 ---
 
@@ -71,12 +69,12 @@
 
 - [x] **LLM 契约层**：`@geewiki/llm`（route→provider 注册表 + 稳定错误码枚举 + 终止 chunk 保证 + **绝不重试** + 密钥只存 secret 字段或环境变量名 + 日志/响应脱敏）。**有意不含任何厂商 adapter**——adapter 在 `@geewiki/openai`。见 architecture §9.4。
 - [x] **检索地基**：`@geewiki/search`（SQLite FTS5 + **`trigram`** 中文分词 + 短词 LIKE 兜底），端点 `GET /api/search?q=&limit=&mode=`，**默认部署即启用**（`config/plugins.base.json` 第 9 条）。中文检索的实测事实见 architecture §9.3。
-- [x] **检索召回缺陷修复**：`mode` 缺省 `phrase` 曾使自然语言问句**恒为 0 命中**；修复为 `mode: 'terms'`（CJK 取 3-gram 滑窗、ASCII 只保留 ≥3 字符词元），**已提交 `04c45c3`**。**仍成立的边界**：`mode=terms` **未接入 Web UI**（搜索框保持 `phrase` 语义）；terms 召回更宽、精确率低于短语检索。
+- [x] **检索召回缺陷修复**：`mode` 缺省为 `phrase` 时自然语言问句**恒为 0 命中**，故 AI 检索路径改为**显式传** `mode: 'terms'`（`packages/plugin-ai-kb/src/index.ts:262`；检索端点自身的缺省**仍是** `phrase`，见 `packages/plugin-search/src/index.ts:748`）—— CJK 取 3-gram 滑窗、ASCII 只保留 ≥3 字符词元。**仍成立的边界**：`mode=terms` **未接入 Web UI**（搜索框保持 `phrase` 语义）；terms 召回更宽、精确率低于短语检索。
 - [x] **AI 工具调用（P0）**：tools 透传（`LlmRequest.tools` / `toolChoice`、`role: 'tool'` 消息、`tool-call-delta` chunk、`done.finishReason`），拼装收敛到全仓唯一一份 `assembleToolCalls()`（`packages/plugin-llm/src/tools.ts`）。
 - [x] **AI 工具总线与知识库工具（P1）**：`@geewiki/ai-tools`（`provides: 'ai-tool-service'`，纯注册表）与 `@geewiki/ai-kb`（`list_pages` / `search_kb` / `read_page` 三条只读工具），都进默认基础层清单。
 - [x] **AI 变更日志与回退（P4）**：`@geewiki/ai-journal`（`ai-journal-service`，四个要求登录主体的端点，迁移按方言分家）+ `@geewiki/ai-pages`（本仓**第一条 `mutating: true`** 的工具 `page.update`）。回退粒度 `turnId` = 一次用户提问；**他人改过即拒绝**（"没拿到当前值"按冲突处理，不按"一致"处理）；自锁护栏 `checkSelfLock()` + `PROTECTED_AI_NODES` **在工具层不在提示层**。**已知竞态窗口（未做）**：`wiki-service.save()` 不带主体，写工具只能自己向 `policy-service` 要 `canEdit`；正解是给 wiki-service 加 `saveAs(principal, …)`。回退 UI、探针优先于客户端自报、`gatedRewriteRefusal()` 结构护栏均已落地。
 - [x] **AI 插件化重构 P5**：`@geewiki/ai-nav`（`open_page` / `scroll_to`，处理器在宿主 `packages/web/src/lib/navTools.ts`）与 `@geewiki/ai-admin`（`plugin.list` / `read_config` / `set_enabled` / `set_config`，仅所有者/管理员可用，护栏在**调用管理器之前**生效）；跨知识库结果带 `grounding` 显著标注；`ai-assistant` 声明 `REQUIRED_TOOL_NAMES = ['search_kb']`，缺席时 `/api/ai/turn` 以 **503 `tools_unavailable`** 拒绝（**不偷偷降级成通用聊天机器人**）；自锁名单扩到五个。验收 `scripts/acceptance/p5-nav-admin/run.ts`。
-- [x] **AI 插件化重构 P6**：`@geewiki/ai-summary` + 折叠摘要卡——平台层新增第七个插槽 `article-summary`（单占用）与第二个平台事件 `PAGE_SAVED_EVENT`（`@geewiki/wiki` 在**事务提交之后**用 `ctx.emit` 同步广播，`unchanged` 不广播、负载不含正文）。摘要只对 public/org 两档写；过期用**内容哈希**判而非时间戳；按摘要检索**有意不走 FTS5**（`LIKE` 粗筛 + JS 精排 ⇒ 方言中立，PG 上也能跑）。折叠卡渲染在 `<h1>` **之后**、正文之前（`packages/web/src/pages/WikiPage.tsx:2228` 是 `<h1>`、`:2240` 是 `ArticleSummarySlotOutlet`；2026-09-17 用户要求从"标题之前"调整过来）；`available === false` ⇒ **整张卡片不渲染**（源码守卫钉住）。验收 `scripts/acceptance/p6-summary/run.ts`。
+- [x] **AI 插件化重构 P6**：`@geewiki/ai-summary` + 折叠摘要卡——平台层新增第七个插槽 `article-summary`（单占用）与第二个平台事件 `PAGE_SAVED_EVENT`（`@geewiki/wiki` 在**事务提交之后**用 `ctx.emit` 同步广播，`unchanged` 不广播、负载不含正文）。摘要只对 public/org 两档写；过期用**内容哈希**判而非时间戳；按摘要检索**有意不走 FTS5**（`LIKE` 粗筛 + JS 精排 ⇒ 方言中立，PG 上也能跑）。折叠卡渲染在 `<h1>` **之后**、正文之前（`packages/web/src/pages/WikiPage.tsx:2228` 是 `<h1>`、`:2240` 是 `ArticleSummarySlotOutlet`）；`available === false` ⇒ **整张卡片不渲染**（源码守卫钉住）。验收 `scripts/acceptance/p6-summary/run.ts`。
 - [x] **AI 插件化重构 P8（已完成）**：拆除旧 UI（决策 17）+ 删除 `@geewiki/ai-qa`（决策 22）——`wiki-ask` 从 `SlotName` 与三处镜像中消失、`#/wiki/ask/<q>` 路由拆除、三个旧端点（`/api/ai/ask`、`/api/ai/stream`、`/api/ai/capabilities`）与旧产物全部 404、`PUT /api/pages/ask` 仍 **400 `invalid_slug`**（保留段未解禁）。验收读数（隔离实例 `GEEWIKI_PORT=3931`）：入口表恰两键（`ai-assistant: ['app-dock']`、`ai-summary: ['article-summary']`）、`GET /api/plugins/slots` 已无 `wiki-ask`。详见 [design/ai-plugin-architecture.md](./design/ai-plugin-architecture.md) §0 决策 22 / §7.1 / §8.12 / §9.0。
 - [x] **AI 会话核心与常驻输入条（P2）**：插槽 `app-dock` + `@geewiki/ai-assistant` 的 agent loop。宿主侧纯逻辑 `lib/dockPlan.ts`（路由 → 页面上下文，`page.kind` 收窄到 `'view' | 'edit'`，列表/新建/检索/图谱/管理台一律 `null`）、客户端工具注册表 `lib/clientTools.ts`、挂载组件 `components/AppDock.tsx`（登录判定 + 按需加载 + props 组装同生同死），渲染点在 `<main>` **之外**（切页不重挂 = 会话存活）。**`POST /api/ai/turn`（无状态回合，SSE）已落地**（`packages/plugin-ai-assistant/src/index.ts:51` 的 `TURN_PATH`）：系统提示与预算、`app-dock` 的 UI bundle、会话历史（浏览器本地近 10 段，决策 9/12）、`out-of-scope` 标注（决策 4）均已接线。
 
@@ -115,29 +113,3 @@
 ### 8. 插件平台仍成立的已知限制
 
 样式无隔离（无 Shadow DOM、无前缀改写）、**ESM 模块实例不回收**（产物更新需整页刷新）、无版本协商与完整性之外的信任机制、`on-demand` 插槽的若干踩坑边界、"插件产物更新需整页刷新"等——完整清单见 [plugin-platform.md](./plugin-platform.md)。
-
----
-
-## 历史读数台账
-
-**仅为备查**。这些读数是**历史时点**且互相不可比（口径、包数、是否含未提交工作树都不同）；标"HEAD 未记录"者原稿未记，不可复现。
-**当前读数只有上文那一处**。
-
-| 时点 / HEAD | 读数 | 备注 |
-| --- | --- | --- |
-| Phase 2 验收（HEAD `75a634b`） | 15/15 | `deps.test.ts` 8 + `manager.test.ts` 7；同批 typecheck 全绿、`vite build` 通过 |
-| 后续治理批次（同一实现期，HEAD 未记录） | 35/35 | deps 8 + manager 13 + repo-paths 3 + server 11 |
-| 读数 A：HEAD `585dbac`（2026-09-10T23:24 +08:00） | 242/242 | 7 个包 |
-| 读数 B（工作树含并行批次未提交改动，2026-09-10T23:35 +08:00） | 251/251 | 较 A 多 `plugin-search` 32 / `plugin-ai` 25；该批次已落为 `04c45c3` |
-| 读数 C：HEAD `3bdcf4b`（2026-09-11T00:29 +08:00） | 266/266 | 7 个包，fail 0 / skipped 0 |
-| 读数 D（工作树含未提交的 `packages/plugin-openai/**`，2026-09-11T00:38 +08:00） | 308/308 | 8 个包；该包现已入库 |
-| P0 AI 工具调用（HEAD 未记录） | 1416/1416 | 真实上游一次工具调用往返（3 轮 / 3 次调用） |
-| P1 工具总线与知识库工具（HEAD 未记录） | 1453/1453 | 真实例 + 真实工具表 + 真实上游 3 轮 / 3 次调用（基线 5 轮 / 15 次） |
-| P4 变更日志与回退（2026-09-14，HEAD 未记录） | 1696/1696，typecheck 23 | 20 个包全部 `# fail 0` |
-| P5 导航与管理工具（HEAD 未记录） | 1774/1774，typecheck 25 | 22 个包；`scripts/acceptance/p5-nav-admin/run.ts` 全过（含真实上游） |
-| P6 摘要与折叠卡（HEAD 未记录） | 1817/1817，typecheck 26 | 23 个包；`scripts/acceptance/p6-summary/run.ts` 全过（含真实上游） |
-| P8 拆除旧 UI + 删除 `ai-qa`（HEAD 未记录） | 1715/1715，typecheck 25 | 22 个包 0 fail；隔离实例 `GEEWIKI_PORT=3931` |
-| **当前：HEAD `98b0ddd`（2026-09-17）** | **`pnpm test` exit 0 全绿 / `pnpm typecheck` exit 0、0 个 `error TS`** | 以实跑为准 |
-
-> **一条教训**：报告读数**必须同时给出 HEAD 与取数时刻**，并说明是否含未提交的工作树。缺少这三样，
-> 读数既不可复现也不可比——上表里同一实现期的读数互相矛盾，全部是这一个原因。

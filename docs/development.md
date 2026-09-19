@@ -1,7 +1,6 @@
 # GeeWiki 工程开发约定与教训
 
 > **性质**：本文是**工程约束的唯一真源** —— 沙箱环境、数据库迁移、PostgreSQL 方言、验收与验证纪律、文档纪律、协作与委派约定。
-> **来源**：原 `docs/design/` 下的一次性交接稿（**已删除**，其分支/worktree 进度表、阶段状态、"下一步做什么"与一次性编排过程属过期内容）中"环境约束与教训""验证基线""新增教训"等小节里**仍然有效**的条目。本文取代它在这些主题上的真源地位。
 > **读者**：任何在本仓库实现、评审或验收的人（含 agent）。**实现交付必须遵守本文全部条目**；条目里保留具体数字、报错文本与命令，是为了让约束可复现、可核对，而不是装饰。
 
 ---
@@ -18,7 +17,7 @@
   GEEWIKI_CONFIG_DIR=<tmp> GEEWIKI_DATA_DIR=<tmp> GEEWIKI_DB_PASSWORD=testpw GEEWIKI_PORT=<自选> \
     node --import tsx packages/server/src/index.ts
   ```
-  ⚠️ **必须轮询 `/api/health` 到 `"present":true` 才开始验收**（http 就绪即 200，迁移可能没跑完 —— 三位执行者栽在这里）。
+  **必须轮询 `/api/health` 到 `"present":true` 才开始验收**（http 就绪即 200，迁移可能没跑完 —— 三位执行者栽在这里）。
 - **PG 共享库 `geewiki_test` 已"中毒"**（留着先前运行的 owner 账号 ⇒ e2e 跳过 setup 直接登录 ⇒ 全线 401 假失败）⇒ 用干净库 **`geewiki_e2e_clean`**。
 - **容器 `geewiki-pg-test`**：`postgres:15-alpine`，host `127.0.0.1` port **55432**，user `geewiki` / password `testpw`。
 - **端口分段避让**：41xxx PG 验证 / 42xxx P1.5 / 43xxx P2 / 45xxx 合并验证 / 46xxx M5 合并 / 47xxx P3a / 48xxx M5 前端 / **50xxx P3bcd**。
@@ -84,7 +83,7 @@
 
 - **红-绿自检是最硬的证据**：临时禁用被测路径 ⇒ 断言必须**变红**（样例：临时禁用两处扇出 ⇒ `K5/K6/K14/K15` 全红并报出响应体里的 `KKK777LEAK` / `DDD999LEAK`；恢复后全绿）。**探针 → 变红 → 删除 → 复绿**。
 - **检查脚本会假阳性**（grep 命中注释、grep 模式路径写错、mN 引用过期）⇒ **关键结论一律二次确认**。
-- **端到端结论必须同时给出 HEAD 与取数时刻**（例：`HEAD 98b4618` + 未提交工作树，取数 `2026-09-13T22:0x+08:00`）。复核请**以你自己当时的 `HEAD` 为准并把提交号写下来**。**早期基线已过时，不要引用**（文档 v8 那轮的 870 例 / 282 断言、更早的 843 / 831 等）。
+- **端到端结论必须同时给出 HEAD 与取数时刻**（例：`HEAD 98b4618` + 未提交工作树，取数 `2026-09-13T22:0x+08:00`）。复核请**以你自己当时的 `HEAD` 为准并把提交号写下来**。**早期基线已过时，不要引用**。
 
 ### 4.6 前端与浏览器行为
 
@@ -110,7 +109,6 @@ bash packages/plugin-authz/test/e2e-p4.sh                # 80/80（后期基线�
 ```
 
 **最近一次记录的全量基线**（`main` = `ed2a3a9`，由编排者实际复跑；取数时刻见当轮记录）：`pnpm typecheck` exit 0（17 包全 Done）；`pnpm test` **886 / 886 通过 / 0 失败**；`pnpm build` exit 0；六条 e2e **共 325 项断言零失败**（38 / 44 / 44 / 34 / 85 / 80）。
-> **例数对账**：`5536bfa` 时为 870；M5 红链三态（`6defefc`）给 web +9 ⇒ 879；P4b 并入给 web +7 ⇒ **886**。逐包自洽。
 > 起服务后**必须轮询 `/api/health` 到 `"present":true`** 再开始验收（见 §1）。
 
 ### 4.8 已声明的验证盲区（诚实清单）
@@ -125,7 +123,7 @@ bash packages/plugin-authz/test/e2e-p4.sh                # 80/80（后期基线�
 
 ## 5. 文档纪律：注释与真源
 
-- **★ 文档注释会成为错误的传播媒介**：规则 B1 那个 `min` 方向错误**正是从设计文档抄进 4 处代码注释的**，而"照注释去修正实现"会**直接造出内容泄漏**。4 处落点：`packages/plugin-search/migrations/0002_blocks_fts.sql`、`packages/db-sqlite/src/migrations/0015_blocks.sql`（两处）、`packages/db-postgres/migrations/0015_blocks.sql`。
+- **文档注释会成为错误的传播媒介**：规则 B1 那个 `min` 方向错误**正是从设计文档抄进 4 处代码注释的**，而"照注释去修正实现"会**直接造出内容泄漏**。4 处落点：`packages/plugin-search/migrations/0002_blocks_fts.sql`、`packages/db-sqlite/src/migrations/0015_blocks.sql`（两处）、`packages/db-postgres/migrations/0015_blocks.sql`。
   ⇒ **引用设计的注释必须写明"哪一份是权威、以及为什么"**，否则注释会先于代码老化。
   > **复核提醒**：这几个迁移文件里至今仍出现 `min(`，但**全部是"解释为什么不是 `min`"的行文**（`packages/plugin-wiki/src/blocks.ts` 同理）。**不要再把它们"改成 `max`"，那会把注释改瞎。** 复核命令：`grep -rn "min(" packages/*/migrations/*.sql packages/*/src/migrations/*.sql`。
 - **两个真源迟早漂移**：例——"哪些扩展名允许"（`ATTACHMENT_EXT_WHITELIST`）与"扩展名 → MIME"（`MIME_BY_EXT`）若是两张独立的表，今天键集合相同，将来往白名单加一项却忘了补 MIME，回退分支就会把 `text/html` 当合法类型下发 ⇒ **存储型 XSS**。

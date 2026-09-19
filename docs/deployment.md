@@ -60,7 +60,7 @@ docker compose down -v       # 连同 named volume 一并删除（bind mount 的
 
 ## 2. 镜像构成
 
-`Dockerfile` 为多阶段构建，基础镜像 `node:22-bookworm-slim`（glibc，与 better-sqlite3 预编译产物匹配）：
+`Dockerfile` 为多阶段构建，基础镜像 `node:26-bookworm-slim`（glibc，与 better-sqlite3 预编译产物匹配）：
 
 | 阶段 | 作用 |
 | --- | --- |
@@ -71,9 +71,9 @@ docker compose down -v       # 连同 named volume 一并删除（bind mount 的
 
 - **为什么运行期还需要 tsx**：后端各包没有编译产物，`exports` 直接指向 `src/index.ts`，由 tsx 在运行时转译 TypeScript 源码。`--prod` 部署会裁掉 devDependencies，因此在 builder 阶段单独安装一份 `tsx` 到 `/opt/tsx`，版本直接取自 lockfile 中实际安装的那一份（不使用浮动范围，也不会写回 `pnpm-lock.yaml`）。
 - **为什么运行镜像里没有编译器**：`better-sqlite3@13` 自带 `prebuilds/**`（含 `linux-x64`），运行时由 `lib/binding.js` 优先加载预编译产物。不过 pnpm 11 的 legacy deploy 在生成部署树时**仍会执行一次原生安装脚本**（即使设置 `npm_config_ignore_scripts=true` 也会调用 `node-gyp`，已实测），因此 **builder 阶段必须安装 `python3/make/g++`**；这些工具不会进入运行镜像。
-- **为什么这里没有 `storeDir`/`cacheDir` 的处理步骤**：`pnpm-workspace.yaml` 里的 store/cache 曾经写死为宿主机的绝对路径，镜像内必须 `sed` 删两次（`COPY . .` 会把原文件覆盖回来）。现已改为**相对路径**（`.pnpm-store` / `.npm-cache`），在 builder 内解析为 `/src/.pnpm-store`，本地、CI、镜像与 Dependabot 各环境通用，相关 `sed` 已随之移除。
+- **为什么这里没有 `storeDir`/`cacheDir` 的处理步骤**：`pnpm-workspace.yaml` 里的 store/cache 写成**相对路径**（`.pnpm-store` / `.npm-cache`），在 builder 内解析为 `/src/.pnpm-store`，本地、CI、镜像与 Dependabot 各环境通用，镜像内无需 `sed` 处理。
 
-构建产物参考（`docker images geewiki:latest`；**读数时点 HEAD `98b0ddd`（2026-09-17），以实跑为准**）：`DISK USAGE` 约 `386MB`、`CONTENT SIZE` 约 `96.8MB`。两者口径不同 —— `DISK USAGE` 是该镜像层在本地磁盘上的未压缩占用，`CONTENT SIZE` 是压缩后的分发体积；容器实际运行时占用的可写层还会另计。镜像内容为 `node:22-bookworm-slim` 基础层 + 约 28MB 生产部署树 + 运行期 `tsx`。
+构建产物参考（`docker images geewiki:latest`；**读数时点 HEAD `98b0ddd`（2026-09-17），以实跑为准**）：`DISK USAGE` 约 `386MB`、`CONTENT SIZE` 约 `96.8MB`。两者口径不同 —— `DISK USAGE` 是该镜像层在本地磁盘上的未压缩占用，`CONTENT SIZE` 是压缩后的分发体积；容器实际运行时占用的可写层还会另计。镜像内容为 `node:26-bookworm-slim` 基础层 + 约 28MB 生产部署树 + 运行期 `tsx`（**上述体积读数取于 `node:22` 时期** —— 基础镜像已在提交 `b057cde` 升到 `node:26`，换代后体积会有出入）。
 
 镜像内环境变量（已在 `Dockerfile` 中固化，无需在 compose 重复声明应用层变量）：
 
@@ -86,7 +86,7 @@ GEEWIKI_PLUGINS_DIR=/app/plugins
 GEEWIKI_WEB_DIST=/app/packages/web/dist
 ```
 
-> **`GEEWIKI_PLUGIN_UI_DIST` 镜像内刻意不设**（已只读核实 `Dockerfile:96-103` 与 `docker-compose.yml:45-52`，两处都只固化 `GEEWIKI_WEB_DIST`）：该变量**缺省即回落 `GEEWIKI_WEB_DIST`**（`packages/server/src/index.ts:1863-1870`；`ServerOptions.pluginUiDist` 的类型声明在 `:1428`），因此镜像里"前端产物根"与"内置插件 UI 资产根"**指向同一个目录** `/app/packages/web/dist`（内置插件 UI 位于其下的 `plugins-ui/<插件名>/`，由镜像内 `vite build` 从 `packages/web/public/` 拷贝而来，见 `.dockerignore` **未排除** `packages/web/public/plugins-ui/` 与 `Dockerfile:111` 的 `COPY --from=builder /src/packages/web/dist /app/packages/web/dist`；**前提**是构建上下文里已有 `packages/web/public/plugins-ui/**`，即宿主机先跑过 `pnpm --filter @geewiki/web run build:fixtures`——该目录被 `.gitignore` 排除、不入版本库。**本次未实跑镜像构建，本段为只读核实 + 推断**）。**镜像行为与拆分前完全一致，无需显式设置**；只有当你想让插件 UI 走独立目录（如 dev 形态的 `packages/web/public`）时，才需要额外覆盖该变量。启动日志会同时打印两个根，相同的那一份带"（同静态产物根）"注记，便于核对。
+> **`GEEWIKI_PLUGIN_UI_DIST` 镜像内刻意不设**（已只读核实 `Dockerfile:96-103` 与 `docker-compose.yml:45-52`，两处都只固化 `GEEWIKI_WEB_DIST`）：该变量**缺省即回落 `GEEWIKI_WEB_DIST`**（`packages/server/src/index.ts:1863-1870`；`ServerOptions.pluginUiDist` 的类型声明在 `:1428`），因此镜像里"前端产物根"与"内置插件 UI 资产根"**指向同一个目录** `/app/packages/web/dist`（内置插件 UI 位于其下的 `plugins-ui/<插件名>/`，由镜像内 `vite build` 从 `packages/web/public/` 拷贝而来，见 `.dockerignore` **未排除** `packages/web/public/plugins-ui/` 与 `Dockerfile:111` 的 `COPY --from=builder /src/packages/web/dist /app/packages/web/dist`；**前提**是构建上下文里已有 `packages/web/public/plugins-ui/**`，即宿主机先跑过 `pnpm --filter @geewiki/web run build:fixtures`——该目录被 `.gitignore` 排除、不入版本库。**本次未实跑镜像构建，本段为只读核实 + 推断**）。**镜像内无需显式设置**；只有当你想让插件 UI 走独立目录（如 dev 形态的 `packages/web/public`）时，才需要额外覆盖该变量。启动日志会同时打印两个根，相同的那一份带"（同静态产物根）"注记，便于核对。
 
 镜像自带 `HEALTHCHECK`（每 30s 请求 `/api/health`），判据是 **`ok:true` 且 `db.present:true`**（即服务在跑、SQLite 已连接），满足时 `docker compose ps` 显示 `healthy`；数据目录不可写等导致数据库插件激活失败的情况会如实显示 `unhealthy`（详见第 9 节）。
 
@@ -174,7 +174,7 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `GEEWIKI_HOST` | `0.0.0.0` | 后端**监听地址**（`packages/server/src/index.ts:1848`：`options.host ?? process.env.GEEWIKI_HOST ?? '0.0.0.0'`）。容器内保持默认即可；只绑 `127.0.0.1` 会让端口映射失效 |
 | `GEEWIKI_OIDC_TICKET_SECRET` | **未设置**（每进程随机） | **OIDC 登录票据的签名密钥**（`packages/plugin-auth/src/index.ts:506-511`）。多实例部署、或需要重启后票据仍有效时必须配置；未配置时每进程随机生成，重启即失效 |
 
-> ⚠️ **`GEEWIKI_DATABASE_URL` / `GEEWIKI_DB_PASSWORD` 不是内置变量**：它们只是 `@geewiki/postgres` 配置项 `connectionStringEnv` / `passwordEnv` 的**示例名**（`packages/db-postgres/src/index.ts:65` / `:73`）。应用本身从不读这两个名字——真正被读的是**你在插件配置里填的那个环境变量名**，填什么读什么。
+> **`GEEWIKI_DATABASE_URL` / `GEEWIKI_DB_PASSWORD` 不是内置变量**：它们只是 `@geewiki/postgres` 配置项 `connectionStringEnv` / `passwordEnv` 的**示例名**（`packages/db-postgres/src/index.ts:65` / `:73`）。应用本身从不读这两个名字——真正被读的是**你在插件配置里填的那个环境变量名**，填什么读什么。
 
 ---
 
@@ -236,7 +236,7 @@ echo "DB_PASSWORD=请改成强密码" >> .env
 docker compose --profile production up -d --build
 ```
 
-该 profile 会额外启动 `postgres:15`（不映射宿主端口，仅在同网络内以 `postgres:5432` 可达）。应用侧对应的插件是 **`@geewiki/postgres`**（`packages/db-postgres/`，**不是** `@geewiki/db-pg`）——它**已实现**（异步适配器 + schema 化配置 + 自有迁移；单测以 `pnpm --filter @geewiki/postgres test` 的**实时读数**为准，本文不写死例数——文档曾写 20、`packages/db-postgres/test/postgres.test.ts` 实测 17 处 `test(`、roadmap 另处写 15，三方不一），与 `@geewiki/db-sqlite` 同属 `conflictGroup: 'database-provider'`（天然互斥）且**默认不启用**。该 profile 只负责把 Postgres 服务跑起来，**切换动作在应用侧显式做**，见下。
+该 profile 会额外启动 `postgres:15`（不映射宿主端口，仅在同网络内以 `postgres:5432` 可达）。应用侧对应的插件是 **`@geewiki/postgres`**（`packages/db-postgres/`，**不是** `@geewiki/db-pg`）——它**已实现**（异步适配器 + schema 化配置 + 自有迁移；单测以 `pnpm --filter @geewiki/postgres test` 的**实时读数**为准，本文不写死例数），与 `@geewiki/db-sqlite` 同属 `conflictGroup: 'database-provider'`（天然互斥）且**默认不启用**。该 profile 只负责把 Postgres 服务跑起来，**切换动作在应用侧显式做**，见下。
 
 `docker-compose.yml` 里 `POSTGRES_PASSWORD` 写成 `${DB_PASSWORD:-}`：未启用该 profile 时不会再出现 `The "DB_PASSWORD" variable is not set` 告警；而一旦启用却没有提供密码，postgres 官方镜像会拒绝以空密码初始化并立即退出（`Error: Database is uninitialized and superuser password is not specified.`，已实测），属安全失败，不会产生弱密码实例。
 
@@ -244,9 +244,9 @@ docker compose --profile production up -d --build
 
 ### 应用侧：怎么切到 PostgreSQL
 
-包名是 **`@geewiki/postgres`**（`packages/db-postgres/`，**不是** `@geewiki/db-pg`）。它已实现——异步适配器 + schema 化配置 + 自有迁移，与 `@geewiki/db-sqlite` 同属 `conflictGroup: 'database-provider'`（**天然互斥**），并且**默认不启用**：刻意不写进 `config/plugins.base.json`，因为"切库"是显式决策。
+`@geewiki/postgres` **默认不启用**：刻意不写进 `config/plugins.base.json`，因为"切库"是显式决策。
 
-**⚠️ 切库是冷操作，不能热切。** 实测确认：`@geewiki/postgres` 与 `@geewiki/db-sqlite` 都声明了 `runtime.supportsHotReload: false`，因此
+**切库是冷操作，不能热切。** 实测确认：`@geewiki/postgres` 与 `@geewiki/db-sqlite` 都声明了 `runtime.supportsHotReload: false`，因此
 
 - `POST /api/plugins/%40geewiki%2Fdb-sqlite/disable` → **409 `base_layer`**：`@geewiki/db-sqlite 属于基础层（冷操作），请编辑基础层清单 plugins.base.json 后重启进程`（基础层插件不可热卸载）；
 - `POST /api/plugins/%40geewiki%2Fpostgres/enable` → **409 `hot_reload_not_supported`**：`@geewiki/postgres 未声明 runtime.supportsHotReload: true，仅支持持久化安装 + 进程重启（冷操作）`。
@@ -265,8 +265,8 @@ export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewik
       "config": { "connectionStringEnv": "GEEWIKI_DATABASE_URL", "ssl": false } },
     { "name": "@geewiki/http" },
     { "name": "@geewiki/wiki" }
-    // ⚠️ 不要同时保留 @geewiki/db-sqlite：两者同属 database-provider 冲突组，互斥
-    // ⚠️ 也不建议保留 @geewiki/search：它依赖 SQLite 专有 FTS5，在 PG 方言下会激活失败（见「已知限制」⑬）
+    // 不要同时保留 @geewiki/db-sqlite：两者同属 database-provider 冲突组，互斥
+    // 也不建议保留 @geewiki/search：它依赖 SQLite 专有 FTS5，在 PG 方言下会激活失败
   ]
 }
 ```
@@ -281,7 +281,7 @@ export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewik
 | `database` | string，`'geewiki'` | 库名 |
 | `user` | string，`'geewiki'` | 用户名 |
 | `passwordEnv` | string，`''` | 存放密码的**环境变量名**（推荐；留空表示无密码）。例如 `GEEWIKI_DB_PASSWORD` |
-| `password` | string（`role: password`），`''` | ⚠️ **明文密码（仅本地开发）**——会明文落进入库清单，生产请改用 `passwordEnv` |
+| `password` | string（`role: password`），`''` | **明文密码（仅本地开发）**——会明文落进入库清单，生产请改用 `passwordEnv` |
 | `max` | number，`10`（1–100） | 连接池上限 |
 | `connectionTimeoutMillis` | number，`10000` | 建立连接超时（毫秒） |
 | `idleTimeoutMillis` | number，`30000` | 空闲连接回收（毫秒） |
@@ -289,7 +289,7 @@ export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewik
 
 **关于"`config/plugins.base.json` 能否承载连接配置"**：**能**。实测：`PUT /api/plugins/:name/config` 会把 `config` 写进该插件所在清单层的条目上，`POST /api/session/persist`（管理台的「应用并持久化」）再把它并入入库的 `config/plugins.base.json`——条目形状就是 `{ "name": …, "config": { … } }`（`packages/manager/src/index.ts:642` 的 `persistConfig()`，已实测看到 postgres 的完整配置出现在入库文件里）。**所以"把凭据放进环境变量名"是纪律问题而非结构限制**——别把明文密码填 `password` 字段。
 
-**两条必须知道的边界**：① 切到 PostgreSQL 后 **`/api/search` 不可用**——`@geewiki/search` 依赖 SQLite 专有的 FTS5，启用时会显式抛错拒绝（详见「已知限制」⑬）。（旧文写的"`/api/ai` 的问答也不可用"已作废：**系统已无任何问答插件**——`@geewiki/ai-qa` 已整包删除。现行 AI 能力经 `@geewiki/ai-assistant` 的 `POST /api/ai/turn` 提供，"不可用"只取决于**有没有可用模型**，与数据库方言无关；缺模型即 503。）② 真实 PG 端到端验证**已完成**，读数、三个被 PG 抓出的真缺陷与两条类级守卫见 **§11**。
+**两条必须知道的边界**：① 切到 PostgreSQL 后 **`/api/search` 不可用**——`@geewiki/search` 依赖 SQLite 专有的 FTS5，启用时会显式抛错拒绝。（`/api/ai` 的问答**不受数据库方言影响**：系统已无任何问答插件，现行 AI 能力经 `@geewiki/ai-assistant` 的 `POST /api/ai/turn` 提供，"不可用"只取决于**有没有可用模型**，缺模型即 503。）② 真实 PG 端到端验证**已完成**，读数、三个被 PG 抓出的真缺陷与两条类级守卫见 **§11**。
 
 ## 8. 升级与重建
 
@@ -311,12 +311,12 @@ docker compose build --no-cache && docker compose up -d
 发布到 GHCR（`ghcr.io/geelinx-ltd/geewiki`），服务器可以改为直接拉取，省掉构建：
 
 ```bash
-# 私有包（默认状态）：需先登录。password 用**具备 read:packages 权限的 token**，
-# 不是账号密码 —— classic PAT 勾 read:packages，或 fine-grained PAT 勾 Packages: Read：
-echo "$CR_PAT" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
+# 当前状态：包已设为 public ⇒ 直接拉取，无需登录（已实测；见 docs/ci-cd.md 第 4.3 节）
 docker pull ghcr.io/geelinx-ltd/geewiki:latest
 
-# 公开包：无需登录
+# 若将来它变回 private：先登录。password 用**具备 read:packages 权限的 token**，
+# 不是账号密码 —— classic PAT 勾 read:packages，或 fine-grained PAT 勾 Packages: Read：
+echo "$CR_PAT" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
 docker pull ghcr.io/geelinx-ltd/geewiki:latest
 ```
 
@@ -324,9 +324,10 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
 改为 `ghcr.io/geelinx-ltd/geewiki:latest`。注意 **`build:` 与 `image:` 同时存在时
 compose 只会构建、不会拉取**（`image:` 仅作为构建产物的名字），这正是当前配置的行为。
 
-> ⚠️ **包的可见性与仓库的可见性是两回事**：仓库是 public 并不代表镜像 public。
-> GHCR 的包默认是 private，且改变可见性需要**包级管理员**权限 —— 仓库自带的
-> `GITHUB_TOKEN` 做不到（已实测 404），需在包设置页手动改。步骤见 `docs/ci-cd.md` 第 4.3 节。
+> **包的可见性与仓库的可见性是两回事**：仓库是 public 并不代表镜像 public。
+> GHCR 的包**默认**是 private；本仓**已手动改为 public**（当前状态与实测见 `docs/ci-cd.md` 第 4.3 节）。
+> 改变可见性需要**包级管理员**权限 —— 仓库自带的
+> `GITHUB_TOKEN` 做不到（已实测 404），需在包设置页手动改。
 
 ---
 
@@ -375,7 +376,7 @@ docker compose stop && docker inspect -f '{{.State.ExitCode}}' $(docker compose 
 
 本仓库的镜像与 compose 编排已在 `x86_64` / Docker 29.7.2 / Compose v5.4.0 上实测（即第 10 节命令的真实执行结果）。**读数时点：HEAD `98b0ddd`（2026-09-17）；容器与镜像相关读数以实跑为准，环境或基础镜像变化都会使其漂移。**
 
-- `docker compose up -d --build` 启动成功，`/api/health` 返回 `ok:true`，SQLite 迁移 `0001_init.sql` 已应用，`/api/plugins` 列出内置插件（**当时**为 4 条，外部插件能力落地后为 5 条 = 内置 4 + `./plugins` 下的示例；**当前为 25 注册 / 21 默认启用**）；
+- `docker compose up -d --build` 启动成功，`/api/health` 返回 `ok:true`，SQLite 迁移 `0001_init.sql` 已应用，`/api/plugins` 列出内置插件（**当前为 25 注册 / 21 默认启用**）；
 - `GET /` 返回 200（前端静态产物由后端托管）；`PUT /api/pages/deploy-check` 写入成功，`docker compose restart` 后仍可读取（`./data` 持久化生效）；
 - 通过 REST 启用 `@geewiki/echo` 并 `POST /api/session/persist`，宿主 `./config/plugins.base.json` 被正确改写，重启后该插件仍处于基础层激活状态（证明 `./config` 可写）；
 - 容器内 `id` 为 `uid=1000(node) gid=1000(node)`（非 root），`init: true` 生效；
@@ -392,12 +393,12 @@ docker compose stop && docker inspect -f '{{.State.ExitCode}}' $(docker compose 
 ### 外部插件与容器集成的复验（同一环境）
 
 - **未挂载 config 卷不再是"死壳"**：不挂 `./config` 直接 `docker run --rm -d -p 3100:3000 geewiki:bc` 时，`/api/health` 返回 `{"ok":true,...,"db":{"present":true}}`。镜像内的 `/app/config/plugins.base.json`（`node:node`；**内容即仓库根 `config/plugins.base.json`，当前默认启用 21 条内置插件**）由构建阶段的 `COPY --from=builder /src/config /app/config` 带入。**反证**：把配置目录指向不存在的路径（`-e GEEWIKI_CONFIG_DIR=/tmp/emptycfg`）时，日志只剩 `[@geewiki/manager] http 路由服务不可用：REST API 未挂载（@geewiki/http 未在清单中？）`，进程以**退出码 0** 结束（`status=exited exit=0`）、端口无监听，随后会被 `restart: unless-stopped` 反复拉起——静默重启循环，这正是镜像必须自带默认清单的原因。
-- **外部插件在容器内被发现并可热插拔**：挂载 `./plugins`、`./config` 与数据目录后启动，日志出现 `[server] 外部插件目录: /app/plugins` 与 `[manager:discovery] 已发现外部插件 @geewiki-plugin/hello@0.1.0（hello-geewiki）`；`/api/plugins` 列出全部内置插件 + 该外部插件（**当时**为 4 内置 + 1 外部；当前内置 25 注册 / 21 默认启用）；`POST /api/plugins/@geewiki-plugin%2Fhello/enable` 返回 `state:active, layer:session`，其自带路由 `GET /api/hello` 返回插件响应；`disable` 后该路由回到 404，宿主 `config/plugins.base.json` 与 `plugins.session.json` 的 md5 与操作前一致。
-- **工作目录无关性**：以 `--entrypoint tsx geewiki:bc /app/src/index.ts -w /tmp` 启动（即覆盖工作目录）时，镜像内置的 `GEEWIKI_PLUGINS_DIR=/app/plugins` 仍使发现根为 `/app/plugins`、发现 1 个外部插件；作为反证，显式传相对值 `-e GEEWIKI_PLUGINS_DIR=plugins` 时发现根变为 `/tmp/plugins`、发现 0 个插件且**不报任何错**（`/api/plugins` 只剩内置插件——当时 4 条，当前 25 条）——这正是镜像内必须固化绝对路径的原因。
+- **外部插件在容器内被发现并可热插拔**：挂载 `./plugins`、`./config` 与数据目录后启动，日志出现 `[server] 外部插件目录: /app/plugins` 与 `[manager:discovery] 已发现外部插件 @geewiki-plugin/hello@0.1.0（hello-geewiki）`；`/api/plugins` 列出全部内置插件 + 该外部插件（当前内置 25 注册 / 21 默认启用）；`POST /api/plugins/@geewiki-plugin%2Fhello/enable` 返回 `state:active, layer:session`，其自带路由 `GET /api/hello` 返回插件响应；`disable` 后该路由回到 404，宿主 `config/plugins.base.json` 与 `plugins.session.json` 的 md5 与操作前一致。
+- **工作目录无关性**：以 `--entrypoint tsx geewiki:bc /app/src/index.ts -w /tmp` 启动（即覆盖工作目录）时，镜像内置的 `GEEWIKI_PLUGINS_DIR=/app/plugins` 仍使发现根为 `/app/plugins`、发现 1 个外部插件；作为反证，显式传相对值 `-e GEEWIKI_PLUGINS_DIR=plugins` 时发现根变为 `/tmp/plugins`、发现 0 个插件且**不报任何错**（`/api/plugins` 只剩内置插件——当前 25 条）——这正是镜像内必须固化绝对路径的原因。
 
 ### PostgreSQL 端到端验证（真实 PostgreSQL 15.19，已完成）
 
-**这一轮验证的读数**（记录自原 `docs/review/plugin-freedom-audit.md` §F19；该文档随本轮文档整理删除，故这段记录**落到本文件**）：
+**这一轮验证的读数**：
 
 **环境（可复现）**：
 
@@ -411,7 +412,7 @@ GEEWIKI_PORT=3101 GW_PG_PASSWORD=… pnpm start
 
 **读数（真实 PostgreSQL 15.19）**：`db-postgres` **13 个迁移全部应用、迁移失败 0**；插件 **20 active / 0 error**；`POST /api/auth/setup` → **201**；`POST /api/auth/login` → **200**；`PUT /api/pages/pg-e2e` → **200**（`outcome: created`, `version: 1`）；`GET /api/pages/pg-e2e` 返回正文与写入**逐字一致**；`psql -c "select slug,title from pages where slug='pg-e2e'"` → `pg-e2e | PG 端到端验证`；`GET /api/pages` 能看到 `builtin-docs` 在 PG 上创建的文档。
 
-> ⚠️ **时点说明**：该轮读数取数于审计报告归档提交 `de53b2f`（2026-09-17 14:04）**之前**，当时 `packages/db-postgres/migrations/` 有 13 个文件。当前 HEAD `98b0ddd` 下该目录为 **15 个**（`0022_invitation_open_code.sql` / `0023_invitation_accepted_by.sql` 于 2026-09-17 17:16 / 17:51 加入）。**迁移数与 active 插件数请以实跑为准。**
+> **时点说明**：该轮读数取数于审计报告归档提交 `de53b2f`（2026-09-17 14:04）**之前**，当时 `packages/db-postgres/migrations/` 有 13 个文件。当前 HEAD `98b0ddd` 下该目录为 **15 个**（`0022_invitation_open_code.sql` / `0023_invitation_accepted_by.sql` 于 2026-09-17 17:16 / 17:51 加入）。**迁移数与 active 插件数请以实跑为准。**
 
 **该轮抓出并修掉三个「SQLite 上全绿、PG 上必炸」的真缺陷**：
 
