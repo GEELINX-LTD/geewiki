@@ -99,7 +99,12 @@ function wikiStub(pages: Record<string, { title: string; content: string }>): {
   return { svc, listCalls, getCalls }
 }
 
-function searchStub(result: { hits?: SearchHit[]; total?: number; mode?: 'fts' | 'like' }): {
+function searchStub(result: {
+  hits?: SearchHit[]
+  total?: number
+  mode?: 'fts' | 'like'
+  modesConverge?: boolean
+}): {
   svc: SearchService
   calls: SearchCall[]
 } {
@@ -107,7 +112,13 @@ function searchStub(result: { hits?: SearchHit[]; total?: number; mode?: 'fts' |
   const svc: SearchService = {
     search: async (principal, q, opts) => {
       calls.push({ principal, q, opts })
-      return { mode: result.mode ?? 'fts', total: result.total ?? (result.hits ?? []).length, hits: result.hits ?? [] }
+      return {
+        mode: result.mode ?? 'fts',
+        total: result.total ?? (result.hits ?? []).length,
+        // kb 只消费 hits/total；缺省给 false，免得掩盖界面侧的"引导"分支
+        modesConverge: result.modesConverge ?? false,
+        hits: result.hits ?? [],
+      }
     },
     contents: async () => new Map(),
   }

@@ -13,12 +13,13 @@ import {
   MAX_QUERY_LENGTH,
   checkQuery,
   detectQueryMode,
+  emptySearchHint,
+  emptySearchPlan,
   hasHighlight,
   queryModeNote,
   queryModeOption,
   scoreBadges,
   snippetToHtml,
-  suggestTermsOnEmpty,
 } from '../src/lib/searchPlan'
 
 /* ------------------------- snippetToHtml ------------------------- */
@@ -272,13 +273,39 @@ test('detectQueryMode：长度按**码点**计，BMP 外汉字不被算成两个
   assert.equal(detectQueryMode('𠀀'.repeat(10)), 'terms', '10 个码点达到长查询阈值')
 })
 
-test('suggestTermsOnEmpty：只在「精确匹配 + 0 命中」时引导换分词', () => {
-  assert.equal(suggestTermsOnEmpty('phrase', 0), true, '这正是本批要修的症状')
+test('emptySearchPlan：精确匹配 + 0 命中 + 换过去真会不同 → 才给换分词的按钮', () => {
+  assert.equal(emptySearchPlan('phrase', 0, false), 'switch-terms', '这正是本批要修的症状')
   // 反向不成立：terms 已是最宽的一侧，0 命中时换 phrase 只会更少 —— 不能给按钮
-  assert.equal(suggestTermsOnEmpty('terms', 0), false)
+  assert.equal(emptySearchPlan('terms', 0, false), 'no-match')
   // 有结果时不打扰
-  assert.equal(suggestTermsOnEmpty('phrase', 3), false)
-  assert.equal(suggestTermsOnEmpty('terms', 3), false)
+  assert.equal(emptySearchPlan('phrase', 3, false), 'no-match')
+  assert.equal(emptySearchPlan('terms', 3, false), 'no-match')
+})
+
+test('emptySearchPlan：换过去必然同结果时**不给按钮**（死路按钮的回归防线）', () => {
+  /*
+    本批修的真实缺陷：短查询（<3 字符）两种语义都回退 LIKE，3 字符无空白时两者的
+    MATCH 表达式字面一致 —— 此时点「改用分词匹配」会重新请求并拿回**一模一样**的
+    0 命中，界面却不给任何解释。服务端用 modesConverge=true 告诉我们这一情况。
+  */
+  assert.equal(emptySearchPlan('phrase', 0, true), 'no-match', '短查询/同表达式：按钮必为死路')
+  // 只要有一条命中就不该出现空结果引导（与 converge 无关）
+  assert.equal(emptySearchPlan('phrase', 1, true), 'no-match')
+})
+
+test('emptySearchHint：不给按钮时**不得**再建议换分词（自相矛盾的文案防线）', () => {
+  const noMatch = emptySearchHint('no-match', 'phrase')
+  assert.ok(!noMatch.includes('分词'), '没给按钮就不能让文案提"换分词"——用户会去找一个不存在的按钮')
+  assert.ok(!noMatch.includes('2–4'), '短查询本就走 LIKE 兜底，不能再建议"缩短到 2–4 个字"')
+  assert.ok(noMatch.includes('知识库'), '总得给一条可执行的出路')
+
+  const switchIt = emptySearchHint('switch-terms', 'phrase')
+  assert.ok(switchIt.includes('分词'), '给按钮时文案要说清"换成什么"')
+  assert.ok(!switchIt.includes('2–4'), '这句里"缩短到 2–4 个字"同样是错的建议，已删除')
+})
+
+test('emptySearchHint：两种 plan 的文案不同（同源派生，不会说反话）', () => {
+  assert.notEqual(emptySearchHint('no-match', 'phrase'), emptySearchHint('switch-terms', 'phrase'))
 })
 
 test('queryModeNote / queryModeOption：文案齐备且两个语义措辞不同', () => {

@@ -71,6 +71,15 @@ export interface SearchResult {
   mode: 'fts' | 'like'
   /** 全量命中数，**不受 limit 影响** */
   total: number
+  /**
+   * 本次查询串下，`phrase` 与 `terms` 两种语义是否**必然给出相同结果**。
+   *
+   * 用于界面判断「改用分词匹配」这个引导按钮是不是死路：短查询（<3 字符）两种模式
+   * 都回退 LIKE，3 字符无空白时两者的 MATCH 表达式字面一致 ⇒ 点按钮等于重新问一遍
+   * 同一个问题。由服务端用与真实检索路径**同一批原语**算出（见 `modesConverge`），
+   * 界面**不得**自己重新推导切词规则。
+   */
+  modesConverge: boolean
   hits: readonly SearchHit[]
 }
 

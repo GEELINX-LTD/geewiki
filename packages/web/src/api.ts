@@ -658,6 +658,12 @@ export interface SearchResponse {
   ok: true
   query: string
   mode: SearchMode
+  /**
+   * 本次查询串下 `phrase` / `terms` 是否**必然同结果**（服务端算，见
+   * `packages/plugin-search/src/index.ts` 的 `modesConverge`）。
+   * 短查询两条路都是 LIKE ⇒ 换语义等于白换，界面据此不给"改用分词匹配"按钮。
+   */
+  modesConverge: boolean
   /** 全量命中数（不受 limit 影响） */
   total: number
   hits: SearchHit[]

@@ -428,6 +428,16 @@ let cdp: Cdp | undefined
 const AUTO = '编辑后怎么保存'
 const MANUAL = '版本管理权'
 const SHORT = '架构' // 短关键词：判 phrase，且真有命中
+/*
+  `DEADEND`：**死路按钮的回归用例**（本批修的第二个缺陷）。
+
+  短查询（<3 字符）两种语义**都回退 LIKE**，3 字符无空白时两者的 MATCH 表达式又字面一致
+  ⇒ 换过去必然同结果。此时界面**不得**给出「改用分词匹配」按钮，也**不得**再建议
+  "缩短到 2–4 个字"（短查询本就走 LIKE 兜底，缩短不会增加命中）。
+
+  实测：`龙宫` 在库里 0 命中，两种模式读数逐字段相同（phrase like/0、terms like/0）。
+*/
+const DEADEND = '龙宫'
 
 try {
   chrome = startChrome()
@@ -513,6 +523,30 @@ try {
   await cdp.waitFor(`document.querySelectorAll('.search-hit').length > 0`, '引导按钮点击后出现命中')
   const e2 = await cdp.evaluate<{ hitCount: number }>(READ_EMPTY)
   check('空结果里的引导按钮点了也有效（用户主动换语义）', e2.hitCount >= 1, `命中 ${e2.hitCount} 条`)
+
+  /* ================= 路径三：死路按钮的回归防线（短查询不给按钮） ================= */
+
+  /*
+    本批修的第二个缺陷：短查询下两种语义走**同一条检索路径**（都回退 LIKE），
+    点「改用分词匹配」会重新请求并拿回一模一样的 0 命中，界面却不给任何解释。
+    现在服务端回传 `modesConverge`，界面据此**不给按钮**。
+  */
+  await cdp.hardGoto(`${BASE}/#/wiki/search/${encodeURIComponent(DEADEND)}`)
+  await cdp.waitFor(`document.querySelector('.search-meta')`, '死路用例 meta 就绪')
+  const d0 = await cdp.evaluate<{ hasEmpty: boolean; hasGuide: boolean; hitCount: number }>(READ_EMPTY)
+  check('短查询「龙宫」确实 0 命中（用例前提成立）', d0.hasEmpty && d0.hitCount === 0, `命中 ${d0.hitCount} 条`)
+  check(
+    '短查询 0 命中时**不给**「改用分词匹配」按钮（换过去必然同结果 = 死路）',
+    !d0.hasGuide,
+    `hasGuide=${d0.hasGuide}`,
+  )
+  // 反向：文案也不得再提"换分词"或"缩短到 2–4 个字"（两者对短查询都是错的建议）
+  const dText = await cdp.evaluate<string>(`document.body.innerText`)
+  check('短查询空结果文案不再建议"缩短到 2–4 个字"（实测无效）', !dText.includes('2–4'), '文案未提 2–4 个字')
+  check('短查询空结果文案不再提"分词"（按钮都不给，提了用户会去找）', !dText.includes('改用分词匹配'))
+  // 点一次「分词」切换仍然可用（按钮没给，但用户自己仍能换；只是换完结果相同）
+  const dSwitch = await cdp.evaluate<boolean>(CLICK_TERMS)
+  check('手动切换条本身仍在（用户仍可自己换语义）', dSwitch === true)
 
   /* ================= 语义随查询串复位（应用内导航，组件不卸载） ================= */
 

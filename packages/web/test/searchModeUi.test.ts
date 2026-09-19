@@ -66,7 +66,7 @@ test('0 命中时**只引导、不自动重试**——setMode 只能由用户动
       '多出来的那处极可能是"搜不到就自动换 terms 重搜"，那会静默改变用户的问题语义',
   )
   assert.match(searchView, /onClick=\{\(\) => setMode\(o\.id\)\}/, '模式切换必须挂在用户点击上')
-  assert.match(searchView, /suggestTermsOnEmpty\(mode, data\.total\)/, '空结果引导必须走共享判据')
+  assert.match(searchView, /emptySearchPlan\(mode, data\?\.total \?\? 0, data\?\.modesConverge \?\? false\)/, '空结果引导必须走共享判据')
   assert.match(searchView, /onClick=\{\(\) => setMode\('terms'\)\}/, '引导按钮由用户点击后才换语义')
   // 反向：不得出现"在 effect 里自动切到 terms"的写法
   assert.ok(
@@ -75,10 +75,22 @@ test('0 命中时**只引导、不自动重试**——setMode 只能由用户动
   )
 })
 
-test('空结果引导只在精确匹配时出现（反向引导是骗人的）', () => {
-  // 判据本身在 searchPlan.test.ts 里覆盖；这里钉住界面**没有**绕过它自己写条件
+test('空结果引导只在「换过去真会不同」时出现（死路按钮的回归防线）', () => {
+  /*
+    本批修的真实缺陷：短查询两种语义都回退 LIKE ⇒ 点按钮重新请求拿回一模一样的 0 命中。
+    判据在 searchPlan.test.ts 里覆盖；这里钉住界面**没有**绕过它自己写条件。
+  */
   assert.ok(
     !/mode === 'phrase' && data\.total === 0/.test(searchView),
-    '界面不得自己重写"该不该引导"的条件——必须走 suggestTermsOnEmpty',
+    '界面不得自己重写"该不该引导"的条件——必须走 emptySearchPlan',
+  )
+  assert.match(
+    searchView,
+    /emptyPlan === 'switch-terms'/,
+    '按钮与文案必须从同一个 emptyPlan 派生（先前是两处各判一次，会自相矛盾）',
+  )
+  assert.ok(
+    !searchView.includes('缩短到 2–4 个字'),
+    '"缩短到 2–4 个字"是错建议：短查询本就走 LIKE 兜底，缩短不会增加命中（实测）',
   )
 })
