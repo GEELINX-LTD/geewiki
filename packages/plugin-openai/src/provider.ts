@@ -121,6 +121,32 @@ function deltaOf(frame: Record<string, unknown>): string | undefined {
   return typeof text === 'string' && text !== '' ? text : undefined
 }
 
+/**
+ * 从一帧里取**思考内容**增量。
+ *
+ * 字段名各家不一，与探测路径的 `reasoningOf`（`probe.ts`）认同一组：
+ * DeepSeek 系是 `reasoning_content`，另一些网关只叫 `reasoning`。
+ * 两个都读、各取第一个非空串——**不合并**：同一帧里同时出现两种是网关在回显，
+ * 拼起来会把同一段思考显示两遍。
+ *
+ * 与 {@link deltaOf} 一样只在**非空字符串**时返回：流式中间帧常带
+ * `"reasoning_content": null`（不是空思考，是"这一段没有思考"）。
+ */
+function reasoningOf(frame: Record<string, unknown>): string | undefined {
+  const choices = frame['choices']
+  if (!Array.isArray(choices) || choices.length === 0) return undefined
+  const first = choices[0]
+  if (first === null || typeof first !== 'object') return undefined
+  const delta = (first as Record<string, unknown>)['delta']
+  if (delta === null || typeof delta !== 'object') return undefined
+  const record = delta as Record<string, unknown>
+  for (const key of ['reasoning_content', 'reasoning'] as const) {
+    const value = record[key]
+    if (typeof value === 'string' && value !== '') return value
+  }
+  return undefined
+}
+
 /** 从一帧里取 token 用量（流式响应里通常只在最后一帧出现） */
 function usageOf(frame: Record<string, unknown>): LlmUsage | undefined {
   const usage = frame['usage']
@@ -361,6 +387,10 @@ export function createOpenAiProvider(options: OpenAiProviderOptions): LlmProvide
         for (const call of toolCallDeltasOf(frame)) {
           yield { type: 'tool-call-delta', ...call }
         }
+        // 思考**先于正文**：推理型模型一定是先吐完 reasoning_content 再吐 content，
+        // 按到达顺序发出去，界面才能"先看到思考、再看到答案"。
+        const reasoning = reasoningOf(frame)
+        if (reasoning !== undefined) yield { type: 'reasoning-delta', text: reasoning }
         const delta = deltaOf(frame)
         if (delta !== undefined) yield { type: 'text-delta', text: delta } // 边收边吐，绝不攒完再发
       }

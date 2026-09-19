@@ -136,6 +136,14 @@ test('parseTurnEvent：未知事件名是 invalid（不是崩溃，也不是当�
   assert.equal(ev.event, 'invalid')
 })
 
+test('parseTurnEvent：thinking 与 delta 同形同校验（缺 text 即 invalid）', () => {
+  const ok = parseTurnEvent('thinking', JSON.stringify({ text: '先想一下' }))
+  assert.equal(ok.event, 'thinking')
+  if (ok.event === 'thinking') assert.equal(ok.data.text, '先想一下')
+  assert.equal(parseTurnEvent('thinking', '{}').event, 'invalid')
+  assert.equal(parseTurnEvent('thinking', JSON.stringify({ text: 42 })).event, 'invalid')
+})
+
 test('★ parseTurnEvent：done 的 messages / finishReason 任一坏掉即 invalid（这两个字段是权威转录与流程分支的依据）', () => {
   assert.equal(parseTurnEvent('done', JSON.stringify({ finishReason: 'stop' })).event, 'invalid')
   assert.equal(
@@ -186,6 +194,26 @@ test('状态机：delta 累积', () => {
   s = applyTurnEvent(s, ev({ event: 'delta', data: { text: '一' } }))
   s = applyTurnEvent(s, ev({ event: 'delta', data: { text: '二' } }))
   assert.equal(s.answer, '一二')
+})
+
+test('★ 状态机：思考累积、且**跨回合**不被 status 清掉（一次提问可能跨多个 HTTP 回合）', () => {
+  let s = withUserMessage(initialDockState(), 'q')
+  s = applyTurnEvent(s, ev({ event: 'status', data: { round: 0, tools: [], clientToolsAccepted: [] } }))
+  s = applyTurnEvent(s, ev({ event: 'thinking', data: { text: '先看' } }))
+  s = applyTurnEvent(s, ev({ event: 'thinking', data: { text: '再查' } }))
+  assert.equal(s.thinking, '先看再查')
+  // 客户端工具跑完会起**第二个 HTTP 回合**，它以 status 开头：正文重置是对的，思考不能跟着没
+  s = applyTurnEvent(s, ev({ event: 'status', data: { round: 1, tools: [], clientToolsAccepted: [] } }))
+  assert.equal(s.thinking, '先看再查', 'status 不得清掉思考（清了就等于第一轮的思考全丢）')
+  assert.equal(s.answer, '')
+})
+
+test('★ 状态机：新的提问清掉上一问的思考（否则像是模型在想这件事）', () => {
+  let s = withUserMessage(initialDockState(), 'q')
+  s = applyTurnEvent(s, ev({ event: 'thinking', data: { text: '上一问的思考' } }))
+  s = applyTurnEvent(s, ev({ event: 'delta', data: { text: '答' } }))
+  s = withUserMessage(s, '第二个问题')
+  assert.equal(s.thinking, '')
 })
 
 test('★ 状态机：tool 帧按 id 归并（start 帧 ok=null，end 帧覆盖它）', () => {
@@ -527,9 +555,17 @@ test('★ 守卫：SSE 事件名与服务端/core 逐字相同', () => {
     assert.ok(core.includes(`export const ${coreName} = '${value}'`), `core 未找到 ${coreName} = '${value}'`)
     assert.ok(ui.includes(`export const ${local} = '${value}'`), `ui 未找到 ${local} = '${value}'`)
   }
-  // 工具活动帧是**插件私有**的中间帧，不进 core —— 这条钉住"别把它加进平台层"
-  assert.ok(ui.includes("export const EVENT_TOOL = 'tool'"))
-  assert.ok(!core.includes("SSE_EVENT_TOOL"), 'tool 帧不该进平台层的事件名集合')
+  // 工具活动帧与思考帧是**插件私有**的中间帧，不进 core —— 这条钉住"别把它们加进平台层"。
+  // 它们不进平台层，所以镜像的比对对象是**本插件服务端**那一份（core 里根本没有它们的名字）。
+  const server = read('packages/plugin-ai-assistant/src/sse.ts')
+  for (const [local, serverName, value] of [
+    ['EVENT_TOOL', 'SSE_EVENT_TOOL', 'tool'],
+    ['EVENT_THINKING', 'SSE_EVENT_THINKING', 'thinking'],
+  ] as const) {
+    assert.ok(server.includes(`export const ${serverName} = '${value}'`), `服务端未找到 ${serverName} = '${value}'`)
+    assert.ok(ui.includes(`export const ${local} = '${value}'`), `ui 未找到 ${local} = '${value}'`)
+    assert.ok(!core.includes(serverName), `${local} 是插件私有中间帧，不该进平台层的事件名集合`)
+  }
 })
 
 test('★ 守卫：AppDockSlotProps 与宿主镜像逐字段一致（含可选性）', () => {

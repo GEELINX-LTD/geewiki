@@ -31,6 +31,7 @@ import {
   SSE_EVENT_DONE,
   SSE_EVENT_ERROR,
   SSE_EVENT_STATUS,
+  SSE_EVENT_THINKING,
   SSE_EVENT_TOOL,
   createFrameWriter,
   createIdleWatchdog,
@@ -442,6 +443,16 @@ export const AiAssistantPlugin = {
               watchdog.kick()
               if (ev.type === 'delta') {
                 writer.write({ event: 'delta', data: { text: ev.text } })
+                return
+              }
+              /*
+               * 思考帧：**中间帧**，认识它的界面折起来显示，不认识的按 `invalid` 静默忽略。
+               * 它同样算"进展"——上面那句 `watchdog.kick()` 已经涵盖了它，
+               * 这一点很要紧：模型可能想很久才吐第一个正文字，那段时间若不重置空闲计时器，
+               * 一个正常思考的回合会被当成卡死砍掉（正是这个计时器 2026-09-16 那次真 bug 的形态）。
+               */
+              if (ev.type === 'reasoning') {
+                writer.write({ event: SSE_EVENT_THINKING, data: { text: ev.text } })
                 return
               }
               if (ev.type === 'tool-start') {

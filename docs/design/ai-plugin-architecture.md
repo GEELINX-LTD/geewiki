@@ -663,6 +663,25 @@ manager 的生命周期与权限模型。
 **不作约束**，所以插件私有中间帧无需动 core。这是 §2「与插槽机制同构」那条判断的
 一次实际兑现：**扩展点只往中间开，不往终结集开**。
 
+**思考帧 `thinking`（推理型模型的思考过程）**：同样是一条**插件私有中间帧**
+（`packages/plugin-ai-assistant/src/sse.ts` 的 `SSE_EVENT_THINKING`，不进 core），
+帧序因此是 `status → (thinking | delta | tool)* → done|error`。两个决定值得记：
+
+1. **必须新开一个帧名，不能复用 `delta` 加字段**。帧名是客户端唯一的分流依据，
+   而复用 `delta` 的后果是**旧界面把思考当正文渲染成答案**——把草稿当结论，比不显示更坏。
+   新帧名对没更新过的客户端就是一条 `invalid` 帧，按既有约定**静默忽略**（`parseTurnEvent`
+   的"任何形状不符都返回 invalid，绝不抛"）。兼容性靠"多一个名字"，不靠"旧客户端读懂新字段"。
+2. **它不进 `done.messages`**，也**不进下一轮的请求**。`messages` 是**给模型的**转录，
+   思考内容是**给人的**：多数网关拒收带 `reasoning_content` 的 assistant 消息，
+   个别会把它当成新指令。这条边界由 `loop.ts` 把 `reasoning-delta` **只往外发、不入账**
+   来保证（单测钉住"转录里没有它、请求里也没有它"）。
+
+链路上它是 `LlmChunk` 的一个新类型 `reasoning-delta`（**与 `text-delta` 并列，不复用**，
+理由同上：正文要进历史、思考不进）。适配器侧认两个字段名（`reasoning_content` / `reasoning`），
+与探测路径的 `reasoningOf()` 同一组。**`plugin-llm` 的 `sanitizeNonTerminal` 是白名单**——
+少放行一个类型不会报错、不会有测试变红，只会让"模型明明在思考、界面一个字都不显示"，
+所以那条白名单的每一行都必须有对应单测。
+
 **需求②（"针对当前页回答"）的落点**：`POST /api/ai/turn` 支持可选 `page: {slug, title?}`，
 由 dock props 的 `page` 透传。**只给 slug 与标题，不给正文**——正文必须经 `read_page`
 带主体去读（会话核心不含任何检索逻辑，见 §1）。若在此传正文，等于**开一条绕过

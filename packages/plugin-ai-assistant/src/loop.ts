@@ -50,6 +50,14 @@ import type { ToolActivity, TurnFinishReason, TurnToolSide } from './sse.js'
 /** loop 向外的单向事件流。SSE 处理器把它逐条翻成帧，测试把它收集成数组 */
 export type LoopEvent =
   | { readonly type: 'delta'; readonly text: string }
+  /**
+   * 模型的思考内容增量（推理型模型才有；普通模型一条都不发）。
+   *
+   * 与 `delta` **分开**是刻意的：它是**过程**而非回答，不写进 `messages`（不给模型看见），
+   * 上层把它翻成一条独立的 `thinking` 帧——复用 `delta` 会让不认识思考的旧界面
+   * 把它当正文渲染出来（把草稿当答案，比不显示更糟）。
+   */
+  | { readonly type: 'reasoning'; readonly text: string }
   | { readonly type: 'tool-start'; readonly id: string; readonly name: string; readonly side: TurnToolSide; readonly arguments: string }
   | { readonly type: 'tool-end'; readonly activity: ToolActivity }
 
@@ -413,6 +421,15 @@ export async function runAgentLoop(
       if (chunk.type === 'text-delta') {
         text += chunk.text
         emit({ type: 'delta', text: chunk.text })
+        continue
+      }
+      /*
+       * 思考内容**只往外发，不入账**：`text` 是这一轮的正文（要拼进 `messages` 回传上游），
+       * 思考拼进去会让下一轮的上游请求带上 `reasoning_content`——多数网关拒收，
+       * 个别会把它当成新的指令。它就是给人看的，别喂给模型。
+       */
+      if (chunk.type === 'reasoning-delta') {
+        emit({ type: 'reasoning', text: chunk.text })
         continue
       }
       if (chunk.type === 'tool-call-delta') {

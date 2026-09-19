@@ -95,6 +95,14 @@ export interface DoneData {
 export type TurnEvent =
   | { readonly event: 'status'; readonly data: StatusData }
   | { readonly event: 'delta'; readonly data: { readonly text: string } }
+  /**
+   * 模型的思考内容增量（推理型模型才有）。
+   *
+   * 与 `delta` 是**两个事件名**：思考要折起来、正文要摊开，混在一个字段里
+   * 就只能靠别的手段猜（而"猜"的那一天正好是模型在正文里写了句"让我想想"）。
+   * 它**不进 `DockState.messages`**：`messages` 来自 `done` 帧，是给模型看的历史。
+   */
+  | { readonly event: 'thinking'; readonly data: { readonly text: string } }
   | { readonly event: 'tool'; readonly data: ToolActivityView }
   | { readonly event: 'done'; readonly data: DoneData }
   | { readonly event: 'error'; readonly data: { readonly code: string; readonly message: string } }
@@ -109,6 +117,8 @@ export type TurnEvent =
  */
 export const EVENT_STATUS = 'status'
 export const EVENT_DELTA = 'delta'
+/* 思考帧与工具帧一样是**插件私有的中间帧**，不进 `@geewiki/core`（理由见服务端 `SSE_EVENT_TOOL`） */
+export const EVENT_THINKING = 'thinking'
 export const EVENT_TOOL = 'tool'
 export const EVENT_DONE = 'done'
 export const EVENT_ERROR = 'error'
@@ -256,6 +266,13 @@ export function parseTurnEvent(event: string, raw: string): TurnEvent {
   if (event === EVENT_DELTA) {
     const text = asString(o['text'])
     return text === null ? { event: 'invalid', reason: 'delta 缺 text' } : { event: 'delta', data: { text } }
+  }
+
+  // 思考帧与 delta **同形同校验**：缺 text 即无效。空串是合法增量（上游偶尔发一个空片），
+  // 不在这里丢——丢与不丢对界面没有区别，少一条分支就少一处漂移。
+  if (event === EVENT_THINKING) {
+    const text = asString(o['text'])
+    return text === null ? { event: 'invalid', reason: 'thinking 缺 text' } : { event: 'thinking', data: { text } }
   }
 
   if (event === EVENT_STATUS) {

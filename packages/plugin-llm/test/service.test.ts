@@ -339,6 +339,27 @@ test('status chunk 的 message 经脱敏；text-delta 原样透传（模型输�
   assert.ok(delta.text.includes('sk-abcdefghijklmnop'), 'text-delta 是模型输出，必须原样透传')
 })
 
+test('★ reasoning-delta 必须被显式放行（白名单漏一个类型 = 静默丢帧，不报错不测试变红）', async () => {
+  const svc = createLlmService()
+  svc.register(
+    makeProvider('think', {
+      chunks: [
+        { type: 'reasoning-delta', text: '先想一下：sk-abcdefghijklmnop 只是形状像密钥' },
+        { type: 'text-delta', text: '答案' },
+        { type: 'done', provider: 'think', model: 'm' },
+      ],
+    }),
+  )
+  const chunks = await collect(svc.stream({ ...request, route: 'think' }))
+  const reasoning = chunks.filter((c) => c.type === 'reasoning-delta')
+  assert.equal(reasoning.length, 1, 'reasoning-delta 被服务层丢掉了（sanitizeNonTerminal 的白名单漏了它）')
+  // 与 text-delta 同待遇：模型输出原样透传，不做脱敏改写
+  assert.ok(
+    reasoning[0]?.type === 'reasoning-delta' && reasoning[0].text.includes('sk-abcdefghijklmnop'),
+    '思考内容也是模型输出，必须原样透传',
+  )
+})
+
 test('available() 抛错视为不可用（不拖垮整个服务）', async () => {
   const svc = createLlmService()
   const provider = makeProvider('angry')

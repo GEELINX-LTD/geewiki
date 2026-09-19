@@ -70,6 +70,19 @@ import {
  */
 export const SSE_EVENT_TOOL = 'tool'
 
+/**
+ * 思考内容帧的事件名（**中间帧**，推理型模型才有）。
+ *
+ * 与工具帧同一个理由不进 `@geewiki/core`：它是插件私有的中间帧，
+ * 平台层的事件名集合只该包含所有问答流都会发的东西。
+ *
+ * **必须是一个新帧名，不能复用 `delta`**：帧名是客户端唯一的分流依据，
+ * 复用 `delta` 会让"还没更新过的旧界面"把思考当正文渲染成答案——
+ * 而新帧名对旧界面就是一条 `invalid` 帧，按既有约定**静默忽略**。
+ * 兼容性靠"多一个新名字"，不靠"旧客户端会读懂新字段"。
+ */
+export const SSE_EVENT_THINKING = 'thinking'
+
 /** 工具执行发生在哪一侧。与 `@geewiki/ai-tools` 的 `AiToolSide` 同值（此处避免为一个联合引入依赖） */
 export type TurnToolSide = 'server' | 'client'
 
@@ -116,6 +129,21 @@ export interface TurnStatusEvent {
 
 export interface TurnDeltaEvent {
   readonly event: typeof SSE_EVENT_DELTA
+  readonly data: { readonly text: string }
+}
+
+/**
+ * 思考内容帧（**中间帧**，可出现在 `status` 之后、终止帧之前的任意位置）。
+ *
+ * 它存在的理由是**推理型模型的静默期**：模型在吐正文之前可能先想十几秒到几十秒，
+ * 期间一个字都不发。没有这条帧，用户只能看着"正在思考…"猜它是不是卡住了；
+ * 有了它，界面能把思考过程折成一行摆在那里，需要时展开看它到底在想什么。
+ *
+ * 是**增量**（与 `delta` 同形），不是整段快照——客户端自己累加。
+ * 它**不进 `done.messages`**：`messages` 是"给模型看的历史"，思考内容不该喂回去。
+ */
+export interface TurnThinkingEvent {
+  readonly event: typeof SSE_EVENT_THINKING
   readonly data: { readonly text: string }
 }
 
@@ -205,4 +233,10 @@ export interface TurnErrorEvent {
   }
 }
 
-export type TurnStreamEvent = TurnStatusEvent | TurnDeltaEvent | TurnToolEvent | TurnDoneEvent | TurnErrorEvent
+export type TurnStreamEvent =
+  | TurnStatusEvent
+  | TurnDeltaEvent
+  | TurnThinkingEvent
+  | TurnToolEvent
+  | TurnDoneEvent
+  | TurnErrorEvent
