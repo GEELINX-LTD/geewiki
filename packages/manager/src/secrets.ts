@@ -1,10 +1,11 @@
 /**
  * **写一次、不可回读**的配置字段（schema `meta.role === 'secret'`）的落盘存储。
  *
- * 为什么需要这个文件（而不是把密钥写进 `plugins.base.json` / `plugins.session.json`）：
- * `plugins.base.json` 是**入库文件**，密钥写进去等于提交进 git 历史；
- * 而"只接受环境变量名"的旧方案把"填一个 API key"变成了
- * "先去 shell 里 export、再重启进程"，正是本次要消掉的复杂度。
+ * 为什么需要这个文件（而不是把密钥值写进 `plugins.base.json` / `plugins.session.json`）：
+ * 清单是**会被复制出去的东西**——`config/plugins.base.example.json`（随版本发布的默认值）由它
+ * 派生、备份会打包它、排障时它是被粘贴出去的第一份材料、镜像构建也读它。密钥值一旦成为清单里
+ * 的一个字段，就会顺着这些路径离开本机；而"只接受环境变量名"的旧方案把"填一个 API key"
+ * 变成了"先去 shell 里 export、再重启进程"，正是本次要消掉的复杂度。
  *
  * 于是取第三条路：密钥由管理器**单独**落盘到本文件，并且：
  * 1. **不进版本库**：文件名在 `.gitignore` 里（`config/secrets.json`），与运行期数据同级；

@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { readBaseListText } from '../../lib/base-list.js'
 
 const REPO = resolve(import.meta.dirname, '..', '..', '..')
 const TOKEN = 'acceptance-token-runtime-disable'
@@ -120,9 +121,9 @@ const persist = async (): Promise<unknown> => {
   return r.json()
 }
 
-const baseFile = join(configDir, 'plugins.base.json')
 const sessionFile = join(configDir, 'plugins.session.json')
-const snapshot = (): string => readFileSync(baseFile, 'utf8') + '\u0000' + readFileSync(sessionFile, 'utf8')
+// 基础清单可能是本机 live 文件，也可能是干净检出里的 example —— 回退口径见 scripts/lib/base-list.ts
+const snapshot = (): string => readBaseListText(configDir) + '\u0000' + readFileSync(sessionFile, 'utf8')
 const nodeOf = async (name: string): Promise<Node | undefined> => (await graphOf()).nodes.find((n) => n.id === name)
 
 try {
@@ -185,7 +186,7 @@ try {
   )
   check(
     '基础清单里该条目已被移除',
-    !readFileSync(baseFile, 'utf8').includes(target.id),
+    !readBaseListText(configDir).includes(target.id),
     '',
   )
   await stopServer()

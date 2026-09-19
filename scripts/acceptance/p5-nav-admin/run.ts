@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'node:net'
 import type { Principal } from '../../../packages/core/src/index.js'
+import { readBaseList } from '../../lib/base-list.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repo = resolve(here, '../../..')
@@ -53,9 +54,9 @@ const dataDir = join(work, 'data')
 mkdirSync(dataDir)
 cpSync(join(repo, 'config'), configDir, { recursive: true })
 
-const base = JSON.parse(readFileSync(join(configDir, 'plugins.base.json'), 'utf8')) as {
-  enabled: { name: string; config?: unknown }[]
-}
+// 隔离副本与本机 config/ 同形状：live 文件缺失时回退读同目录的 example
+// （live 文件不入库，干净检出只有 example —— 回退口径见 scripts/lib/base-list.ts）
+const base = readBaseList(configDir)
 /**
  * 本次链路需要的插件。
  *

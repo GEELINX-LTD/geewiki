@@ -3,7 +3,8 @@
 > 本文档只回答"**接下来做什么**"。**已完成且形态未被推翻的事项不在此复述**——逐批历史见
 > [changelog/implementation-log.md](./changelog/implementation-log.md)，当前实现口径见
 > [architecture.md](./architecture.md)。凡数量口径（内置插件数、启用条数、插槽、端点数）一律以
-> `defaultRegistry()`（`packages/server/src/index.ts`）与 `config/plugins.base.json` 为真源。
+> `defaultRegistry()`（`packages/server/src/index.ts`）与 `config/plugins.base.example.json`
+> （随版本发布的默认启用清单；`plugins.base.json` 是**本机现状**、不入库，不能当口径）为真源。
 > 任务清单中的"清单文件"指 `plugins.base.json` / `plugins.session.json`，"双层状态"指基础层（Base Layer）与会话层（Session Layer）。
 
 ## 阶段总览

@@ -30,6 +30,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'node:net'
+import { readBaseList } from '../../lib/base-list.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repo = resolve(here, '../../..')
@@ -62,9 +63,9 @@ const dataDir = join(work, 'data')
 mkdirSync(dataDir)
 
 cpSync(join(repo, 'config'), configDir, { recursive: true })
-const base = JSON.parse(readFileSync(join(configDir, 'plugins.base.json'), 'utf8')) as {
-  enabled: { name: string; config?: unknown }[]
-}
+// 隔离副本与本机 config/ 同形状：live 文件缺失时回退读同目录的 example
+// （live 文件不入库，干净检出只有 example —— 回退口径见 scripts/lib/base-list.ts）
+const base = readBaseList(configDir)
 /** 本次链路需要的插件：存储 → 策略 → 页面 → 检索 → 模型 → 工具总线 → 工具提供者 → 助手 */
 const NEEDED = [
   '@geewiki/db-sqlite',
@@ -83,7 +84,9 @@ const NEEDED = [
 ]
 for (const name of NEEDED) {
   if (!base.enabled.some((e) => e.name === name)) {
-    throw new Error(`基础层清单里没有 ${name} —— 本脚本的隔离清单需要它，请先确认 config/plugins.base.json`)
+    throw new Error(
+      `基础层清单里没有 ${name} —— 本脚本的隔离清单需要它，请先确认 config/plugins.base.json（本机 live）或 config/plugins.base.example.json（随版本发布的默认值）`,
+    )
   }
 }
 base.enabled = base.enabled.filter((e) => NEEDED.includes(e.name))
@@ -279,7 +282,10 @@ const llm = app.get('llm-service') as
   | undefined
 if (!llm) throw new Error('llm-service 不在 —— @geewiki/llm 没激活？')
 const usable = llm.availableProviders()
-if (usable.length === 0) throw new Error('llm-service 没有可用路由 —— 检查 config/plugins.base.json 与 secrets.json')
+if (usable.length === 0)
+  throw new Error(
+    'llm-service 没有可用路由 —— 检查 config/plugins.base.json（缺省时为其默认值 config/plugins.base.example.json）与 secrets.json',
+  )
 console.log(`上游：${llm.settings().baseUrl}  模型：${llm.settings().model}\n`)
 
 /* ------------------------------ 断言累计 ------------------------------ */

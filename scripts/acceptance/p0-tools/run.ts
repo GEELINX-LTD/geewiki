@@ -17,7 +17,8 @@
  * `data/verify/ai-native-probe/` 的 E2）。故验收要测的是"有界收敛"，不是"恰好两轮"。
  *
  * 用法：node --import tsx scripts/acceptance/p0-tools/run.ts
- *      （读 `config/plugins.base.json` 的 @geewiki/llm 条目与 `config/secrets.json` 的密钥；
+ *      （读 `config/plugins.base.json` 的 @geewiki/llm 条目 —— 本机 live 文件缺失时回退
+ *        随版本发布的 `config/plugins.base.example.json`；另读 `config/secrets.json` 的密钥。
  *        没有可用密钥时**明确跳过并退出码 2**，而不是假装通过）
  */
 import { readFileSync } from 'node:fs'
@@ -33,6 +34,7 @@ import {
   type LlmToolDef,
 } from '../../../packages/plugin-llm/src/index.js'
 import { createOpenAiProvider } from '../../../packages/plugin-openai/src/provider.js'
+import { readBaseList } from '../../lib/base-list.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repo = resolve(here, '../../..')
@@ -56,11 +58,14 @@ interface LlmEntry {
 }
 
 function readConfig(): { config: LlmEntry; apiKey: string } {
-  const base = JSON.parse(readFileSync(resolve(repo, 'config/plugins.base.json'), 'utf8')) as {
-    enabled?: { name: string; config?: unknown }[]
-  }
+  // live 文件不入库，干净检出只有 example —— 回退口径见 scripts/lib/base-list.ts
+  const base = readBaseList(resolve(repo, 'config'))
   const entry = (base.enabled ?? []).find((e) => e.name === '@geewiki/llm')
-  if (entry === undefined) throw new Error('config/plugins.base.json 里没有 @geewiki/llm 条目')
+  if (entry === undefined) {
+    throw new Error(
+      '基础层清单（config/plugins.base.json，缺省时回退 config/plugins.base.example.json）里没有 @geewiki/llm 条目',
+    )
+  }
   const config = (entry.config ?? {}) as LlmEntry
 
   let apiKey = ''

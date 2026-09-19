@@ -108,10 +108,17 @@ GEEWIKI_WEB_DIST=/app/packages/web/dist
 容器内以**非 root** 的 `node` 用户（uid/gid 默认 `1000`）运行。绑定挂载时宿主目录的属主决定容器能否写入：
 
 - `./data`：必须可写。SQLite 需要在该目录创建 `geewiki.db` 及其 `-wal`/`-shm` 文件；崩溃自愈标记 `crash.marker` 也写在这里。
-- `./config`：必须可写。除只读的 `plugins.base.json` 外，插件管理器还会写 `plugins.session.json`（会话层清单）、`plugins.base.json`（持久化操作）与 **`secrets.json`**（`role: 'secret'` 字段的落盘位置：模型 API 密钥等，权限 `0600`，已被 `.gitignore` 忽略）。目录不可写会导致「启用插件/持久化/**保存密钥**」失败——典型症状是管理台里填了密钥、保存报错或重启后"未配置"。容器内进程以 `node`（uid 1000）运行，宿主目录属主不对时先 `chown -R 1000:1000 config`。
+- `./config`：**必须可写**。插件管理器会写这里三个**本机**文件：`plugins.base.json`（基础层 live 清单：保存配置/持久化时改写，**首次写入时生成**）、`plugins.session.json`（会话层清单）、**`secrets.json`**（`role: 'secret'` 字段的落盘位置：模型 API 密钥等，权限 `0600`）。三者都不入版本库（`.gitignore` 默认拒绝整个 `config/`）；**随版本发布的默认基础层清单是同目录的 `plugins.base.example.json`**——live 文件不存在时按它装配（`packages/manager/src/index.ts` 的 `readBaseList`，且**启动不写盘**）。目录不可写会导致「启用插件/持久化/**保存密钥**」失败——典型症状是管理台里填了密钥、保存报错或重启后"未配置"。容器内进程以 `node`（uid 1000）运行，宿主目录属主不对时先 `chown -R 1000:1000 config`。
 - `./plugins`：外部插件的发现根。每个子目录识别为一个插件（清单见下节），插件文件需可读；容器内该路径固定为 `/app/plugins`（由镜像的 `GEEWIKI_PLUGINS_DIR` 决定）。
 
 两种处理方式，任选其一：
+
+> ⚠️ **挂载会覆盖镜像里的默认清单模板**。镜像只带 `config/plugins.base.example.json`，而
+> `./config:/app/config` 这个绑定挂载会把它挡住：**宿主目录若为空，容器就读到空清单** ⇒ 没有任何插件
+> 被激活 ⇒ HTTP 不监听 ⇒ 进程以退出码 0 结束被 restart 策略反复拉起（日志里只剩「http 路由服务不可用：
+> REST API 未挂载」）。首次部署请让宿主 config 目录至少有一份清单：
+> `mkdir -p config && cp config/plugins.base.example.json config/plugins.base.json`（或只留模板那份，
+> 运行期代码在 live 文件缺失时会回退读模板）。
 
 ```bash
 # 方式 A：把宿主目录交给 uid 1000（默认）
@@ -185,7 +192,8 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `./data/geewiki.db` | 全部页面、版本快照与迁移记录（`_migrations` / `pages` / `page_versions`） |
 | `./data/geewiki.db-wal`、`-shm` | SQLite WAL 模式附带文件（备份时建议一并复制，或先 `docker compose stop`） |
 | `./data/crash.marker` | 崩溃自愈标记，仅异常退出时出现（见下节） |
-| `./config/plugins.base.json` | 基础层清单（随仓库提交）。**当前默认启用 21 条内置插件**：`db-sqlite http auth org authz ops wiki builtin-docs search` + `llm openai ai-tools ai-journal ai-kb ai-web-search ai-summary ai-pages ai-assistant ai-writing ai-nav ai-admin`；内置注册表共 **25** 个（另有 `echo editor-plain oidc postgres` 已注册未启用），另有 `plugins/` 下 2 个外部示例。以 `defaultRegistry()` 与该文件为真源 |
+| `./config/plugins.base.json` | 基础层 **live** 清单：本机现状，**不入库**，首次保存配置时生成 |
+| `./config/plugins.base.example.json` | 基础层**默认值模板**（随版本发布、入库）：live 文件缺失时按它装配。**当前默认启用 21 条内置插件**：`db-sqlite http auth org authz ops wiki builtin-docs search` + `llm openai ai-tools ai-journal ai-kb ai-web-search ai-summary ai-pages ai-assistant ai-writing ai-nav ai-admin`；内置注册表共 **25** 个（另有 `echo editor-plain oidc postgres` 已注册未启用），另有 `plugins/` 下 2 个外部示例。以 `defaultRegistry()` 与该模板为真源 |
 | `./config/plugins.session.json` | 会话层清单（运行时生成，已被 `.gitignore` 忽略） |
 | `./config/secrets.json` | **密钥文件**（`role: 'secret'` 字段的值，如模型 API 密钥；运行时生成，权限 `0600`，已被 `.gitignore` 忽略）。**备份它 = 备份密钥**：请与数据库同级看待——放进受控的备份位置，不要把备份产物提交进版本库。不需要它时删掉即可（配置里只留下"未配置"） |
 | `./plugins/` | 外部插件源码（每个子目录一个插件）。**不打进镜像**，容器只通过该绑定挂载发现（见第 2 节） |
@@ -280,14 +288,13 @@ export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewik
 | `port` | number，`5432`（1–65535） | 端口 |
 | `database` | string，`'geewiki'` | 库名 |
 | `user` | string，`'geewiki'` | 用户名 |
-| `passwordEnv` | string，`''` | 存放密码的**环境变量名**（推荐；留空表示无密码）。例如 `GEEWIKI_DB_PASSWORD` |
-| `password` | string（`role: password`），`''` | **明文密码（仅本地开发）**——会明文落进入库清单，生产请改用 `passwordEnv` |
+| `passwordEnv` | string，`''` | 存放密码的**环境变量名**（留空表示无密码）。例如 `GEEWIKI_DB_PASSWORD` |
 | `max` | number，`10`（1–100） | 连接池上限 |
 | `connectionTimeoutMillis` | number，`10000` | 建立连接超时（毫秒） |
 | `idleTimeoutMillis` | number，`30000` | 空闲连接回收（毫秒） |
 | `ssl` | boolean，`false` | 是否使用 SSL |
 
-**关于"`config/plugins.base.json` 能否承载连接配置"**：**能**。实测：`PUT /api/plugins/:name/config` 会把 `config` 写进该插件所在清单层的条目上，`POST /api/session/persist`（管理台的「应用并持久化」）再把它并入入库的 `config/plugins.base.json`——条目形状就是 `{ "name": …, "config": { … } }`（`packages/manager/src/index.ts:642` 的 `persistConfig()`，已实测看到 postgres 的完整配置出现在入库文件里）。**所以"把凭据放进环境变量名"是纪律问题而非结构限制**——别把明文密码填 `password` 字段。
+**关于"清单能否承载连接配置"**：**能**。实测：`PUT /api/plugins/:name/config` 会把 `config` 写进该插件所在清单层的条目上，`POST /api/session/persist`（管理台的「应用并持久化」）再把它并入 `config/plugins.base.json`——条目形状就是 `{ "name": …, "config": { … } }`（`packages/manager/src/index.ts` 的 `persistConfig()`）。**但清单是会被复制出去的文件**（`plugins.base.example.json` 由它派生、备份会打包它、排障时它被粘贴出去），所以凭据一律走**环境变量名**：`@geewiki/postgres` 现在**只有** `connectionStringEnv` 与 `passwordEnv` 两个字段，**不提供任何明文密码字段**（`packages/db-postgres/src/index.ts` 的 `PostgresConfigSchema`；实施日志里"postgres 的 `password` 会明文落进清单"那条**已过时**）。
 
 **两条必须知道的边界**：① 切到 PostgreSQL 后 **`/api/search` 不可用**——`@geewiki/search` 依赖 SQLite 专有的 FTS5，启用时会显式抛错拒绝。（`/api/ai` 的问答**不受数据库方言影响**：系统已无任何问答插件，现行 AI 能力经 `@geewiki/ai-assistant` 的 `POST /api/ai/turn` 提供，"不可用"只取决于**有没有可用模型**，缺模型即 503。）② 真实 PG 端到端验证**已完成**，读数、三个被 PG 抓出的真缺陷与两条类级守卫见 **§11**。
 

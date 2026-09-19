@@ -121,7 +121,9 @@ function main(): number {
   console.log(`
 下一步：
   1. 启用它 —— 把 { "name": "@geewiki-plugin/${spec.name}" } 加进 config/plugins.base.json 的 enabled
-     （或在管理台里临时启用；外部插件不会自动启用）
+     （那是**本机** live 清单，不入库、首次保存配置时生成）；
+     要让它在**随版本发布的默认值**里生效，则改 config/plugins.base.example.json。
+     也可以在管理台里临时启用 —— 外部插件不会自动启用
   2. 跑起来 —— pnpm run dev，然后 curl -s localhost:3000/api/${spec.name}
      发现失败的原因会出现在 GET /api/plugins 的 issues 里，先看那里再看日志`)
   if (spec.withUi) printGitignoreHint(spec.name)

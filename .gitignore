@@ -26,12 +26,18 @@ data/
 *.db-shm
 *.db-wal
 
-# 运行期会话清单（运行时被改写，属本机状态；基础层清单 plugins.base.json 保留入库）
-config/plugins.session.json
-
-# 密钥文件（模型 API key 等 role:'secret' 字段的落盘位置：绝不进版本库）
-# 注意：plugins.base.json / plugins.session.json 里**只有**"是否已配置"，没有值
-config/secrets.json
+# 配置目录：**默认全部忽略**，只放行"随版本发布的默认值"模板 plugins.base.example.json。
+#
+# 这里装的全部是本机运行期状态，且都会被进程改写：
+#   plugins.base.json     基础层清单（保存配置时改写；首次写入时生成）
+#   plugins.session.json  会话层清单（启用/停用/持久化时改写）
+#   secrets.json          role:'secret' 字段的**值**（模型 API key 等）
+#
+# 为什么是默认拒绝而不是逐个拉黑：逐个拉黑意味着"下次新增一个本机配置文件时，
+# 默认后果是提交进 git"。这条与 .dockerignore 的同名规则必须同时成立——那边漏一个，
+# 本机密钥就会被 COPY 进镜像层（见 config/plugins.base.example.json 的文件头注释）。
+config/*
+!config/plugins.base.example.json
 
 # 日志
 logs/

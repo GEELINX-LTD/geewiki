@@ -63,7 +63,8 @@ docs/
 
 5. **具体读数必须给出取数方式**（命令 + HEAD + 时刻），否则它会过时且不可复核。
    本仓库的 README 一度同时写着「1904/1904」「内置插件 22 个」「启用 18 条」——**过时的数字比没有数字更坏**，
-   它让人以为已经核对过。数量类口径的真源只有两个：**`config/plugins.base.json`** 与源码里的
+   它让人以为已经核对过。数量类口径的真源只有两个：**`config/plugins.base.example.json`**（随版本发布的
+   默认启用清单；本机 live 文件 `config/plugins.base.json` 不入库，**不能当口径**）与源码里的
    **`defaultRegistry()`**；不要在多处各抄一份。
 
 6. **删除或改名文档时，同步全仓引用**。引用不只出现在 `docs/`，也在 `README.md` 与**源码注释**里；
@@ -79,7 +80,7 @@ docs/
 | --- | --- |
 | 包清单 | `ls -d packages/*/` |
 | 内置插件注册清单 | `packages/server/src/index.ts` 的 `defaultRegistry()`（`grep -c "source: 'builtin'"`） |
-| 默认启用清单 | `config/plugins.base.json` 的 `enabled` |
+| 默认启用清单 | `config/plugins.base.example.json` 的 `enabled`（随版本发布；`plugins.base.json` 是本机现状） |
 | 内置插槽与基数 | `packages/core/src/slots.ts`（`BuiltinSlotName` / `SLOT_NAMES` / `SLOT_CARDINALITY`） |
 | 前端路由 | `packages/web/src/App.tsx` |
 | 数据库迁移 | `packages/db-sqlite/src/migrations/` 与 `packages/db-postgres/migrations/` |

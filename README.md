@@ -109,7 +109,8 @@ README 不固化具体数字；读数随提交变化，**引用时请同时给�
 **密钥的处理口径**：
 
 - 值落在 `config/secrets.json`，权限 `0600`，已在 `.gitignore` 中，不进版本库也不进镜像；
-- **绝不写进 `config/plugins.*.json`**（那是入库文件）——管理器在落盘前就摘掉 `role: 'secret'` 字段；
+- **绝不写进 `config/plugins.*.json`**（清单是**会被复制出去**的文件：随版本发布的默认值由它派生、
+  备份会打包它、镜像构建也读它）——管理器在落盘前就摘掉 `role: 'secret'` 字段；
 - **任何 HTTP 响应都不回显**：`GET /api/plugins/:name/config` 只回 `secrets: { apiKey: true }`
   表示"是否已配置"，`config.apiKey` 恒为空；
 - 清除：`PUT` 请求体里带 `clearSecrets: ["apiKey"]`；
@@ -192,8 +193,12 @@ curl -s -X POST "$BASE/api/llm/test" -H 'content-type: application/json' \
 
 ## 插件平台
 
-插件是 GeeWiki 唯一的扩展机制。宿主启动时读取 `config/plugins.base.json`，并从 `plugins/` 目录
+插件是 GeeWiki 唯一的扩展机制。宿主启动时读取基础层清单，并从 `plugins/` 目录
 自动发现外部插件（清单取子目录 `package.json` 的 `geewiki` 键或独立的 `geewiki.manifest.json`）。
+
+> 基础层清单是**两份**：`config/plugins.base.json` 是**本机** live 文件（不入库，首次保存配置/启用插件时
+> 生成），`config/plugins.base.example.json` 是**随版本发布**的默认值（入库）；live 文件不存在时按模板装配。
+> 「默认启用哪些插件」这类数量口径请看**模板**。
 
 **出厂清单**：内置插件共 **25 个**注册于代码内注册表 `defaultRegistry()`，其中 **21 个默认启用**：
 
@@ -276,7 +281,8 @@ geewiki/
 │   └── plugin-*/             # 22 个插件包：auth org authz ops echo editor-plain llm openai oidc
 │                             #   search wiki builtin-docs 与 10 个 ai-* 插件
 │                             #   （连同上面两个数据库插件，共 24 个包提供 25 个内置插件注册）
-├── config/                   # 插件清单：plugins.base.json（入库） / plugins.session.json（运行时）
+├── config/                   # 插件清单：plugins.base.example.json（随版本发布的默认值，入库）
+│                             #   与 plugins.base.json / plugins.session.json / secrets.json（本机状态，.gitignore）
 ├── data/                     # SQLite 数据库与运行时数据（.gitignore）
 ├── docs/                     # 项目文档（见下方「文档」）
 ├── plugins/                  # 外部插件目录：一个子目录一个插件，启动时自动发现
@@ -330,6 +336,8 @@ pnpm run new:plugin foo  # 生成插件脚手架
 
 ```bash
 mkdir -p data config plugins && chown -R 1000:1000 data config plugins
+# 挂载会挡住镜像内的模板：config/ 里至少要有一份清单，否则容器读到空清单 → HTTP 不监听
+test -f config/plugins.base.json || cp -n config/plugins.base.example.json config/plugins.base.json
 docker compose up -d --build        # → http://localhost:3000
 ```
 
