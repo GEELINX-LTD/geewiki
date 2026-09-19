@@ -554,6 +554,34 @@ export interface WikiService {
    * 改变层级意味着改 URL（那是"移动页面"，不是排序）。
    */
   setNavOrder(parent: string | null, items: readonly string[]): Promise<number>
+
+  /**
+   * 站点主页**显式设置**的 slug；从未设置过时返回 `null`（= 回落约定主页 `home`）。
+   *
+   * 这是**存储口径**（库里有什么就回什么），不是"主页该渲染哪一篇"：
+   * "当前主体读不读得到这一篇"属于端点（`GET /api/site/home` 的三态），
+   * 在这里再判一次可见性就是第二个真源。故本方法**不带 `principal`** ——
+   * 它是全仓读方法里唯一不需要主体的一个，理由正是"它不返回任何页面内容"。
+   *
+   * 为什么进契约（而不是像 `listNavOrder` 那样只作为列表响应的一半）：
+   * 它有**自己的端点**，契约的"方法集与端点一一对应"因此不被破坏。
+   */
+  homeSlug(): Promise<string | null>
+
+  /**
+   * 设置 / 清除站点主页，返回是否写入成功。
+   *
+   * - `slug === null` = **清除设置**（主页回落约定 slug `home`），恒成功；
+   * - `slug` 有效但页面不存在 ⇒ `false`（同 {@link setNavHidden} 的口径：不留悬挂设置，
+   *   否则日后同 slug 新建的页面会"继承"一条没人做过的设置）；
+   * - slug 形状非法 ⇒ 抛错（`message` 以 `invalid_slug: ` 开头，对应端点 400）。
+   *
+   * **刻意不校验可见性**（与 `setNavHidden` 同口径）：主页的可见性由该页自己的档位决定，
+   * 把"能不能设为主页"与"能不能读这一篇"绑成一条判据，会造出第二套权限规则；
+   * 端点的门是站点管理员（站点级设置），与"这一页你能不能编辑"是正交的两件事。
+   */
+  setHomeSlug(slug: string | null): Promise<boolean>
+
   /** 引用了该页的页面（按标题、slug 稳定排序）；页面不存在时返回 `undefined`（对应端点 404）。已按主体可见性过滤 */
   backlinks(slug: string, principal: Principal): Promise<WikiBacklink[] | undefined>
   /** 该页正文指向的目标；`undefined` 对应 404。不可见的目标带 `exists:'hidden'`，**不得**当作"不存在" */

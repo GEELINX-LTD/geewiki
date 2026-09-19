@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HOME_SLUG, isWikiHomeAlias, parseWikiRoute } from '../lib/wikiRoute'
+import { homePageSlug, hasExplicitHome, isHomeAliasNow } from '../lib/homePlan'
+import { invalidateHome, useHome } from '../lib/homeStore'
 import { hashQueryOf } from '../lib/hashAnchor'
 import { invalidatePages, usePages } from '../lib/pagesStore'
 import { onContentChanged } from '../lib/contentEvents'
 import { Sidebar, SidebarDrawer, wikiHref } from '../components/Sidebar'
-import { ArrowDown, ArrowUp, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, GripVertical, List as ListIcon, LogIn, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, GripVertical, House, List as ListIcon, LogIn, Pencil, RefreshCw, RotateCcw, Save, Search, SearchX, ShieldCheck, Trash2 } from 'lucide-react'
 /*
  * 相对/绝对时间的唯一真源（`lib/timePlan.ts`）：右栏「本页信息」与版本下拉共用同一套口径，
  * 避免"11小时前"与"2026/9/12 15:56:59"两种写法在同一个页面里各说各的。
@@ -19,6 +21,7 @@ import {
   createParam,
   loginForEditPage,
   loginForNewPage,
+  loginForWikiPath,
   newPageEntry,
   type NewPageEntry,
 } from '../lib/newPageGate'
@@ -100,6 +103,7 @@ import { useDocumentTitle } from '../lib/useDocumentTitle'
 import { useHashAnchor } from '../lib/useHashAnchor'
 import { useUnsavedGuard } from '../lib/useUnsavedGuard'
 import {
+  Badge,
   Button,
   Card,
   CardHeader,
@@ -188,17 +192,20 @@ export function WikiPage(props: {
   // 编码路径被双重编码成 404）。
   const route = parseWikiRoute(sub)
   /*
-   * 主页（`kind === 'home'`）在侧栏里高亮的是**主页那一篇**，所以 activeSlug 取约定 slug；
-   * 否则侧栏在主页上不高亮任何一项，用户会以为"我不在任何地方"。
+   * 站点主页是**哪一篇**（`lib/homeStore.ts` 的共享缓存 + `lib/homePlan.ts` 的纯换算）。
+   *
+   * ⚠️ `homeSlug === null` 的含义是"**现在没有可渲染的一篇**"（还没有结论，或者已设置
+   * 但按当前主体的权限读不到），**不是**"没人设置过"——后者由 `homePageSlug()` 换算成
+   * 约定 slug `home`。两者混为一谈会让"主页不给你看"被静默换成一篇文章。
    */
-  const activeSlug =
-    route.kind === 'detail'
-      ? route.slug
-      : route.kind === 'edit'
-        ? route.slug
-        : route.kind === 'home'
-          ? HOME_SLUG
-          : null
+  const home = useHome()
+  const homeSlug = homePageSlug(home.home)
+  /*
+   * 侧栏高亮用的 slug：详情/编辑路由就是它自己那一篇。其余路由不用这个量——
+   * 主页（`kind === 'home'` 及其别名）高亮的是**当前主页那一篇**，由下面的主页分支
+   * 直接用 `homeSlug` 传给 `WikiShell`（走 `activeSlug` 反而要多绕一次换算）。
+   */
+  const activeSlug = route.kind === 'detail' || route.kind === 'edit' ? route.slug : null
   const pages = usePages()
   /*
    * 登录态与能力（本批 R11）：`useAuth()` 必须在**任何 early return 之前**调用
@@ -207,9 +214,16 @@ export function WikiPage(props: {
   const auth = useAuth()
   /** 「新建页面」的入口门控（见 `newPageEntry`）：列表页按钮与 `#/wiki/new` 路由共用同一判据 */
   const newEntry = newPageEntry(auth.user, auth.capabilities)
+  /**
+   * 主页设置的加载是否已经"慢到该给个说法"（与列表页的 `slowList` 同一套提示机制）。
+   *
+   * 必须在**任何 early return 之前**求值：hook 顺序不能随分支改变（React 抛 #310）。
+   */
+  const slowHome = useSlowHint(home.home === null && home.error === null)
 
   /*
-   * `#/wiki/home` 是主页的**另一个写法**，不是第二个页面：重定向到 `#/wiki`。
+   * `#/wiki/home` 是主页的**另一个写法**（当主页恰好是约定 slug `home` 那一篇时），
+   * 不是第二个页面：改写成规范地址 `#/wiki`。
    *
    * 为什么重定向而不是两个 URL 渲染同一篇：两套 URL 会让"复制链接/浏览器历史/面包屑"
    * 出现两种形态，而且选中态、返回行为都会分叉。用 `replace: true`（改写历史而不是压栈）
@@ -222,8 +236,11 @@ export function WikiPage(props: {
    * ⚠️⚠️ 光"带上查询串"还不够：这个查询串**必须从当前 URL 现读**，不能取 `props.query`
    * （它由另一个 `hashchange` 订阅者维护，可能比 `route` 落后一拍）。详见下面 effect 里的长注释 ——
    * 点击版本下拉时丢 `?v=` 的根因就在这里。
+   *
+   * ★ 主页批（2026-09-18）：判据不再只看 slug 叫什么，还要看**当前主页是不是这一篇**
+   * （`isHomeAliasNow` → `isWikiHomeAlias(hash, homeSlug)`）。管理员把主页设成别的 slug 之后，
+   * `home` 退化成一篇普通文章，`#/wiki/home` 必须照常打开它——它的地址仍然对外分享着。
    */
-  const normalizeHome = route.kind === 'detail' && route.slug === HOME_SLUG
   /*
    * 别名**不止裸 slug 一种写法**：`#/wiki/home/`（尾斜杠）、`#/wiki/home?v=68`（历史快照）、
    * `#/wiki/home?a=usage`（页内锚点）都是主页。
@@ -238,9 +255,9 @@ export function WikiPage(props: {
    *
    * 根因是 effect 里的守卫写成**字符串全等**（`stripHashQuery(hash) !== 'wiki/home'`），
    * 而 `#/wiki/home/` 剥掉前缀后是 `wiki/home/`（带尾斜杠）⇒ 串不等 ⇒ 守卫 `return`，
-   * 既不重写 URL；同时 `parseWikiRoute('home/')` 得到的是 `detail + home` ⇒ `normalizeHome`
-   * 为真 ⇒ `return null`。两者叠加就是"**既不重写、也不渲染**"的夹缝：页面停在空白，
-   * 而且不像未知 slug 那样给"页面不存在"提示 —— 这就是"打开别名地址没有内容"的真身。
+   * 既不重写 URL；同时 `parseWikiRoute('home/')` 得到的是 `detail + home` ⇒ 组件不渲染主页
+   * ⇒ 两者叠加就是"**既不重写、也不渲染**"的夹缝：页面停在空白，而且不像未知 slug 那样给
+   * "页面不存在"提示 —— 这就是"打开别名地址没有内容"的真身。
    * 地址栏自动补全、从别处粘贴、IM 自动加链接都可能产出这条尾斜杠，命中概率不低。
    *
    * 判据因此不再拼字符串，而是**复用唯一的路由解析器** `isWikiHomeAlias`（见
@@ -251,14 +268,14 @@ export function WikiPage(props: {
    * ⚠️ 它收的是**整串 `window.location.hash`**（不是 `props.sub`），因为本 effect 要判的
    * 正是"**当前 URL** 是不是别名"，而不是"这次渲染的 route 是什么"。
    */
-  const isHomeAlias = isWikiHomeAlias
   useEffect(() => {
     /*
-     * 依赖数组是 `[]`（**订阅一次，生命周期内一直有效**），而不是 `[normalizeHome]`。
-     * 理由：判据已经完全是"**当前 URL** 是不是别名"（`isHomeAlias` 直接读 `window.location.hash`），
-     * 与 `route` / `query` 这两个 state 谁先落地无关，因此没有需要跟着变的依赖。
-     * 反过来说，若像原来那样用 `normalizeHome` 当**闸门**，`#/wiki/home/` 那条路径就会
-     * 在"守卫串不等 ⇒ 提前 return"里丢掉唯一一次改写机会，永久停在空白。
+     * 依赖是 `[homeSlug]`（而不是 `[]`）：判据里多了一个**异步**得到的量 ——
+     * "主页是哪一篇"。它在加载完成前后会从 `null` 变成具体 slug，那一刻必须重跑一次
+     * （否则 `#/wiki/home` 这条别名会在"结论还没到"时被错过，之后再也没有机会改写）。
+     * 依赖里**没有** `route` / `query`：判据完全是"**当前 URL** 是不是别名"
+     * （直接读 `window.location.hash`），与这两个 state 谁先落地无关，因此没有需要跟着变的依赖。
+     * 本函数是幂等的：规范地址下判据为 false，不做任何事，也不会与路由自身的 hash 变更互相激发。
      */
     /*
      * ⚠️ 查询串**从当前 URL 现读**，不用 `props.query`。这不是风格偏好，是本页最容易复发的缺陷：
@@ -275,12 +292,13 @@ export function WikiPage(props: {
     const normalize = (): void => {
       const hash = window.location.hash
       /*
-       * 再用 `isHomeAlias` 复核一次：本函数可能在**又发生了一次导航之后**才被冲刷，
+       * 再用同一判据复核一次：本函数可能在**又发生了一次导航之后**才被冲刷，
        * 那时当前 URL 已经不是别名了 —— 这种过期调用必须什么都不做，绝不能把新地址劫持回主页。
        * 复用解析器也保证了 `wiki/homework`、`wiki/home/edit`、`wiki/guide%2Fhome` 这类只是
-       * "名字里带 home"的地址不会被误判。
+       * "名字里带 home"的地址不会被误判；带上 `homeSlug` 则保证了主页换掉之后
+       * `#/wiki/home` 不再被当成别名（那时它是一篇普通文章的真实地址）。
        */
-      if (!isHomeAlias(hash)) return
+      if (!isWikiHomeAlias(hash, homeSlug)) return
       /*
        * 查询串**必须原样带过去**（`?v=68` 是历史快照、`?a=usage` 是页内锚点）：漏掉它，
        * 用户拿到的是一条"看起来打开了、其实静默降级成最新版 + 无锚点"的地址。
@@ -290,19 +308,30 @@ export function WikiPage(props: {
        */
       window.location.replace(`#/wiki${hashQueryOf(hash)}`)
     }
-    // 挂载时先跑一次：**深链/刷新**（`#/wiki/home` 直接冷加载）走的是这条路，
-    // 而它正是"页面停在空白"最容易被撞上的入口。
+    // 挂载时先跑一次：**深链/刷新**（`#/wiki/home` 直接冷加载）走的是这条路。
     normalize()
     /*
      * 再订阅 `hashchange`：**文档内导航**（已经在 wiki 里，地址被改成 `#/wiki/home`）不会让
-     * 本组件重新挂载，只靠挂载那一次会漏掉，地址停在别名、组件 `return null` ⇒ 又是空白。
-     * 这里是"只读当前 URL"的幂等改写：规范地址下 `isHomeAlias` 为 false，不做任何事，
-     * 因此不会与路由自身的 hash 变更互相激发（`replace` 到规范地址后再次回调即返回）。
+     * 本组件重新挂载，只靠挂载那一次会漏掉，地址停在别名。
      */
     window.addEventListener('hashchange', normalize)
     return () => window.removeEventListener('hashchange', normalize)
-  }, [])
-  if (normalizeHome) return null
+  }, [homeSlug])
+
+  /*
+   * 本次渲染要不要走「主页」分支。
+   *
+   * 两个入口：规范地址 `#/wiki`（`route.kind === 'home'`），以及**当主页正是约定那一篇时**
+   * 的别名地址 `#/wiki/home…`（`kind === 'detail'` + slug 恰为 `home` + 它确实是当前主页）。
+   *
+   * ★ 别名也走同一个分支（而不是像以前那样 `return null`、等 effect 把地址改写掉）是**刻意的**：
+   * 那种"先什么都不渲染"的写法正是 2026-09-14 那个永久空白缺陷的一半成因；而本批之后
+   * `homeSlug` 是**异步**得到的，判据会在结论到达前后翻面 —— 那一刻的 `return null`
+   * 就是一次货真价实的白屏。两个入口渲染同一个 `<WikiDetail>` 之后，URL 改写退化成纯粹的
+   * 地址栏整理：改写失败、慢一拍、被拦截，用户看到的都还是正确的内容。
+   */
+  const homeAliasRoute = route.kind === 'detail' && route.slug === HOME_SLUG && isHomeAliasNow(home.home)
+  const homeRoute = route.kind === 'home' || homeAliasRoute
 
   /*
    * ★「创建主页」= **`#/wiki/new?create=home`**（本轮修正）。
@@ -326,20 +355,78 @@ export function WikiPage(props: {
   /** 是否走「创建主页」语义：只在 `new` 路由上成立，其余路由下这个参数无意义（忽略） */
   const createHome = route.kind === 'new' && create === HOME_SLUG
 
-  if (route.kind === 'home') {
+  if (homeRoute) {
     /*
      * 主页 = **一篇文章**，复用详情页的阅读态能力（标题/正文/版本/权限入口/上下篇之外的一切），
      * 而不是"所有页面的管理表格"。列表页退居次要入口：`#/wiki/list` 保持原样，
      * 并由侧栏的「全部页面」链接抵达（此前唯一入口是命令面板，等于藏起来了）。
+     *
+     * ★ 主页批：这里渲染的是**服务端设置的**那一篇（`homeSlug`），不再写死约定 slug。
+     * `homeSlug === null` 有两种来源，必须分开处理 —— 这正是 `SiteHome` 三态存在的理由：
+     *   · 结论还没到（加载中 / 上次请求失败）⇒ 骨架屏 / 错误态，**绝不**先渲染约定 slug：
+     *     若设置的其实是另一篇，那会先显示一篇错的再换掉（"闪一下换了东西"）；
+     *   · 设置了，但当前主体读不到（`hidden`）⇒ 明确告知"主页不给你看"，
+     *     同样**不**退回约定 slug —— 那等于把无权者静默送去另一篇文章，而他会以为
+     *     那就是本站主页（真实情况可能是：主页设成了组织内页，而他是匿名访客）。
      */
+    if (homeSlug === null) {
+      const d = describeError(home.errorValue)
+      let body: ReactNode
+      if (home.home === null && home.error !== null) {
+        body = (
+          <ErrorState
+            title={d.title}
+            hint={d.hint}
+            onRetry={d.retryable ? home.reload : undefined}
+            retrying={home.loading}
+          />
+        )
+      } else if (home.home === null) {
+        body = (
+          <LoadingState slow={slowHome}>
+            <SkeletonTable rows={4} cols={1} />
+          </LoadingState>
+        )
+      } else {
+        body = (
+          <EmptyState
+            icon={<House className="size-8" />}
+            title="主页当前不可访问"
+            hint="本站的主页被设置成了某一篇文章，但你的账号读不到它。它可能尚未发布、只对特定范围开放，或者已经被删除。"
+            action={
+              <div className="flex flex-wrap items-center gap-2">
+                {newEntry.kind === 'login' && (
+                  <Button variant="primary" icon={<LogIn className="size-3.5" />} onClick={() => loginForWikiPath('/wiki')}>
+                    去登录
+                  </Button>
+                )}
+                <Button variant="secondary" onClick={() => onNavigate('list')}>
+                  全部页面
+                </Button>
+                <Button variant="ghost" onClick={home.reload}>
+                  重试
+                </Button>
+              </div>
+            }
+          />
+        )
+      }
+      return (
+        <WikiShell activeSlug={null} pages={pages} onNavigate={onNavigate}>
+          <div className="page">{body}</div>
+        </WikiShell>
+      )
+    }
     return (
-      <WikiShell activeSlug={activeSlug} pages={pages} onNavigate={onNavigate}>
+      <WikiShell activeSlug={homeSlug} pages={pages} onNavigate={onNavigate}>
         <WikiDetail
-          key={HOME_SLUG}
-          slug={HOME_SLUG}
+          // `key` 用实际 slug：主页被换成另一篇时（同一会话里改了设置）必须**重挂载**，
+          // 否则 `WikiDetail` 会把上一篇的正文/版本/目录原样展示在新 slug 的地址上
+          key={homeSlug}
+          slug={homeSlug}
           query={query}
           homeMode
-          onEdit={() => onNavigate(`${HOME_SLUG}/edit`)}
+          onEdit={() => onNavigate(`${homeSlug}/edit`)}
           onDeleted={() => onNavigate('list')}
           onNavigate={onNavigate}
         />
@@ -676,6 +763,30 @@ function WikiList(props: {
   const pagesState = usePages()
   const pages = pagesState.pages
   /*
+   * 站点主页（`lib/homeStore.ts`）：本页要回答两个问题——
+   *   · 哪一行挂「主页」徽标（= 当前实际渲染的那一篇）；
+   *   · 要不要给「设为主页 / 恢复默认」按钮（只有**站点管理员**有这门权限，见下）。
+   * 判据与 `#/wiki` 的落点、AI 对话的"当前页"共用同一个换算（`homePageSlug`），
+   * 不在这里自己拼一套（那会让"列表说 A 是主页、点开却是 B"）。
+   */
+  const home = useHome()
+  const homeSlug = homePageSlug(home.home)
+  /*
+   * 站点主页的设置门是**站点管理员**（后端 `access: 'admin'`），
+   * 刻意比同列的「隐藏 / 排序」（只要对该页 canEdit）严一档：那两者改的是导航列表的呈现，
+   * 而主页是所有访客（含匿名）打开本站看到的第一屏。
+   *
+   * 前端据此**不渲染**那个注定 403 的按钮（与 `newPageGate` 同一条理由：把用户引进死路
+   * 是纯浪费）；判定的真源仍在服务端，被拒时把服务端的原话显示在行内。
+   */
+  const auth = useAuth()
+  /**
+   * ⚠️ `capabilities` 可能是 `null`（还在确认）。用 `?.` 而不是 `!`：**未知即不给入口**
+   * （与 `newPageGate` 的失败关闭同一条策略）——先亮一个点了必然 403 的按钮，
+   * 比晚一帧看到它更糟。
+   */
+  const canAdminister = auth.capabilities?.administer === true
+  /*
     列表区域的四态（**互斥**）：error / loading / empty / ready。
     判据来自状态本身，**不是**从"数据是否存在"反推——请求失败时 `pages` 同样是 null，
     用 `pages === null` 当"正在加载"会让头部说「正在加载…」而正文说「出错了」
@@ -731,6 +842,16 @@ function WikiList(props: {
   /** 正在提交的行（path 或 `__root__`）——提交期间禁用控件，避免连点产生两次顺序写入 */
   const [navBusy, setNavBusy] = useState<string | null>(null)
   const [_navNotice, setNavNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
+  /**
+   * 「设为主页 / 恢复默认主页」的**提交中**标记与反馈位。
+   *
+   * 为什么反馈位单独一个 state、不复用上面那个 `_navNotice`：后者（排序 / 隐藏的提示）
+   * 在本页**没有任何渲染点**，挂上去等于这个新动作永远静默；而主页动作失败必须让人看见 ——
+   * 403（你不是站点管理员）与 404（页面刚被别人删掉）的处理方式完全不同，
+   * 静默失败只会让人以为"点了没反应"。
+   */
+  const [homeBusy, setHomeBusy] = useState(false)
+  const [homeNotice, setHomeNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
   /** 拖动中的行（含它所在的层，用于判"只能同层"） */
   const [drag, setDrag] = useState<{ path: string; parent: string } | null>(null)
   const [dropAt, setDropAt] = useState<string | null>(null)
@@ -776,6 +897,38 @@ function WikiList(props: {
       setNavNotice({ kind: 'error', text: `「${slug}」的隐藏设置没有保存：${errorLine(e)}` })
     } finally {
       setNavBusy(null)
+    }
+  }
+
+  /**
+   * 把某一篇设为站点主页（`slug`），或清除这项设置（`null`）。
+   *
+   * `null` = **恢复默认**：主页回落约定 slug `home`（与从未设置过完全等价，见 homeStore）。
+   * 为什么不做成"删除那一行设置"之外的语义：主页必须**总有**一个落点，
+   * "没有主页"不是一种可用状态（`#/wiki` 会变成 404）。
+   */
+  const setHomePage = async (slug: string | null): Promise<void> => {
+    setHomeBusy(true)
+    setHomeNotice(null)
+    try {
+      await api.setSiteHome(slug)
+      /*
+       * 必须**重取**而不是本地改状态：服务端才是"设置成了什么"的真源
+       * （它还要在写入时校验页面是否存在），而本页与主页分支、AI 对话共用这份缓存。
+       * 重取而不是乐观更新，也是为了让"设完之后 `#/wiki` 打开的是哪一篇"当场可见。
+       */
+      await invalidateHome()
+      setHomeNotice({
+        kind: 'ok',
+        text:
+          slug === null
+            ? '已恢复默认主页：打开本站将显示约定页面 home（若它还不存在，首页会给创建引导）'
+            : `「${slug}」已设为站点主页：所有访客打开本站都会先看到这一篇`,
+      })
+    } catch (e) {
+      setHomeNotice({ kind: 'error', text: `主页设置没有保存：${errorLine(e)}` })
+    } finally {
+      setHomeBusy(false)
     }
   }
 
@@ -980,6 +1133,36 @@ function WikiList(props: {
           }
         />
         {/*
+          主页动作（设为主页 / 恢复默认）的反馈位。
+          失败**必须可见**：403（不是站点管理员）与 404（页面刚被别人删掉）的处理方式
+          完全不同，静默失败只会让人以为"点了没反应"——那正是本仓在写路径上一贯拒绝的姿态。
+        */}
+        {homeNotice !== null && (
+          <div
+            role={homeNotice.kind === 'error' ? 'alert' : 'status'}
+            className={cn(
+              'border-b border-line px-4 py-2 text-note',
+              homeNotice.kind === 'error' ? 'bg-danger-bg text-danger-ink' : 'bg-bg text-ink-soft',
+            )}
+          >
+            {homeNotice.text}
+          </div>
+        )}
+        {/*
+          主页设置指向一篇**当前主体读不到**的页面（服务端为此不下发 slug，见 `SiteHome` 的
+          `hidden` 态）时，这里是**唯一**能自救的地方：这一态下没有任何一行能挂「主页」徽标，
+          于是"恢复默认"只可能出现在这条横条上；否则管理员会卡在"设置里明明有一项、
+          界面上却找不到"。只有站点管理员看得到它（按钮点了必然 403 的人不该看到入口）。
+        */}
+        {canAdminister && home.home?.state === 'hidden' && (
+          <div className="flex flex-wrap items-center gap-2 border-b border-line bg-bg px-4 py-2 text-note text-muted">
+            <span>站点主页当前指向一篇你看不到（或已被删除）的页面。</span>
+            <Button size="sm" variant="secondary" disabled={homeBusy} onClick={() => void setHomePage(null)}>
+              恢复默认主页
+            </Button>
+          </div>
+        )}
+        {/*
           可滚动区域的键盘可达性：`tabIndex={0}` 让键盘用户能把焦点落到表格上，
           随后用方向键滚动（容器现在**双向**可滚：横向溢出看右侧列，纵向溢出看下面的行）。
           这是 WCAG 2.1.1（键盘）在"可滚动区域"上的具体要求，VitePress 等实现亦如此。
@@ -1058,7 +1241,12 @@ function WikiList(props: {
             >
               <thead className="sticky top-0 z-10 bg-bg">
                 <tr>
-                  {['标题', '页面标识', '版本', '最近更新', '导航'].map((h) => (
+                  {/*
+                    「导航」列同时承载**站点主页**的入口（主页批）。它不是一个纯导航属性，
+                    但它是"这一页在全站里被摆在哪"这一类站点级设置，与隐藏/排序同族，
+                    故沿用同一列而不再加第六列（多一列会让表格在窄屏下更早横向溢出）。
+                  */}
+                  {['标题', '页面标识', '版本', '最近更新', '导航 / 主页'].map((h) => (
                     <th
                       key={h}
                       scope="col"
@@ -1080,6 +1268,15 @@ function WikiList(props: {
                   const inheritedHidden = node.hidden && !ownHidden
                   const canReorder = row.siblings.length > 1
                   const busy = navBusy !== null
+                  /*
+                   * 这一行**就是当前站点主页**吗。
+                   *
+                   * 判据用 `homeSlug`（与 `#/wiki` 渲染哪一篇、AI 对话说"当前页是哪个 slug"
+                   * 同一个换算）：`homeSlug` 为 `null` 时（结论未到，或主页被设置成一篇
+                   * 当前主体读不到的页面）**没有任何一行**是主页 —— 这正是"不泄露存在性"
+                   * 与"不假装知道"的必然结果，而不是没算出来。
+                   */
+                  const isSiteHome = homeSlug !== null && page !== null && page.slug === homeSlug
                   return (
                     <tr
                       key={node.path}
@@ -1150,6 +1347,16 @@ function WikiList(props: {
                             <span className="font-mono text-2xs text-muted" title="只有路径段、没有页面（纯分组）">
                               {node.segment}
                             </span>
+                          )}
+                          {isSiteHome && (
+                            /*
+                              徽标对**所有能看到列表的人**都显示（不只管理员）："打开本站先看到哪一篇"
+                              是所有人都该知道的事实，藏起来只会让人以为主页是另一篇。
+                              `title` 只是补充说明，不是唯一信息源（文字"主页"本身就在）。
+                            */
+                            <Badge tone="accent" title="站点主页：打开本站（#/wiki）时默认显示这一篇">
+                              主页
+                            </Badge>
                           )}
                           {node.hidden && (
                             <span
@@ -1232,6 +1439,46 @@ function WikiList(props: {
                                 <ArrowDown className="size-3.5" />
                               </button>
                             </>
+                          )}
+                          {/*
+                            「设为主页 / 恢复默认」——主页批。
+                            门是**站点管理员**（后端 `access: 'admin'`）：比同列的隐藏/排序严一档
+                            （那两者只要对该页 `canEdit`），因为主页是所有访客（含匿名）看到的
+                            第一屏。前端据此**不渲染**注定 403 的按钮，判定真源仍在服务端 ——
+                            被拒时把服务端的原话显示在上方横条里，不假装成功。
+                          */}
+                          {canAdminister && page !== null && !isSiteHome && (
+                            <button
+                              type="button"
+                              disabled={busy || homeBusy}
+                              title="设为站点主页：所有访客打开本站（#/wiki）都会先看到这一篇"
+                              className={cn('rounded-sm px-1.5 py-0.5 text-2xs text-muted hover:bg-hover disabled:opacity-40', focusRing)}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void setHomePage(page.slug)
+                              }}
+                            >
+                              设为主页
+                            </button>
+                          )}
+                          {/*
+                            「恢复默认」只出现在**本身就是主页**的那一行，且只在设置确实存在时
+                            （`hasExplicitHome`）：从未设置过时主页已经落在约定 slug `home` 上，
+                            再放一个"恢复默认"是个什么都不做的按钮。
+                          */}
+                          {canAdminister && isSiteHome && hasExplicitHome(home.home) && (
+                            <button
+                              type="button"
+                              disabled={busy || homeBusy}
+                              title="清除主页设置：打开本站回到约定页面 home（若它还不存在，首页会给创建引导）"
+                              className={cn('rounded-sm px-1.5 py-0.5 text-2xs text-muted hover:bg-hover disabled:opacity-40', focusRing)}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void setHomePage(null)
+                              }}
+                            >
+                              恢复默认
+                            </button>
                           )}
                           {!canReorder && page === null && <span className="text-2xs text-muted">—</span>}
                         </span>

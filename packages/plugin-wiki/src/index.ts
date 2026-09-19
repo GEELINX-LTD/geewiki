@@ -548,6 +548,33 @@ function parseNavOrderBody(body: unknown): { parent: string | null; items: strin
   return { parent: parent as string | null, items: raw as string[] }
 }
 
+/**
+ * `POST /api/site/home` 的请求体（白名单：只认 `slug` 一个字段）。
+ *
+ * `slug: null` 是**合法值**，含义是"清除设置、主页回落约定 slug"。
+ * ⚠️ 它与**字段缺失**必须分开：把缺失当成清除，会让一次拼错的请求（比如
+ * `{"slug_": "x"}`）静默把站点主页重置掉——而"重置"看起来和"没生效"一模一样，
+ * 排查时毫无线索。故缺字段是 400 `invalid_body`，清除必须显式写 `null`。
+ */
+function parseSiteHomeBody(body: unknown): { slug: string | null } {
+  const b = (body ?? {}) as Record<string, unknown>
+  if (typeof b !== 'object' || Array.isArray(b)) {
+    throw new Error('invalid_body: 请求体须为 JSON 对象')
+  }
+  const unknown = Object.keys(b).filter((k) => k !== 'slug')
+  if (unknown.length > 0) {
+    throw new Error(`invalid_body: 未知字段: ${unknown.join(', ')}`)
+  }
+  if (!('slug' in b)) {
+    throw new Error('invalid_body: 缺少 slug 字段（清除设置请显式传 null）')
+  }
+  const slug = b['slug']
+  if (slug !== null && typeof slug !== 'string') {
+    throw new Error('invalid_body: slug 必须是字符串或 null')
+  }
+  return { slug }
+}
+
 export const WikiPlugin = {
   name: '@geewiki/wiki',
   /** cordis 约定：声明 Config 后由 cordis 负责校验与默认值填充 */
@@ -1633,6 +1660,16 @@ export const WikiPlugin = {
           await tx.run('DELETE FROM blocks_fts WHERE rowid IN (SELECT id FROM blocks WHERE page_id = ?)', [page.id])
         }
         await tx.run('DELETE FROM pages WHERE id = ?', [page.id])
+        /*
+         * 被删的这一篇若正是站点主页，**同事务**清掉那条设置。
+         *
+         * 为什么必须清：留着它就是一条指向不存在 slug 的悬挂设置，而
+         * `GET /api/site/home` 只能把它报成"主页当前不可访问"——设置里明明有、
+         * 页面却没了，这个状态没有任何写入方做过，排查时毫无线索。
+         * 放在同一个事务里而不是删除之后再补一句：删除失败时设置必须原样还在，
+         * 否则一次失败的删除会把站点主页悄悄清掉。
+         */
+        await tx.run('DELETE FROM site_home WHERE slug = ?', [slug])
         await tx.run('DELETE FROM page_links WHERE source_slug = ? OR target_slug = ?', [slug, slug])
         return summary
       })
@@ -1797,6 +1834,41 @@ export const WikiPlugin = {
           return items.length
         })
       },
+      homeSlug: async () => {
+        assertLive()
+        /*
+         * 单行表（`id = 1`）。读**不加任何可见性判断**：本方法的契约就是"存储口径"
+         * （见 core 的 WikiService 注释），可见性属于 `GET /api/site/home` 的三态。
+         * 没有行 = 未设置 = 返回 null（由调用方回落约定 slug），不吞成空串 ——
+         * 空串与"未设置"在路由层是两种结局（前者会去读一个 slug 为空的页面）。
+         */
+        const rows = await adb.query<{ slug: string }>('SELECT slug FROM site_home WHERE id = 1')
+        return rows[0]?.slug ?? null
+      },
+      setHomeSlug: async (slug) => {
+        assertLive()
+        if (slug === null) {
+          // 清除 = 删掉那一行（而不是写空串）：只有"行在不在"一种判据，见迁移注释
+          await adb.run('DELETE FROM site_home WHERE id = 1')
+          return true
+        }
+        assertValidSlug(slug)
+        /*
+         * 页面不存在就**不写**（与 `setNavHidden` 同一条理由）：否则设置会指向一个不存在的
+         * slug，而 `GET /api/site/home` 只能把它报成"主页当前不可访问"——管理员看到设置
+         * 明明在、页面却没了，这种状态没有任何写入方做过，查起来极难。
+         * 存在性用 `pageExists`（服务内 helper）而不是 `resolvePage`：后者对无权者一律 none，
+         * 那是"不泄露存在性"的纪律，不能用来判"页面在不在"。
+         */
+        if (!(await pageExists(slug))) return false
+        await adb.run(
+          // 与 `page_nav_state` 同一写法：`ON CONFLICT` 在 SQLite(≥3.24) 与 PostgreSQL 通用
+          `INSERT INTO site_home (id, slug, updated_at) VALUES (1, ?, ?)
+           ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, updated_at = excluded.updated_at`,
+          [slug, new Date().toISOString()],
+        )
+        return true
+      },
     }
 
     /* ---------- GET /api/pages：列表 ---------- */
@@ -1901,6 +1973,84 @@ export const WikiPlugin = {
           throw err
         }
       }, { access: 'public' }),
+    )
+
+    /* ---------- GET /api/site/home：站点主页指向哪一篇 ---------- */
+    /*
+     * **三态而不是一个可空 slug**：
+     *   · `unset`   —— 从未设置过 ⇒ 前端回落约定 slug `home`。
+     *                  从旧版本升级上来的站点全是这一态，行为与本批之前完全一致；
+     *   · `visible` —— 设置了，且**当前主体读得到** ⇒ 附上 `slug`；
+     *   · `hidden`  —— 设置了，但当前主体读不到（未发布 / 仅对特定范围开放 / 已被删除）。
+     *
+     * ⚠️ `hidden` 态**不下发 slug**：一个主体看不见的页面，它的标识也不该从"站点设置"
+     * 这条侧路漏出去——这与读路径"不存在与无权同报 404"是同一条纪律。
+     * 但**也不能把它并进 `unset`**：两者的含义截然不同（前者是"本站主页不给你看"，
+     * 后者是"本站还没设置主页"）。并起来会让无权者被静默送去**另一篇文章**，
+     * 那正是仓库不接受的"看起来打开了、其实换了东西"（见 `dockPlan`/`wikiRoute` 的既有注释）。
+     *
+     * 端点**公开**（与 `GET /api/pages` 同级）：主页是所有访客的落点，匿名也必须能知道
+     * 该渲染哪一篇。可见性逐请求现算（`policy()` 的唯一出口），不看也不缓存任何判定结果。
+     */
+    cleanups.push(
+      router.register('GET', '/api/site/home', async (h) => {
+        const stored = await svc.homeSlug()
+        if (stored === null) {
+          h.json(200, { ok: true, state: 'unset' })
+          return
+        }
+        /*
+         * 判"读不读得到"用 `resolvePage`（单篇）而不是 `visibleSlugs`（全量）：
+         * 后者要把整站可见 slug 算一遍，只为一篇页面付这个代价不值（`listPages` 用它
+         * 是因为它本来就需要全集）。`level === 'none'` 对"不存在"与"无权"是同一条回答，
+         * 这里也**刻意不区分**（区分就等于给出一个存在性探针）。
+         */
+        const access = await policy().resolvePage(requirePrincipal(h), stored)
+        if (access.level === 'none') {
+          h.json(200, { ok: true, state: 'hidden' })
+          return
+        }
+        h.json(200, { ok: true, state: 'visible', slug: stored })
+      }, { access: 'public' }),
+    )
+
+    /* ---------- POST /api/site/home：把某一篇设为站点主页 / 清除设置 ---------- */
+    /*
+     * 门是 **`access: 'admin'`（站点管理员）**，刻意比同表里的「隐藏 / 排序」严一档
+     * （那两个只要对该页有 `canEdit`）。理由：隐藏与排序改的是导航**列表**里的呈现，
+     * 而主页是**所有访客（含匿名）打开本站看到的第一屏**——一次误操作能把组织内的页面
+     * 顶到全员面前（可见性仍然生效，但它不再是"我这一页的事"）。站点级设置的既有先例
+     * （插件管理 / 组织 / 审计）用的也是这道门。
+     *
+     * 用 `POST` 而不是 `PUT`：与 `POST /api/pages/:slug/hidden` 同款（本仓 router 只认
+     * GET/PUT/POST/DELETE 四种方法，"设置某个开关"用 POST + 幂等 upsert 表达）。
+     */
+    cleanups.push(
+      router.register('POST', '/api/site/home', async (h) => {
+        let body: { slug: string | null }
+        try {
+          body = parseSiteHomeBody(await readBody(h))
+        } catch (err) {
+          h.json(400, { ok: false, error: 'invalid_body', message: (err as Error).message })
+          return
+        }
+        /*
+         * slug 形状先在这里挡一道：`setHomeSlug` 内部的 `assertValidSlug` 抛的是普通
+         * Error（服务层口径，消息前缀即错误码），不接住的话会变成 500 ——
+         * 而"slug 写错了"明明是调用方的输入问题，必须是 400。
+         */
+        if (body.slug !== null && !isValidSlug(body.slug)) {
+          h.json(400, { ok: false, error: 'invalid_slug', message: SLUG_HINT })
+          return
+        }
+        const stored = await svc.setHomeSlug(body.slug)
+        if (!stored) {
+          h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${body.slug}` })
+          return
+        }
+        // 回显**落库后的值**（`null` = 已清除、主页回落约定 slug），前端据此刷新徽标
+        h.json(200, { ok: true, slug: body.slug })
+      }, { access: 'admin' }),
     )
 
     /* ---------- GET /api/pages/:slug：详情 + 最近版本历史 ---------- */

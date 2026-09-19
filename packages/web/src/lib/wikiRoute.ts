@@ -60,12 +60,13 @@ export type WikiRoute =
   | { kind: 'edit'; slug: string }
 
 /**
- * 主页文章的约定 slug。
+ * 主页文章的**默认**约定 slug —— 也是"从未设置过主页"时的回落值。
  *
- * 为什么用约定 slug 而不是"站点设置里指向某一页"：**零迁移、零新表**。
- * 已有部署不需要任何数据变更——没有这一页时首页给出「创建主页」引导。
- * 将来若要"管理员可换主页"，把这里当成**默认值**再读一处 `homeSlug()` 即可，
- * 不必推翻本方案。
+ * 主页批（2026-09-18）之前，主页**只能**是这一篇：约定 slug 零迁移、零新表，
+ * 已有部署不需要任何数据变更（没有这一页时首页给出「创建主页」引导）。
+ * 本批把"管理员可换主页"实到位了，但**没有推翻本方案**：这里仍然是默认值，
+ * 只是多读了一处设置（`GET /api/site/home` 的三态，见 `lib/homePlan.ts`）。
+ * 因此 `unset` 的老站点行为与本批之前逐字节一致。
  *
  * 为什么是 `home`：它**不在** `WIKI_RESERVED_FIRST_SEGMENTS` 里，因此不需要改动
  * 前后端镜像的保留段集合（动了就要同步后端 `RESERVED_FIRST_SEGMENTS`，那是
@@ -148,11 +149,19 @@ export function wikiRouteHash(slug: string): string {
  * （与 `App.tsx` 传 `sub` 的算法一致），最后交给同一个解析器。
  * 自己再写一套字符串判断就是上一条缺陷的成因。
  *
- * 未登录/无权也照常返回 true：它只回答"这是不是主页地址"，权限判定不归它管。
+ * ★ 主页批（2026-09-18）起**必须是"当前主页 slug"的函数**，不能只看 slug 叫什么：
+ * 主页可被设为任何一篇，一旦 `home` 不再担任主页，它就是一篇**普通文章**，
+ * `#/wiki/home` 必须照常打开它。此时若还按老判据把它改写成 `#/wiki`，
+ * 一篇真实存在的文章会**打不开**——而它的地址仍然对外分享着。
+ *
+ * 未登录/无权也照常判定：它只回答"这是不是主页地址"，权限判定不归它管。
  *
  * @param rawHash `window.location.hash`（可含 `#`、可含 `?…` 查询串）
+ * @param homeSlug 当前站点主页**实际渲染**的那一篇（`lib/homePlan.ts` 的
+ *   `homePageSlug()`；`null` = 还没有结论或主页不可读）。只有它恰好是约定 slug
+ *   `home` 时，`#/wiki/home` 才仍然是别名。
  */
-export function isWikiHomeAlias(rawHash: string): boolean {
+export function isWikiHomeAlias(rawHash: string, homeSlug: string | null): boolean {
   const withoutPrefix = rawHash.replace(/^#\/?/, '')
   const q = withoutPrefix.indexOf('?')
   const route = q === -1 ? withoutPrefix : withoutPrefix.slice(0, q)
@@ -162,7 +171,8 @@ export function isWikiHomeAlias(rawHash: string): boolean {
     const parsed = parseWikiRoute(route.slice('wiki'.length).replace(/^\/+/, ''))
     // `#/wiki` 本身解析成 `{kind:'home'}`（规范落点，无需改写）；只有 slug 恰为 `home` 的
     // 详情路由才是"别名"——这两者必须分开，否则规范地址会被反复重写。
-    return parsed.kind === 'detail' && parsed.slug === HOME_SLUG
+    // 后半句是与"当前主页"比对：主页换成别的 slug 之后，`#/wiki/home` 不再是别名。
+    return parsed.kind === 'detail' && parsed.slug === HOME_SLUG && parsed.slug === homeSlug
   } catch {
     // `parseWikiRoute` 对坏转义已有兜底，这里只是保底：调用方在 effect 里跑，
     // 抛出去就是整页空白，代价远大于忽略一个畸形地址。

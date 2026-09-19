@@ -9,7 +9,7 @@
  * 这条翻译值得单测，因为它错起来很安静：把列表页翻译成"当前页 = 上一篇"不会报错，
  * 只会让模型对着旧上下文回答，而用户看不出答案为什么不对。
  */
-import { HOME_SLUG, isUnreachableSlug, parseWikiRoute } from './wikiRoute'
+import { isUnreachableSlug, parseWikiRoute } from './wikiRoute'
 
 /**
  * 当前页面上下文。
@@ -34,13 +34,24 @@ export interface DockPageContext {
   readonly kind: 'view' | 'edit'
 }
 
-export function pageContextOf(route: string): DockPageContext | null {
+export function pageContextOf(route: string, homeSlug: string | null): DockPageContext | null {
   if (route !== 'wiki' && !route.startsWith('wiki/')) return null
   const sub = route === 'wiki' ? '' : route.slice('wiki/'.length)
   const parsed = parseWikiRoute(sub)
   switch (parsed.kind) {
     case 'home':
-      return { slug: HOME_SLUG, kind: 'view' }
+      /*
+       * ★ 主页批（2026-09-18）：`#/wiki` 落点是**哪一篇**由站点设置决定，不再是编译期常量
+       * （调用方传 `homePageSlug(home)`，见 `lib/homePlan.ts`）。
+       *
+       * `null` 有两种来源，都**不能**回落成约定 slug `home`：
+       *   · 结论还没到（设置请求在途/失败）⇒ 猜一个 slug 等于告诉模型"当前页是 X"，
+       *     而 X 可能根本不对 —— 那正是本文件头注里点名要避免的"安静的错"；
+       *   · 设置了，但当前主体读不到 ⇒ 更不能用别的 slug 顶上（用户看的是"主页不可访问"，
+       *     不是那一篇约定主页）。
+       * 没有当前页是**诚实**的答案，插件的正确反应是"不回答关于当前页的问题"。
+       */
+      return homeSlug === null ? null : { slug: homeSlug, kind: 'view' }
     case 'detail':
     case 'edit': {
       /*

@@ -80,8 +80,8 @@ pnpm test        # 汇总打印 # tests / # pass / # fail
 pnpm typecheck   # 输出 error TS 计数
 ```
 
-**当前实测**：`pnpm test` **2241 例 / 26 个包 / 0 失败**；`pnpm typecheck` **0 个 `error TS`**。
-读数会随提交变化，**引用时请同时给出取数时刻与 HEAD**。
+**读数以实时输出为准**：上面两条命令会分别汇总 `# tests` / `# pass` / `# fail` 与 `error TS` 计数，
+README 不固化具体数字；读数随提交变化，**引用时请同时给出取数时刻与 HEAD**。
 
 ## 配置
 
@@ -179,18 +179,16 @@ curl -s -X POST "$BASE/api/llm/test" -H 'content-type: application/json' \
 **默认不启用**，且切换是**冷操作**（两者都声明 `supportsHotReload: false`，须改
 `config/plugins.base.json` 后重启）。
 
-> ⚠️ **切换到 PostgreSQL 后全文检索不可用**：`@geewiki/search` 依赖 SQLite 专有的 FTS5，
+> **切换到 PostgreSQL 后全文检索不可用**：`@geewiki/search` 依赖 SQLite 专有的 FTS5，
 > 它会显式拒绝而不是静默退化。
 
 切换步骤、Compose `production` profile 与两条必须知道的边界见 [docs/deployment.md](docs/deployment.md)。
 
-**验证状态**：PostgreSQL 适配已完成过一次**真实 PG 15 端到端验证** —— `db-postgres` 的 13 个迁移
-全部应用、迁移失败 0、插件 20 active / 0 error，`setup` 201 → `login` 200 → 建页 200 → 读回正文
-逐字一致 → `psql` 落库确认。该过程抓出并修掉了三个"在 SQLite 上全绿、在 PG 上必炸"的真缺陷，
-并留下两条类级守卫随 `pnpm test` 一起运行：`packages/manager/test/migrations-dialect.test.ts`
+**验证状态**：PostgreSQL 适配已通过**真实 PG 15 端到端验证**（该读数未入库为可复跑资产，要回归请按实跑取数）；
+完整读数与当时抓出的缺陷见 [docs/deployment.md](docs/deployment.md) 的 PostgreSQL 端到端验证记录。
+另有两条类级守卫随 `pnpm test` 一起运行：`packages/manager/test/migrations-dialect.test.ts`
 （用了 SQLite 专有语法的迁移目录必须配 `migrations-postgres/`）与
 `packages/manager/test/db-dual-track.test.ts`（凡在代码里取 `ctx.get('db')` 的文件必须出现 `asAsync`）。
-该次读数**未入库为可复跑资产**——要回归请按实跑取数。
 
 ## 插件平台
 
@@ -314,8 +312,13 @@ pnpm run new:plugin foo  # 生成插件脚手架
   `#/plugins` 插件管理（旧链接 `#/graph` 仍可用，解析时改写为 `#/plugins`，两者是同一页）·
   `#/org` 组织管理 · `#/audit` 审计与运维（由 `@geewiki/ops` 声明）· `#/account` · `#/invite/<token>` ·
   `#/login` · `#/setup` · `#/denied`。
-- **`#/wiki` 的主页是一篇约定 slug 为 `home` 的普通文章**：可编辑、有版本历史，与其它页面一样受
-  既有权限体系管辖。⚠️ 升级提示：若库里已存在 slug 为 `home` 的页面，它会直接成为站点主页。
+- **`#/wiki` 的主页是一篇普通文章**：可编辑、有版本历史，与其它页面一样受既有权限体系管辖。
+  **默认落点是约定 slug 为 `home` 的那一篇**（库里没有它就给出「创建主页」引导）；
+  站点管理员可以在**「全部页面」**里把任意一篇**设为主页**（那一行会挂上「主页」徽标，
+  旁边另有「恢复默认」把落点退回约定 slug）。设置本身是一条站点级记录，不影响任何页面的可见性：
+  主页若只对特定范围开放，读不到它的人会看到「主页当前不可访问」，而**不会**被悄悄换去另一篇。
+  接口：`GET /api/site/home`（公开，返回 `unset` / `visible` / `hidden` 三态）、
+  `POST /api/site/home`（站点管理员，`{slug}` 设置，`{slug:null}` 恢复默认）。
 - **保留段**：`WIKI_RESERVED_FIRST_SEGMENTS = ['search', 'ask', 'new', 'list']`——这些名字不能作为
   页面 slug 的首段。（`ask` 已不再被路由解析，但保留，因为解禁是单向不可回收的。）
 - **验收脚本**在 `scripts/acceptance/`，零依赖直连 Chrome DevTools Protocol，刻意不纳入 `pnpm test`。

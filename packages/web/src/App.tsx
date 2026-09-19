@@ -28,6 +28,8 @@ import { SystemStatusDialog } from './components/SystemStatusDialog'
 import { MAIN_CONTENT_ID } from './lib/domIds'
 import { hashQueryOf, stripHashQuery } from './lib/hashAnchor'
 import { recordRecentPage, visitedSlugFromSub } from './lib/commandPlan'
+import { homePageSlug } from './lib/homePlan'
+import { useHome } from './lib/homeStore'
 import { titleForRoute } from './lib/pageMeta'
 import { visibleDests, pluginNavDests, type NavDest } from './lib/navPlan'
 import { pluginUiRoutes, subscribePluginUiState } from './lib/pluginUi'
@@ -385,13 +387,21 @@ export function App(): ReactNode {
   /**
    * 记录"最近访问"。只在**详情页**记（`visitedSlugFromSub` 用 `parseWikiRoute` 判断，
    * 保留段与 `/edit` 后缀都不算），这样"最近访问"里不会混进列表页/检索页/编辑页。
+   *
+   * ★ 主页批：`#/wiki`（`wikiSub === ''`）记的是**站点设置的那一篇**，不再是常量 `home`，
+   * 因此要把主页设置读进来（与 `WikiPage` 的落点、`AppDock` 的"当前页"共用同一份缓存）。
+   * 它在依赖数组里：设置取回来之后这次记录才会落到正确的 slug 上（取回来之前
+   * `homePageSlug()` 返回 null，`visitedSlugFromSub` 返回 null，**不记**——
+   * 往"最近访问"里写一个猜出来的 slug，点开必然不是用户看到的那一篇）。
    */
+  const home = useHome()
   const wikiSub = route === 'wiki' ? '' : route.startsWith('wiki/') ? route.slice('wiki/'.length) : null
+  const homeSlug = homePageSlug(home.home)
   useEffect(() => {
     if (wikiSub === null) return
-    const slug = visitedSlugFromSub(wikiSub)
+    const slug = visitedSlugFromSub(wikiSub, homeSlug)
     if (slug !== null) recordRecentPage(slug)
-  }, [wikiSub])
+  }, [wikiSub, homeSlug])
 
   /**
    * 系统状态对话框的开关。提升到这里（而非让 DialogTrigger 包住菜单项）是为了
