@@ -611,6 +611,56 @@
   opacity: 0.8;
 }
 
+/*
+ * ---------- 思考过程（默认折叠） ----------
+ *
+ * 折起来是刻意的：推理型模型的思考常比答案长几倍，摊开会把结论挤出屏幕。
+ * 折叠行复用工具的样式语言（同样的 13px 灰字 + 同一个 chevron 类），
+ * 让"过程信息"在这块界面上长得一样——三种不同的折叠样子只会让人猜哪个能点。
+ */
+
+.gw-dock-think {
+  margin: 0;
+}
+
+.gw-dock-think-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-muted);
+  text-align: left;
+  cursor: pointer;
+}
+
+.gw-dock-think-toggle:hover {
+  color: var(--color-ink);
+}
+
+/*
+ * 展开后的思考正文。**限高 + 内部滚动**：思考正文常常几千字，
+ * 不限高的话展开一次就把正在写的回答推到看不见的地方——
+ * 而用户展开它多半是想"边看它想边等答案"。
+ */
+.gw-dock-think-body {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--color-line-strong);
+  border-radius: 8px;
+  background: var(--color-sunken);
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-muted);
+}
+
 .gw-dock-empty,
 .gw-dock-thinking {
   opacity: 0.6;

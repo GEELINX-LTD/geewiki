@@ -142,6 +142,18 @@ export type LlmChunk =
     }
   | { readonly type: 'text-delta'; readonly text: string }
   /**
+   * 推理型模型的**思考内容**增量（DeepSeek 的 `reasoning_content`、部分网关的 `reasoning`）。
+   *
+   * 为什么**不复用 `text-delta`**：思考与正文是两种东西，混成一条流会同时坏两处——
+   * ① **历史**：正文要进 `LlmMessage[]` 回传给上游，思考**不该**进（多数网关拒收带
+   * `reasoning_content` 的 assistant 消息，个别会把上一轮的思考当成新指令）；
+   * ② **界面**：思考要折起来、正文要摊开，一条流里分不出种类就只能二选一。
+   *
+   * 消费者**可以完全忽略它**（不做这个分支就是忽略）：它只决定"看不看得见思考"，
+   * 不影响任何一轮对话的正确性。
+   */
+  | { readonly type: 'reasoning-delta'; readonly text: string }
+  /**
    * 工具调用的一个流式片段。**消费者必须自己累加**（与 `text-delta` 对称），
    * 拼装请用 {@link assembleToolCalls}——不要在各插件里各写一遍。
    *

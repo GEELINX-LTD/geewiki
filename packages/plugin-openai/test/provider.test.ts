@@ -158,6 +158,14 @@ function frame(content: string): string {
   return `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`
 }
 
+/**
+ * 一帧**思考内容**增量。字段名由调用方给（各家不一：DeepSeek 是 `reasoning_content`，
+ * 另一些网关只叫 `reasoning`），值可以是 null（流式中间帧的常态）。
+ */
+function reasoningFrame(key: string, value: unknown): string {
+  return `data: ${JSON.stringify({ choices: [{ delta: { [key]: value } }] })}\n\n`
+}
+
 const DONE = 'data: [DONE]\n\n'
 
 /* ------------------------------ 用例 ------------------------------ */
@@ -222,6 +230,40 @@ test('正常流式：status → 多个 text-delta（与上游帧一一对应）�
     assert.equal(sent['stream'], true)
     assert.equal(sent['model'], 'test-model')
     assert.deepEqual(sent['stream_options'], { include_usage: true })
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('★ 思考内容：reasoning_content 产出 reasoning-delta，且在正文之前（两类字段名都认）', async () => {
+  const name = freshEnvName()
+  const mock = await startMock({
+    frames: [
+      reasoningFrame('reasoning_content', '先看第一段。'),
+      reasoningFrame('reasoning_content', '再看第二段。'),
+      // 中间帧的常态：字段在、值是 null（不是"空思考"，是"这一段没有思考"）
+      reasoningFrame('reasoning_content', null),
+      reasoningFrame('reasoning', '这是别名写法。'),
+      frame('正式答案。'),
+      DONE,
+    ],
+  })
+  process.env[name] = 'sk-test-1234567890'
+  try {
+    const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
+    // 顺序是**先思考后正文**（界面据此"先看到它想什么、再看到答案"），空帧不产生 chunk
+    assert.deepEqual(
+      chunks.map((c) => `${c.type}:${'text' in c ? c.text : ''}`),
+      [
+        'status:',
+        'reasoning-delta:先看第一段。',
+        'reasoning-delta:再看第二段。',
+        'reasoning-delta:这是别名写法。',
+        'text-delta:正式答案。',
+        'done:',
+      ],
+    )
   } finally {
     delete process.env[name]
     await mock.close()

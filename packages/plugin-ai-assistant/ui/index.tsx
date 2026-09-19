@@ -193,9 +193,9 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
    * 用**几个数字拼成的一个原始值**当依赖，而不是把 `state` 整个放进依赖数组：
    * `state` 每帧都是新对象，放进去等于"每帧都滚一次"（流式期间每来一个字就滚，白干且抖）。
    * 这几个量恰好覆盖了对话区高度会变的全部来源（追加消息、正文变长、工具活动行出现、
-   * 回退区块出现、思考中提示出现/消失）。
+   * 回退区块出现、思考中提示出现/消失、**思考块出现与展开**）。
    */
-  const threadKey = `${state.messages.length}:${state.answer.length}:${state.activities.length}:${journal.length}:${state.streaming ? 1 : 0}:${state.error?.code ?? ''}`
+  const threadKey = `${state.messages.length}:${state.answer.length}:${state.thinking.length}:${state.activities.length}:${journal.length}:${state.streaming ? 1 : 0}:${state.error?.code ?? ''}`
 
   /*
    * 自动置底。三件事必须同时成立才对：
@@ -760,7 +760,12 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
                 </p>
               )}
               {renderThread(state)}
-              {state.streaming && state.answer === '' && state.activities.length === 0 && (
+              {/*
+                占位提示只在"**什么都还没到**"时出现（一个字节的思考都还没收到）。
+                一旦思考开始流入，那句话已经由 `ThinkingRun` 的摘要行负责
+                （"正在思考…（N 字）"）——两处同时显示就是两句一样的字。
+              */}
+              {state.streaming && state.answer === '' && state.activities.length === 0 && state.thinking === '' && (
                 <p className="gw-dock-thinking">正在思考…</p>
               )}
               {state.partial && state.finishReason === 'rounds' && (
@@ -1025,6 +1030,58 @@ function ToolRun({
   )
 }
 
+/**
+ * 模型的思考过程：**一行摘要 + 按需展开**（默认收起）。
+ *
+ * 为什么默认收起（用户原话："把模型思考过程放进去，当然要折叠起来"）：
+ * 推理型模型的思考常常比答案本身长好几倍，摊开来会把真正的回答挤出屏幕——
+ * 那时用户要读的结论在下面，得先滑过一大段草稿。收成一行，需要复盘时再点开。
+ *
+ * 与上面 `ToolRun` 有意**不同的一点**：工具行在流式期间自动展开（那是在"等结果"，
+ * 让用户看见在干什么），思考行**流式期间也保持收起**，只在摘要上标"正在思考…"。
+ * 理由是两者体量差着一个数量级：工具的展开是三五行，思考的展开是几千字。
+ *
+ * 展开状态**由用户自己掌控**（不在流式结束时自动收起）：用户点开就是想看着它想，
+ * 读完一半被折叠回去比不展开更烦人。
+ */
+function ThinkingRun({
+  text,
+  streaming,
+}: {
+  text: string
+  streaming: boolean
+}): ReactNode {
+  const [expanded, setExpanded] = useState(false)
+  if (text === '') return null
+  // 字符数按**原始长度**报（不做词数估算）：它只用来说明"这段有多长"，不参与任何判定
+  const label = streaming ? `正在思考…（${text.length} 字）` : `思考过程（${text.length} 字）`
+  return (
+    <div className="gw-dock-think">
+      <button
+        type="button"
+        className="gw-dock-think-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span
+          className={`gw-dock-tools-chevron${expanded ? ' gw-dock-tools-chevron-open' : ''}`}
+          aria-hidden="true"
+        >
+          <ChevronIcon />
+        </span>
+        {label}
+      </button>
+      {expanded && (
+        // 纯文本（与流式正文同一个 `Body`）：思考里全是 markdown 符号和缩进，
+        // 按 markdown 渲染会把"它只是在列提纲"错读成排版好的回答。
+        <div className="gw-dock-think-body">
+          <Body text={text} rich={false} />
+        </div>
+      )}
+    </div>
+  )
+}
+
 function renderThread(state: DockState): ReactNode {
   const nodes: ReactNode[] = []
   /*
@@ -1086,6 +1143,13 @@ function renderThread(state: DockState): ReactNode {
    */
   if (state.activities.length > 0) {
     nodes.push(<ToolRun activities={state.activities} streaming={state.streaming} key="activities" />)
+  }
+  /*
+   * 思考过程摆在**工具活动之后、正文之前**：它和工具活动一样是"过程"，
+   * 而正文是"结果"。顺序上它对应用户实际看到的时序（先想、再查、再答）。
+   */
+  if (state.thinking !== '') {
+    nodes.push(<ThinkingRun text={state.thinking} streaming={state.streaming} key="thinking" />)
   }
   // 正在累积的正文：**纯文本**（半截 markdown 渲染会抖动，见文件头第 3 条）
   if (state.answer !== '' && state.streaming) {

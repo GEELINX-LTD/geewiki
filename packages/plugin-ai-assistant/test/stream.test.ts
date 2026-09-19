@@ -122,6 +122,8 @@ function makeTestRouter(opts: { principal: Principal }): TestRouter {
 type Script = readonly ScriptRound[]
 interface ScriptRound {
   readonly text?: string
+  /** 推理型模型的思考内容（先于 `text` 产出，与真实上游同序） */
+  readonly reasoning?: string
   readonly calls?: readonly { id: string; name: string; arguments: string }[]
   /** 收到请求后挂住不返回（用来测并发上限与断连取消） */
   readonly hang?: boolean
@@ -156,6 +158,9 @@ function scriptedProvider(scripts: Script, counter: { calls: number }): LlmProvi
           })
           yield { type: 'error', code: 'ABORTED' }
           return
+        }
+        if (script.reasoning !== undefined && script.reasoning !== '') {
+          yield { type: 'reasoning-delta', text: script.reasoning }
         }
         if (script.text !== undefined && script.text !== '') {
           yield { type: 'text-delta', text: script.text }
@@ -512,6 +517,30 @@ test('★ 正常一回合：帧序列合法（status → delta* → done），�
     assert.equal(done.partial, false)
     assert.equal(done.rounds, 1)
     assert.deepEqual(done.messages.map((m) => m.role), ['user', 'assistant'])
+  } finally {
+    await h.close()
+  }
+})
+
+test('★ 思考帧：thinking 在 delta 之前，且不进 done.messages（老界面按未知帧静默忽略）', async () => {
+  const h = await makeHarness({ script: [{ reasoning: '先想一下……', text: '答案。' }] })
+  try {
+    const r = await post(h.port, TURN_PATH, { messages, round: 0 })
+    const frames = parseFrames(r.text)
+    // thinking 是**中间帧**：平台的序列不变量对它不作名字约束（这正是它不必进 core 的原因）
+    assert.equal(validateFrameSequence(frames), null)
+    assert.deepEqual(frames.map((f) => f.event), ['status', 'thinking', 'delta', 'done'])
+    assert.equal((frames[1]?.data as { text: string }).text, '先想一下……')
+    const done = frames.at(-1)?.data as {
+      answer: string
+      messages: readonly { content: string }[]
+    }
+    assert.equal(done.answer, '答案。')
+    assert.equal(
+      done.messages.some((m) => m.content.includes('先想一下')),
+      false,
+      '思考内容不得进 done.messages（那份转录会被原样回传给上游）',
+    )
   } finally {
     await h.close()
   }

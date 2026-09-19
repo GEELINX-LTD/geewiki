@@ -27,6 +27,8 @@ const principal: Principal = {
 
 interface RoundScript {
   readonly text?: string
+  /** 推理型模型的思考内容（先于 `text` 产出，与真实上游同序） */
+  readonly reasoning?: string
   readonly calls?: readonly { id: string; name: string; arguments: string }[]
   readonly finishReason?: string
   readonly errorCode?: LlmErrorCode
@@ -55,6 +57,10 @@ function scriptedLlm(scripts: readonly RoundScript[]): ScriptedLlm {
       round++
       return (async function* generate(): AsyncGenerator<LlmChunk> {
         yield { type: 'status', provider: 'fake', model: 'fake-model' }
+        // 思考**先于正文**（与真实推理型上游同序：先 reasoning_content 再 content）
+        if (script.reasoning !== undefined && script.reasoning !== '') {
+          yield { type: 'reasoning-delta', text: script.reasoning }
+        }
         if (script.text !== undefined && script.text !== '') {
           yield { type: 'text-delta', text: script.text }
         }
@@ -161,6 +167,29 @@ test('一轮答完：answer 与转录正确，rounds=1，无 pending', async () 
     ['user', 'assistant'],
   )
   assertPairing(outcome.messages, '一轮答完')
+})
+
+test('★ 思考内容只往外发：不进 answer、不进转录、也不出现在回传给上游的请求里', async () => {
+  const thinking = '先看看知识库里有没有相关页面……'
+  const { svc, requests } = scriptedLlm([{ reasoning: thinking, text: '答案是 A。' }])
+  const { outcome, events } = await run(opts({ llm: svc }))
+  // ① 它是一条**独立的** `reasoning` 事件（界面据此折叠渲染，不与正文混流）
+  assert.deepEqual(
+    events.filter((e) => e.type === 'reasoning').map((e) => (e.type === 'reasoning' ? e.text : '')),
+    [thinking],
+  )
+  // ② 它不是回答
+  assert.equal(outcome.answer, '答案是 A。')
+  const assistant = outcome.messages.filter((m) => m.role === 'assistant')
+  assert.equal(assistant.length, 1)
+  assert.equal(assistant[0]?.content, '答案是 A。')
+  // ③ 也不进转录：多轮时转录会整份回传给上游，带上思考内容会被网关拒收/当成新指令
+  assert.equal(
+    outcome.messages.some((m) => m.content.includes(thinking)),
+    false,
+    '思考内容不得进入转录（它是给人看的，不是给模型的）',
+  )
+  assert.equal(JSON.stringify(requests).includes(thinking), false, '请求里也不该出现思考内容')
 })
 
 test('没有工具时，请求体里**不出现** tools 键（沿用 P0 的口径：不填 ≠ 发空数组）', async () => {

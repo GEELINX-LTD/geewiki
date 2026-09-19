@@ -46,6 +46,17 @@ export interface DockState {
   readonly streaming: boolean
   /** 本轮累积的正文（流式期间是纯文本，结束才交给 markdown 渲染） */
   readonly answer: string
+  /**
+   * 本轮累积的**思考内容**（推理型模型才有；不思考的模型恒为空串）。
+   *
+   * 与 `answer` 并列而不是塞进 `answer` 的一个字段里：它俩的生命周期不同——
+   * `answer` 会被 `done.messages` 覆盖成权威版本，而思考**没有权威版本**
+   * （服务端不把它放进 `messages`），只能靠流式增量自己攒。
+   *
+   * **不落盘**（不进 `DockConversation`）：思考是过程，刷新后重看一条已经读完的回答
+   * 不需要它的思考过程；而真要留，那会是每个会话几 KB 的纯增量文本。
+   */
+  readonly thinking: string
   /** 本轮交给模型的工具名（来自 status 帧） */
   readonly tools: readonly string[]
   /** 本轮的工具活动（按 id 归并，起止两条帧合一条记录） */
@@ -139,6 +150,7 @@ export function initialDockState(): DockState {
     messages: [],
     streaming: false,
     answer: '',
+    thinking: '',
     tools: [],
     activities: [],
     error: null,
@@ -228,6 +240,8 @@ export function withUserMessage(state: DockState, text: string): DockState {
     messages: [...state.messages, { role: 'user', content: text }],
     streaming: true,
     answer: '',
+    // 新提问 ⇒ 上一问的思考清掉（否则第二问会带着第一问的思考内容显示，像是模型在想这件事）
+    thinking: '',
     activities: [],
     error: null,
     finishReason: null,
@@ -273,6 +287,13 @@ export function applyTurnEvent(state: DockState, ev: TurnEvent): DockState {
       }
     case 'delta':
       return { ...state, answer: state.answer + ev.data.text }
+    /*
+     * 思考**按增量累加**，且 `status` 帧**刻意不清它**：一次提问可能跨多个 HTTP 回合
+     * （客户端工具跑完再发一轮），每一轮都以 `status` 开头——在那里清空会把第一轮的
+     * 思考整段抹掉。清空只发生在"新的提问"（`withUserMessage`），那才是它的边界。
+     */
+    case 'thinking':
+      return { ...state, thinking: state.thinking + ev.data.text }
     case 'tool':
       return { ...state, activities: upsertActivity(state.activities, ev.data) }
     case 'done': {

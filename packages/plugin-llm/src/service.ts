@@ -164,6 +164,10 @@ function sanitizeNonTerminal(chunk: LlmChunk): LlmChunk | undefined {
   // ★ 工具片段必须显式放行：下面那句 `return undefined` 会把"契约外类型"丢掉。
   //   少写这一行不会报错、不会有测试变红，只会让工具调用**静默地一个都收不到**。
   if (chunk.type === 'tool-call-delta') return chunk
+  // 思考内容同样必须**显式**放行（白名单的代价就在这几行）：漏掉它不会报错，
+  // 只会让"模型明明在思考、界面一个字都不显示"——一个看不出坏在哪的降级。
+  // 它不含密钥风险（是模型自己产的内容），故原样透传，与 text-delta 同待遇。
+  if (chunk.type === 'reasoning-delta') return chunk
   return undefined // done/error 不会走到这里（调用方先判终止）；其它类型属契约外
 }
 
