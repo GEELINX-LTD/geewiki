@@ -13,7 +13,7 @@
 | **5 分钟跑起来** | [../README.md](../README.md) 的「快速开始」 |
 | 知道**现在有哪些能力**、到什么程度 | [roadmap.md](roadmap.md) |
 | 知道系统**长什么样** | [architecture.md](architecture.md) |
-| 知道平台**还有哪些限制**、哪些是**有意不做**的 | [plugin-platform.md](plugin-platform.md) 的「已知限制与风险」 |
+| 知道平台**还有哪些限制**、哪些是**有意不做**的 | [plugin-platform.md](plugin-platform.md) 的「当前限制与风险」 |
 | **写一个自己的插件** | [architecture.md](architecture.md) 的 Manifest 规范 + [plugin-platform.md](plugin-platform.md) 的插件接口契约；脚手架跑 `pnpm run new:plugin <名字>` |
 | **部署到服务器** | [deployment.md](deployment.md) |
 | 知道**备份 / 恢复**怎么做 | [deployment.md](deployment.md)；命令是 `pnpm run backup` / `pnpm run restore` |
@@ -37,8 +37,8 @@ docs/
 ├── development.md            工程约定：环境约束、迁移约定、方言差异、验收纪律
 ├── roadmap.md                路线图：已完成、接下来做什么、有意不做
 ├── design/                   专题设计（决策与契约的定稿）
-│   ├── access-control.md         访问控制与组织管理（v8）
-│   ├── attachments.md            附件能力（v1.1）
+│   ├── access-control.md         访问控制与组织管理
+│   ├── attachments.md            附件能力
 │   └── ai-plugin-architecture.md AI 能力架构：工具总线 + 单入口 + mutation journal
 └── changelog/
     └── implementation-log.md 历史实施台账 —— **不是当前口径**
@@ -58,7 +58,7 @@ docs/
 3. **不要在一行里写一篇文章。** README 里曾有一行**表格单元格**长到约 6900 字节、内含未转义的 `|`，
    于是整行被 Markdown 解析成 5 列、出现在一张 2 列表格里 —— **它本来就是坏的**，不只是"太长"。
 
-4. **不要用「修正（本批）」块打补丁。** 本仓库一度流行在旧段落后面追加修正块，
+4. **不要用「修正」块打补丁。** 本仓库一度流行在旧段落后面追加修正块，
    结果是同一节里正确与错误并存、读者无法判断哪句算数。**正文直接写当前事实**，历史折到文末或进 `changelog/`。
 
 5. **具体读数必须给出取数方式**（命令 + HEAD + 时刻），否则它会过时且不可复核。
