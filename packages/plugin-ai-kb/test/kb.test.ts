@@ -89,6 +89,12 @@ function wikiStub(pages: Record<string, { title: string; content: string }>): {
     // 导航批（2026-09-16）：侧栏隐藏与同层排序。同样不调，但全量替身要诚实实现
     setNavHidden: async (slug, hidden) => Object.prototype.hasOwnProperty.call(pages, slug) && hidden !== undefined,
     setNavOrder: async (_parent, slugs) => slugs.length,
+    /*
+     * 主页批（2026-09-18）：站点主页设置。本测试不调它们，但全量替身就得诚实实现 ——
+     * 替身里"从未设置过主页"（`homeSlug` 回 null），正是升级上来的老站点的形态。
+     */
+    homeSlug: async () => null,
+    setHomeSlug: async (slug) => slug === null || Object.prototype.hasOwnProperty.call(pages, slug),
   }
   return { svc, listCalls, getCalls }
 }

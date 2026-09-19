@@ -21,6 +21,8 @@
  */
 import { useEffect, useMemo, type ReactNode } from 'react'
 import { pageContextOf } from '../lib/dockPlan'
+import { homePageSlug } from '../lib/homePlan'
+import { useHome } from '../lib/homeStore'
 import { registerNavTools } from '../lib/navTools'
 import { ensureSlotLoaded } from '../lib/pluginUi'
 import { AppDockSlotOutlet } from '../lib/slots'
@@ -77,7 +79,15 @@ export function AppDock(props: AppDockProps): ReactNode {
   }, [loggedIn, props.openPage])
 
   // hooks 必须在任何提前 return 之前调用（React 的调用顺序约束）
-  const page = useMemo(() => pageContextOf(props.route), [props.route])
+  /*
+   * `#/wiki`（`route === 'wiki'`）的"当前页"是**站点设置的那一篇**，不再是编译期常量，
+   * 因此这里订阅同一份设置缓存（与 `WikiPage`、`#/wiki` 的落点同源，见 `lib/homePlan.ts`）。
+   *
+   * 顺带一个副作用是好的：dock 在所有**已登录**页面上常驻，于是这次订阅通常早就把主页
+   * 设置取回来了——用户随后走到 `#/wiki` 时正文不必再等它（见 `homeStore` 头注里的代价说明）。
+   */
+  const home = useHome()
+  const page = useMemo(() => pageContextOf(props.route, homePageSlug(home.home)), [props.route, home.home])
   const clientTools = useClientTools()
 
   if (!loggedIn) return null

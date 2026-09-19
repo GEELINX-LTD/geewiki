@@ -125,44 +125,84 @@ test('保留段清单与后端一致（顺序无关，集合相同）', () => {
  * （`stripHashQuery(hash) !== 'wiki/home'`）判 false ⇒ 不重写 URL；而 `parseWikiRoute` 把
  * `home/` 解析成 `detail + home` ⇒ 组件 `return null`。两者叠加就是"既不重写也不渲染"。
  * 判据收进本文件后，组件不再自己拼字符串，这类漂移没有第二个落点。
+ *
+ * ★ 主页批（2026-09-18）：判据多了一个参数 —— **当前主页实际渲染的那一篇**
+ * （`lib/homePlan.ts` 的 `homePageSlug()`）。下面这一批用例全部按"主页就是约定那一篇"
+ * （`DEFAULT_HOME`，也就是本批之前唯一的形态）运行，行为必须逐条不变；
+ * 文末新增的一批钉住"主页换成别的 slug 之后 `#/wiki/home` 不再是别名"。
  */
+/** 主页就是约定 slug 那一篇 = 从未设置过主页时的形态（本批之前的唯一形态） */
+const DEFAULT_HOME = HOME_SLUG
+/** 主页被管理员设成了另一篇（`home` 因此退化成一篇普通文章） */
+const OTHER_HOME = 'guide/intro'
 test('isWikiHomeAlias：`#/wiki/home/` 尾斜杠也算别名（回归：曾永久空白）', () => {
-  assert.equal(isWikiHomeAlias('#/wiki/home/'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home/', DEFAULT_HOME), true)
   // 多一条尾斜杠同样归一（`parseWikiRoute` 本来就忽略空段）
-  assert.equal(isWikiHomeAlias('#/wiki/home//'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home//', DEFAULT_HOME), true)
 })
 
 test('isWikiHomeAlias：四种写法都算别名（裸 / 尾斜杠 / ?v= / ?a=）', () => {
-  assert.equal(isWikiHomeAlias('#/wiki/home'), true)
-  assert.equal(isWikiHomeAlias('#/wiki/home/'), true)
-  assert.equal(isWikiHomeAlias('#/wiki/home?v=68'), true)
-  assert.equal(isWikiHomeAlias('#/wiki/home?a=usage'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home', DEFAULT_HOME), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home/', DEFAULT_HOME), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home?v=68', DEFAULT_HOME), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home?a=usage', DEFAULT_HOME), true)
   // 空查询串（复制的地址常带一个孤零零的 `?`）同样算
-  assert.equal(isWikiHomeAlias('#/wiki/home?'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home?', DEFAULT_HOME), true)
   // 没有 `#` 前缀的写法也要认（`location.hash` 一定有，但函数不该依赖它）
-  assert.equal(isWikiHomeAlias('wiki/home'), true)
+  assert.equal(isWikiHomeAlias('wiki/home', DEFAULT_HOME), true)
   // 编码过的尾斜杠归一为 `home/`，与上一条同一形态
-  assert.equal(isWikiHomeAlias('#/wiki/home%2F'), true)
+  assert.equal(isWikiHomeAlias('#/wiki/home%2F', DEFAULT_HOME), true)
 })
 
 test('isWikiHomeAlias：规范地址 `#/wiki` **不是**别名（否则会被反复重写）', () => {
   // `#/wiki` 解析为 `{kind:'home'}`，是规范落点；把它当别名会造成自我重写
-  assert.equal(isWikiHomeAlias('#/wiki'), false)
-  assert.equal(isWikiHomeAlias('#/wiki/'), false)
-  assert.equal(isWikiHomeAlias('#/'), false)
-  assert.equal(isWikiHomeAlias(''), false)
+  assert.equal(isWikiHomeAlias('#/wiki', DEFAULT_HOME), false)
+  assert.equal(isWikiHomeAlias('#/wiki/', DEFAULT_HOME), false)
+  assert.equal(isWikiHomeAlias('#/', DEFAULT_HOME), false)
+  assert.equal(isWikiHomeAlias('', DEFAULT_HOME), false)
 })
 
 test('isWikiHomeAlias：只是"名字里带 home"的地址不得被误判（反例）', () => {
-  assert.equal(isWikiHomeAlias('#/wiki/home/edit'), false) // 编辑主页
-  assert.equal(isWikiHomeAlias('#/wiki/homework'), false) // 另一个页面
-  assert.equal(isWikiHomeAlias('#/wiki/guide%2Fhome'), false) // 分层 slug 的第二段
-  assert.equal(isWikiHomeAlias('#/wiki/HOME'), false) // slug 大小写敏感
-  assert.equal(isWikiHomeAlias('#/access/home'), false) // 另一个命名空间
-  assert.equal(isWikiHomeAlias('#/wiki/list'), false)
+  assert.equal(isWikiHomeAlias('#/wiki/home/edit', DEFAULT_HOME), false) // 编辑主页
+  assert.equal(isWikiHomeAlias('#/wiki/homework', DEFAULT_HOME), false) // 另一个页面
+  assert.equal(isWikiHomeAlias('#/wiki/guide%2Fhome', DEFAULT_HOME), false) // 分层 slug 的第二段
+  assert.equal(isWikiHomeAlias('#/wiki/HOME', DEFAULT_HOME), false) // slug 大小写敏感
+  assert.equal(isWikiHomeAlias('#/access/home', DEFAULT_HOME), false) // 另一个命名空间
+  assert.equal(isWikiHomeAlias('#/wiki/list', DEFAULT_HOME), false)
 })
 
 test('isWikiHomeAlias：坏转义不抛错（调用方在 effect 里跑，抛出去就是整页空白）', () => {
-  assert.equal(isWikiHomeAlias('#/wiki/%E0%A4%A'), false)
-  assert.equal(isWikiHomeAlias('#/wiki/home%'), false)
+  assert.equal(isWikiHomeAlias('#/wiki/%E0%A4%A', DEFAULT_HOME), false)
+  assert.equal(isWikiHomeAlias('#/wiki/home%', DEFAULT_HOME), false)
+})
+
+/*
+ * ══════ 本批（主页批）新增：别名判据是"当前主页"的函数 ══════
+ *
+ * 主页可被设成任何一篇之后，`#/wiki/home` 的**含义取决于设置**：
+ *   · 主页是 `home` 那一篇（含未设置）⇒ 它仍是别名，改写成 `#/wiki`（上面那批用例）；
+ *   · 主页是别的 slug ⇒ `home` 只是一篇普通文章，它的地址必须照常打开它。
+ * 后者若漏掉，症状是"一篇真实存在的文章打不开"，而它的链接还对外分享着 ——
+ * 正是本仓反复记档的那类安静错误。
+ */
+test('isWikiHomeAlias：主页换成别的 slug 之后，`#/wiki/home` **不再是**别名', () => {
+  assert.equal(isWikiHomeAlias('#/wiki/home', OTHER_HOME), false)
+  assert.equal(isWikiHomeAlias('#/wiki/home/', OTHER_HOME), false)
+  // 历史快照 / 页内锚点两种形态同样不该被劫持：它们指向的是 `home` 这篇文章的某一版
+  assert.equal(isWikiHomeAlias('#/wiki/home?v=68', OTHER_HOME), false)
+  assert.equal(isWikiHomeAlias('#/wiki/home?a=usage', OTHER_HOME), false)
+})
+
+test('isWikiHomeAlias：主页结论还没到时（null）不改写 —— 猜"默认那一篇"会劫持一篇真实文章', () => {
+  // `homePageSlug()` 对"加载中/上次失败"与"设置了但读不到"都返回 null。
+  // 两种情况都**不能**按约定 slug 猜：前者会把 `home` 文章劫持成主页，
+  // 后者等于把无权者静默送去另一篇文章。宁可这次不改写（地址栏停在别名，内容正确）。
+  assert.equal(isWikiHomeAlias('#/wiki/home', null), false)
+  assert.equal(isWikiHomeAlias('#/wiki/home/', null), false)
+})
+
+test('isWikiHomeAlias：显式把主页设成 `home` 那一篇时，别名照旧成立', () => {
+  // "设置过"与"没设置过"在这一判据上是同一结果 —— 因为落点确实是同一篇，
+  // 别名改写（`#/wiki/home` → `#/wiki`）也就同样成立
+  assert.equal(isWikiHomeAlias('#/wiki/home', HOME_SLUG), true)
 })

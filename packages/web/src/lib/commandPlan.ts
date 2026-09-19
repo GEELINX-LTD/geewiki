@@ -10,7 +10,7 @@
  * 组件（`components/CommandPalette.tsx`）只负责：把数据接进来、把 `run` 挂上去、
  * 渲染与键盘/ARIA 接线。
  */
-import { HOME_SLUG, isUnreachableSlug, parseWikiRoute } from './wikiRoute'
+import { isUnreachableSlug, parseWikiRoute } from './wikiRoute'
 
 /** 分组 id（顺序即展示顺序的语义，具体顺序由 {@link buildPaletteGroups} 决定） */
 export type PaletteGroupId = 'recent' | 'page' | 'action'
@@ -223,12 +223,16 @@ export function moveIndex(current: number, delta: number, total: number): number
  * 与 `/edit` 后缀的语义只该有一处定义，否则迟早与路由解析漂移
  * （`lib/wikiRoute.ts` 的注释记录了这类漂移已经造成过一次真缺陷）。
  *
- * **主页也算一次页面访问**（`kind === 'home'` ⇒ 约定 slug `home`）：它就是一篇文章，
+ * **主页也算一次页面访问**（`kind === 'home'` ⇒ 当前主页那一篇，由调用方传入）：它就是一篇文章，
  * 而且是默认落点 —— 不记的话，"最近访问"里永远不会出现用户最常到的那个页面。
+ *
+ * ★ 主页批（2026-09-18）：主页是哪一篇不再由本文件假定，而是**入参**（`homeSlug`）。
+ * `homeSlug === null`（结论未到 / 设置了但当前主体读不到）时返回 `null`：
+ * "最近访问"里记一个猜出来的 slug，比不记更糟——那一条点开必然不是用户看到的那一篇。
  */
-export function visitedSlugFromSub(sub: string): string | null {
+export function visitedSlugFromSub(sub: string, homeSlug: string | null): string | null {
   const route = parseWikiRoute(sub)
-  if (route.kind === 'home') return HOME_SLUG
+  if (route.kind === 'home') return homeSlug
   if (route.kind !== 'detail') return null
   /*
    * 保留段开头的 slug 结构上不可能存在（后端拒建），不该进"最近访问"。

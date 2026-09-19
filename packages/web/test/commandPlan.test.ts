@@ -231,19 +231,34 @@ test('moveIndex：环绕、未选中时的惯例、空列表', () => {
 /* ------------------------------ 路由 → 访问记录 ------------------------------ */
 
 test('visitedSlugFromSub：详情页与主页算"页面访问"，其余都不算', () => {
-  assert.equal(visitedSlugFromSub('guide/intro'), 'guide/intro')
-  assert.equal(visitedSlugFromSub('standalone'), 'standalone')
+  assert.equal(visitedSlugFromSub('guide/intro', HOME_SLUG), 'guide/intro')
+  assert.equal(visitedSlugFromSub('standalone', HOME_SLUG), 'standalone')
   /*
    * 空子路径 = 主页（`parseWikiRoute` 的 `kind: 'home'`），它**是一篇文章**：
-   * 记成约定 slug `home`，"最近访问"里才会出现用户最常到的那个页面。
+   * 记成当前主页的 slug，"最近访问"里才会出现用户最常到的那个页面。
    * （这条断言此前写的是「列表页不算」并期望 null —— 那是"空路由=列表"时代的语义。）
    */
-  assert.equal(visitedSlugFromSub(''), HOME_SLUG, '主页算一次页面访问')
-  assert.equal(visitedSlugFromSub('list'), null, '列表页不算')
-  assert.equal(visitedSlugFromSub('new'), null, '新建页不算')
-  assert.equal(visitedSlugFromSub('search/关键词'), null, '检索页不算')
-  assert.equal(visitedSlugFromSub('ask/问题'), null)
-  assert.equal(visitedSlugFromSub('guide/intro/edit'), null, '编辑页不算')
+  assert.equal(visitedSlugFromSub('', HOME_SLUG), HOME_SLUG, '主页算一次页面访问')
+  assert.equal(visitedSlugFromSub('list', HOME_SLUG), null, '列表页不算')
+  assert.equal(visitedSlugFromSub('new', HOME_SLUG), null, '新建页不算')
+  assert.equal(visitedSlugFromSub('search/关键词', HOME_SLUG), null, '检索页不算')
+  assert.equal(visitedSlugFromSub('ask/问题', HOME_SLUG), null)
+  assert.equal(visitedSlugFromSub('guide/intro/edit', HOME_SLUG), null, '编辑页不算')
+})
+
+test('visitedSlugFromSub：主页 slug 由调用方给定（主页批），结论未到时**不记**', () => {
+  /*
+   * 主页可被设为任何一篇，"最近访问"要记的是**实际渲染的那一篇**。
+   * 记成常量 `home` 的症状很安静：最近访问里多一条点开不是主页的条目。
+   */
+  assert.equal(visitedSlugFromSub('', 'guide/intro'), 'guide/intro')
+  /*
+   * `null` = 主页结论还没到，或者主页被设置成一篇当前主体读不到的页面。
+   * 两种都不许猜一个 slug 记进去 —— 那一条点开必然不是用户看到的那一篇（与 dockPlan 同一条纪律）。
+   */
+  assert.equal(visitedSlugFromSub('', null), null)
+  // 详情页与这个入参无关：它自带 slug
+  assert.equal(visitedSlugFromSub('guide/intro', null), 'guide/intro')
 })
 
 /* ------------------------------ 最近访问存储 ------------------------------ */

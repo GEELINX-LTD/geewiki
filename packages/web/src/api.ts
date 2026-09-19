@@ -463,6 +463,22 @@ export interface NavOrderGroup {
 }
 
 /**
+ * 站点主页的**三态**（`GET /api/site/home`）。
+ *
+ * ⚠️ 刻意不是 `slug: string | null`：`unset`（本站没设置过主页 ⇒ 落点是约定 slug `home`）
+ * 与 `hidden`（设置了，但**当前主体读不到**）对用户的含义完全不同。并成一个 `null`
+ * 会让无权者被静默送去**另一篇文章**（约定主页，或者干脆 404）——
+ * "看起来打开了、其实换了东西"正是本仓反复记档的那类缺陷（见 `lib/dockPlan.ts`）。
+ *
+ * `hidden` 态**没有 `slug` 字段**，这也是刻意的：一个主体看不见的页面，其标识不该
+ * 从"站点设置"这条侧路漏出去（与读路径"不存在与无权同报 404"同一口径）。
+ */
+export type SiteHome =
+  | { ok: true; state: 'unset' }
+  | { ok: true; state: 'visible'; slug: string }
+  | { ok: true; state: 'hidden' }
+
+/**
  * 版本元数据（详情端点内嵌的 `versions[]`：最近 N 条，按 id 降序）。
  *
  * ★ 三个字段的语义（后端 0019 起全量下发）：
@@ -1021,6 +1037,24 @@ export const api = {
       '/api/pages/order',
       { parent, items },
     ),
+  /**
+   * 站点主页指向哪一篇（三态：未设置 / 可读 / 不可读）。
+   *
+   * **公开端点**：主页是所有访客的落点，匿名也必须能知道该渲染哪一篇。
+   * 可见性由服务端逐请求判定（策略层的唯一出口），前端只消费结论 ——
+   * 不拿本地页面列表去反推（那份列表只含"我看得见"的页，反推不出"设置了但你看不见"）。
+   */
+  siteHome: () => request<SiteHome>('GET', '/api/site/home'),
+  /**
+   * 把某一篇设为站点主页；`slug: null` = **清除设置**（主页回落约定 slug `home`）。
+   *
+   * 门是**站点管理员**（后端 `access: 'admin'`），刻意比旁边那两条导航控件
+   * （隐藏 / 排序，只要对该页 `canEdit`）严一档：那两者改的是导航列表里的呈现，
+   * 而主页是所有访客（含匿名）打开本站看到的第一屏。前端只是**不显示**注定 403 的按钮，
+   * 判定真源仍在服务端（被拒时把服务端的消息显示在行内，不假装成功）。
+   */
+  setSiteHome: (slug: string | null) =>
+    request<{ ok: true; slug: string | null }>('POST', '/api/site/home', { slug }),
   version: (slug: string, id: number) =>
     request<{ ok: true; id: number; content: string; saved_at: string }>(
       'GET',
