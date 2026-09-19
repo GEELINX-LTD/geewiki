@@ -7,6 +7,7 @@ import type { CapabilitySet, PageVisibility } from '@geewiki/core/domain'
 import { ATTACHMENT_URL_PREFIX } from './lib/attachmentPlan'
 import { authFailureAction, type AuthFailureAction } from './lib/authFailure'
 import type { SlotName } from './lib/slots'
+import type { SearchQueryMode } from './lib/searchPlan'
 
 export interface ApiFailure {
   ok: false
@@ -1113,10 +1114,16 @@ export const api = {
     request<OutLinksResponse>('GET', `/api/pages/${encodeURIComponent(slug)}/links`),
 
   /* 全文检索（检索插件未启用时这个端点会 404，调用方须优雅降级） */
-  search: (q: string, limit?: number) =>
+  /**
+   * `opts.mode` 是**查询语义**（`SearchQueryMode`，与响应里的 `SearchMode` 不是一回事）：
+   * `phrase` = 整串连续短语，`terms` = 词元 OR 宽召回。**显式传**而不是省略——省略虽然等价于
+   * `phrase`（后端缺省），但显式传让"这一轮是怎么问的"在 Network 面板里一眼可见，排障时
+   * 不必回头读前端代码。缺省语义仍归后端定义，这里不复制那条规则。
+   */
+  search: (q: string, opts: { limit?: number; mode?: SearchQueryMode } = {}) =>
     request<SearchResponse>(
       'GET',
-      `/api/search?q=${encodeURIComponent(q)}${limit === undefined ? '' : `&limit=${encodeURIComponent(String(limit))}`}`,
+      `/api/search?q=${encodeURIComponent(q)}${opts.limit === undefined ? '' : `&limit=${encodeURIComponent(String(opts.limit))}`}${opts.mode === undefined ? '' : `&mode=${opts.mode}`}`,
     ),
   /* 服务健康：「系统状态」面板用产品化方式呈现，不再把裸 JSON 端点做成头部链接 */
   health: () => request<HealthResponse>('GET', '/api/health'),

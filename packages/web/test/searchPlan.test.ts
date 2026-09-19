@@ -12,9 +12,13 @@ import assert from 'node:assert/strict'
 import {
   MAX_QUERY_LENGTH,
   checkQuery,
+  detectQueryMode,
   hasHighlight,
+  queryModeNote,
+  queryModeOption,
   scoreBadges,
   snippetToHtml,
+  suggestTermsOnEmpty,
 } from '../src/lib/searchPlan'
 
 /* ------------------------- snippetToHtml ------------------------- */
@@ -211,4 +215,80 @@ test('scoreBadges：返回数组与入参**等长同序**（调用方可按 inde
   assert.equal(badges.length, hits.length)
   assert.equal(badges[0]?.label, '100%')
   assert.equal(badges[3]?.label, '67%', '2/3 ≈ 67%')
+})
+
+/* ------------------------- detectQueryMode（查询语义） ------------------------- */
+
+/*
+  这一组钉住的是**本批要修的那个症状**：自然语言问句在缺省的 `phrase` 语义下恒为 0 命中。
+  断言分两类——该判 terms 的（问句、长串、多词）与**必须留在 phrase** 的（短关键词）。
+  后者同样重要：把「插件热插拔」也判成 terms 会让精确检索的既有语义静默变宽。
+*/
+
+test('detectQueryMode：短关键词留在 phrase（精确语义不因本批变宽）', () => {
+  for (const q of ['插件热插拔', 'OIDC', 'search', '附件上传']) {
+    assert.equal(detectQueryMode(q), 'phrase', `短关键词应保持精确匹配：${q}`)
+  }
+})
+
+test('detectQueryMode：**含"请求式动词"但实为精确关键词**的短串不得被判成问句', () => {
+  // 反例防线：这几个词本身是常见正文用词，把它们当问句信号会让用户的精确检索静默变宽。
+  // 判据因此收紧为"动词 + 一下"（见 REQUEST_PHRASES）。
+  for (const q of ['说明书模板', '插件平台介绍', '总结报告', '解释器配置']) {
+    assert.equal(detectQueryMode(q), 'phrase', `不得误判为问句：${q}`)
+  }
+  // 但真正的请求式问句仍要判 terms
+  assert.equal(detectQueryMode('介绍一下插件平台'), 'terms')
+  assert.equal(detectQueryMode('说明一下权限模型'), 'terms')
+})
+
+test('detectQueryMode：问句/长查询/含空白一律判 terms', () => {
+  // 问句信号
+  assert.equal(detectQueryMode('怎么配置 OIDC'), 'terms')
+  assert.equal(detectQueryMode('如何实现段落级权限'), 'terms')
+  assert.equal(detectQueryMode('检索增强是什么'), 'terms')
+  assert.equal(detectQueryMode('为什么搜不到'), 'terms')
+  assert.equal(detectQueryMode('什么是插件热插拔'), 'terms')
+  assert.equal(detectQueryMode('介绍一下插件平台'), 'terms')
+  // 标点信号（含全角）
+  assert.equal(detectQueryMode('插件热插拔？'), 'terms')
+  assert.equal(detectQueryMode('检索增强!'), 'terms')
+  // 含空白（多词）——即使每个词都很短
+  assert.equal(detectQueryMode('OIDC 配置'), 'terms')
+  assert.equal(detectQueryMode('附件 上传 权限'), 'terms')
+  // 纯长度信号：无问号、无引导词、无空白，但已经是一句话
+  assert.equal(detectQueryMode('段落级阅读权限的实现方式'), 'terms')
+})
+
+test('detectQueryMode：空串返回缺省 phrase（调用方本应先过 checkQuery）', () => {
+  assert.equal(detectQueryMode(''), 'phrase')
+  assert.equal(detectQueryMode('   '), 'phrase')
+})
+
+test('detectQueryMode：长度按**码点**计，BMP 外汉字不被算成两个字符', () => {
+  // 「𠀀」是 CJK 扩展 B 的代理对：`.length` 为 2，[...q].length 为 1。
+  // 若误用 .length，9 个这种字会被当成 18 字符而误判 terms。
+  assert.equal(detectQueryMode('𠀀'.repeat(9)), 'phrase', '9 个码点仍是短查询')
+  assert.equal(detectQueryMode('𠀀'.repeat(10)), 'terms', '10 个码点达到长查询阈值')
+})
+
+test('suggestTermsOnEmpty：只在「精确匹配 + 0 命中」时引导换分词', () => {
+  assert.equal(suggestTermsOnEmpty('phrase', 0), true, '这正是本批要修的症状')
+  // 反向不成立：terms 已是最宽的一侧，0 命中时换 phrase 只会更少 —— 不能给按钮
+  assert.equal(suggestTermsOnEmpty('terms', 0), false)
+  // 有结果时不打扰
+  assert.equal(suggestTermsOnEmpty('phrase', 3), false)
+  assert.equal(suggestTermsOnEmpty('terms', 3), false)
+})
+
+test('queryModeNote / queryModeOption：文案齐备且两个语义措辞不同', () => {
+  assert.notEqual(queryModeNote('phrase'), queryModeNote('terms'))
+  for (const id of ['phrase', 'terms'] as const) {
+    const o = queryModeOption(id)
+    assert.equal(o.id, id)
+    assert.ok(o.label.length > 0)
+    assert.ok(o.hint.length > 0)
+    // 界面上该 hint 按纯文本渲染，故不得依赖 markdown 强调号
+    assert.ok(!o.hint.includes('**'), 'hint 不得依赖 markdown 强调（界面按纯文本渲染）')
+  }
 })

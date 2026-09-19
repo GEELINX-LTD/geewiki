@@ -6,10 +6,31 @@
  *   **不得二次转义**（否则高亮变成字面 `&lt;mark&gt;`）；
  * - 空/超长查询本地先拦一次并给明确提示，同时仍容忍后端 400；
  * - 检索插件未启用时端点 404 → 不报 error，只在结果区给出"未启用"提示。
+ *
+ * ## 查询语义（`mode`）为什么必须在界面上可见
+ *
+ * 后端有两种问法（`packages/plugin-search/src/index.ts`）：`phrase` 要求整串**逐字连续**出现，
+ * `terms` 切词元后 OR。此前界面上**没有**这个开关，宿主永远用缺省的 `phrase` —— 于是出现一个
+ * 反直觉的现象：**同一句话，AI 助手能搜到，人在搜索框里敲却恒为 0 命中**（AI 那条路径显式传了
+ * `mode: 'terms'`，见 `packages/plugin-ai-kb/src/index.ts`）。本组件把语义做成可见、可切换的一等
+ * 公民，并在"精确匹配 0 命中"时**只引导不自动重试**（静默换模式会让用户以为自己搜的就是原串）。
+ *
+ * 注意与响应里的 `data.mode`（`fts`/`like`，服务端最终走了哪条路）区分：那是"服务端怎么答的"，
+ * 这里是"我们怎么问的"，两者会在结果区同时出现，措辞刻意不同。
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ApiError, api, type SearchResponse } from '../api'
-import { checkQuery, scoreBadges, snippetToHtml } from '../lib/searchPlan'
+import {
+  QUERY_MODE_OPTIONS,
+  checkQuery,
+  detectQueryMode,
+  queryModeNote,
+  queryModeOption,
+  scoreBadges,
+  snippetToHtml,
+  suggestTermsOnEmpty,
+  type SearchQueryMode,
+} from '../lib/searchPlan'
 import { SearchX } from 'lucide-react'
 import { describeError, errorLine } from '../lib/errorText'
 import { Button, EmptyState, ErrorState } from '../ui'
@@ -48,7 +69,15 @@ export function SearchView(props: {
    * 直接放大 limit 更简单也更可预期。
    */
   const [limit, setLimit] = useState(PAGE_FIRST)
-  /** 上一次发起取数的查询串：用来识别"查询变了 ⇒ limit 必须复位"，见下面的 effect */
+  /**
+   * 本轮查询语义（`phrase` / `terms`）。
+   *
+   * **随查询串重置**：`route.q` 变化意味着用户提交了一次新检索，此时按新串重新猜一个缺省
+   * （见下面 effect 里的 `lastQuery` 分支）。用户在同一串上手动切过的选择只对那一串有效——
+   * 把上一次的偏好带到下一次查询，会让"为什么这次又是分词"变得无法解释。
+   */
+  const [mode, setMode] = useState<SearchQueryMode>(() => detectQueryMode(query))
+  /** 上一次发起取数的查询串：用来识别"查询变了 ⇒ limit 与 mode 都必须复位"，见下面的 effect */
   const lastQuery = useRef<string | null>(null)
 
   useEffect(() => {
@@ -60,23 +89,28 @@ export function SearchView(props: {
       return
     }
     /*
-      查询串变了 ⇒ **分页复位到首屏**（否则新关键词会直接带着上一轮的 limit 去取，
+      查询串变了 ⇒ **分页与查询语义都复位**（否则新关键词会直接带着上一轮的 limit 去取，
       首屏就变成"已显示 100 / N"，既慢又把"这只是第一屏"这件事藏了起来）。
-      实现上提前 return 一次、由 `setLimit` 触发本 effect 再跑一遍：这样同一轮里
+      实现上提前 return 一次、由 `setLimit` / `setMode` 触发本 effect 再跑一遍：这样同一轮里
       只会发**一次**请求（若在这里直接继续，旧 limit 与新 limit 两次请求会并发，
       先到的那次可能覆盖后到的）。
     */
-    if (lastQuery.current !== query && limit !== PAGE_FIRST) {
+    if (lastQuery.current !== query) {
       lastQuery.current = query
-      setLimit(PAGE_FIRST)
-      return
+      const next = detectQueryMode(query)
+      // 只在真的不同时才 set：无谓的 set 会多触发一轮 effect（值相同 React 会跳过，
+      // 但"值相同"这件事在这里依赖 React 的比较，显式判一次更不容易踩坑）
+      if (limit !== PAGE_FIRST || mode !== next) {
+        setLimit(PAGE_FIRST)
+        setMode(next)
+        return
+      }
     }
-    lastQuery.current = query
     setErr('')
     setErrValue(null)
     setBusy(true)
     api
-      .search(checked.value, limit)
+      .search(checked.value, { limit, mode })
       .then((r) => setData(r))
       .catch((e: unknown) => {
         setData(null)
@@ -98,7 +132,7 @@ export function SearchView(props: {
         }
       })
       .finally(() => setBusy(false))
-  }, [query, retryNonce, limit])
+  }, [query, retryNonce, limit, mode])
 
   const submit = (): void => {
     const checked = checkQuery(input)
@@ -142,6 +176,35 @@ export function SearchView(props: {
         </button>
       </form>
 
+      {/*
+        查询语义切换。放在表单**下方**而不是塞进输入行：它与"搜什么"正交，是"怎么搜"。
+        用 aria-pressed 的切换按钮而非 Tabs —— 两个模式是**同一次检索**的两种问法，
+        面板是同一个（与 `components/editor/EditorToolbar.tsx` 的模式切换同款理由）。
+
+        `disabled={busy}`：切换会立即重发请求，而 in-flight 时放开会产生两个并发请求，
+        先到的那个可能覆盖后到的（与上面 effect 里 limit 复位的注释同一个理由）。
+        详细说明走 `title`，行内只放短标注——那段 hint 有两行，铺在行内会压过输入框。
+      */}
+      <div className="search-mode" role="group" aria-label="查询语义">
+        <span className="muted small">匹配方式</span>
+        {QUERY_MODE_OPTIONS.map((o) => (
+          <Button
+            key={o.id}
+            size="sm"
+            variant={mode === o.id ? 'primary' : 'ghost'}
+            aria-pressed={mode === o.id}
+            title={o.hint}
+            disabled={busy || query.trim() === ''}
+            onClick={() => setMode(o.id)}
+          >
+            {o.label}
+          </Button>
+        ))}
+        <span className="muted small" title={queryModeOption(mode).hint}>
+          {queryModeNote(mode)}
+        </span>
+      </div>
+
       {errValue !== null ? (
         <ErrorState
           title={describeError(errValue).title}
@@ -156,8 +219,8 @@ export function SearchView(props: {
       {data && (
         <>
           <div className="search-meta muted small">
-            查询「{data.query}」· 命中 {data.total} 条 · 路径 {data.mode}
-            {data.mode === 'like' ? '（短查询兜底）' : ''}
+            查询「{data.query}」· 命中 {data.total} 条 · 问法 {queryModeNote(mode)}
+            {data.mode === 'like' ? ' · 服务端走 LIKE 短查询兜底' : ''}
             {data.total > data.hits.length ? ` · 仅显示前 ${data.hits.length} 条` : ''}
             {data.mode === 'fts' ? ' · 相关度为本次查询内的相对值' : ''}
           </div>
@@ -166,13 +229,24 @@ export function SearchView(props: {
             <EmptyState
               icon={<SearchX className="size-8" />}
               title={`没有找到与「${data.query}」相关的内容`}
-              hint="换个关键词，或缩短到 2–4 个字试试短查询兜底。也可以先把这个主题写进知识库。"
+              hint={
+                suggestTermsOnEmpty(mode, data.total)
+                  ? '当前是「精确」匹配——它要求正文里逐字连着出现这串文字，问句几乎不可能命中。换「分词」再试一次，或缩短到 2–4 个字走短查询兜底。'
+                  : '换个关键词，或缩短到 2–4 个字试试短查询兜底。也可以先把这个主题写进知识库。'
+              }
               action={
-                onSearch !== undefined ? (
-                  <Button variant="secondary" size="sm" onClick={() => onSearch('')}>
-                    返回全部页面
-                  </Button>
-                ) : undefined
+                <div className="flex flex-wrap items-center gap-2">
+                  {suggestTermsOnEmpty(mode, data.total) && (
+                    <Button variant="primary" size="sm" onClick={() => setMode('terms')}>
+                      改用分词匹配
+                    </Button>
+                  )}
+                  {onSearch !== undefined ? (
+                    <Button variant="secondary" size="sm" onClick={() => onSearch('')}>
+                      返回全部页面
+                    </Button>
+                  ) : null}
+                </div>
               }
             />
           ) : (

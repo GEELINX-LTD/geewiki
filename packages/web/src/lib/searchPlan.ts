@@ -143,6 +143,132 @@ export function scoreBadges(hits: readonly ScoredHit[]): ScoreBadge[] {
   })
 }
 
+/* ------------------------- 查询语义（mode） ------------------------- */
+
+/**
+ * 查询语义：**我们怎么问**（`GET /api/search?mode=`）。
+ *
+ * - `phrase`：整串当一个**连续短语**（后端缺省）。等价于对正文做 Ctrl+F，精确，
+ *   但要求逐字连续出现——自然语言问句几乎不可能逐字出现在正文里，于是**恒为 0 命中**。
+ * - `terms`：按 3-gram / ≥3 字符词切成词元后 **OR** 连接（宽召回）。切词规则与硬约束
+ *   见后端 `packages/plugin-search/src/index.ts` 的 `buildTermQuery`。
+ *
+ * ⚠️ 本类型与 `api.ts` 的 `SearchMode`（`'fts' | 'like'`）**不是一回事**，两者会同时出现在
+ * 同一轮检索里：本类型是**请求侧**的（怎么问），`SearchMode` 是**响应侧**的（服务端最终
+ * 走了 FTS5 还是 LIKE 兜底）。名字刻意区分开，好让"改了请求侧却去读响应侧"这类错配一眼可见。
+ */
+export type SearchQueryMode = 'phrase' | 'terms'
+
+/** 与后端端点的缺省一致（`packages/plugin-search/src/index.ts:744`：不传 mode 即 phrase） */
+export const DEFAULT_QUERY_MODE: SearchQueryMode = 'phrase'
+
+/**
+ * 长查询阈值（**按字符数**，不是字节）：达到即判为"成句"。
+ *
+ * 为什么是 10：中文 4–9 字仍可能是用户**确知正文里有**的术语（「插件热插拔」「段落级阅读权限」），
+ * 此时 phrase 的精确语义有正面价值；10 字往上更像一句话，把它当整串逐字匹配的期望值已经很低，
+ * 而 terms 至少还有召回。阈值刻意取**保守**的一侧——短关键词的既有精确语义不因本批改变。
+ */
+const LONG_QUERY_CHARS = 10
+
+/**
+ * 问号/叹号（半角与全角）：出现即视为问句
+ */
+const QUESTION_PUNCT = /[?？!！]/
+
+/**
+ * 问句引导词。刻意**只收"几乎是问句信号"的词**：像「的」「是」「有」这种高频字一旦收进来，
+ * 「段落级阅读权限是什么」以外的绝大多数正常关键词都会被误判成问句。
+ */
+const QUESTION_WORDS = /(怎么|如何|怎样|为什么|为何|什么是|是什么|哪些|哪个|哪一种|是否|能否|可否)/
+
+/**
+ * "请求式"动词短语：`介绍一下…` / `说明一下…`。
+ *
+ * ⚠️ 这里**必须带「一下」**，不能只匹配 `介绍|说明|解释|总结`：那几个词本身是常见的
+ * **正文用词**，而「说明书模板」「插件平台介绍」「总结报告」都是完全正常的**精确**关键词
+ * （用户确知页面标题里就有这几个字）。只匹配「动词 + 一下」既覆盖了真正的请求式问句，
+ * 又不会把这些精确检索误判成宽召回。
+ */
+const REQUEST_PHRASES = /(介绍|说明|解释|总结|讲讲|说说)(一下|下|下这)/
+
+/**
+ * 猜一个**默认**查询语义（用户仍可在界面上改）。
+ *
+ * 判据是"这串东西看起来像不像一段能在正文里逐字找到的片段"：
+ * 1. **含空白** → `terms`。phrase 要求正文里连着出现**含这段空白**的原串；用户打多个词
+ *    （无论中英）表达的通常是"这些词都相关"，不是"正文里有这一串带空格的字符"。
+ * 2. **含问号/叹号、问句引导词，或"请求式"短语（`介绍一下…`）** → `terms`。问句的意图是"找讲这件事的页面"。
+ * 3. **长度 ≥ {@link LONG_QUERY_CHARS}** → `terms`。理由见该常量的注释。
+ * 4. 其余（短关键词）→ `phrase`，保持搜索框既有的精确语义——**包括「说明书模板」这类
+ *    恰好含"请求式动词"的精确关键词**，见 {@link REQUEST_PHRASES} 的说明。
+ *
+ * 纯函数、不读全局，故可单测；`''` 返回缺省值（调用方应先过 {@link checkQuery}）。
+ */
+export function detectQueryMode(raw: string): SearchQueryMode {
+  const q = raw.trim()
+  if (q === '') return DEFAULT_QUERY_MODE
+  if (/\s/.test(q)) return 'terms'
+  if (QUESTION_PUNCT.test(q)) return 'terms'
+  if (QUESTION_WORDS.test(q)) return 'terms'
+  if (REQUEST_PHRASES.test(q)) return 'terms'
+  // 按**码点**计数（`[...q]`）而非 `.length`：BMP 外的汉字是代理对，`.length` 会算成 2 个
+  if ([...q].length >= LONG_QUERY_CHARS) return 'terms'
+  return DEFAULT_QUERY_MODE
+}
+
+/** 两个可选语义的界面文案（`label` 上按钮，`hint` 作 title 与结果区解释） */
+export interface QueryModeOption {
+  id: SearchQueryMode
+  label: string
+  hint: string
+}
+
+/**
+ * 选项**逐个命名**而不是内联进数组：`noUncheckedIndexedAccess` 下 `QUERY_MODE_OPTIONS[0]`
+ * 的类型含 `undefined`，回退分支就没法直接返回它。命名常量让"缺省项"有确定类型。
+ */
+const PHRASE_OPTION: QueryModeOption = {
+  id: 'phrase',
+  label: '精确',
+  hint: '整句连续匹配：要求正文里逐字连着出现这段文字。适合你确知正文写法的短关键词，如「插件热插拔」。',
+}
+
+const TERMS_OPTION: QueryModeOption = {
+  id: 'terms',
+  label: '分词',
+  hint: '按词元宽松匹配：中文切 3 字滑窗、英文按词切，命中任意一个词元即算。适合问句与长查询，如「怎么配置 OIDC」。',
+}
+
+export const QUERY_MODE_OPTIONS: readonly QueryModeOption[] = [PHRASE_OPTION, TERMS_OPTION]
+
+/** 取某个语义的界面文案（未知值回落缺省，避免界面出现空白按钮） */
+export function queryModeOption(mode: SearchQueryMode): QueryModeOption {
+  return QUERY_MODE_OPTIONS.find((o) => o.id === mode) ?? PHRASE_OPTION
+}
+
+/**
+ * 结果区那句"这一轮是怎么问的"——**必须显示**，否则用户无法解释"同一句话换个模式结果天差地别"。
+ *
+ * 注意它与响应里的 `mode`（`fts`/`like`，服务端怎么答的）是两件事，界面上两者都会出现。
+ */
+export function queryModeNote(mode: SearchQueryMode): string {
+  return mode === 'terms' ? '分词匹配（词元 OR，召回更宽）' : '精确匹配（整串连续）'
+}
+
+/**
+ * 0 命中时是否该引导用户换用 `terms`。
+ *
+ * 只在**精确匹配且一条都没有**时给这条引导：这正是本轮要修的症状——用户把问句粘进搜索框，
+ * phrase 要求整串逐字出现，于是"明明写过却搜不到"。反向不成立：`terms` 已经是最宽的一侧，
+ * 它 0 命中时换成 `phrase` 只会更少，给按钮等于骗人。
+ *
+ * **只引导、不自动重试**：静默换模式会让用户以为自己搜的就是原串（也违背本仓"失败语义诚实"）。
+ */
+export function suggestTermsOnEmpty(mode: SearchQueryMode, total: number): boolean {
+  return mode === 'phrase' && total === 0
+}
+
 /** 前端预检查询串：空/超长在本地就拦下并给出明确文案（同时仍容忍后端 400） */
 export function checkQuery(raw: string): { ok: true; value: string } | { ok: false; message: string } {
   const value = raw.trim()
