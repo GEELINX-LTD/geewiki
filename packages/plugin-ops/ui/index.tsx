@@ -249,10 +249,21 @@ function AuditSection(props: {
     setPage(1)
   }
 
+  /*
+   * 解构出这个 effect 真正用到的 props 字段。
+   *
+   * 不是风格洁癖：`react-hooks/exhaustive-deps` **解析不了嵌套闭包里的 `props.x`**
+   * （这里是 `.catch((e) => { if (alive) props.onError(e) })`），它会把整个 `props`
+   * 报成缺失依赖。而"把 `props` 本体加进依赖数组"是**更坏**的修法——它每次渲染都换
+   * 身份，等于每渲染重发一次请求（在这里就是重发一次审计查询）。
+   * 解构之后依赖是三个具体值，规则与运行时看到的是同一件事。
+   */
+  const { view, reloadToken, onError } = props
+
   useEffect(() => {
     let alive = true
     setLoading(true)
-    fetchAudit(props.view, applied, offset)
+    fetchAudit(view, applied, offset)
       .then((r) => {
         if (!alive) return
         setRows(r.entries)
@@ -261,7 +272,7 @@ function AuditSection(props: {
         setPage((p) => clampPage(p, r.total, AUDIT_PAGE_SIZE))
       })
       .catch((e: unknown) => {
-        if (alive) props.onError(e)
+        if (alive) onError(e)
       })
       .finally(() => {
         if (alive) setLoading(false)
@@ -269,7 +280,7 @@ function AuditSection(props: {
     return () => {
       alive = false
     }
-  }, [props.view, applied, offset, props.reloadToken, props.onError])
+  }, [view, applied, offset, reloadToken, onError])
 
   const last = pageCount(total, AUDIT_PAGE_SIZE)
   const reload = `audit:${props.view}`
@@ -482,6 +493,10 @@ function SessionsSection(props: {
 }): ReactNode {
   const [rows, setRows] = useState<readonly SessionEntry[] | null>(null)
 
+  /* 同 `AuditSection`：解构是为了让 `exhaustive-deps` 看得见真实依赖（它解析不了
+   * 嵌套闭包里的 `props.x`），而不是把每次渲染都换身份的 `props` 塞进依赖数组。 */
+  const { reloadToken, onError } = props
+
   useEffect(() => {
     let alive = true
     fetchSessions()
@@ -489,12 +504,12 @@ function SessionsSection(props: {
         if (alive) setRows(r.entries)
       })
       .catch((e: unknown) => {
-        if (alive) props.onError(e)
+        if (alive) onError(e)
       })
     return () => {
       alive = false
     }
-  }, [props.reloadToken, props.onError])
+  }, [reloadToken, onError])
 
   /** 该用户还有几条**活着**的会话（批量吊销只对活的有意义） */
   const activeOf = (userId: number): number =>

@@ -523,7 +523,20 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
   // 卸载即取消上游：用户关掉页面后不该继续烧 token
   useEffect(() => () => abortRef.current?.abort(), [])
 
-  const pageHint: PageHint | null = props.page !== null ? { slug: props.page.slug } : null
+  /*
+   * `pageHint` 必须**按 slug 记忆**，不能每次渲染新建对象。
+   *
+   * 它进 `runTurn` 的依赖数组（下面那个 useCallback），而对象字面量每渲染都是新身份
+   * ⇒ `runTurn` 每渲染换一次 ⇒ 依赖它的 `send` 也跟着换。展开动画里每次滚动重渲染都会
+   * 重建整条提问链路，这不是性能洁癖：`runTurn` 内部持有 abort 控制流。
+   * 依赖取**字符串 slug**（原始值）而不是 `props.page`：宿主每次渲染都可能下发新的
+   * page 对象，用对象做依赖等于没记忆。
+   */
+  const pageSlug = props.page?.slug ?? null
+  const pageHint: PageHint | null = useMemo(
+    () => (pageSlug !== null ? { slug: pageSlug } : null),
+    [pageSlug],
+  )
 
   const persist = useCallback(
     (messages: readonly DockMessage[]) => {
@@ -736,7 +749,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
               conversationId,
               turnId,
               tool: writable.map((c) => c.name).join(','),
-              target: props.page?.slug ?? '',
+              target: pageSlug ?? '',
               before: docBefore,
               after: docAfter,
             })
@@ -754,7 +767,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
       // 服务端工具（如 page.update）在这一回合里可能刚改过东西 ⇒ 刷新回退入口
       void refreshJournal()
     },
-    [transport, props.clientTools, props.invokeTool, pageHint, persist, conversationId, journalTransport, refreshJournal],
+    [transport, props.clientTools, pageSlug, props.invokeTool, pageHint, persist, conversationId, journalTransport, refreshJournal],
   )
 
   const send = useCallback((preset?: string) => {
@@ -801,7 +814,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
     savedRef.current = false
     // 新的提问 ⇒ 新的轮次 id。**逐句**换，而不是逐回合换（见 runTurn 的注释）。
     void runTurn(seeded.messages, 0, newId())
-  }, [input, state, runTurn, setPending])
+  }, [input, state, runTurn, setPending, stickToBottom])
 
   const stop = useCallback(() => {
     abortRef.current?.abort()
@@ -847,7 +860,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
     setConversationId(conversation.id)
     setHistoryOpen(false)
     setOpen(true)
-  }, [])
+  }, [stickToBottom])
 
   const toolsLabel = state.tools.length > 0 ? `可用工具 ${state.tools.length} 个` : ''
 
