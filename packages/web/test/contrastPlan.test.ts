@@ -116,12 +116,12 @@ test('已知失败清单的处置建议是可核算的：gray-600 确实全部�
 
   本断言把两边钉在一起：数据直接读源文本，不手抄一份值（照本文件的既有做法）。
 */
-test('外壳宽度：App 的 WIDE_MAX_WIDTH 与 tokens.css 的 --spacing-wide 同值', () => {
+test('外壳宽度：App 的 WIDE_MAX_WIDTH 与 tokens.css 的 --gw-spacing-wide 同值', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
   const m = app.match(/const WIDE_MAX_WIDTH = '([^']+)'/)
   const wide = m?.[1]
   assert.ok(wide !== undefined, "App.tsx 里应有 `const WIDE_MAX_WIDTH = '…'`（扫描态外壳宽度）")
-  const token = css.match(/--spacing-wide:\s*([^;]+);/)
+  const token = css.match(/--gw-spacing-wide:\s*([^;]+);/)
   const tokenValue = token?.[1]
   assert.ok(tokenValue !== undefined, 'tokens.css 里应有 `--spacing-wide`（扫描态外壳上限的唯一真源）')
   assert.equal(
