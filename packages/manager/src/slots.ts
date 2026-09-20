@@ -24,11 +24,20 @@
  */
 
 import {
+  EXT_MODES,
+  HOST_NODE_NAMES,
   PLUGIN_UI_ASSET_MAX_DEPTH,
   SLOT_NAMES,
+  extModesOf,
+  extendCardinalityOf,
+  hostNodeSpec,
   isBuiltinSlotName,
+  isExtName,
+  isHostNodeName,
   isPluginSlotName,
-  slotCardinalityOf,
+  supportsExtMode,
+  type ExtMode,
+  type HostNodeKind,
   type SlotContribution,
   type SlotContributionMeta,
   type SlotDeclaration,
@@ -37,13 +46,17 @@ import {
 } from '@geewiki/core'
 
 /**
- * 名字是否可接受：**内置插槽** ∪ **插件自定义扩展点**（语法见 core 的 `PLUGIN_SLOT_NAME`）。
+ * 名字是否可接受：**宿主节点**（`@geewiki/core/extensions` 的目录）∪
+ * **插件自定义扩展点**（语法见 core 的 `PLUGIN_SLOT_NAME`）。
  *
- * 注意这里**不是**"任意字符串都行"：自定义插槽名必须含 `/`，于是不含 `/` 又不在白名单里的
+ * 判据由 core 的 `isExtName` 提供——目录从"7 个插槽"扩为"宿主节点目录"之后，
+ * 白名单不再住在本文件里（否则就又成了一份会漂移的镜像）。
+ *
+ * 注意这里**不是**"任意字符串都行"：自定义插槽名必须含 `/`，于是不含 `/` 又不在目录里的
  * 名字（`app-headr` 这类笔误）依然被挡下并告警——这是"开放键空间"与"笔误可见"的取舍点。
  */
 export function isSlotName(name: unknown): name is SlotName {
-  return isBuiltinSlotName(name) || isPluginSlotName(name)
+  return isExtName(name)
 }
 
 /** 已声明的自定义扩展点查表（`resolveSlots` 与注册表共用同一套裁决） */
@@ -80,6 +93,57 @@ export interface SlotAssignment {
   readonly suppressed: readonly string[]
 }
 
+/* ===================== 界面扩展平台：模式化裁决（P3） ===================== */
+
+/** 一条**生效**的扩展贡献（前端据此决定调用哪个组件的哪种模式） */
+export interface ExtEffectiveContribution {
+  readonly owner: string
+  readonly mode: ExtMode
+  readonly via: 'manifest' | 'runtime'
+  readonly lazy: boolean
+  readonly importPath?: string
+}
+
+/** 一条被抑制的贡献：它撞上了谁（诊断要点名"被谁顶掉"） */
+export interface ExtSuppressedContribution {
+  readonly owner: string
+  readonly mode: ExtMode
+  readonly winner: string
+}
+
+/**
+ * 一个节点的扩展裁决结果。
+ *
+ * 与 {@link SlotAssignment} 的关系：后者是"只有追加语义"的**旧视图**（形状是已发布契约，
+ * 保留），本结构是它的超集，额外回答"**以哪种模式**生效"。两者由同一个
+ * {@link resolveExtensions} 产出，不存在两套裁决。
+ */
+export interface ExtNodeAssignment {
+  readonly node: SlotName
+  /** 宿主节点分组；`'custom'` = 插件自定义扩展点（未在目录里登记） */
+  readonly kind: HostNodeKind | 'custom'
+  /** `extend` 的占用基数（与 {@link SlotAssignment.cardinality} 同义） */
+  readonly cardinality: 'single' | 'multi'
+  /** 该节点允许的模式；自定义扩展点一律 `['extend']` */
+  readonly modes: readonly ExtMode[]
+  /** props 契约版本（非宿主节点为 1） */
+  readonly propsVersion: number
+  /** **全部贡献者**，按激活顺序（不在激活顺序里的排在最后，按名字典序） */
+  readonly owners: readonly string[]
+  /** **实际生效**的贡献，顺序 = 应用顺序（replace → wrap → extend） */
+  readonly effective: readonly ExtEffectiveContribution[]
+  /** 被抑制的贡献者（按激活顺序） */
+  readonly suppressed: readonly string[]
+  /** 按模式分桶的生效者：前端拿它直接组装（`replace`/`wrap` 至多一个） */
+  readonly byMode: {
+    readonly replace?: string
+    readonly wrap?: string
+    readonly extend: readonly string[]
+  }
+  /** 被抑制的明细（谁、以什么模式、被谁顶掉）——诊断与管理台告警用 */
+  readonly suppressedDetail: readonly ExtSuppressedContribution[]
+}
+
 /** 冲突诊断：单占用插槽被多个插件声明（裁决仍确定，但必须**可见**） */
 export interface SlotConflict {
   readonly slot: SlotName
@@ -109,56 +173,142 @@ function orderOf(activationOrder: readonly string[]): (a: string, b: string) => 
 }
 
 /**
- * 纯函数：把"谁声明了哪些插槽"裁决成"每个插槽谁生效"。
+ * 纯函数：把"谁声明了哪些扩展点"裁决成"每个节点谁生效"（**界面扩展平台的主裁决器**）。
  *
- * 裁决规则（`single` 插槽被多方声明时）：
- * **激活顺序里最早的胜出**，其余进 `suppressed` 并被记为冲突。
+ * ## 裁决规则
+ * - `replace` / `wrap`：**恒为单占用**（模式定义的一部分，不是可配置项）——
+ *   多方声明时**激活顺序最早者胜出**，其余进 `suppressed` 并被记为冲突。
+ * - `extend`：占用基数由节点决定（内置插槽取 `SLOT_CARDINALITY`，其余默认 `multi`）。
  *
  * 为什么是"最早"而不是"最新"：最新胜出会让后启用的插件**静默顶掉**已在工作的编辑器，
  * 用户看到的是"我的编辑器突然换了"却没有任何提示；最早胜出则保证"先来的继续工作"，
  * 后来者被明确抑制——**状态可预期，且冲突在诊断里可见**。
  * 真正的解法是让插件作者用 `conflictGroup` 声明互斥（那时第二个根本激活不了，
  * 用户会在启用时就收到明确拒绝，而不是激活后才发现没生效）。
+ *
+ * ## `effective` 的顺序 = 应用顺序
+ * `replace → wrap → extend`（见 `EXT_MODES` 的定义顺序）：先确定"渲染什么"，
+ * 再"包一层"，最后"追加"。前端据此顺序组装即可，不需要自己再排一遍。
+ */
+export function resolveExtensions(
+  contributions: readonly SlotContribution[],
+  activationOrder: readonly string[],
+  declarations: readonly (SlotDeclaration & { readonly slot: string })[] = [],
+): ExtNodeAssignment[] {
+  const cmp = orderOf(activationOrder)
+  const declared = declarationIndex(declarations)
+  const present = new Set<string>(contributions.map((c) => c.slot as string))
+
+  /*
+    输出顺序 = 内置插槽（白名单顺序）→ 其它宿主节点（目录顺序）→ 插件自定义扩展点（字典序）。
+    为什么自定义扩展点用**字典序**而不是"首次贡献顺序"：本函数是纯函数，
+    若次序取决于贡献列表的插入序，结果就会随 Map 迭代顺序漂移、也无法稳定单测。
+    字典序是确定的，且"自定义排在所有宿主节点之后"让内置名的定位成本不变。
+  */
+  const ordered: string[] = []
+  for (const s of SLOT_NAMES) if (present.has(s)) ordered.push(s)
+  for (const s of HOST_NODE_NAMES) if (!isBuiltinSlotName(s) && present.has(s)) ordered.push(s)
+  for (const s of [...present].filter((n) => !isBuiltinSlotName(n) && !isHostNodeName(n)).sort((a, b) => a.localeCompare(b))) {
+    ordered.push(s)
+  }
+
+  const out: ExtNodeAssignment[] = []
+  for (const node of ordered) {
+    /*
+      同一 `(owner, node)` 只保留一条贡献：注册表以它为键（后登记覆盖模式），
+      故 `list()` 里不会出现同键两条；这里的 Map 只是让"万一出现"也有确定结果。
+    */
+    const byOwner = new Map<string, SlotContribution>()
+    for (const c of contributions) {
+      if (c.slot !== node) continue
+      if (!byOwner.has(c.owner)) byOwner.set(c.owner, c)
+    }
+    if (byOwner.size === 0) continue
+    const owners = [...byOwner.keys()].sort(cmp)
+
+    const spec = hostNodeSpec(node)
+    // 内置插槽的基数真源是 SLOT_CARDINALITY（`extendCardinalityOf` 内部读它）；
+    // 自定义扩展点取 `define()` 的声明，未声明默认 multi。
+    const cardinality = spec ? extendCardinalityOf(node) : (declared.get(node)?.cardinality ?? 'multi')
+    const modes = spec ? extModesOf(node) : (['extend'] as readonly ExtMode[])
+    const propsVersion = spec?.propsVersion ?? 1
+
+    const effective: ExtEffectiveContribution[] = []
+    const suppressed: string[] = []
+    const suppressedDetail: ExtSuppressedContribution[] = []
+
+    // EXT_MODES 的顺序就是应用顺序（replace → wrap → extend），循环直接复用它
+    for (const mode of EXT_MODES) {
+      const candidates = owners.filter((o) => (byOwner.get(o)?.mode ?? 'extend') === mode)
+      if (candidates.length === 0) continue
+      const winners =
+        mode === 'extend'
+          ? cardinality === 'single'
+            ? candidates.slice(0, 1)
+            : candidates
+          : candidates.slice(0, 1)
+      const winnerSet = new Set(winners)
+      for (const w of winners) {
+        const c = byOwner.get(w) as SlotContribution
+        effective.push({
+          owner: w,
+          mode,
+          via: c.via,
+          lazy: c.lazy,
+          ...(c.importPath === undefined ? {} : { importPath: c.importPath }),
+        })
+      }
+      for (const loser of candidates.filter((o) => !winnerSet.has(o))) {
+        suppressed.push(loser)
+        suppressedDetail.push({ owner: loser, mode, winner: winners[0] as string })
+      }
+    }
+
+    const replaceWinner = effective.find((e) => e.mode === 'replace')?.owner
+    const wrapWinner = effective.find((e) => e.mode === 'wrap')?.owner
+    out.push({
+      node: node as SlotName,
+      kind: spec?.kind ?? 'custom',
+      cardinality,
+      modes,
+      propsVersion,
+      owners,
+      effective,
+      suppressed,
+      byMode: {
+        ...(replaceWinner === undefined ? {} : { replace: replaceWinner }),
+        ...(wrapWinner === undefined ? {} : { wrap: wrapWinner }),
+        extend: effective.filter((e) => e.mode === 'extend').map((e) => e.owner),
+      },
+      suppressedDetail,
+    })
+  }
+  return out
+}
+
+/**
+ * 旧视图：只有"追加"语义的插槽裁决（**兼容外壳**，不是第二套实现）。
+ *
+ * 为什么保留：`SlotAssignment` 的形状是**已发布的契约**（入口表的按插件 `slots` 字段、
+ * `GET /api/plugins/slots` 的既有字段、`effectiveSlotsByOwner` / `conflictsOf` /
+ * `undeclaredSlots` 三个消费者，以及它们的守卫测试）。这里**只做投影**，
+ * 不重写裁决——否则"同一事实两处裁决"必然漂移，而漂移的表现是
+ * "诊断端点说 A 生效、界面渲染 B"。
  */
 export function resolveSlots(
   contributions: readonly SlotContribution[],
   activationOrder: readonly string[],
   declarations: readonly (SlotDeclaration & { readonly slot: string })[] = [],
 ): SlotAssignment[] {
-  const cmp = orderOf(activationOrder)
-  const declared = declarationIndex(declarations)
-  const out: SlotAssignment[] = []
-  /*
-    输出顺序 = 内置插槽（白名单顺序）→ 插件自定义插槽（字典序）。
-    为什么自定义插槽用**字典序**而不是"首次贡献顺序"：`resolveSlots` 是纯函数，
-    若次序取决于贡献列表的插入序，结果就会随 Map 迭代顺序漂移、也无法稳定单测。
-    字典序是确定的，且"自定义插槽排在所有内置之后"让内置名的定位成本不变。
-  */
-  const ordered: string[] = [...SLOT_NAMES]
-  const custom = new Set<string>()
-  for (const c of contributions) {
-    if (isBuiltinSlotName(c.slot)) continue
-    custom.add(c.slot)
-  }
-  for (const s of [...custom].sort((a, b) => a.localeCompare(b))) ordered.push(s)
-
-  for (const slot of ordered) {
-    const owners = contributions
-      .filter((c) => c.slot === slot)
-      .map((c) => c.owner)
-      .sort(cmp)
-    if (owners.length === 0) continue
-    const cardinality = slotCardinalityOf(slot, declared.get(slot))
-    const effective = cardinality === 'single' ? owners.slice(0, 1) : owners
-    out.push({
-      slot,
-      cardinality,
-      owners,
-      effective,
-      suppressed: cardinality === 'single' ? owners.slice(1) : [],
-    })
-  }
-  return out
+  return resolveExtensions(contributions, activationOrder, declarations).map((a) => ({
+    slot: a.node,
+    cardinality: a.cardinality,
+    owners: a.owners,
+    // 逐字保留旧公式（而不是取 byMode.extend）：旧视图的读者不知道"模式"，
+    // 用新概念去改写旧语义会让既有诊断结果悄悄变化。
+    effective: a.cardinality === 'single' ? a.owners.slice(0, 1) : a.owners,
+    suppressed: a.cardinality === 'single' ? a.owners.slice(1) : [],
+  }))
 }
 
 /** 从裁决结果里取出"每个 owner 实际生效的插槽"（供入口表按插件写 `slots` 字段） */
@@ -219,7 +369,7 @@ export function undeclaredSlots(
  * 这与 `HttpRouter.closeStreams(owner)` 的 `Map<owner, Set<res>>` 是同一形状。
  */
 export class SlotRegistry implements SlotService {
-  private readonly byOwner = new Map<string, Map<SlotName, { via: 'manifest' | 'runtime'; lazy: boolean; importPath?: string }>>()
+  private readonly byOwner = new Map<string, Map<SlotName, { via: 'manifest' | 'runtime'; lazy: boolean; importPath?: string; mode: ExtMode }>>()
 
   /**
    * 插件自定义扩展点的**声明**：slot → { 声明者, 基数 }。
@@ -283,24 +433,72 @@ export class SlotRegistry implements SlotService {
   }
 
   /**
-   * 登记一条贡献，返回**幂等**的注销函数。
+   * 登记一条贡献（`mode: 'extend'` 的简写），返回**幂等**的注销函数。
    *
-   * 同一 `(owner, slot)` 重复登记视为同一条：后登记的 `lazy`/`importPath` 覆盖先前的，
+   * 同一 `(owner, node)` 重复登记视为同一条：后登记的 `lazy`/`importPath`/`mode` 覆盖先前的，
    * 但 `via` 保留**先登记**的那个（manifest 先于运行期登记，故声明式身份不会被运行期改写）。
    */
   contribute(owner: string, slot: SlotName, meta?: SlotContributionMeta): () => void {
+    return this.extend(owner, slot, 'extend', meta)
+  }
+
+  /**
+   * 登记一条**指定模式**的扩展贡献（界面扩展平台，P3）。
+   *
+   * 与 `contribute` 的唯一区别是模式，外加两条"宿主才知道"的拒绝规则：
+   * - 节点不允许该模式（如对 `app-header` 声明 `replace`）⇒ 忽略并告警；
+   * - 插件自定义扩展点上的 `replace` / `wrap` ⇒ 忽略并告警（别的插件的扩展点契约由它自己定义）。
+   *
+   * 两条都**不抛**：插件作者拿不到目录，猜错是常态；但**绝不能静默**——
+   * 静默的后果是"插件声明了 replace、界面上什么都没变"，且日志干净。
+   */
+  extend(owner: string, slot: SlotName, mode: ExtMode, meta?: SlotContributionMeta): () => void {
+    return this.register(owner, slot, mode, 'runtime', meta)
+  }
+
+  /**
+   * 全部登记的**唯一实现**（`extend` 与 `contributeFromManifest` 都走这里）。
+   *
+   * ## 为什么必须合成一个方法（踩过）
+   * 最初的写法是"`contributeFromManifest` 先往表里塞一条占住 `via:'manifest'`，再调
+   * `extend()` 覆盖 meta"。于是**被拒绝的声明会留在表里**：`app-header` 不允许 `replace`，
+   * `extend()` 拒绝并告警，但那条预塞的占位记录没人清——表现为"清单里声明了、诊断端点里
+   * 却出现一条谁也不认识的贡献"，而且 `resolveExtensions` 会把它算进 `owners`。
+   * 正确形状：**先校验、后落表**，中间没有"半成品状态"。
+   *
+   * @param via 贡献来源；已存在的同键记录保留**先登记的** `via`
+   *   （manifest 先于运行期登记，故声明式身份不会被运行期改写）
+   */
+  private register(
+    owner: string,
+    slot: SlotName,
+    mode: ExtMode,
+    via: 'manifest' | 'runtime',
+    meta?: SlotContributionMeta,
+  ): () => void {
     if (!isSlotName(slot)) {
-      // 既不是内置插槽、也不是合法的自定义扩展点名：忽略 + 告警，**不抛**
+      // 既不是宿主节点、也不是合法的自定义扩展点名：忽略 + 告警，**不抛**
       // （与前端忽略未知插槽名的既有行为一致）。
-      // 这条正是"笔误可见"的落点：`app-headr` 会走到这里，而不是被当成一个新插槽静默接受。
+      // 这条正是"笔误可见"的落点：`app-headr` 会走到这里，而不是被当成一个新节点静默接受。
       console.warn(
-        `[manager:slot] 忽略未知插槽名 ${JSON.stringify(slot)}（贡献者 ${owner}）：` +
-          `内置插槽见 SLOT_NAMES；自定义扩展点须形如 "命名空间/名字"（含 \`/\`）`,
+        `[manager:slot] 忽略未知扩展点 ${JSON.stringify(slot)}（贡献者 ${owner}）：` +
+          `宿主节点见 @geewiki/core/extensions 的目录；自定义扩展点须形如 "命名空间/名字"（含 \`/\`）`,
       )
       return () => {}
     }
     if (typeof owner !== 'string' || owner.length === 0) {
       console.warn(`[manager:slot] 忽略空 owner 的插槽贡献（slot=${slot}）`)
+      return () => {}
+    }
+    if (!EXT_MODES.includes(mode)) {
+      console.warn(`[manager:slot] 忽略未知模式 ${JSON.stringify(mode)}（贡献者 ${owner}，node=${slot}）`)
+      return () => {}
+    }
+    if (!supportsExtMode(slot, mode)) {
+      console.warn(
+        `[manager:slot] 忽略 ${owner} 对 ${JSON.stringify(slot)} 的 ${mode} 声明：` +
+          `该节点只允许 ${JSON.stringify(extModesOf(slot))}（宿主节点目录是唯一判据）`,
+      )
       return () => {}
     }
     let importPath: string | undefined
@@ -321,10 +519,21 @@ export class SlotRegistry implements SlotService {
       this.byOwner.set(owner, slots)
     }
     const existing = slots.get(slot)
+    /*
+      同一 (owner, node) 只有一条贡献，模式是它的属性：改了模式要**告警**而不是静默覆盖。
+      理由：`replace` 会让宿主默认实现整个不渲染（无障碍与键盘可达的责任转移），
+      一次静默的模式变化足以解释"我的编辑器昨天还在、今天没了"，而日志里什么都不该少。
+    */
+    if (existing && existing.mode !== mode) {
+      console.warn(
+        `[manager:slot] ${owner} 把 ${JSON.stringify(slot)} 的模式由 ${existing.mode} 改为 ${mode}（同一 (owner, node) 只保留一条贡献）`,
+      )
+    }
     slots.set(slot, {
-      via: existing?.via ?? 'runtime',
+      via: existing?.via ?? via,
       lazy: meta?.lazy ?? existing?.lazy ?? false,
       importPath: importPath ?? existing?.importPath,
+      mode,
     })
     let done = false
     return () => {
@@ -338,19 +547,9 @@ export class SlotRegistry implements SlotService {
   }
 
   /** 登记一条 **manifest 声明**的贡献（管理器在激活时调用，故 `via` 为 'manifest'） */
-  contributeFromManifest(owner: string, slot: SlotName, meta?: SlotContributionMeta): void {
-    if (!isSlotName(slot)) {
-      console.warn(`[manager:slot] 插件 ${owner} 的 manifest 声明了未知插槽 ${JSON.stringify(slot)}（已忽略）`)
-      return
-    }
-    // 先登记以占住 via:'manifest'，再覆盖 meta
-    let bucket = this.byOwner.get(owner)
-    if (!bucket) {
-      bucket = new Map()
-      this.byOwner.set(owner, bucket)
-    }
-    if (!bucket.has(slot)) bucket.set(slot, { via: 'manifest', lazy: false })
-    this.contribute(owner, slot, meta)
+  contributeFromManifest(owner: string, slot: SlotName, meta?: SlotContributionMeta, mode: ExtMode = 'extend'): void {
+    // 校验与落表都在 register 里一次完成：**不得**先塞占位再校验（踩过：被拒的声明会留在表里）
+    this.register(owner, slot, mode, 'manifest', meta)
   }
 
   list(slot?: SlotName): readonly SlotContribution[] {
@@ -366,6 +565,7 @@ export class SlotRegistry implements SlotService {
           via: meta.via,
           lazy: meta.lazy,
           ...(meta.importPath === undefined ? {} : { importPath: meta.importPath }),
+          mode: meta.mode,
         })
       }
     }

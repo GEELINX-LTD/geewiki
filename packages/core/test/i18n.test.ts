@@ -113,6 +113,47 @@ test('★ F15：同一键被两家提供时先到者保留，并记为冲突（�
   assert.deepEqual(r.conflicts, ['plugin.demo.x'])
 })
 
+/* --------------------------- P8：品牌文案可覆盖 --------------------------- */
+
+test('★ P8：白名单内的宿主键允许插件覆盖，白名单外的一律仍拒（同一把尺子）', () => {
+  /*
+   * 这条钉的是 `OVERRIDABLE_HOST_KEYS` 的**强制点**（服务端 mergeCatalogs）。
+   * 客户端 `checkPluginCatalog` 走的是同一个函数，因此这里绿 ⇒ 前端预览也绿。
+   */
+  const r = mergeCatalogs([
+    { owner: null, catalog: { 'host.app.title': 'GeeWiki', 'host.nav.wiki': '知识库' } },
+    {
+      owner: '@geewiki-plugin/brand',
+      catalog: {
+        // 白名单内 ⇒ 放行（品牌名描述"这个部署叫什么"，覆盖它是正当需求）
+        'host.app.title': 'Acme 知识库',
+        // 白名单外 ⇒ 仍拒（界面语义文案被插件改写 = 能骗用户点"继续"）
+        'host.nav.wiki': '点我删除',
+      },
+    },
+  ])
+
+  /*
+   * 注意"覆盖"在这里的形态：宿主**先**提供、插件**后**提供时，键已存在 ⇒ 走冲突分支
+   * （先到者保留）。这是刻意的，也是前端不依赖服务端结果的原因：
+   * 服务端 `mergeCatalogs` 只合并**插件**贡献（`packages/manager/src/i18n.ts`），
+   * 宿主文案随前端产物打包，覆盖发生在前端 `catalogsNow()` 的「宿主 → 插件」展开顺序里。
+   * 因此这里断言的是**放行**（不拒绝），而不是"插件值赢了宿主值"。
+   */
+  assert.equal(r.merged['host.app.title'], 'GeeWiki', '服务端只合并插件贡献，宿主值不会被插件改写')
+  assert.deepEqual(r.conflicts, ['host.app.title'], '放行的覆盖键若与宿主同名，仍应作为冲突可见')
+  assert.deepEqual(r.rejected.map((x) => x.key), ['host.nav.wiki'], '白名单外的宿主键必须被拒绝')
+  assert.match(r.rejected[0]!.reason, /host\.app\.title/, '拒绝理由要指出白名单里有哪些键可覆盖')
+})
+
+test('★ P8：白名单内的宿主键在【只有插件贡献】时直接落地（服务端的真实调用形态）', () => {
+  // 服务端拿到的 contributions 只有插件（宿主文案不进接口），故覆盖键不会被冲突分支吃掉
+  const r = mergeCatalogs([{ owner: '@geewiki-plugin/brand', catalog: { 'host.app.title': 'Acme 知识库' } }])
+  assert.equal(r.merged['host.app.title'], 'Acme 知识库')
+  assert.deepEqual(r.rejected, [])
+  assert.deepEqual(r.conflicts, [])
+})
+
 /* ------------------------------ 解析 ------------------------------ */
 
 test('★ F15：回退命中顺序为 精确 → 基语言 → 默认语言 → 默认的基语言', () => {

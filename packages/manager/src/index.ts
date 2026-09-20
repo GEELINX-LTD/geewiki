@@ -84,7 +84,7 @@ import {
   type RegisteredPlugin,
 } from './deps.js'
 import { decideWatchdog } from './watchdog.js'
-import { SlotRegistry, resolveSlots, undeclaredSlots, type SlotAssignment } from './slots.js'
+import { SlotRegistry, resolveExtensions, resolveSlots, undeclaredSlots, type ExtNodeAssignment, type SlotAssignment } from './slots.js'
 import {
   collectRouteDecls,
   effectiveRoutesByOwner,
@@ -752,6 +752,13 @@ export class GeeWikiManager {
       webDist: this.config.pluginUiDist,
       statFile: statFileSync,
       slotAssignments: this.slotAssignments(),
+      /*
+        P12：扩展点裁决也要进入口表（`extNodes` 字段）。前端拿它做越权闸门——
+        "声明了但被抑制"与"根本没声明"必须区分开，否则被抑制的 replace 仍会注册，
+        而 `Ext` 按注册顺序取第一个 ⇒ 可能渲染出后端判为被抑制的那一个。
+        只下发插槽（`slots`）覆盖不到 `ui-*` / `shell-*` / `page` 这些节点。
+      */
+      extAssignments: this.extNodeAssignments(),
       // F2：路由声明必须进入口表 —— 它是"要不要推迟加载该插件产物"的判据之一
       // （只贡献按需插槽 + 一个页面的插件若被推迟，点导航项会看到空白页且不报错）。
       routesByOwner: effectiveRoutesByOwner(this.routeResolution().routes),
@@ -785,6 +792,17 @@ export class GeeWikiManager {
      * （因为裁决时压根不知道它是单占用）。
      */
     return resolveSlots(this.slots.list(), this.activationOrder, this.slots.declarations())
+  }
+
+  /**
+   * **模式化**的扩展裁决结果（`resolveExtensions` 的产物，界面扩展平台 P3）。
+   *
+   * 与 {@link slotAssignments} 的关系：后者是"只有追加语义"的旧视图（形状是已发布契约，
+   * 入口表与既有诊断都在读它），本方法返回同一份裁决**加上模式信息**。
+   * 两者由同一个纯函数产出（`resolveSlots` 只是它的投影），因此不存在"两套裁决"。
+   */
+  extNodeAssignments(): ExtNodeAssignment[] {
+    return resolveExtensions(this.slots.list(), this.activationOrder, this.slots.declarations())
   }
 
   /**
@@ -1985,15 +2003,32 @@ export class GeeWikiManager {
   }
 
   /**
-   * 把 manifest 的 `geewiki.slots` 声明登记为插槽贡献。
+   * 把 manifest 的 `geewiki.slots` / `geewiki.extensions` 声明登记为扩展贡献。
    *
    * 为什么在激活后才登记：与激活失败的处理保持一致——失败的插件不应占着插槽。
-   * 未知插槽名由 `SlotRegistry` 忽略并告警（不阻断激活），与前端"忽略未知插槽名"一致。
+   * 未知节点名 / 该节点不允许的模式由 `SlotRegistry` 忽略并告警（不阻断激活），
+   * 与前端"忽略未知节点"一致。
+   *
+   * `slots` 是 `extensions` 中 `mode: 'extend'` 的简写：两者都走同一条登记路径，
+   * 于是不存在"声明式扩展点只在清单里有效、运行期查询看不到"的分裂。
+   * 同一 `(owner, node)` 重复声明时**先登记者保留 `via`**：`slots` 里已经声明过的节点，
+   * 在 `extensions` 里再以别的模式出现时会被 `extend()` 告警并覆盖模式（可见，不静默）。
    */
   private registerManifestSlots(name: string, entry: RegisteredPlugin): void {
     const declared = entry.manifest.geewiki.slots
-    if (!declared || declared.length === 0) return
-    for (const slot of declared) this.slots.contributeFromManifest(name, slot)
+    if (declared && declared.length > 0) {
+      for (const slot of declared) this.slots.contributeFromManifest(name, slot)
+    }
+    const extensions = entry.manifest.geewiki.extensions
+    if (extensions && extensions.length > 0) {
+      for (const decl of extensions) {
+        if (decl === null || typeof decl !== 'object') {
+          console.warn(`[manager] 插件 ${name} 的 geewiki.extensions 里有非对象条目（已忽略）`)
+          continue
+        }
+        this.slots.contributeFromManifest(name, decl.node, undefined, decl.mode ?? 'extend')
+      }
+    }
   }
 
   /**
@@ -2422,6 +2457,17 @@ export function registerRoutes(router: HttpRouterService, manager: GeeWikiManage
     ok(h, {
       slots: assignments,
       conflicts: assignments.filter((a) => a.suppressed.length > 0),
+      /*
+       * 界面扩展平台（P3）：同一份裁决**加上模式**。
+       *
+       * 为什么是**新增字段**而不是把 `slots` 改成新模式：`slots` 的形状是已发布契约
+       * （既有前端解析器、既有守卫测试、既有管理台都在读它）。新增而不是改写，
+       * 于是"后端升级、前端未升级"的组合仍然工作——这是插件平台的常态，不是过渡期。
+       *
+       * `node` 是宿主节点 id 或插件自定义扩展点名；`byMode` 让前端直接组装
+       * （replace → wrap → extend 的应用顺序已由 `effective` 排好）。
+       */
+      extensions: manager.extNodeAssignments(),
       // A1：谁开了哪些插件自定义扩展点（基数由声明决定，未声明默认 multi）
       declarations,
       /*

@@ -33,7 +33,13 @@ import {
   type SlotName,
 } from '@geewiki/core'
 import type { RegisteredPlugin } from './deps.js'
-import { conflictsOf, effectiveSlotsByOwner, type SlotAssignment, type SlotConflict } from './slots.js'
+import {
+  conflictsOf,
+  effectiveSlotsByOwner,
+  type ExtNodeAssignment,
+  type SlotAssignment,
+  type SlotConflict,
+} from './slots.js'
 
 /** 文件指纹（只 stat，不读内容）：入口/样式的 mtime 与大小 */
 export interface UiFileStat {
@@ -72,6 +78,18 @@ export interface PluginUiTableEntry {
    *    **本次新增该字段不会改变任何既有部署的 revision**，不会平白触发一次全量重取。
    */
   slots?: SlotName[]
+  /**
+   * 该插件**生效的扩展节点**（`shell-*` / `page` / `ui-*` / 插件自定义扩展点；**不含插槽**——
+   * 插槽见上面的 `slots`，构造处保证两者**互不重叠**，故不构成同一事实的两份表示）。
+   *
+   * 为什么必须下发（P12，修一个真缺陷）：前端要用它做**越权闸门**——"声明了但被抑制"与
+   * "根本没声明"必须区分开，否则被抑制的 `replace` 仍会注册，而 `Ext` 按**注册顺序**取第一个，
+   * 于是可能渲染出后端判为被抑制的那一个（`packages/web/src/lib/pluginUi.ts` 里记着
+   * "E2E 抓到过：赢家是 A，界面却渲染了 B"）。只靠 `slots` 字段覆盖不到非插槽节点。
+   *
+   * 同样空值时省略该键（理由见 `slots`）：既有部署的 revision 不变。
+   */
+  extNodes?: SlotName[]
   /**
    * 该插件**生效的**页面路由声明（F2 新增）。同样空值时省略该键（理由同上）。
    *
@@ -236,6 +254,25 @@ function revOf(hit: { entryStat: UiFileStat; cssStat?: UiFileStat }): string {
   return createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 8)
 }
 
+/**
+ * 每个 owner **生效的**扩展节点（**排除插槽**——插槽由 `slots` 字段承担，两者必须互不重叠，
+ * 否则同一事实就有两份表示，漂移时表现为"闸门按一份放行、加载决策按另一份"）。
+ *
+ * `effective` 里已经是"replace → wrap → extend"的应用顺序，这里只取 owner 与节点名。
+ */
+function extNodesByOwnerOf(assignments: readonly ExtNodeAssignment[]): Map<string, SlotName[]> {
+  const byOwner = new Map<string, SlotName[]>()
+  for (const a of assignments) {
+    if (a.kind === 'slot') continue
+    for (const contribution of a.effective) {
+      const list = byOwner.get(contribution.owner)
+      if (list) list.push(a.node)
+      else byOwner.set(contribution.owner, [a.node])
+    }
+  }
+  return byOwner
+}
+
 export interface BuildPluginUiTableOptions {
   registry: readonly RegisteredPlugin[]
   /** 当前激活集合（通常来自管理器的 activeNames()） */
@@ -247,6 +284,11 @@ export interface BuildPluginUiTableOptions {
   dirExists?: UiDirExists
   /** 插槽裁决结果（`resolveSlots` 的产物）。缺省视为"无人贡献插槽"，行为与改动前完全一致。 */
   slotAssignments?: readonly SlotAssignment[]
+  /**
+   * 扩展点裁决结果（`resolveExtensions` 的产物，含插槽与非插槽节点）。
+   * 缺省视为"没有插件贡献扩展点"，`extNodes` 键不出现 ⇒ revision 不变。
+   */
+  extAssignments?: readonly ExtNodeAssignment[]
   /**
    * 每个 owner **生效的**路由声明（`effectiveRoutesByOwner` 的产物）。
    * 缺省视为"没有插件声明路由"，行为与改动前完全一致（`routes` 键不出现 ⇒ revision 不变）。
@@ -282,6 +324,7 @@ export function buildPluginUiTable(opts: BuildPluginUiTableOptions): PluginUiTab
   const found: Record<string, PluginUiTableEntry> = {}
   const skipped: PluginUiSkipped[] = []
   const slotsByOwner = effectiveSlotsByOwner(opts.slotAssignments ?? [])
+  const extNodesByOwner = extNodesByOwnerOf(opts.extAssignments ?? [])
   for (const entry of opts.registry) {
     const name = entry.name
     if (!isPluginUiName(name)) {
@@ -303,6 +346,7 @@ export function buildPluginUiTable(opts: BuildPluginUiTableOptions): PluginUiTab
       continue
     }
     const slots = slotsByOwner.get(name)
+    const extNodes = extNodesByOwner.get(name)
     const routes = opts.routesByOwner?.get(name)
     found[name] = {
       entry: declared.entry,
@@ -310,6 +354,7 @@ export function buildPluginUiTable(opts: BuildPluginUiTableOptions): PluginUiTab
       rev: revOf(hit),
       // 空数组时省略键：见 PluginUiTableEntry.slots 的说明（保持既有部署 revision 不变）
       ...(slots === undefined || slots.length === 0 ? {} : { slots }),
+      ...(extNodes === undefined || extNodes.length === 0 ? {} : { extNodes }),
       ...(routes === undefined || routes.length === 0 ? {} : { routes }),
     }
   }

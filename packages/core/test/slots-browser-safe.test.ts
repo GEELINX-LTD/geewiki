@@ -244,3 +244,106 @@ test('★ F9：web 与 plugin-auth 不得再本地定义 AuthCapabilities 白名
     assert.match(code, must, `${rel}: ${why}。`)
   }
 })
+
+/* ==================== 界面扩展平台：宿主节点目录的浏览器安全守卫 ==================== */
+
+/**
+ * `src/extensions.ts` 是「宿主节点目录 + 扩展模式」的真源，与 `slots.ts`、`domain.ts`
+ * 承担**完全相同**的约束：前端经 `@geewiki/core/extensions` 直接 import 它
+ * （`<Ext>` 出口要据此判断"这个节点认不认识"、`registerExtension` 要据此校验模式），
+ * 因此任何 Node / cordis 依赖都会让 Vite 构建失败、或在运行期才抛。
+ */
+const coreExtensionsPath = join(here, '..', 'src', 'extensions.ts')
+
+test('src/extensions.ts 不引入任何 Node / 服务端依赖', () => {
+  const code = stripComments(readFileSync(coreExtensionsPath, 'utf8'))
+  const forbidden = [
+    { re: /from\s+['"]node:[^'"]+['"]/g, what: 'node:* 导入' },
+    { re: /require\(\s*['"]node:/g, what: 'node:* require' },
+    { re: /from\s+['"]cordis['"]/g, what: 'cordis 导入' },
+    { re: /from\s+['"]schemastery['"]/g, what: 'schemastery 导入' },
+  ]
+  for (const { re, what } of forbidden) {
+    const hit = code.match(re)
+    assert.equal(
+      hit,
+      null,
+      `src/extensions.ts 出现了 ${what}：${hit?.join(', ')}。` +
+        '本文件会被 Vite 打进浏览器 bundle（前端据此校验节点名与模式），' +
+        '任何 Node 依赖都会让前端构建失败或在运行期抛错。',
+    )
+  }
+})
+
+test('src/extensions.ts 不 import 本包 index.ts（否则 node:fs 会被拖回来）', () => {
+  const code = stripComments(readFileSync(coreExtensionsPath, 'utf8'))
+  const bad = code.match(/from\s+['"]\.\/index(\.js)?['"]/g)
+  assert.equal(
+    bad,
+    null,
+    'src/extensions.ts 不得 import ./index.js —— index.ts 顶层 import "node:fs"，' +
+      '这会让浏览器构建把 node:fs 拖进来，正好废掉本文件"浏览器安全子集"的全部意义。',
+  )
+})
+
+test('★ src/extensions.ts 必须从 slots.ts 取插槽事实，而不是重抄一份', () => {
+  const code = stripComments(readFileSync(coreExtensionsPath, 'utf8'))
+  // 正面：确实从 ./slots.js 取类型与常量（基数真源 SLOT_CARDINALITY、判据 PLUGIN_SLOT_NAME）
+  assert.match(
+    code,
+    /from '\.\/slots\.js'/,
+    'src/extensions.ts 必须从 ./slots.js 取插槽事实（BuiltinSlotName / SLOT_CARDINALITY / isPluginSlotName）。',
+  )
+  // 反面：不得出现"自己又写一份插槽名字数组"的写法
+  const localDefs = code.match(/\b(?:const|type)\s+(?:SLOT_NAMES|SLOT_CARDINALITY|BuiltinSlotName|PLUGIN_SLOT_NAME)\b\s*[=:]/g)
+  assert.equal(
+    localDefs,
+    null,
+    `src/extensions.ts 又本地定义了一份插槽事实：${localDefs?.join(', ')}。` +
+      '宿主节点目录必须**并入** BuiltinSlotName，而不是把它重抄成第二份字面量。',
+  )
+})
+
+test('src/extensions.ts 导出目录与模式判据的那组名字', () => {
+  const code = readFileSync(coreExtensionsPath, 'utf8')
+  for (const name of [
+    'ExtMode',
+    'HostNodeKind',
+    'HostNodeName',
+    'HostNodeSpec',
+    'HOST_NODE_CATALOG',
+    'HOST_NODE_NAMES',
+    'DEFAULT_EXT_MODE',
+    'EXT_MODES',
+    'isHostNodeName',
+    'isExtName',
+    'hostNodeSpec',
+    'extModesOf',
+    'supportsExtMode',
+    'extendCardinalityOf',
+    'modeCardinalityOf',
+  ]) {
+    assert.match(
+      code,
+      new RegExp(`export (type|const|function|interface) ${name}\\b`),
+      `src/extensions.ts 缺少导出 ${name}（前端与 manager 都依赖它）`,
+    )
+  }
+})
+
+test('core 的 index.ts 转出 extensions.ts，且 package.json 有对应子路径', () => {
+  const index = readFileSync(coreIndexPath, 'utf8')
+  assert.match(
+    index,
+    /export \* from '\.\/extensions\.js'/,
+    "src/index.ts 必须 `export * from './extensions.js'`，否则既有调用点拿不到目录。",
+  )
+  const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as {
+    exports: Record<string, string>
+  }
+  assert.equal(
+    pkg.exports['./extensions'],
+    './src/extensions.ts',
+    "package.json 的 exports 里必须有 './extensions' —— web 侧要经它 import（否则只能从 index 引，进而拖进 node:fs）。",
+  )
+})

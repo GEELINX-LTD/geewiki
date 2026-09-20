@@ -328,6 +328,33 @@ export function pluginMessagePrefixOf(pluginName: string): string {
   return `${PLUGIN_MESSAGE_PREFIX}${short}.`
 }
 
+/**
+ * 允许插件**覆盖**的宿主文案键白名单（P8）。
+ *
+ * ## 为什么是"一份极小的白名单"，而不是放开宿主键
+ * 命名空间强制的理由（见本文件头 ①）依然成立：`host.nav.wiki`、`host.notfound.*`
+ * 这类**界面语义**文案若可被任意插件改写，一个"把'确认删除'改成'继续'"的插件就能骗用户点下去。
+ * 但**品牌类**文案是另一回事——它描述的是"这个部署叫什么"，企业皮肤插件覆盖它是正当需求，
+ * 也是"一切前端元素可被扩展"里"文案"这一半的落点。
+ *
+ * 因此名单**逐个评审**：只有名单内的宿主键允许插件覆盖，其余宿主键仍按原规则拒绝并报告。
+ * 名单是契约的一部分，加键必须同时给出理由与守卫（`packages/web/test/i18n.test.ts` 钉住名单内容）。
+ *
+ * ## 一条准入纪律：只放"宿主真的渲染了"的键
+ * 允许一个宿主**从不渲染**的键，插件会得到"声明成功、界面毫无变化"的静默失败——
+ * 比拒绝更坏（与 `packages/core/src/extensions.ts` 里"只登记已接线的节点"同一条纪律）。
+ *
+ * ## 覆盖优先级（两侧一致，不新造规则）
+ * - 服务端 `mergeCatalogs` 只合并**插件**贡献，名单内的键因此直接进入插件 catalog；
+ * - 前端 `catalogsNow()`（`packages/web/src/lib/i18n.ts`）的顺序是「宿主 → 插件」，
+ *   故插件值**覆盖**宿主值；
+ * - 多个插件提供同一个名单内键 ⇒ 仍是"先到者保留"并记入 `conflicts`（与插件命名空间同规则）。
+ */
+export const OVERRIDABLE_HOST_KEYS: readonly string[] = Object.freeze([
+  // 品牌名（页头 `shell-brand-text` 字样，`packages/web/src/App.tsx`）
+  'host.app.title',
+])
+
 /** 键的完整语法：`host.a.b` 或 `plugin.<短名>.a.b`（小写字母数字与 `.`/`-`，段内不得为空） */
 export const MESSAGE_KEY =
   /^(?:host|plugin\.[a-z][a-z0-9-]*(?:\/[a-z][a-z0-9-]*)*)\.[a-z0-9]+(?:[.-][a-z0-9]+)*$/
@@ -438,14 +465,20 @@ export function mergeCatalogs(
         rejected.push({ key, owner: label, reason: '键名不符合语法（应为 host.* 或 plugin.<短名>.*）' })
         continue
       }
-      if (!key.startsWith(allowed)) {
+      /*
+        插件提供**名单内**的宿主键是允许的（P8 品牌覆盖）：它描述的是"这个部署叫什么"，
+        与"改界面语义"是两类东西。名单外的宿主键仍然拒绝——判据不放开。
+      */
+      const overridable = owner !== null && OVERRIDABLE_HOST_KEYS.includes(key)
+      if (!key.startsWith(allowed) && !overridable) {
         rejected.push({
           key,
           owner: label,
           reason:
             owner === null
               ? '宿主文案键必须以 host. 开头'
-              : `插件只能提供 ${allowed} 前缀下的键（否则可覆盖宿主或其它插件的界面文案）`,
+              : `插件只能提供 ${allowed} 前缀下的键（否则可覆盖宿主或其它插件的界面文案）；` +
+                `宿主键中只有 ${OVERRIDABLE_HOST_KEYS.join('、')} 允许被插件覆盖`,
         })
         continue
       }

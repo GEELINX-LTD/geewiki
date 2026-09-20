@@ -19,7 +19,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SLOT_CARDINALITY, SLOT_NAMES, type SlotContribution } from '@geewiki/core'
+import { SLOT_CARDINALITY, SLOT_NAMES, type ExtMode, type SlotContribution } from '@geewiki/core'
 import {
   SlotRegistry,
   conflictsOf,
@@ -42,8 +42,8 @@ function findRepoRoot(from: string): string {
 }
 
 /** 造一条贡献记录（测试用，字段与 SlotContribution 对齐） */
-function contrib(owner: string, slot: string, lazy = false): SlotContribution {
-  return { slot: slot as SlotContribution['slot'], owner, via: 'manifest', lazy }
+function contrib(owner: string, slot: string, lazy = false, mode: ExtMode = 'extend'): SlotContribution {
+  return { slot: slot as SlotContribution['slot'], owner, via: 'manifest', lazy, mode }
 }
 
 /* ---------------------- 跨包白名单：单一真源守卫 ---------------------- */
@@ -216,7 +216,7 @@ test('contribute/list：登记后可见，注销函数幂等', () => {
   assert.equal(listed.length, 1)
   assert.deepEqual(
     { ...listed[0] },
-    { slot: 'editor', owner: 'p1', via: 'runtime', lazy: true, importPath: 'chunks/editor.js' },
+    { slot: 'editor', owner: 'p1', via: 'runtime', lazy: true, importPath: 'chunks/editor.js', mode: 'extend' },
   )
   off()
   off() // 幂等：第二次不应抛，也不应影响别人
