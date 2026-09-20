@@ -64,8 +64,20 @@ export const ASSISTANT_CAPABILITIES_PATH = '/api/ai/assistant/capabilities'
  */
 export const REQUIRED_TOOL_NAMES: readonly string[] = ['search_kb']
 
-/** 请求体上限（与其它 JSON 端点同量级）。历史消息可能很长，故比 1MB 稍宽 */
-const MAX_BODY_BYTES = 4_000_000
+/**
+ * 请求体上限。
+ *
+ * 16 MB 是**被图片撑上去的**：无状态轮次协议每轮都要重发整段转录，转录里带图
+ * ⇒ 请求体随对话里的图片数增长。取值与另外三个常量是一组：
+ * `MAX_IMAGE_BASE64_CHARS`(1.4 MB) × `MAX_IMAGES_PER_MESSAGE`(4) ≈ 5.6 MB（单条消息的图），
+ * 客户端 `MAX_CONVERSATION_IMAGES`(8) × 1.4 MB ≈ 11.2 MB（整段对话的图），
+ * 余下的留给文本与工具结果（`maxRounds` 40 × `maxToolResultChars` 8000 = 320 KB）。
+ *
+ * 仍然**必须有**这道闸：没有它，一个匿名请求就能拿任意大的 body 把进程内存打满
+ * （body 是整体缓冲后 `JSON.parse` 的）。它与逐图上限不是重复——
+ * 那条挡"一张图吃掉整个预算"，这条挡"总量"。
+ */
+const MAX_BODY_BYTES = 16_000_000
 
 /**
  * 测试专用注入口。**刻意不进 `configSchema`**——照 `@geewiki/ai-qa` 的先例：
@@ -239,6 +251,14 @@ export const AiAssistantPlugin = {
           available: pre === null && missingTools.length === 0,
           degraded: pre,
           tools: toolNames,
+          /*
+           * 当前模型收不收图 —— 界面据此决定**要不要显示图片按钮**。
+           *
+           * 为什么要下发而不是让浏览器猜：这是 LLM 设置里的一项显式声明，
+           * 猜错的代价不对称（见 `LlmSettings.supportsVision`）。界面拿到 false 时
+           * 不显示入口，用户就不会经历"贴了图、发出去、才发现发不了"。
+           */
+          vision: svc?.settings().supportsVision === true,
           missing,
         })
       }, { access: 'public' }),
@@ -338,6 +358,28 @@ export const AiAssistantPlugin = {
         if (!llmSvc) {
           // preGenerationDegraded 已经覆盖；这里是给类型收窄用的第二道，不会真的走到
           h.json(503, { ok: false, error: 'model_unavailable', message: 'llm-service 不可用', degraded: null })
+          return
+        }
+
+        /*
+         * ★ 模型没声明支持看图时，**客户端仍塞了图就明确拒绝**（2026-09-20）。
+         *
+         * 为什么不在这一层"宽容地丢掉图片继续跑"：用户贴了图、看到回答里只字不提，
+         * 会以为模型没认真看；而真正的原因（这个模型收不了图）一个字都没说出来。
+         * 明确 400 + 一句可执行的指引，是这条链路上唯一诚实的处理。
+         *
+         * 输入条那一侧会据此**不显示图片按钮**（能力由 `capabilities` 端点下发），
+         * 所以这条错误只在"设置被改小之后旧页面还开着"这类窗口里出现。
+         */
+        if (!llmSvc.settings().supportsVision && parsed.value.messages.some((m) => (m.images?.length ?? 0) > 0)) {
+          h.json(400, {
+            ok: false,
+            error: 'vision_unsupported',
+            message:
+              '当前模型未声明支持图像输入（LLM 设置里的「支持图像输入」没有打开），' +
+              '所以这次请求里的图片无法交给它。请去掉图片后重发，或让管理员打开该开关。',
+            degraded: null,
+          })
           return
         }
 

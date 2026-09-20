@@ -38,6 +38,8 @@ function settingsWith(patch: Partial<LlmSettings>): () => LlmSettings {
     maxOutputTokens: 4096,
     reasoningEffort: 'off',
     timeoutMs: 60000,
+    // 夹具的模型是假的；能力面从严（与 `LlmSettings.supportsVision` 的缺省一致）
+    supportsVision: false,
     includeUsage: true,
     extraBody: '',
     apiKeyEnv: '',

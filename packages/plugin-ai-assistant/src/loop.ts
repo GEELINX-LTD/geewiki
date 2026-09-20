@@ -30,10 +30,11 @@ import type { AiToolContext } from '@geewiki/ai-tools'
  * 伪装成了「资料里没有」，模型据此回答"知识库资料不足"。
  */
 import type { Principal } from '@geewiki/core'
-import type { AiToolGrounding, AiToolResult, ResolvedTool } from '@geewiki/ai-tools'
+import type { AiToolGrounding, AiToolImage, AiToolResult, ResolvedTool } from '@geewiki/ai-tools'
 import {
   assembleToolCalls,
   redact,
+  type LlmImagePart,
   type LlmMessage,
   type LlmService,
   type LlmToolCall,
@@ -42,7 +43,11 @@ import {
   type LlmUsage,
 } from '@geewiki/llm'
 import { buildMessages, SYSTEM_PROMPT, type PageHint } from './prompt.js'
-import type { TurnMessage } from './types.js'
+import {
+  isAcceptableImage,
+  MAX_IMAGES_PER_MESSAGE,
+  type TurnMessage,
+} from './types.js'
 import type { ToolActivity, TurnFinishReason, TurnToolSide } from './sse.js'
 
 /* ============================== 事件与结果 ============================== */
@@ -178,32 +183,125 @@ export interface LoopOptions {
 
 /* ============================== 消息转换 ============================== */
 
-/**
- * `TurnMessage` → `LlmMessage`。
- *
- * 丢掉 `name`（它只给界面看）；其余字段**逐字往返**。这个函数刻意做成纯映射，
- * 不做任何裁剪或补全——裁剪在 `buildMessages()`，那里一处就够。
- */
-function toLlmMessages(messages: readonly TurnMessage[]): LlmMessage[] {
-  return messages.map((m) => {
-    const out: {
-      role: TurnMessage['role']
-      content: string
-      toolCalls?: readonly LlmToolCall[]
-      toolCallId?: string
-    } = { role: m.role, content: m.content }
-    if (m.toolCalls !== undefined) out.toolCalls = m.toolCalls
-    if (m.toolCallId !== undefined) out.toolCallId = m.toolCallId
-    return out
-  })
-}
-
 function toToolDefs(tools: readonly ResolvedTool[]): LlmToolDef[] {
   return tools.map((t) => ({
     name: t.descriptor.name,
     description: t.descriptor.description,
     parameters: t.descriptor.parameters,
   }))
+}
+
+/* ========================= 工具交上来的图片 ========================= */
+
+/**
+ * 单条工具结果最多带几张图。与 `MAX_IMAGES_PER_MESSAGE` **同值**，因为折到线上就是
+ * 一条 user 消息（那个常量管的是"一条消息能带几张"）。
+ */
+const MAX_TOOL_IMAGES_PER_RESULT = MAX_IMAGES_PER_MESSAGE
+
+/**
+ * 一回合最多把几张图折进上下文。
+ *
+ * 与浏览器侧的 `MAX_CONVERSATION_IMAGES` 同值不是巧合：那是本仓对"一段对话里能有多少张图"
+ * 的既有判断，这里是它的服务端对偶——模型可以在一回合里连读好几张图，不设总量的话
+ * 40 轮 × 每轮一张就是 40 张图进了上下文（每张约一千多 token）。
+ */
+const MAX_TURN_TOOL_IMAGES = 8
+
+/**
+ * 校验工具交上来的图片，折成上游形态的 {@link LlmImagePart}。
+ *
+ * **两头都不可信**：工具是插件写的（可能实现得随意），字节来自用户上传（外部输入）。
+ * 判据与线协议那条**完全一致**（`isAcceptableImage`：形状 / MIME / 长度）——
+ * 两处各写一遍必然漂移，而漂移方向若是"工具那条更松"，就等于绕过了线协议的全部校验。
+ *
+ * 丢掉一张图**不报错**（工具结果照旧进上下文）：一张图不合规不该让整个回合失败。
+ * 但调用方要在自己的 `content` 里如实写出给了几张——模型据此才知道自己看到的是不是全部。
+ */
+function sanitizeToolImages(raw: readonly AiToolImage[] | undefined): LlmImagePart[] {
+  if (raw === undefined || raw.length === 0) return []
+  const out: LlmImagePart[] = []
+  for (const img of raw) {
+    if (img === null || typeof img !== 'object') continue
+    if (!isAcceptableImage(img.mime, img.data)) continue
+    out.push({ url: `data:${img.mime};base64,${img.data}` })
+  }
+  return out
+}
+
+/**
+ * 这一轮实际交给模型的图片，以及"少给了几张"的如实说明。
+ *
+ * **两道上限在这里一起算，且必须一起说**：单条工具结果最多
+ * {@link MAX_TOOL_IMAGES_PER_RESULT} 张、一回合累计最多 {@link MAX_TURN_TOOL_IMAGES} 张。
+ * 第一版把单条上限写在 `sanitizeToolImages` 里，于是超过 4 张时**静默**丢掉——
+ * 而工具已经在自己 `content` 里写了"已附上 6 张"，模型据此以为看全了。
+ * 这与 `truncateResult` 是同一条纪律：**少给可以，静默少给不行**。
+ */
+function admitToolImages(
+  images: readonly LlmImagePart[],
+  used: number,
+): { readonly kept: LlmImagePart[]; readonly note: string | null } {
+  const room = Math.max(0, Math.min(MAX_TOOL_IMAGES_PER_RESULT, MAX_TURN_TOOL_IMAGES - used))
+  const kept = images.slice(0, room)
+  if (kept.length === images.length) return { kept, note: null }
+  return {
+    kept,
+    note:
+      `[这次工具返回了 ${images.length} 张图，只有前 ${kept.length} 张交给了你` +
+      `（单次最多 ${MAX_TOOL_IMAGES_PER_RESULT} 张、本回合累计最多 ${MAX_TURN_TOOL_IMAGES} 张）。` +
+      '需要看其余的图，请在下一轮重新读取。]',
+  }
+}
+
+/**
+ * 把一回合里攒下的图片挂到**对应的那条 tool 消息**上。
+ *
+ * ## 为什么是 tool 消息而不是另起一条 user 消息（2026-09-20 改）
+ * 第一版在这里直接拼了一条"系统附注 + 图片"的 user 消息插进请求。那**在线上是对的**
+ * （chat-completions 的 tool 消息只能是字符串），但**分层是错的**：它把"这个协议表达不了
+ * 工具带图"这件**适配器的事**写进了会话核心，于是会话核心的语义里凭空多出一种
+ * "不是用户说的 user 消息"。
+ *
+ * 现在的分层照搬 DSH（`packages/llm/llm-deepseek/src/serialize.ts` 的 `flushToolImages`）：
+ * 内部模型里图片**就是工具结果的一部分**（`LlmMessage.images` + `role:'tool'`），
+ * 由**适配器**在拼线上请求时 flush 成一条 user 消息。会话核心只说事实，不说协议方言。
+ *
+ * ## 为什么图片不进转录
+ * 转录（`TurnMessage[]`）是权威的，会随 `done.messages` 回给客户端、被原样存下、下一轮原样带回。
+ * base64 图片进去就会（a）在界面上显示成"用户发过的图"，（b）每轮重发一遍把请求体撑爆，
+ * （c）挤爆 localStorage 配额。所以它是一条**只存在于发给上游那一份里**的派生数据，
+ * 由这张按 `toolCallId` 索引的表承载。
+ */
+function toLlmMessages(
+  messages: readonly TurnMessage[],
+  toolImages: ReadonlyMap<string, readonly LlmImagePart[]>,
+): LlmMessage[] {
+  return messages.map((m) => {
+    const out: {
+      role: TurnMessage['role']
+      content: string
+      images?: readonly LlmImagePart[]
+      toolCalls?: readonly LlmToolCall[]
+      toolCallId?: string
+    } = { role: m.role, content: m.content }
+    if (m.toolCalls !== undefined) out.toolCalls = m.toolCalls
+    if (m.toolCallId !== undefined) out.toolCallId = m.toolCallId
+    /*
+     * 图片在这里才折成 data URL：`TurnImage` 是 `{mime, data}`（校验友好的形态），
+     * 而上游要的是自包含的 URL。转换放在**唯一需要上游形态的地方**，
+     * 于是"线上形态"与"上游形态"各自只有一处定义，不会漂移。
+     */
+    if (m.images !== undefined && m.images.length > 0) {
+      out.images = m.images.map((img) => ({ url: `data:${img.mime};base64,${img.data}` }))
+    }
+    // 工具结果带的图：按 `toolCallId` 挂上去（适配器负责 flush，见函数头）
+    if (m.toolCallId !== undefined) {
+      const carried = toolImages.get(m.toolCallId)
+      if (carried !== undefined && carried.length > 0) out.images = carried
+    }
+    return out
+  })
 }
 
 /** 把一行的换行与连续空白压平，供界面显示（`summary` 会进 DOM 的一行里） */
@@ -242,7 +340,13 @@ async function executeTool(
   principal: Principal,
   context: AiToolContext,
   budget: number,
-): Promise<{ content: string; ok: boolean; summary: string; grounding: AiToolGrounding | null }> {
+): Promise<{
+  content: string
+  ok: boolean
+  summary: string
+  grounding: AiToolGrounding | null
+  images: LlmImagePart[]
+}> {
   let result: AiToolResult
   try {
     result = await tool.execute(principal, parseArguments(call.arguments), context)
@@ -254,6 +358,8 @@ async function executeTool(
       summary: `执行失败：${oneLine(message, 80)}`,
       // 失败没有产出任何资料——"跑了但没拿到"不算依据（与 search_kb 0 命中同一条判据）
       grounding: null,
+      // 抛异常的工具不可能交出可信的图（可能连字节都没读完）
+      images: [],
     }
   }
   const content = truncateResult(result.content, budget)
@@ -272,6 +378,8 @@ async function executeTool(
     ok: true,
     summary: oneLine(content, 120),
     grounding: result.grounding ?? null,
+    // 工具交上来的图（校验与条数上限见 `sanitizeToolImages`），由适配器 flush 成 user 消息
+    images: sanitizeToolImages(result.images),
   }
 }
 
@@ -315,6 +423,15 @@ export async function runAgentLoop(
 ): Promise<LoopOutcome> {
   const transcript: TurnMessage[] = [...opts.messages]
   const toolResults: ToolActivity[] = []
+  /*
+   * 工具交上来的图片**不能进转录**（转录是权威的、会随 `done.messages` 回给客户端、
+   * 被原样存下、下一轮原样带回）：base64 进去就会在界面上显示成"用户发过的图"、
+   * 每轮重发一遍把请求体撑爆、并挤爆 localStorage 配额。
+   * 所以它只活在发给上游那一份里，用 `toolCallId` 索引（见 `toLlmMessages`）。
+   */
+  const toolImages = new Map<string, LlmImagePart[]>()
+  /** 本回合已经折进上下文的图片张数（跨轮次累计，闸见 `MAX_TURN_TOOL_IMAGES`） */
+  let injectedImageCount = 0
   const byName = new Map(opts.tools.map((t) => [t.descriptor.name, t]))
   const toolDefs = toToolDefs(opts.tools)
   let usage: LlmUsage | null = null
@@ -404,6 +521,7 @@ export async function runAgentLoop(
       { role: 'system' as const, content: SYSTEM_PROMPT },
       ...toLlmMessages(
         buildMessages(transcript, { page: opts.page, maxHistoryMessages: opts.maxHistoryMessages }),
+        toolImages,
       ),
     ]
     const request = {
@@ -602,7 +720,19 @@ export async function runAgentLoop(
 
       emit({ type: 'tool-start', id: call.id, name: call.name, side: 'server', arguments: call.arguments })
       const outcome = await executeTool(tool, call, opts.principal, opts.context, opts.maxToolResultChars)
-      transcript.push({ role: 'tool', content: outcome.content, toolCallId: call.id, name: call.name })
+      /*
+       * 图片挂在**这一条**工具结果上（`toolCallId` 索引），并受两道上限约束。
+       * 被挤掉的那些必须**说出来**——否则工具已经在自己的文本里写了"已附上 N 张"，
+       * 而模型只拿到几张，它会以为自己看到了全部。这与 `truncateResult` 是同一条纪律：
+       * 少给可以，**静默**少给不行。
+       */
+      const admitted = admitToolImages(outcome.images, injectedImageCount)
+      if (admitted.kept.length > 0) {
+        toolImages.set(call.id, admitted.kept)
+        injectedImageCount += admitted.kept.length
+      }
+      const content = admitted.note === null ? outcome.content : `${outcome.content}\n\n${admitted.note}`
+      transcript.push({ role: 'tool', content, toolCallId: call.id, name: call.name })
       /*
        * `grounded` 只认 `'kb'`（它问的是"有没有知识库依据"）；`groundingSources` 收全部档。
        * 两个判断写法不同不是笔误：把任何档都塞进 `grounded` 会让「依据公开网络」

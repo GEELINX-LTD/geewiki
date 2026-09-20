@@ -565,6 +565,34 @@ export interface WikiService {
   setNavOrder(parent: string | null, items: readonly string[]): Promise<number>
 
   /**
+   * 读取**附件字节**（服务内调用，判据与 `GET /api/attachments/:id` **同一份**）。
+   *
+   * 为什么需要它（而不是让调用方自己去请求那个端点）：附件下载的判据是
+   * "页面可见 ∧ 该附件出现在你看得见的正文段落里"，而**上游 LLM 不是本站主体**
+   * （没有 cookie），拿到 URL 也取不到；`@geewiki/ai-kb` 的 `read_page` 因此只能
+   * 在服务端把字节取出来、随工具结果交给模型。走盘中目录或另写一份判据都是不可接受的：
+   * 前者绕过 ACL，后者是第二份会漂移的实现（本仓反复记档的那类缺陷）。
+   *
+   * 四类拒绝**一律返回 `undefined`**，且**不区分原因**：不存在、页面无权、附件只出现在
+   * 你看不到的受限段落里、字节在盘上缺失。区分开就等于提供了一个存在性探测接口——
+   * 附件 id 是连续整数、可枚举（下载端点为此把 403 改成了 404，理由见该处注释）。
+   * 需要区分原因的只有**审计**，那条路径留在 HTTP 处理器里。
+   */
+  readAttachment(
+    principal: Principal,
+    id: number,
+    opts?: {
+      /**
+       * 字节上限：**超过就返回 `undefined`，且在打开流之前就判**。
+       *
+       * 调用方常常只是"看看这份字节能不能用"（AI 侧只接受很窄的图片体积），
+       * 先把几十 MB 读进内存再丢掉是纯粹的浪费。
+       */
+      readonly maxBytes?: number
+    },
+  ): Promise<WikiAttachmentBytes | undefined>
+
+  /**
    * 站点主页**显式设置**的 slug；从未设置过时返回 `null`（= 回落约定主页 `home`）。
    *
    * 这是**存储口径**（库里有什么就回什么），不是"主页该渲染哪一篇"：
@@ -595,6 +623,22 @@ export interface WikiService {
   backlinks(slug: string, principal: Principal): Promise<WikiBacklink[] | undefined>
   /** 该页正文指向的目标；`undefined` 对应 404。不可见的目标带 `exists:'hidden'`，**不得**当作"不存在" */
   links(slug: string, principal: Principal): Promise<WikiOutlink[] | undefined>
+}
+
+/**
+ * 附件字节读出结果（{@link WikiService.readAttachment}）。
+ *
+ * `mime` 取自 `attachments` 表（上传时由**扩展名白名单**推出，不信任客户端声明），
+ * 因此调用方可以据它判断"这份附件是不是图片"，不需要自己去猜扩展名。
+ */
+export interface WikiAttachmentBytes {
+  readonly id: number
+  /** 上传时的原始文件名，仅用于展示 */
+  readonly name: string
+  readonly mime: string
+  readonly ext: string
+  readonly byteSize: number
+  readonly bytes: Uint8Array
 }
 
 /* ============================ attachment-service ============================ */

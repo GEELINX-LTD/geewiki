@@ -25,6 +25,7 @@
  * 见 `resolveTurnTools()`：服务端只认「注册表里确有 ∧ 该 owner 插件当前激活 ∧
  * 客户端声明它会执行」三者交集。一个没注册的名字被声明一万次也不会进工具表。
  */
+import { AI_TOOL_IMAGE_MIME_WHITELIST } from '@geewiki/ai-tools'
 import type { LlmToolCall } from '@geewiki/llm'
 import Schema from 'schemastery'
 
@@ -47,10 +48,61 @@ export const MAX_MESSAGE_CHARS = 64_000
 /** 客户端声明的客户端工具名条数上限（多到这个量级说明调用方在乱报，直接截断而不是 400） */
 export const MAX_CLIENT_TOOLS = 64
 
+/** 单条消息最多带几张图。防的是"一个请求塞进几十张图"把上游与内存都打满 */
+export const MAX_IMAGES_PER_MESSAGE = 4
+
+/**
+ * 单张图片的 base64 **字符**上限（1.4M 字符 ≈ 1 MB 字节）。
+ *
+ * 为什么按字符而不是按字节：线上传输的就是 base64，而校验发生在解析前——
+ * 字符数是**不解码**就能判定的量。解一次 1 MB 的 base64 只为"看看它是不是合法 base64"，
+ * 那正是拒绝服务最省事的入口。
+ *
+ * 取值不是随手定的：它与**另外两道闸**构成一组自洽的数字——
+ * `MAX_IMAGES_PER_MESSAGE`(4) × 本值 ≈ 5.6 MB ≤ `MAX_BODY_BYTES`(16 MB)，
+ * 而客户端 `MAX_CONVERSATION_IMAGES`(8) × 本值 ≈ 11.2 MB ≤ 16 MB。
+ * 三者的关系由 `test/uiDockImage.test.ts` 的镜像守卫钉住；
+ * 改任意一个而不同步另外两个，症状是"某张图在某一层被 413/400，而界面说它已发出"。
+ *
+ * 浏览器侧的镜像常量是 `ui/imagePlan.ts` 的 `IMAGE_MAX_BASE64_CHARS`。
+ */
+export const MAX_IMAGE_BASE64_CHARS = 1_400_000
+
+/**
+ * 允许的图片 MIME 白名单。
+ *
+ * **真源在 `@geewiki/ai-tools` 的 `AI_TOOL_IMAGE_MIME_WHITELIST`**（2026-09-20）：
+ * 这份名单现在有**三个**消费方——本层（线协议 + 工具结果校验）、工具实现
+ * （`read_page` 挑正文里的图）、浏览器界面（另一份不能 import node 模块的镜像）。
+ * 前两个都依赖 `@geewiki/ai-tools`，所以真源放那里；这里保留同名导出，
+ * 是为了让"线协议的判据"仍然能在本文件里一眼读到，而不是散在依赖树里。
+ *
+ * **刻意不含 `image/svg+xml`**：SVG 是"能被解释的文档"，同源内联时可带脚本
+ * （附件层已因此把它排除在内联之外）。交给上游模型既没有收益，也让"这张图到底是不是图"
+ * 变成一个需要解释的问题。`image/gif` 保留：动图的第一帧对模型仍然有意义。
+ */
+export const IMAGE_MIME_WHITELIST: readonly string[] = AI_TOOL_IMAGE_MIME_WHITELIST
+
+/** 裸 base64 的形态：字母表 + 至多两个 `=` 补齐。**不做长度必须是 4 的倍数的断言**（宽松处只此一项） */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
+
 /* ============================== 消息 ============================== */
 
 /** 允许出现的角色。**刻意不含 `'system'`**——见文件头红线 1 */
 export type TurnRole = 'user' | 'assistant' | 'tool'
+
+/**
+ * 随一条用户消息发给模型的图片。
+ *
+ * 形态是 `{mime, data}`（**不带 `data:` 前缀的裸 base64**）而不是一整条 data URL：
+ * 校验必须能**分别**判定"这是不是白名单里的图片类型"与"载荷是不是合法 base64"，
+ * 而从一整条 data URL 里反解这两件事，等于在本层再写一个 URL 解析器。
+ * 折成 data URL 是**下游**（`loop.ts` 的 `toLlmMessages`）的事——那是唯一需要上游形态的地方。
+ */
+export interface TurnImage {
+  readonly mime: string
+  readonly data: string
+}
 
 /**
  * 往返于客户端与服务端之间的一条消息。
@@ -62,6 +114,14 @@ export type TurnRole = 'user' | 'assistant' | 'tool'
 export interface TurnMessage {
   readonly role: TurnRole
   readonly content: string
+  /**
+   * `role:'user'` 时：随这条消息一起发的图片（多模态）。
+   *
+   * 它**随转录原样往返**：`done.messages` 把用户那条连图一起回给客户端，
+   * 客户端原样存下、下一轮原样带回（与"服务端是转录唯一真源"同一条纪律）。
+   * 只允许出现在 user 上——模型与工具都不会"附图"。
+   */
+  readonly images?: readonly TurnImage[]
   /** `role:'assistant'` 时：本轮模型请求的全部工具调用（含服务端已执行的） */
   readonly toolCalls?: readonly LlmToolCall[]
   /** `role:'tool'` 时：对应哪一个调用（原样往返 `LlmToolCall.id`） */
@@ -155,6 +215,55 @@ function parseToolCall(raw: unknown, where: string): LlmToolCall | string {
   return { id, name, arguments: args }
 }
 
+/**
+ * 一张图的**形状**是否合规：MIME 命中白名单 ∧ base64 形态 ∧ 长度上限。
+ *
+ * 单独导出是因为它有**两个**判据完全相同的调用点：
+ * ① 线协议（浏览器上送的图，不合规就 400）；② 工具结果里附带的图
+ * （`loop.ts` 校验插件交上来的图，不合规就丢掉）。两处各写一遍必然漂移——
+ * 而漂移的方向若是"工具那条更松"，就等于绕过了线协议的全部校验。
+ *
+ * **不解码**：解一次 1 MB 的 base64 只为验证它合不合法，那正是拒绝服务最省事的入口。
+ */
+export function isAcceptableImage(mime: unknown, data: unknown): boolean {
+  if (typeof mime !== 'string' || !IMAGE_MIME_WHITELIST.includes(mime)) return false
+  if (typeof data !== 'string' || data === '' || data.length > MAX_IMAGE_BASE64_CHARS) return false
+  return BASE64_RE.test(data)
+}
+
+/**
+ * 解析一条消息的图片数组。
+ *
+ * 逐项校验 MIME 白名单与 base64 形态，**不解码**（理由见 `MAX_IMAGE_BASE64_CHARS`）。
+ * 形态不对一律 400：这是一条从浏览器来的、会原样转发给上游的载荷，
+ * "宽容地包一层"只会把一个畸形请求变成上游的 400，报错点离病因更远。
+ */
+function parseImages(raw: unknown, where: string): TurnImage[] | string {
+  if (!Array.isArray(raw)) return `${where}.images 必须是数组`
+  if (raw.length > MAX_IMAGES_PER_MESSAGE) {
+    return `${where}.images 过多（${raw.length} > ${MAX_IMAGES_PER_MESSAGE}）`
+  }
+  const out: TurnImage[] = []
+  for (const [i, item] of raw.entries()) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      return `${where}.images[${i}] 必须是对象 { mime, data }`
+    }
+    const o = item as Record<string, unknown>
+    const mime = o['mime']
+    const data = o['data']
+    if (typeof mime !== 'string' || !IMAGE_MIME_WHITELIST.includes(mime)) {
+      return `${where}.images[${i}].mime 不支持：${String(mime)}（只接受 ${IMAGE_MIME_WHITELIST.join(' / ')}）`
+    }
+    if (typeof data !== 'string' || data === '') return `${where}.images[${i}].data 必须是非空 base64 字符串`
+    if (data.length > MAX_IMAGE_BASE64_CHARS) {
+      return `${where}.images[${i}].data 过大（${data.length} > ${MAX_IMAGE_BASE64_CHARS}）`
+    }
+    if (!BASE64_RE.test(data)) return `${where}.images[${i}].data 不是合法 base64`
+    out.push({ mime, data })
+  }
+  return out
+}
+
 function parseMessage(raw: unknown, index: number): TurnMessage | string {
   const where = `messages[${index}]`
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return `${where} 必须是对象`
@@ -176,9 +285,27 @@ function parseMessage(raw: unknown, index: number): TurnMessage | string {
     return `${where}.content 超长（${content.length} > ${MAX_MESSAGE_CHARS}）`
   }
 
-  const message: { role: TurnRole; content: string; toolCalls?: LlmToolCall[]; toolCallId?: string; name?: string } = {
+  const message: {
+    role: TurnRole
+    content: string
+    images?: TurnImage[]
+    toolCalls?: LlmToolCall[]
+    toolCallId?: string
+    name?: string
+  } = {
     role: role as TurnRole,
     content,
+  }
+
+  if (obj['images'] !== undefined) {
+    /*
+     * 只允许 user 附图。assistant/tool 带图是**协议上没有的形态**：
+     * 上游只接受 user 消息的多模态内容，放行它会在上游 400，而报错点离病因很远。
+     */
+    if (role !== 'user') return `${where}.images 只允许出现在 role:'user' 上（只有用户会附图）`
+    const images = parseImages(obj['images'], where)
+    if (typeof images === 'string') return images
+    if (images.length > 0) message.images = images
   }
 
   if (obj['toolCalls'] !== undefined) {

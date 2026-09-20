@@ -73,3 +73,29 @@ export function CollapseIcon() {
     </svg>
   )
 }
+
+/**
+ * 添加图片（lucide `image`）：画框 + 山 + 太阳。
+ *
+ * 与头部那三个图标同一条几何（24 网格 / 2px 描边 / 圆头圆角），故并排放在输入行里
+ * 不会显得是两套东西。
+ */
+export function ImageIcon() {
+  return (
+    <svg {...BASE}>
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+      <circle cx="9" cy="9" r="2" />
+      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+    </svg>
+  )
+}
+
+/** 移除一张待发图片：叉（lucide `x`）。做成**独立图标**而不是字符 `×`，字号/基线才与其它图标一致 */
+export function RemoveIcon() {
+  return (
+    <svg {...BASE} width={12} height={12}>
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </svg>
+  )
+}

@@ -141,10 +141,12 @@ test('④ 图标 svg 都 aria-hidden（可访问名由按钮提供，不重复�
    * 这份清单是**枚举**而非"至少包含"：新增图标必须显式登记，否则它掉了 BASE 也没人发现。
    * 2026-09-16 新增 `ChevronIcon`（工具摘要行的展开指示）——它同样只是装饰，
    * 可访问名由那个 `aria-expanded` 按钮提供。
+   * 2026-09-20 新增 `ImageIcon`（输入行的加图按钮）与 `RemoveIcon`（移除待发图片）——
+   * 两条的可访问名同样由各自按钮的 `aria-label` 提供，svg 只是装饰。
    */
   assert.deepEqual(
     exported.sort(),
-    ['ChevronIcon', 'CollapseIcon', 'HistoryIcon', 'NewChatIcon'],
+    ['ChevronIcon', 'CollapseIcon', 'HistoryIcon', 'ImageIcon', 'NewChatIcon', 'RemoveIcon'],
     `每个图标都必须展开 BASE（当前：${exported.join(' / ')}）——手写属性会漏掉 aria-hidden`,
   )
 })

@@ -75,9 +75,51 @@ export interface LlmRouteDescriptor {
   available(): boolean
 }
 
+/**
+ * 随一条消息一起发给模型的图片（多模态）。
+ *
+ * `url` 是 **data URL**（`data:image/png;base64,…`）。为什么不用一个对象存储 URL：
+ * 本仓的附件下载端点带**页面级 ACL**，而上游模型服务商不是本站的主体、取不到那个 URL。
+ * 把附件 URL 交给上游的结果是"模型看不见图"，且**不会有任何报错**——它会照着看不到的图
+ * 编一段描述。data URL 是自包含的，任何 OpenAI 兼容网关都直接接受。
+ *
+ * 代价是请求体变大（base64 约为原字节的 4/3）。这由调用方在**入站校验**里收紧：
+ * 超限直接 400，而不是把一个几 MB 的请求转发给上游（见
+ * `packages/plugin-ai-assistant/src/types.ts` 的 `MAX_IMAGE_BASE64_CHARS`）。
+ */
+export interface LlmImagePart {
+  /** 图片的 data URL。**只有 `data:image/<type>;base64,` 形态会被上游接受**（校验在回合端点） */
+  readonly url: string
+  /**
+   * 可选：给服务商的细节档位（OpenAI 的 `detail`）。**缺省不下发**，由服务商按自己的默认值处理。
+   *
+   * 与 `LlmRequest.temperature` 同一条理由：各家网关对"默认"的写法不一致，
+   * 客户端补一个默认值等于替服务商做决定。
+   */
+  readonly detail?: 'auto' | 'low' | 'high'
+}
+
 export interface LlmMessage {
   readonly role: 'system' | 'user' | 'assistant' | 'tool'
   readonly content: string
+  /**
+   * 可选：随这条消息一起发的图片（多模态）。两种合法用法：
+   *
+   * - **`role:'user'`**：用户发的图（输入条粘贴/拖拽/选择）。
+   * - **`role:'tool'`**：**这次工具调用返回的图**（如 `read_image` 读到的附件）。
+   *   ⚠️ 适配器**不得**把它塞进 tool 消息的 content —— chat-completions 协议里
+   *   tool 消息只能是字符串。正确做法是照 DSH 的 `flushToolImages`：
+   *   先发 tool 消息（纯文本），把图攒起来，在**下一条非 tool 消息之前**折成一条
+   *   `user` 消息发出去（见 `plugin-openai` 的 `serializeMessages`）。
+   *   其余角色带图是**契约错误**，适配器可以拒绝。
+   *
+   * 刻意做成 `content` 旁边的**可选字段**，而不是把 `content` 改成
+   * "字符串 | 内容块数组"：后者是一次破坏性契约变更，会让每个读 `content` 的存量消费方
+   * （问答 / 辅助写作 / 摘要）都要改类型，而它们本来就不发图片。
+   * 有图片时由**适配器**折成上游的 content 数组形态（见 `plugin-openai` 的 `serializeMessage`）；
+   * 没有图片时请求体逐字节不变，前缀缓存与严格网关都不受影响。
+   */
+  readonly images?: readonly LlmImagePart[]
   /**
    * `role:'assistant'` 时：本轮请求的工具调用。
    *
@@ -347,6 +389,22 @@ export interface LlmSettings {
    * 密钥值本身只能经 {@link LlmService.resolveApiKey} 取，且绝不进响应体。
    */
   readonly apiKeyEnv: string
+  /**
+   * **当前模型是否支持图像输入**（多模态）——由用户在 LLM 设置里显式声明。
+   *
+   * ## 为什么是一个"用户说了算"的开关，而不是自动探测
+   * OpenAI 兼容协议里**没有任何字段**能问出"这个模型收不收图"：`/models` 只回 id 列表，
+   * 真正的模态信息在服务商自己的文档里。本仓的 `LlmRouteDescriptor` 也没有模态元数据
+   * （对比 DSH 的 `inputModalities`——它有，所以能在调用前拒绝）。既然如此，
+   * 与其猜一个默认值，不如**让配模型的人说清楚**：他本来就知道自己接的是哪个模型。
+   *
+   * ## 缺省为什么是 `false`（从严）
+   * 猜错的代价不对称：猜"支持"而实际不支持 ⇒ 上游 400，**整轮对话失败**；
+   * 猜"不支持"而实际支持 ⇒ 图片按钮不出现、`read_image` 不进工具表，
+   * 用户少用一个能力，但**没有坏掉的东西**，而且设置页里就写着怎么打开。
+   * 与 `LlmMessage.images` 的"只认 data URL"、附件的"扩展名白名单"是同一条纪律。
+   */
+  readonly supportsVision: boolean
 }
 
 export interface LlmService {

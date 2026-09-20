@@ -13,6 +13,9 @@
  * 与 `packages/plugin-ai-qa/ui/sse.ts` 是**两份**实现（两个插件各自的帧载荷不同），
  * 但解码的骨架刻意一致——它们共用的是同一套线上协议（`@geewiki/core` 的 `sse.ts`）。
  */
+import { fromTurnImages, type DockImage } from './imagePlan.js'
+
+export type { DockImage }
 
 /** 工具执行发生在哪一侧 */
 export type ToolSide = 'server' | 'client'
@@ -44,6 +47,13 @@ export interface TurnToolCallView {
 export interface DockMessage {
   readonly role: 'user' | 'assistant' | 'tool'
   readonly content: string
+  /**
+   * `role:'user'` 时：随这条消息一起发的图片（多模态）。
+   *
+   * 服务端把用户那条**连图一起**放进 `done.messages` 回传（转录唯一真源），
+   * 这里原样解出来、原样存下、下一轮原样带回。旧服务端不发这个字段 ⇒ 空数组。
+   */
+  readonly images?: readonly DockImage[]
   readonly toolCalls?: readonly TurnToolCallView[]
   readonly toolCallId?: string
   readonly name?: string
@@ -181,10 +191,22 @@ function parseMessages(raw: unknown): DockMessage[] | null {
     const message: {
       role: 'user' | 'assistant' | 'tool'
       content: string
+      images?: DockImage[]
       toolCalls?: TurnToolCallView[]
       toolCallId?: string
       name?: string
     } = { role, content }
+    /*
+     * 图片**坏一条就整帧判 invalid**（与 `toolCalls` 同口径），而不是"跳过坏的、留好的"：
+     * 静默丢一张图的表现是"模型说它看不到图"，而用户明明发出去了——
+     * 那正是本仓反复记档的"静默降级"。
+     */
+    if (o['images'] !== undefined) {
+      const images = fromTurnImages(o['images'])
+      const raw = o['images']
+      if (!Array.isArray(raw) || images.length !== raw.length) return null
+      if (images.length > 0) message.images = images
+    }
     if (o['toolCalls'] !== undefined) {
       const calls = parseToolCalls(o['toolCalls'])
       if (calls === null) return null

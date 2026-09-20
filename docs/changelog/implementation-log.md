@@ -14,6 +14,120 @@
 
 **当前实现状态**
 
+- **AI 能读文章里的图（2026-09-20，第二批）**：用户提问「如果文章中有图，可以读到吗」——
+  当时的答案是**读不到**（`read_page` 只给 Markdown 文本，图就是 `![说明](/api/attachments/42)`
+  这一行），随后用户要求「找一个最优的方案来实现」，并指出「变成临时 user 消息感觉很诡异，
+  应该给 ai 提供一个读图工具，你可以参考 dsh 的设计」。
+  - **照搬 DSH 的三层分工**（`packages/llm/llm-deepseek/src/serialize.ts` 的 `flushToolImages`）：
+    **工具**说"我读到了一张图"（`AiToolResult.images`）→ **会话核心**说"这条工具结果带着图"
+    （`LlmMessage.images` + `role:'tool'`）→ **适配器**说协议方言（chat-completions 的 tool
+    消息只能是字符串，故 `plugin-openai` 的 `serializeMessages` 把图攒起来、在下一条非 tool
+    消息之前折成一条 user 消息）。
+  - **第一版做错了什么（记档）**：最初在会话核心里直接拼了一条"系统附注 + 图片"的 user 消息。
+    那**在线上是对的**，但把"协议表达不了工具带图"这件**适配器的事**写进了会话核心，
+    凭空造出一种"不是用户说的 user 消息"。改过来之后会话核心不再知道任何协议细节。
+  - **新工具 `read_image(id)`**（`@geewiki/ai-kb`），模型**按需**调用；`read_page` 改成
+    **只数不取**（只说"正文里引用了 N 张图，要看用 read_image"）。这与 DSH 的
+    `read_file`（文本）/ `read_image`（图）是同一种分工：读一页不再变成一次**不可预期**的
+    开销（一页可能引用十张图），模型也有了"这张我不用看"的选择权。
+  - **取字节只有一条路**：新增 `WikiService.readAttachment(principal, id, { maxBytes })`，
+    与 `GET /api/attachments/:id` **共用同一个** `resolveAttachmentAccess`（从下载端点里抽出来的）。
+    不这么抽就会有两份会漂移的判据，而漂移方向一旦是"放宽"，就是"正文里看不到的段落，
+    附件却能读"且**不会报错**。`maxBytes` 在**打开流之前**判（不把 25 MB 读进内存再丢）。
+  - **图片不进权威转录**：转录会随 `done.messages` 回给客户端、被原样存下、下一轮原样带回；
+    base64 进去就会在界面上显示成"用户发过的图"、每轮重发撑爆请求体、并挤爆 localStorage。
+    它只活在发给上游那一份里（`loop.ts` 的 `toLlmMessages(messages, toolImages)`，按 `toolCallId` 索引）。
+  - **两道上限，且少给必说**：单条工具结果 4 张、一回合累计 8 张、单图 1 MB
+    （`AI_TOOL_IMAGE_MAX_BYTES`，base64 后 ≈1.33 M 字符 ≤ 核心的 1.4 M）。`admitToolImages`
+    把两道上限一起算并把"少给了几张"写进工具结果文本——第一版把单条上限写在
+    `sanitizeToolImages` 里，超过 4 张时**静默**丢掉，而工具已在自己文本里写了"已附上 6 张"。
+    与 `truncateResult` 同一条纪律：**少给可以，静默少给不行**。
+  - **拒绝回复是 `id` 的纯函数**：五类拒绝（不存在 / 页面无权 / 只在受限段落 / 字节缺失 / 超限）
+    回同一句话——附件 id 连续可枚举，按原因分叉就成了存在性探测接口（下载端点当初把 403
+    改成 404 正是为此）。守卫的判据不是词表黑名单，而是"把 id 替换掉之后两次回复逐字节相同"，
+    即**结构上无法**按原因分叉。
+  - **读数**：全仓 `pnpm test` **2475/2475 绿**（26 个包全部 `# fail 0`）、
+    `pnpm run typecheck` **26** 个 project 全 Done、0 个 `error TS`。
+    新增守卫：`plugin-openai` 三条 flush 测试（tool 消息只发字符串 / 一轮多图只多一条 user
+    且 tool 必须相邻 / 末尾必须再 flush）、`plugin-ai-assistant` 三条循环测试
+    （图挂在 tool 消息上且不进转录 / 与线协议同一份校验 / 超限少给必说）、
+    `plugin-ai-kb` 六条工具测试。
+  - **未做**：**没有"当前模型支不支持图像输入"的前置判据**——DSH 的 `assertImageCapableRoute`
+    查路由的 `inputModalities`，而本仓的 `LlmRouteDescriptor` 没有模态元数据。上游若是纯文本
+    模型，flush 出来的那条 user 消息可能被判 400（整轮失败，不是降级）。设计真源见
+    [docs/design/dock-images.md](../design/dock-images.md) §11。
+    → **同日第三批已解决**，见下一条。
+- **LLM 设置里显式声明"支持视觉"（2026-09-20，第三批）**：用户指出「在 llm 的设置那里可以
+  显式设置为是否支持视觉」——正是上一条那个缺口的正解。DSH 查路由的 `inputModalities`，
+  而**本仓没有模态元数据**（OpenAI 兼容协议也没有任何字段能问出这件事：`/models` 只回 id 列表），
+  既然探测不到，就**让配模型的人说清楚**。
+  - **一处开关、三处生效**：`LlmConfigSchema` 新增 `supportsVision`（`Schema.boolean()`，
+    **缺省 false**，放在 `model` 紧后面——它是对**这个模型**的声明）；经 `LlmSettings` 下发后：
+    ① 输入条的图片按钮（`capabilities` 端点新增 `vision` 字段，界面缺省从严）**不渲染**；
+    ② `read_image` **不进模型的工具表**，且 `read_page` 的提示改成"你看不到这些图，不要臆测"；
+    ③ `POST /api/ai/turn` 在客户端仍塞了图时明确 **400 `vision_unsupported`**。
+  - **缺省为什么是 false**：猜错的代价不对称——猜"支持"而实际不支持 ⇒ 上游 400、**整轮失败**；
+    猜"不支持"而实际支持 ⇒ 少一个入口，且设置里就写着怎么打开。与 `LlmMessage.images`
+    的"只认 data URL"、附件的"扩展名白名单"是同一条纪律。
+  - **为什么由插件自己问、而不是让宿主把能力塞进插槽 props**：这是"本插件自己那条链路的配置"，
+    不是宿主才有的事实（路由、身份、客户端工具名单才是）。宿主契约每加一个字段要同步三处
+    镜像与两条守卫，为一件插件内部的事付那个代价不划算。故 `ui/dockPlan.ts` 新增
+    `fetchVision()` / `visionOf()`（解析**从严**：任何不符合预期的形态都回 false）。
+  - **换模型后要重新确认这一项**：做成"按模型记忆"需要一张模型→能力表，而那张表没有任何
+    权威来源，只会变成一个会过期的猜测。
+  - **读数**：全仓 `pnpm test` **2481/2481 绿**（26 个包全部 `# fail 0`）、
+    `pnpm run typecheck` 26 个 project 全 Done、0 个 `error TS`。新增守卫 8 条
+    （`visionOf` 从严 / ai-kb 的能力门与提示跟随 / capabilities 下发 / 回合 400 / 打开后放行 /
+    schema 顺序）。**两个既有 schema 顺序守卫被有意更新**：`plugin-llm/test/settings.test.ts`
+    的"前 7 项"变成"前 8 项"（新增的那项紧跟 `model`）。
+  - **仍未做**：开关只表达"人声明它支持"，本仓**不替你验证**——打开而模型其实不支持时，
+    症状是上游 400（§9 的 L1）。
+- **输入条支持图片（2026-09-20）**：用户原话「当前在dock栏还无法输入图片给ai，加一下此功能」。
+  三条口径与用户当场定档：**多模态直发上游**（不是"先传成附件再给 URL"）、**随对话历史保存**、
+  **模型要有把图存进服务器的能力**（用户原话口径："比如说用户要求把图片插入进文章的时候"）。
+  - **契约面**：`LlmMessage` 加**可选** `images?: LlmImagePart[]`（`packages/core/src/llm.ts`），
+    `content` 仍是 `string`——**刻意**没改成"字符串 | 内容块数组"：那是破坏性变更，会让每个读
+    `content` 的存量消费方（问答 / 写作 / 摘要）都要改类型，而它们本来就不发图片。
+    `@geewiki/openai` 的 `serializeMessage` **有图才**把 `content` 折成内容块数组，无图逐字节不变
+    （存量请求体的前缀缓存因此不失效）。
+  - **为什么必须直发 data URL**：附件下载端点的判据是页面 ACL，而**上游 LLM 不是本站主体**——
+    给它 `/api/attachments/<id>` 它取不到图（没有 cookie），而且**不报错**，只会凭文字猜。
+    那正是"看起来接上了、其实模型是瞎的"。
+  - **七跳链路**：三个入口（文件选择 / 粘贴 / 拖拽）→ `prepareImageFile`（超 400 KB 才重编码到
+    JPEG，**GIF 永不重编码**）→ `DockImage{url}` → `trimConversationImages` → `{mime,data}` →
+    服务端 `parseImages`（白名单 + base64 形状 + 长度，**不解码**）→ `toLlmMessages` 折 data URL。
+  - **一组必须同时成立的数字**：单图 1.4M 字符 / 单条消息 4 张 / **整段对话 8 张** / 请求体 16 MB。
+    后两条不是洁癖：无状态协议每轮都要重发**整段转录**，图片在里面 ⇒ 请求体随图片数**线性增长**，
+    不设上限的结局是"聊到第十张图时突然 413"，而用户完全不知道自己做错了什么。
+    **裁在 `withUserMessage` 而不是上送边界**：`applyTurnEvent` 的 `done` 分支用 `messages: d.messages`
+    **整个替换**本地转录，上送时才裁会让服务端回灌的那份丢图而界面还留着，两边从此不一致且不报错。
+    有损取舍记档：超限的旧图**连同文字一起留下、图消失**（`image.save` 读的就是这段转录，故也存不回来）。
+  - **`image.save` 是客户端工具**（`packages/web/src/lib/clientTools.ts` 的两半结构）：描述符由
+    `@geewiki/ai-pages` 在服务端以 `side:'client'` 声明，执行体由 `@geewiki/ai-assistant` 的 UI
+    登记（`ui/imageSave.ts`）。**执行体必须在浏览器**的两个各自独立的理由：① 图片字节只在用户那一侧
+    （用户完全可能**下一轮**才说"把刚才那张存起来"，而服务端手上的请求体只覆盖当前回合）；
+    ② 上传走既有的 `PUT /api/attachments/:slug`（会话 cookie + CSRF + 页面 `canEdit`），
+    与编辑页上传**完全同一条路径**，不新增"AI 专用的写入通道"。**不标 `mutating`**：它只新增附件行，
+    真正的"插进文章"由 `page.update` 落笔且那条已进变更日志、可回退。
+  - **界面三条硬约束**：① 三个入口只调 `addFiles`（粘贴**只在真有图片时** `preventDefault`，
+    否则会把正常文字粘贴吃掉——那个 bug 与图片毫无关系，看起来像输入框坏了）；
+    ② 预览条住**面板里**，不在那个绝对定位的 55px `.gw-dock-row` 里（塞进去会撑破高度、
+    连带弄坏"收起/展开是同一个盒子"这条不变量）；③ 拖拽悬停走 `data-dragging` 属性 +
+    `rootRef` 上的 `addEventListener`，因为 `uiDockDismiss` / `uiDockMotion` 两条既有守卫
+    **逐字**钉住了 `.gw-dock` 与 `.gw-dock-shell` 的起始标签。
+  - **落盘**：localStorage 配额写不下时**只丢图片、不丢文字**（`withoutImages`）——
+    反过来会让用户刷新后发现整段对话都没了；读回来的每条消息都过 `normalizeDockImages`
+    （坏数据一律丢弃、**绝不抛**，隐私模式下 `localStorage` 会抛异常）。
+  - **读数**：全仓 `pnpm test` **2459/2459 绿**（**26 个包全部 `# fail 0`**；`@geewiki/ai-assistant`
+    262 条含新增 21、`@geewiki/ai-pages` 40 条含新增 6）、`pnpm typecheck` **26** 个 project 全 Done、
+    0 个 `error TS`。**两个既有守卫被有意更新**（不是绕过）：`uiDockContent.test.ts` 的「继续」按钮正则
+    （`send()` 里多了一段清理待发图片的块）与 `uiDockIcons.test.ts` 的图标枚举（新增 `ImageIcon` /
+    `RemoveIcon`），两处都补了注释说明为什么这次变更正当。
+  - **未做（记档）**：**没跑过真实上游的视觉调用**（全部验收停在"请求体正确"这一层；配置里的模型
+    是否支持视觉、`detail` 缺省行为**未实测**）、**没跑过浏览器端到端验收**（剪贴板 / 拖拽 / canvas
+    压缩只能在真浏览器里验，本批未跑 CDP 脚本）；图片**有损保留**（>8 张后旧图消失）；
+    上传附件本身**不可回退**（孤儿附件归附件层的 GC 话题，那边同样未做）。
+    设计真源见 [docs/design/dock-images.md](../design/dock-images.md)。
 - **界面扩展平台：一切前端元素可被扩展 / 替换，主题统一化（2026-09-21）**：用户原话
   「我希望能够让一切前端元素可被扩展修改、替换，然后所有主题都要能够统一化」。起点是一个具体问题：
   「如果我想改左上角 geewiki 字样，能用插件实现吗」——**当时官方做不到**，只能靠两个后门

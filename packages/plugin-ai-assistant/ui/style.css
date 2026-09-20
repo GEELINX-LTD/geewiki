@@ -951,3 +951,130 @@
   line-height: 1.5;
   color: var(--color-muted);
 }
+
+/* ===================== 图片输入（2026-09-20） ===================== */
+
+/*
+ * 输入行里的附件按钮。
+ *
+ * 做成 32×32 的方形而不是 `.gw-dock-btn` 那种文字按钮：它坐在输入框左边，
+ * 与"发送"这个主操作抢宽度会显得是两个同等重要的按钮，而它其实是一个**附件槽**。
+ * 图标按钮没有可见文字 ⇒ `aria-label` 是唯一的可访问名（同头部那三个图标）。
+ */
+.gw-dock-attach {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--color-muted);
+  background: transparent;
+}
+
+.gw-dock-attach:hover:not(:disabled) {
+  background: var(--color-hover);
+  color: var(--color-ink);
+}
+
+.gw-dock-attach:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/*
+ * 待发图片条。
+ *
+ * `flex-wrap` + `overflow-y: auto` 一起用是刻意的：张数上限（4）保证它不会长到
+ * 撑爆面板，而小屏上四个缩略图换行后仍要能看见最后一个的**移除按钮**——
+ * 裁掉的话用户只能靠猜哪张是哪张。
+ */
+.gw-dock-attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 0;
+}
+
+.gw-dock-attach-chip {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.gw-dock-attach-thumb {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-line);
+  background: var(--color-sunken);
+}
+
+.gw-dock-attach-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--color-accent-ink);
+  background: var(--color-ink);
+}
+
+.gw-dock-attach-note {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--color-muted);
+}
+
+/* 用户消息里的图片：跟着气泡宽度走，不撑破对话流 */
+.gw-dock-msg-imgs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.gw-dock-msg-img {
+  max-width: 180px;
+  max-height: 180px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-line);
+  object-fit: cover;
+}
+
+/*
+ * 拖拽悬停态。
+ *
+ * 属性选择器而不是 React state：`.gw-dock` 的 `className` 会被展开态切换重写，
+ * 而 React 不管理 `data-dragging`，两者因此不会互相覆盖（见 index.tsx 里那段注释）。
+ */
+.gw-dock[data-dragging] .gw-dock-shell {
+  outline: 2px dashed var(--color-accent);
+  outline-offset: 2px;
+}
+
+/*
+ * 新按钮的焦点环。
+ *
+ * 单独一条而不是并进上面那条多选择器规则：那一组是 `test/uiDockIcons.test.ts`
+ * 逐字钉着的既有事实，往它里面塞新选择器会让守卫的意图变模糊。
+ * 图标按钮**必须**有 `:focus-visible`——去掉可见文字的同时也去掉了"我在这儿"的唯一线索。
+ */
+.gw-dock-attach:focus-visible,
+.gw-dock-attach-remove:focus-visible {
+  outline: 2px solid var(--gw-focus-ring);
+  outline-offset: 2px;
+}
