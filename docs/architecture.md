@@ -354,7 +354,7 @@ unprovide()                      // ① 先摘掉服务，后续 get('http') 拿
 **已知边界（不要按"完整的插件前端扩展"理解）**：
 
 > **2026-09-21 更新（界面扩展平台 P4–P11b）**：插槽已泛化为**宿主节点 + 三种模式**（`replace` / `wrap` / `extend`），
-> 节点目录 `HOST_NODE_CATALOG`（`packages/core/src/extensions.ts`）现有 **7 插槽 + 7 外壳 + 5 页面元素 + 11 个 `ui-*` 原语**
+> 节点目录 `HOST_NODE_CATALOG`（`packages/core/src/extensions.ts`）现有 **7 插槽 + 7 外壳 + 5 页面元素 + 15 个 `ui-*` 原语**（其中 4 个是 **portal 类**：只开 `extend` + `replace`——`wrap` 的包装元素装不下 portal 内容，属静默失效，故由 `PORTAL_UI_MODES` 排除并由守卫按规则钉住）
 > （外壳节点已全部接线，含 `shell-header` / `shell-footer`；原候选 `shell-sidebar` 经核实**外壳里没有该元素**，已移除）；
 > **容器节点**（`nestedSlots`：`shell-header`→`app-header`、`shell-footer`→`app-footer`）的外壳元素与内层插槽出口
 > **由宿主独占**，`replace` 只换内容 ⇒ 单个插件不可能删掉其他插件的贡献（贡献者用 `props.slots[名]` 决定它落在哪；

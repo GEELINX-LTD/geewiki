@@ -44,8 +44,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 /** 白名单：上游许可证提示、Vite HMR 调试日志、React DevTools 提示（都不是本机制的缺陷） */
 /*
-  P11c 场景**故意**触发两条宿主诊断（"容器节点 + shadow" 与 "shadow 内的挂载点被忽略"）：
-  它们是正确用法提示，不是缺陷。故按**精确文案**放行——写成"放行所有 warning"会把真实告警一起吞掉。
+  P11c 场景**故意**触发两条宿主诊断（"容器节点 + shadow" 与 "shadow 内的挂载点被忽略"）；
+  P13 场景也**故意**触发一条（"portal 节点不允许 wrap"）——那条告警本身就是断言对象
+  （"wrap 被真的拦下"与"它告警了"是同一件事的两面）。
+  它们都是正确用法提示，不是缺陷。故按**精确文案**放行——写成"放行所有 warning"会把真实告警一起吞掉。
 */
 const consoleWhitelist = [
   /proOptions/,
@@ -54,6 +56,7 @@ const consoleWhitelist = [
   /Download the React DevTools/,
   /容器节点（内层出口：app-header）/,
   /内层插槽出口 "app-header" 的挂载点落在 Shadow Root 内/,
+  /节点 "ui-tooltip" 不允许 wrap 模式/,
 ]
 
 const failures = []
@@ -753,7 +756,47 @@ async function unregister(token) {
   }
 }
 
-/* ⑫ 全程 console 零错误、无失败请求 */
+/* ⑫ P13：portal 类节点（extend + replace 可用，**wrap 被拒**） */
+{
+  /*
+    ## 为什么这条必须存在
+    portal 类节点（`ui-dialog-content` / `ui-dropdown-menu-content` / `ui-confirm-dialog` /
+    `ui-tooltip`）的**可见内容**经 Radix `<Portal>` 渲染到 `document.body` 附近，**不在调用处的
+    DOM 子树里**。目录据此给它们标了 `portal: true` 并砍掉 `wrap`（`PORTAL_UI_MODES`）：
+    `wrap` 的契约是"把你的元素包在宿主默认实现外面"，而包装元素的子树**装不下 portal 的内容**
+    ⇒ 样式与作用域都进不去，作者却以为包住了。静默失效，所以不提供。
+
+    这条在真浏览器里验证两件**单测证明不了**的事：
+    ① `replace` 经**定义处接线**在全站生效（`ui-tooltip` 的调用点真的被换掉）；
+    ② `wrap` 在**注册路径**上被真的拦下（宿主侧模式校验 + 告警），而不是只有目录字段写着不允许。
+  */
+  const replacedToken = await withExtension(
+    'ui-tooltip',
+    `(p) => React.createElement(React.Fragment, null, p.children,
+       React.createElement('span', { 'data-acc-tooltip': '1' }, 'TOOLTIP-REPLACED'))`,
+    `{ mode: 'replace' }`,
+  )
+  const replaced = await evaluate(`document.querySelectorAll('[data-acc-tooltip]').length`)
+  check('P13 portal 节点 replace 生效（ui-tooltip 的调用点被换掉）', replaced >= 1, `换掉 ${replaced} 处`)
+  await unregister(replacedToken)
+  const restored = await evaluate(`document.querySelectorAll('[data-acc-tooltip]').length`)
+  check('P13 卸载后 portal 节点还原宿主默认实现', restored === 0, `残留 ${restored}`)
+
+  const wrapToken = await withExtension(
+    'ui-tooltip',
+    `(p) => React.createElement('span', { 'data-acc-tooltip-wrap': '1' }, p.default)`,
+    `{ mode: 'wrap' }`,
+  )
+  const wrapped = await evaluate(`document.querySelectorAll('[data-acc-tooltip-wrap]').length`)
+  check(
+    'P13 portal 节点拒绝 wrap（包装元素装不下 portal 内容 ⇒ 不提供这个陷阱）',
+    wrapped === 0,
+    `wrap 贡献渲染了 ${wrapped} 处`,
+  )
+  await unregister(wrapToken)
+}
+
+/* ⑬ 全程 console 零错误、无失败请求 */
 {
   /*
     未登录时 SPA 自己会去打 `/api/session` 这类需要登录的端点并拿到 401 —— 那是**预期状态**，

@@ -14,6 +14,7 @@
 import * as TooltipPrimitive from '@radix-ui/react-tooltip'
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
 export const TooltipProvider = TooltipPrimitive.Provider
 export const TooltipRoot = TooltipPrimitive.Root
@@ -25,7 +26,7 @@ export interface TooltipProps {
   side?: 'top' | 'right' | 'bottom' | 'left'
 }
 
-export function Tooltip({ content, children, side = 'bottom' }: TooltipProps): ReactNode {
+function TooltipBase({ content, children, side = 'bottom' }: TooltipProps): ReactNode {
   return (
     <TooltipPrimitive.Root>
       <TooltipPrimitive.Trigger asChild>{children}</TooltipPrimitive.Trigger>
@@ -45,3 +46,6 @@ export function Tooltip({ content, children, side = 'bottom' }: TooltipProps): R
     </TooltipPrimitive.Root>
   )
 }
+
+/* ★ P13：宿主节点接线（portal 类**只开放 `replace`**，见 docs/design/ui-extension-platform.md） */
+export const Tooltip = withExt('ui-tooltip', TooltipBase)

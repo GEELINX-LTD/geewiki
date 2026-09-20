@@ -73,25 +73,54 @@ test('★ 双向比对：目录里的每个 ui-* 都已接线，且接线了的�
   )
 })
 
-test('★ 每个已接线的 ui 节点都是三种模式全开（叶子元素的口径）', () => {
+test('★ 已接线的 ui 节点模式集合符合规则（叶子三模式 / portal 两模式）', () => {
   for (const [node, file] of wiredNodes()) {
     const spec = hostNodeSpec(node)
     assert.ok(spec, `${node}（${file}）不在目录里`)
     assert.equal(spec.kind, 'ui', `${node} 的 kind 应为 ui`)
-    assert.deepEqual([...spec.modes], ['extend', 'wrap', 'replace'], `${node} 的模式集合变了`)
+    const expected = spec.portal === true ? ['extend', 'replace'] : ['extend', 'wrap', 'replace']
+    assert.deepEqual([...spec.modes], expected, `${node} 的模式集合变了（portal=${String(spec.portal)}）`)
     assert.equal(spec.propsVersion, 1)
   }
 })
 
-test('★ portal 类组件**不在**目录里（这是决策，不是遗漏）', () => {
+test('★ portal 类组件已接线，但**不开放 wrap**（这是决策，不是遗漏）', () => {
   /*
-   * Dialog / ConfirmDialog / DropdownMenu / Tooltip 的根是 Radix 的 `<Portal>`：
-   * 它不在调用处的 DOM 位置上。`replace` 尚可解释，但 `wrap` 会在调用处留下一个**空的包裹元素**
-   * （肉眼可见的布局残留）。与其提供一个语义可疑的模式，不如先不接——见目录文件头。
-   * 这条断言把"没接"从遗漏变成**写下来的决定**：将来要接，必须同时改这里与文档。
+   * 这四个的**可见内容**经 Radix `<Portal>` 渲染到 `document.body` 附近，**不在调用处的 DOM
+   * 子树里**。于是：
+   * - `replace`（接管整个渲染）成立，且自由度最高；
+   * - `extend`（在调用处追加）成立——调用处就是"用到这个 tooltip / 对话框的地方"，
+   *   追加的东西看得见、位置可预期；
+   * - `wrap` 的契约是"把你的元素包在宿主默认实现外面"，而 portal 的内容**装不进包装元素的
+   *   子树**：包装元素落在调用处、样式与作用域都进不去（CSS 继承与选择器跨不过 portal 边界）
+   *   ⇒ 作者会看到"我明明包住了，什么都没变"。**静默失效**，故砍掉这个模式
+   *   （`PORTAL_UI_MODES = ['extend', 'replace']`），不是限制能力。
+   *
+   * 反过来，`ui-dialog` / `ui-dropdown-menu` **仍然不在目录里**：它们只是 Radix `Root` 的再导出，
+   * 渲染不出 DOM、也不是可见元素——要换的"对话框面 / 菜单面"是 Content，节点挂在后者上。
+   *
+   * 每个节点的 `portal: true` 都必须有**源码证据**（下表最后一列），否则这个标记会变成
+   * 一句没人核对的注释，而它的唯一作用就是决定 `wrap` 能不能用。
    */
-  for (const id of ['ui-dialog', 'ui-dialog-content', 'ui-dropdown-menu', 'ui-tooltip', 'ui-confirm-dialog']) {
-    assert.equal(hostNodeSpec(id), undefined, `${id} 不该在目录里（portal 组件的 wrap 语义不成立）`)
+  const PORTAL_NODES = [
+    { id: 'ui-dialog-content', file: 'Dialog.tsx', evidence: /DialogPrimitive\.Portal/ },
+    { id: 'ui-dropdown-menu-content', file: 'DropdownMenu.tsx', evidence: /Menu\.Portal/ },
+    // 经 `DialogContent` **间接** portal：本文件里没有 `Portal` 字样，渲染的是上面那个节点
+    { id: 'ui-confirm-dialog', file: 'ConfirmDialog.tsx', evidence: /<DialogContent/ },
+    { id: 'ui-tooltip', file: 'Tooltip.tsx', evidence: /TooltipPrimitive\.Portal/ },
+  ] as const
+  for (const { id, file, evidence } of PORTAL_NODES) {
+    const spec = hostNodeSpec(id)
+    assert.ok(spec, `${id} 应当在目录里（portal 类：extend + replace）`)
+    assert.equal(spec.kind, 'ui', `${id} 的 kind 应为 ui`)
+    assert.equal(spec.portal, true, `${id} 必须标 portal: true（它决定了 wrap 不可用）`)
+    assert.deepEqual([...spec.modes], ['extend', 'replace'], `${id} 不得开放 wrap`)
+    const src = readFileSync(join(UI_DIR.pathname, file), 'utf8')
+    assert.match(src, evidence, `${file} 里没有 portal 渲染的证据——portal: true 这个声明不成立`)
+    assert.match(src, new RegExp(`withExt\\('${id}'`), `${file} 里没有 withExt('${id}') 接线`)
+  }
+  for (const id of ['ui-dialog', 'ui-dropdown-menu']) {
+    assert.equal(hostNodeSpec(id), undefined, `${id} 只是 Radix Root 的再导出，渲染不出 DOM，不该进目录`)
   }
 })
 

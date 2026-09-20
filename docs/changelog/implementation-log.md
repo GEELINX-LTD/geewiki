@@ -163,6 +163,29 @@
     夹具构建出的另外几个产物），CDP 新增 2 条 ⇒ **39/39 全绿**：`{"toplevel":true,"toplevelInHeader":true}`
     （归属生效）与 `{"toplevel":false}`（停用后回收——**修复前这个标记会残留**）。
     `HOST_SDK_VERSION` 0.11.0 → **0.12.0**。
+  - **P13b portal 类原语接线（关闭"portal 类不接"这个洞）**：`Dialog` / `ConfirmDialog` /
+    `DropdownMenu` / `Tooltip` 此前整批不接 `ui-*`，理由写的是"`wrap` 会在调用处留下空的包裹元素"。
+   那个理由**不完整**——真正的问题是 **`wrap` 在这里不可能生效**：宿主的默认实现经 Radix `Portal`
+    渲染到 `document.body` 附近、**不在包装元素的 DOM 子树里**，包装元素既包不住它也传不进样式
+    （CSS 继承与选择器都跨不过 portal 边界），作者看到的是"我明明包住了，什么都没变"。**静默失效**。
+    于是决定：**接，但只砍掉真正坏掉的那个模式**——`PORTAL_UI_MODES = ['extend', 'replace']`。
+    逐条理由：`replace` 接管整个渲染（自己决定 portal 与否），语义完全成立且自由度最高；
+    `extend` 在**调用处**追加（调用处就是"用到这个 tooltip / 对话框的地方"，看得见、位置可预期），
+    并且满足"每个节点都必须支持 `extend`"这条既有不变量；`wrap` 是唯一静默失效的一个。
+    落地细节：目录新增 **4 个节点**（`ui-dialog-content` / `ui-dropdown-menu-content` /
+    `ui-confirm-dialog` / `ui-tooltip`）+ **事实标记 `portal: true`**（它唯一的作用就是决定 `wrap`
+    能不能用，所以守卫要求它**必须有源码证据**：`DialogPrimitive.Portal` / `Menu.Portal` /
+    `<DialogContent`（间接 portal）/ `TooltipPrimitive.Portal`）；节点名对应**真正渲染内容的导出**
+    ——`Dialog` / `DropdownMenu` 只是 Radix `Root` 的再导出、渲染不出 DOM，**仍然不进目录**。
+    守卫改写：`extensions-catalog.test.ts` 的"开放口径"规则增加第三类（portal ⇒ 不得含 `wrap`、
+    必须允许 `replace`）+ 两条非空洞自证；`uiExt.test.ts` 把原来那条"portal 不在目录里"的断言
+    改写成"已接线 + 不得开放 wrap + `portal: true` 有源码证据"；`designSystem.test.ts` 里
+    "`export function ConfirmDialog(`"这条断言放宽为 `export (function|const) ConfirmDialog`
+    （接线后是 `export const … = withExt(...)`；钉死语法会让"组件存在"与"有没有接线"互相绊住）。
+    **验证读数**：`packages/core` **93/93**、`packages/web` **976/976**；CDP **42/42**
+    （+3 条：`replace ui-tooltip` 换掉 **1 处**调用点、卸载残留 **0**、同节点 `wrap` 渲染 **0 处**
+    ——最后一条证明"不提供陷阱"是**注册路径上真的拦下来**，不是只有目录字段写着不允许；
+    那条告警本身就是断言对象，按**精确文案**进 console 白名单）。
   - **未做 / 已知缺口（如实登记）**：① ~~`scripts/acceptance/plugin-ui-cdp.mjs` 已陈旧~~
     —— **已于 P12b 修复**（共用夹具 `lib/session.mjs` + 断言更新，见上）；
     ② ~~插件 bundle → `registerExtension(mode)` 这条端到端链只有单测覆盖~~

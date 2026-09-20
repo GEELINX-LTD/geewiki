@@ -231,7 +231,17 @@ test('设计系统：危险操作确认组件存在，并从 ui barrel 统一导
   const src = readFileSync(join(SRC, 'ui', 'ConfirmDialog.tsx'), 'utf8')
   // 反空洞：同上，先证明读到了组件本体
   assert.ok(src.length > 500, `ConfirmDialog.tsx 读入异常（仅 ${src.length} 字符），路径可能不对`)
-  assert.match(src, /export function ConfirmDialog\(/, '应导出 ConfirmDialog 组件')
+  /*
+    两种形态都算"导出"：普通 `export function X(`，或接了宿主节点之后的
+    `export const X = withExt('ui-confirm-dialog', XBase)`（P13 起 portal 类也接线了）。
+    这里要断言的是**从本模块导出**（设计系统的意图），不是导出语法——钉死某一种语法会让
+    "组件存在"与"有没有接线"这两件无关的事互相绊住。
+  */
+  assert.match(
+    src,
+    /export (?:function|const) ConfirmDialog\b/,
+    "应导出 ConfirmDialog 组件（接线后是 `export const ConfirmDialog = withExt('ui-confirm-dialog', …)`）",
+  )
   assert.match(src, /export function useConfirm\(/, '应导出 useConfirm（否则调用方无法发起确认）')
   // barrel 也要导出：否则各页面会绕过统一出口各自 import 文件，替换 window.confirm 时容易漏
   const barrel = readFileSync(join(SRC, 'ui', 'index.ts'), 'utf8')

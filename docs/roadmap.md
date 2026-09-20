@@ -113,8 +113,16 @@
    （否则别人的贡献被拖进隔离根、丢掉宿主样式，且宿主视角与"消失"无异）；CDP +1 条（读数 **28/28**）。
    **`shell-sidebar` 经核实外壳里不存在该元素，已从候选移除**（不是漏做）——桌面导航在
    `<header>` 的 `<nav>` 里、阅读页右栏由 `wiki-toc` 覆盖。
-4. **portal 类组件是否接**（Dialog / ConfirmDialog / DropdownMenu / Tooltip）：当前有意不接
-   （`wrap` 会在调用处留下空包裹元素）。若要接，先解决"包装元素落在哪里"这个问题。
+4. ~~**portal 类组件是否接**（Dialog / ConfirmDialog / DropdownMenu / Tooltip）~~ ——
+   **已决定并落地**：接，但**只开 `extend` + `replace`**。原因是原口径只说了"`wrap` 会留下空包裹
+   元素"，而真正的问题是 **`wrap` 在这里不可能生效**——宿主的默认实现经 Radix `Portal` 渲染到
+   `document.body` 附近、不在包装元素的 DOM 子树里，包装元素包不住它、样式与作用域也跨不过
+   portal 边界 ⇒ 作者会看到"我包住了但什么都没变"（**静默失效**）。
+   落地形态：目录新增 4 个节点 + **事实标记** `portal: true`（`packages/core/src/extensions.ts`
+   的 `PORTAL_UI_MODES`），守卫按规则断言"标了 portal 的节点不得含 `wrap`"；
+   节点名对应**真正渲染内容的导出**（`DialogContent` / `DropdownMenuContent` / `ConfirmDialog` /
+   `Tooltip`），`Dialog` / `DropdownMenu` 只是 Radix `Root` 的再导出、渲染不出 DOM，故不进目录。
+   读数：`packages/web` **976/976**、CDP **42/42**（+3 条：replace 生效、卸载还原、wrap 被拒）。
 5. ~~**顶层直接调全局 SDK 的注册没有归属**（2026-09-21 P12 时发现并登记）~~ —— **P13 已修复**。
    做法：加载期间把"按插件作用域构造的宿主"临时装成 `window.__GEEWIKI_HOST__`
    （`packages/web/src/lib/pluginUi.ts` 的 `installPluginScope`，栈式安装/还原、`finally` 兜底），

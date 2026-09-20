@@ -18,12 +18,13 @@ import { X } from 'lucide-react'
 import { cn } from './cn'
 import { Button } from './Button'
 import { focusRing } from './a11y'
+import { withExt } from '../lib/slots'
 
 export const Dialog = DialogPrimitive.Root
 export const DialogTrigger = DialogPrimitive.Trigger
 export const DialogClose = DialogPrimitive.Close
 
-export function DialogContent({
+function DialogContentBase({
   title,
   description,
   children,
@@ -110,3 +111,6 @@ export const dialogCloseClass = cn(
   'text-ink hover:bg-hover',
   focusRing,
 )
+
+/* ★ P13：宿主节点接线（portal 类**只开放 `replace`**，见 docs/design/ui-extension-platform.md） */
+export const DialogContent = withExt('ui-dialog-content', DialogContentBase)
