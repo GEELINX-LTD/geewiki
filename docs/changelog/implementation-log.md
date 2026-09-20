@@ -14,6 +14,144 @@
 
 **当前实现状态**
 
+- **界面扩展平台：一切前端元素可被扩展 / 替换，主题统一化（2026-09-21）**：用户原话
+  「我希望能够让一切前端元素可被扩展修改、替换，然后所有主题都要能够统一化」。起点是一个具体问题：
+  「如果我想改左上角 geewiki 字样，能用插件实现吗」——**当时官方做不到**，只能靠两个后门
+  （插件 CSS 以全局 `<link>` 注入后命中私有类名 `.text-wordmark`；或插件 bundle 直接改 DOM），
+  两者都在卸载后留残留、宿主也无法诊断。三答已与用户定档：覆盖深度＝**一次性全量**；
+  失败语义＝**replace/wrap 出错自动回退宿主默认实现**（控件不消失）；主题＝**单层 `--gw-*` 令牌 +
+  禁止插件硬编码颜色 + replace 模式可选 Shadow DOM**。契约真源：
+  [../design/ui-extension-platform.md](../design/ui-extension-platform.md)。
+  - **做法：把既有插槽机制泛化，而不是另建一套并行系统**。宿主节点目录
+    `packages/core/src/extensions.ts` 登记 **7 个插槽 + 2 个外壳（`shell-brand` / `shell-brand-text`）
+    + 5 个页面元素（`wiki-meta` / `wiki-actions` / `wiki-toc` / `graph-toolbar` / `account-profile`）
+    + 11 个 `ui-*` 原语**；三种模式 `replace` / `wrap` / `extend`，组合顺序
+    `extend(wrap(replace(默认实现)))`。裁决复用既有的"**激活顺序最早者胜出**"（replace/wrap 恒单占用），
+    后端 `resolveExtensions()`（`packages/manager/src/slots.ts`）是唯一裁决器，`resolveSlots` 退化为投影。
+  - **"一切元素"的关键杠杆在 `ui/*` 的定义处接线**：`packages/web/src/ui/*.tsx` 的 11 个原语改成
+    `function XBase` + 文件末尾 `export const X = withExt('ui-x', XBase)`。**必须在定义处**——
+    全仓大量 `import '../ui/Button'` 不走 barrel，在 `ui/index.ts` 包一层会漏掉它们。
+  - **主题统一化（P0）**：`tokens.css` 的六类尺度（字号 / 圆角 / 阴影 / 缓动 / 层级 / 间距）真值全部
+    收进 `--gw-*` 并声明在**非 `@theme` 块**（Tailwind v4 的 `@theme` 不输出自定义属性），
+    `@theme inline` 与插件契约块只留 `var(--gw-*)` 别名。收益是 `registerTheme` 的
+    `TOKEN_NAME` 只放行 `--gw-*`，此前**字号/圆角/阴影/层级对插件完全不可改**，现在一次覆盖全站。
+  - **失败语义**：`replace`/`wrap` 抛错 ⇒ `ExtBoundary` 回退宿主默认并记入 `extFailures()`；
+    **刻意没有**设计文档初版写的 `data-ext-fallback` 标记属性——标记需要额外包裹元素，
+    而回退恰恰发生在 `<tr>`/flex 行这类位置，多一层元素会造成布局错位甚至非法 HTML。
+  - **P8 文案**：品牌字样改走 `t('host.app.title')`；新增 `OVERRIDABLE_HOST_KEYS`
+    （`packages/core/src/domain.ts`，**唯一一项** `host.app.title`）让插件能在**自己的**文案目录里覆盖它，
+    其余宿主键仍拒（防"把『确认删除』改成『继续』"）。准入纪律：白名单只放**宿主真的渲染了**的键，
+    否则插件会得到"声明成功、界面毫无变化"的静默失败。
+  - **P9 隔离**：`registerExtension(node, c, { mode: 'replace', shadow: true })` 渲染进 Shadow Root，
+    壳是 `<span data-ext-shadow style="display:contents">`（不生成盒子）。**只在 replace 上成立**，
+    其余模式丢弃该标志并告警、但**不丢弃贡献**（"隔离没生效"与"组件没渲染"严重程度不同）。
+  - **P10 插件 CSS 纪律**：新增 `packages/web/src/lib/pluginCssPlan.ts`（摘掉 `var(...)` 调用后再找颜色
+    字面量 ⇒ `var(--gw-x, #1d4ed8)` 合法、`color: #1d4ed8` 违规）。守卫**当场抓到两件真事**：
+    ① 夹具 `packages/web/fixtures/src/style.css` 里真有 3 处硬编码颜色（深色模式不会变、主题覆盖不跟随、
+    对比度告警看不见）；② 扫描 `plugins/*/dist/client.css` 时发现**产物是旧的**——改了源码没重建。
+    另加 `themeContrastIssues()`（沿 `var()` 链解析宿主 token）接入管理台告警块，**不阻断注册**。
+  - **P11 外壳节点收尾**：`shell-header`、`shell-footer`、`shell-theme-toggle`、
+    `shell-command-palette`、`shell-status-dialog` 五个节点接线并登记进目录
+    （守卫 `packages/web/test/shellChromeExt.test.ts`，含"目录 ⇄ 源码双向比对"）；原候选
+    `shell-sidebar` **经核实外壳里没有这个元素**（桌面导航在 `<header>` 的 `<nav>`、阅读页右栏由
+    `wiki-toc` 覆盖），**已从候选移除**——为不存在的元素登记名字比拒绝更坏。
+  - **P11b 容器节点（用户当场驳回后的修正）**：初版把 `shell-header` / `shell-footer` 做成
+    **整元素**节点，`replace` 于是接管整个 `<header>` 子树——**单个插件就能删掉其他所有插件在
+    页头 / 页脚的贡献，且没有任何报错**。用户驳回后改为**容器节点**（目录字段 `nestedSlots`）：
+    `<header>` / `<footer class="app-footer">` 与 `app-header` / `app-footer` 插槽出口**由宿主独占**
+    （`<NestedSlotOutlet node slot>`），节点只覆盖容器**内容**。贡献者拿到 `props.slots[插槽名]`
+    = 一个 `display: contents` 的挂载点元素（`ExtSlotMount`），渲染它就把出口摆进自己的标记里；
+    搬运由宿主在**绘制前**完成（挂载点 `useLayoutEffect` 登记 ⇒ 承运者 `useSyncExternalStore`
+    同步重渲染 ⇒ portal），故无闪烁；**不渲染则留在宿主位置——最坏只是位置不合意，永不丢失、
+    也不重复**（"忘了渲染"不会造成静默失效，这是它相对"插件负责渲染别人的贡献"的关键优势）。
+    代价如实记录：贡献者换不掉外壳元素本身（定位 / 高度 / 底色随宿主），也搬不出外壳之外。
+    附带修正：`SlotOutlet` 的服务端快照原先返回 `EMPTY`（SSR 下插槽贡献不渲染），导致这条契约
+    在单测里断言不了，已改为与 `Ext` 同口径的真实快照。
+  - **P11c 容器节点 × Shadow DOM（先实测、后修）**：`replace shell-header` + `shadow: true` 的贡献者
+    若把 `props.slots['app-header']` 渲染在隔离根里，出口就被 portal 进 Shadow Root ——
+    其他插件的页头贡献丢掉全部宿主样式，而且**从宿主视角看与"贡献消失"完全一样**
+    （首版探针只查宿主侧，读到 `counterLight:false, outletsLight:0`；两侧都查才看到
+    `counterShadow:true, outletsShadow:1`，这正是**先加断言跑未修复代码**的价值）。
+    修法：新增纯函数 `isUsableMountTarget(el, doc)`（`isConnected && getRootNode() === document`），
+    `notifyMounts` 忽略 Shadow Root 内的挂载点并告警一次（每个插槽一条），注册时另有一条
+    提前告知"容器节点 + shadow ⇒ 挂载点会被忽略"。**隔离本身仍然生效**，只忽略挂载点——
+    不丢弃贡献、不拒绝注册。守卫 `extShadow.test.ts` +2 条（假对象判据 + 注册告警与"贡献照常登记"的
+    反向对照），CDP +1 条（读数 28/28）。
+  - **P12 越权闸门补全 + 受限宿主提供 `registerExtension`（两个真缺陷）**：
+    ① **带模式注册没有一条"既受管辖、又能被回收"的路**——`registerExtension` 早就在全局 SDK 上，
+    但 bundle 的 `export function register(host)` 拿到的**受限宿主只有 `registerSlot`**（= 只会 `extend`），
+    于是走这条正规形态的插件（示例 `plugins/ui-demo` 就是）**根本用不了 `replace` / `wrap` / `shadow`**；
+    改用全局 SDK 虽然能带模式，来源却是 `'host-sdk'`（**卸载时收不回**，插件停用后贡献残留）且绕过闸门。
+    ② **闸门只认插槽裁决**——入口表的 `slots` 由 `effectiveSlotsByOwner(slotAssignments)` 派生，
+    非插槽节点（`ui-*` / `shell-*` / `page`）的 `replace` / `wrap` 抑制前端一无所知：
+    两个插件抢同一个 `ui-button` 时，被后端抑制的那个仍会注册，而 `Ext` 按**注册顺序**取第一个
+    ⇒ 可能渲染出被抑制者（正是代码注释里记着的"赢家是 A、界面渲染了 B"）。
+    修法：入口表新增 **`extNodes`**（生效的非插槽节点，与 `slots` 互不重叠、空值省略、计入 `revision`）；
+    `parseSuppressedOwners` **同时读 `extensions[]`**（缺省=旧后端可接受，存在但非数组=整体不可信）；
+    把受限宿主抽成可单测的 **`createPluginUiHost`** 并补上 `registerExtension`（来源 = 插件名 ⇒ 停用即回收）；
+    次判据**逐字段**校验（字段缺省 ⇒ 不校验该空间，保住纯浏览器侧注册的插件）。
+    示例插件同步演示：`plugins/ui-demo` 声明 `geewiki.slots` + `geewiki.extensions`，
+    夹具 bundle 经受限宿主 `wrap shell-brand-text`。
+    **过程中被测试抓到的子缺陷**：`pluginUiPlan.ts` 里那个本地 `isSlotName` 只认"内置插槽 ∪ 带 `/`
+    的自定义扩展点"，**不认 `ui-button` 这类宿主节点**（manager 侧的 `isSlotName` 委托的是 `isExtName`，
+    web 侧不是）——按 manager 的语义写就会把每一行都当非法名丢掉，于是**闸门整体静默失效**。
+    已改为插槽用 `isSlotName`、宿主节点用 `isExtName`，并在两处注释里写明"混用不报错、只静默失效"。
+  - **P12b 验收层补齐（修陈旧脚本 + 补真浏览器覆盖）**：`scripts/acceptance/plugin-ui-cdp.mjs`
+    **整脚本跑不动**已有一批——它断言 `loaded()` 含 `@geewiki/wiki`（夹具产物早已搬到
+    `@geewiki-plugin/ui-demo`、wiki 不再声明 `geewiki.client`），且它裸 `fetch` 调
+    `/api/plugins/:name/enable`，而该端点现在要求 admin 会话（实测 401）。做法：
+    ① 新增共用夹具 `scripts/acceptance/lib/session.mjs`：三条鉴权路径（实例启动时设
+    `GEEWIKI_ADMIN_TOKEN` ⇒ 走 `x-gw-admin-token` break-glass；无账号 ⇒ `POST /api/auth/setup`
+    建首个 owner；否则用固定验收账号登录），自动带 `cookie` 与 `x-gw-csrf`，并把会话 cookie
+    注入浏览器（CDP `Network.setCookie`）以便管理台按钮路径可用；拿不到凭据时依赖鉴权的用例
+    **明确跳过**（写进结果 JSON 的 `skipped`），不记失败也不记通过。
+    ② `ui-extension-cdp.mjs` 新增 **P12b 场景 8 条**：启用真实示例插件 ⇒ 断言其 `registerSlot`
+    贡献（页头计数器）与 **`registerExtension(wrap)`** 贡献（品牌字样被包一层且 `default` 未丢）
+    都出现、产物与 CSS 经入口表加载；停用 ⇒ 贡献**按 owner 回收**、字样逐字还原、`<link>` 移除
+    （这条同时是"归属到插件名 ⇒ 可回收"的端到端证据）。
+    **修复中抓到的两个脚本自身真问题**：① `Runtime.enable` 会**重放**浏览器缓冲的 console 历史，
+    上一次运行留下的告警漏进来，把"console 零错误"弄成**假失败**（首次导航后清空 events 修掉）；
+    ② 首屏断言假设"默认有启用的夹具插件"——该前提随夹具搬运早已消失，现改为"出口在、贡献为 0"，
+    React 单例与真实点击验证搬到插件启用之后。
+  - **验证读数**：`pnpm test`（全仓）**exit 0**、26 个包 `fail 0`——`packages/web` **971/971**、
+    `packages/core` **93/93**、`packages/manager` **290/290**；`pnpm typecheck` 28 个 project 全 Done；
+    新增浏览器端到端脚本 `scripts/acceptance/ui-extension-cdp.mjs`（零依赖直连 CDP）
+    在 prod 构建 + Chrome 151 headless 下 **36/36 全绿**（P11 时 22、P11b 27、P11c 28、P12b 36），
+    硬证据包括：replace 品牌字样后卸载**逐字**还原、
+    replace `ui-button` 后 9 个宿主按钮里 5 个同时改变且卸载残留 0、shadow 内 `.font-bold` 字重 400
+    （宿主内 700）⇒ 工具类进不去、shadow 内 `var(--gw-accent)` 与宿主同值 ⇒ 令牌跨边界继承、
+    `registerTheme` 覆盖 `--gw-radius-md:17px` 后 `.rounded-md` 计算值 8px→17px→卸载还原；
+    外壳与容器节点：空页脚 computed `display:none`（`:only-child` 基线）、replace `shell-footer`
+    只换内容而 `<footer>` 与出口仍在且恰好一份、extend `shell-footer` 落在 footer 内使页脚显形、
+    replace `shell-header` 后品牌字样让位而 `<header>` 仍在，以及 **P11b 的三条要害断言**——
+    注册 `app-header` 贡献后 `replace shell-header` 且**无视 `props.slots`** ⇒ 贡献仍渲染；
+    改为渲染 `props.slots['app-header']` ⇒ 贡献被**搬进**插件标记里且出口恰好 1 份；
+    卸载后回到宿主位置、挂载点消失；**P11c**：容器节点 + `shadow: true` 且把挂载点渲染在隔离根内 ⇒
+    读数 `{"mountInShadow":true,"counterLight":true,"counterShadow":false,"outletsLight":1,"outletsShadow":0}`
+    （出口与别人的贡献都留在 light DOM，隔离只作用于贡献者自己的标记）。
+    **P12b**：启用真实示例插件 ⇒ `{"counter":true,"counterInHeader":true}`（`registerSlot`）、
+    `{"brandTag":true,"brandTagInHeader":true}` 且 `wordmark="GeeWiki"`（`registerExtension(wrap)`，
+    `default` 没丢）；停用 ⇒ 两者都消失、字样还原、`<link>` 移除（按 owner 回收的端到端证据）。
+    另一个脚本 `plugin-ui-cdp.mjs`（加载链路）经同一夹具修复后**全通过**（`--missing-asset` 路径亦跑通：
+    "产物缺失时页面不白屏、无 console error / 404、该插件不被加载"）。
+    **数字勘误**：P11b 那一轮本文一度写成 28/28，**实测是 27/27**（静态 `check(` 29 处，
+    减去 P9 场景 `if/else` 二选一 ⇒ 28，再减去当时尚未存在的 P11c ⇒ 27）；当前以脚本输出的
+    `ok` 行数为准 = **28**。
+  - **未做 / 已知缺口（如实登记）**：① ~~`scripts/acceptance/plugin-ui-cdp.mjs` 已陈旧~~
+    —— **已于 P12b 修复**（共用夹具 `lib/session.mjs` + 断言更新，见上）；
+    ② ~~插件 bundle → `registerExtension(mode)` 这条端到端链只有单测覆盖~~
+    —— **已由 P12b 场景 8 条在真浏览器覆盖**；
+    ③ ~~设计文档点名的 `shell-header` / `shell-footer` / `shell-sidebar` / `shell-theme-toggle` /
+    `shell-command-palette` / `shell-status-dialog` **尚未接线**~~ —— **已在同日收尾批次完成**
+    （见本文件上方的「P11 外壳节点收尾」：五个接线并登记，`shell-sidebar` 经核实不存在该元素而移除）；
+    ④ portal 类组件（Dialog / ConfirmDialog / DropdownMenu / Tooltip）有意不接（`wrap` 会在调用处
+    留下空包裹元素）；
+    ⑤ **顶层直接调全局 SDK 的注册没有归属**（P12 时发现并登记 roadmap 第 0 项第 5 件）：
+    `window.__GEEWIKI_HOST__` 上的 `registerSlot` / `registerExtension` / `registerRoute` / `registerTool` /
+    `registerTheme` / `registerMarkdownExtension` 一律以 `'host-sdk'` 为来源 ⇒ `unloadPluginUi(name)`
+    **收不回**它们（停用后贡献残留、重新启用会叠加），也**不经过越权闸门**。走
+    `export function register(host)` 的插件不受影响（P12 已给受限宿主补上 `registerExtension`）。
+
 - **补上响应压缩（gzip / brotli）（2026-09-20）**：用户原话「开始实现吧」，承接上一轮实测出的
   「全仓无响应压缩中间件」。
   - **先纠正上一轮我自己的举证方向**：我当时拿 `q=架构&limit=100` 的 21688 字节说事，暗示"检索响应太肥"。

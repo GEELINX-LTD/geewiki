@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | ① | 插件配置系统：manifest `configSchema` → 前端表单 + 持久化 + 热更新 | **已落地**：`configSchema` 采用 schemastery 3.18.0（`packages/core/src/index.ts` 的类型 + 内置插件均为 `Schema.object({...})`）；服务端校验 + 白名单裁剪 + 原子落盘 + 已激活插件 `fork.update()` 热更新（失败双向回滚）；管理台按 schema 自动生成表单，无 schema 插件退回 JSON 原文通道（不校验、不裁剪） |
 | ② | 外部插件加载：`./plugins` 目录 + 清单发现 | **已落地**：`packages/manager/src/discovery.ts` 的 `loadExternalPlugins()` 发现并加载，`packages/server/src/index.ts` 的 `buildRegistry()` 把外部插件**并入同一注册表**；发现期问题经 `GET /api/plugins` 的 `issues` 字段可观测（见 §4.6）。**当前数量口径**：`packages/server/src/index.ts` 共 **25 条内置插件注册**（`source: 'builtin'`），`config/plugins.base.json` **默认启用 21 条**；**已注册未启用 4 条**：`@geewiki/echo`、`@geewiki/editor-plain`、`@geewiki/oidc`、`@geewiki/postgres` |
-| ③ | 前端 Slot 插槽：插件向 Web 管理台贡献 UI | **宿主侧与后端链路均已落地**（详见 §4.8）。真源是 `packages/core/src/slots.ts`（浏览器安全子集，前端经 `@geewiki/core/slots` 子路径导入；`SLOT_NAMES` `:94`、`SlotName` `:123`、`SLOT_CARDINALITY` `:138`）——**前端手抄镜像已删除**（守卫 `packages/manager/test/slots.test.ts` + `packages/web/test/slotPropsMirror.test.ts` 仍在）。**当前 7 个内置插槽**：`app-header`(multi) / `app-footer`(multi) / `editor`(single) / `editor-toolbar`(multi) / `app-dock`(single) / `article-summary`(single) / `account-identities`(multi) |
+| ③ | 前端 Slot 插槽：插件向 Web 管理台贡献 UI | **宿主侧与后端链路均已落地**（详见 §4.8）。真源是 `packages/core/src/slots.ts`（浏览器安全子集，前端经 `@geewiki/core/slots` 子路径导入；`SLOT_NAMES` `:94`、`SlotName` `:123`、`SLOT_CARDINALITY` `:138`）——**前端手抄镜像已删除**（守卫 `packages/manager/test/slots.test.ts` + `packages/web/test/slotPropsMirror.test.ts` 仍在）。**当前 7 个内置插槽**：`app-header`(multi) / `app-footer`(multi) / `editor`(single) / `editor-toolbar`(multi) / `app-dock`(single) / `article-summary`(single) / `account-identities`(multi) | **2026-09-21 起已泛化为「宿主节点 + 三种模式」**（`replace` / `wrap` / `extend`）：目录 `packages/core/src/extensions.ts` 现有 7 插槽 + 2 外壳（`shell-brand` / `shell-brand-text`）+ 5 页面元素（`wiki-meta` / `wiki-actions` / `wiki-toc` / `graph-toolbar` / `account-profile`）+ 11 个 `ui-*` 原语；契约与验收读数见 §4.9 与 [design/ui-extension-platform.md](design/ui-extension-platform.md) |
 | ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 三项**均已落地**：排空见 §5.3 L-1（粒度是**全站**在途请求，非 owner 级）；冲突组替换 = `POST /api/plugins/:name/replace` + 管理台顶替确认框（前置校验与前端交互已收紧为三类零副作用阶段拒绝：被顶替者真实激活层非 session → 409 `base_layer`；卸载集合内任一成员真实激活层非 session → 409 `base_layer` + `details.plugins`；目标无法承接依赖边 → 409 `provider_mismatch`）；`enable` 回滚改为全递归共用集合 |
 | ⑤ | 容器化：`docker compose up` 可用 | **已落地并实测**（`Dockerfile` / `docker-compose.yml` / [deployment.md](./deployment.md)）。残留的运行期口径见 §5.3 L-12 |
 | ⑥ | PostgreSQL 适配 | **已落地**：真 PG 15 端到端验证通过（迁移失败 0、插件 20 active / 0 error）；`DatabaseAdapterAsync` 双轨 + 方言迁移目录双路径已就位。 |
@@ -430,7 +430,59 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 后端 `409 has_dependents`（`details.dependents` 为依赖方名单）现被管理台捕获并弹出**专门说明块**（`packages/web/src/pages/GraphPage.tsx:911-949`，标题在 `:918`）——标题「无法停用「X」：还有插件在依赖它」+ 列出依赖方 + **两段可操作指引**（① 先在上表逐个停用依赖方再回来停用目标；② 若它是被同冲突组其它插件顶替，可在目标插件那行点「启用」走**冲突组替换**，会连同依赖方一起安全接管）。`dependentNamesOf()`（`packages/web/src/pages/GraphPage.tsx:142`，在 `:431` 捕获 `has_dependents` 时调用）**防御性**读取 `details`：形状不符退回空数组 → 走兜底文案，**不显示 `undefined`**。**刻意未实现自动级联停用**（破坏性操作）。
 
-### 4.8 其它已核对事实
+### 4.9 界面扩展平台（P4–P10）：插槽泛化为**宿主节点 + 三种模式**
+
+设计真源是 [design/ui-extension-platform.md](design/ui-extension-platform.md)，此处只记**契约要点与实现位置**。
+
+- **节点目录**：`packages/core/src/extensions.ts` 的 `HOST_NODE_CATALOG`。`kind` 四类：`slot`（既有 7 个，
+  语义不变）、`shell`（**7 个**：`shell-brand` / `shell-brand-text` / `shell-header` / `shell-footer` /
+  `shell-theme-toggle` / `shell-command-palette` / `shell-status-dialog`，守卫
+  `packages/web/test/shellChromeExt.test.ts`；原候选 `shell-sidebar` 经核实外壳里**没有该元素**已移除）、
+  `page`（`wiki-meta` / `wiki-actions` / `wiki-toc` / `graph-toolbar` / `account-profile`）、
+  `ui`（11 个 `ui-*` 原语，在**定义处**接线）。
+  **只登记"已经接线"的节点**——没接线的名字放进去，插件会得到"声明成功、界面毫无变化"的静默失败。
+  **容器节点**（`shell-header` / `shell-footer`，目录字段 `nestedSlots`）：它们的 DOM 里嵌着
+  多方共存的插槽出口（`app-header` / `app-footer`），因此**外壳元素与出口由宿主独占**，
+  `replace` 只换**内容**——单个插件不可能删掉其他插件在这些位置的贡献。贡献者拿到
+  `props.slots[插槽名]`（一个 `display: contents` 的挂载点元素），渲染它即可把出口摆进自己的
+  标记里；不渲染则留在宿主位置（**最坏只是位置不合意，不会丢也不会重复**）。
+  `extend` 的追加语义不变：`Ext` 把 extend 条目渲染为节点的**兄弟**，而容器节点位于外壳元素
+  **内部**，故追加内容落在外壳里（`extend shell-footer` ⇒ 页脚显形）。
+  **与 Shadow DOM 的交互**：容器节点上开 `shadow: true` 仍生效，但落在隔离根内的 `props.slots`
+  挂载点会被**忽略**（出口留在 light DOM）并告警——挂载点装的是别人的贡献，被拖进隔离根会丢掉
+  宿主样式，且在宿主视角与"贡献消失"无法区分（判据 `isUsableMountTarget`）。
+- **模式**：`replace`（整体接管）/ `wrap`（拿到宿主默认元素作为 `props.default`）/ `extend`（追加，
+  等价既有插槽）。渲染顺序 `extend(wrap(replace(默认实现)))`；`replace` / `wrap` **恒单占用**
+  （沿用"激活顺序最早者胜出"），`extend` 取节点基数（插槽仍以 `SLOT_CARDINALITY` 为唯一真源）。
+- **失败语义**：`replace` / `wrap` 抛错 ⇒ 回退宿主默认实现 + 记入 `extFailures()`
+  （**没有** `data-ext-fallback` 标记属性：回退可能发生在 `<tr>`/flex 行，多一层元素会造成布局错位）。  `extend` 抛错 ⇒ 只丢那一条，渲染既有 `.slot-error`。
+- **接入方式**：清单 `geewiki.extensions: [{ node, mode? }]`（与 `geewiki.slots` 并列，后者是 `extend` 简写）
+  + 客户端 `window.__GEEWIKI_HOST__.registerExtension(node, component, { mode?, shadow? })`
+  （`HOST_SDK_VERSION` **0.11.0**）。`shadow: true` **仅 `replace`** 有意义：渲染进 Shadow Root，
+  `--gw-*` 跨边界继承、宿主 Tailwind 类名进不去，壳是 `display: contents` 元素。
+  **bundle 有两种写法，能力已对齐（P12）**：`export function register(host)` 拿到的是**受限宿主**
+  （来源 = 插件名 ⇒ 停用即回收、过越权闸门），它也提供 `registerExtension`；
+  顶层直接调全局 SDK 也能带模式，但来源是 `'host-sdk'`（**收不回**）且**不经过闸门**
+  ——这条缺口已登记 roadmap。
+- **越权闸门（P12）**：入口表新增 `extNodes`（生效的非插槽节点，与 `slots` 互不重叠、计入 `revision`）；
+  前端用它 + `GET /api/plugins/slots` 的 `suppressed`（`slots[]` 与 `extensions[]` **都要读**）拦下
+  "被抑制"与"未获生效"的注册。次判据**逐字段**校验（字段缺省 ⇒ 不校验该空间），
+  因为缺省意味着纯浏览器侧注册的插件。判据分两个名字空间：插槽用 `isSlotName`、宿主节点用 `isExtName`。
+- **裁决与诊断**：`resolveExtensions()`（`packages/manager/src/slots.ts`）是唯一裁决器；
+  `GET /api/plugins/slots` 增加 `extensions` 字段（additive），`suppressedDetail` 点名被谁顶掉。
+- **主题层**：`--gw-*` 是唯一真值（必须声明在非 `@theme` 块），`registerTheme` 因此能覆盖颜色与六类尺度。
+  插件 CSS **禁止硬编码颜色**（`packages/web/src/lib/pluginCssPlan.ts` + `test/pluginCssGuard.test.ts`，
+  扫源码与 `plugins/*/dist/client.css` 产物）；`themeContrastIssues()` 在管理台告警低于 4.5:1 的组合
+  （**不阻断注册**）。插件可覆盖的**宿主文案键**只有 `OVERRIDABLE_HOST_KEYS` 名单（当前仅 `host.app.title`）。
+- **端到端验收**：`scripts/acceptance/ui-extension-cdp.mjs`（零依赖直连 CDP，**刻意不进 `pnpm test`**），
+  用法 `node scripts/acceptance/ui-extension-cdp.mjs <页面 URL> [cdpPort]`，需要 Chrome + 运行中实例。
+  读数见设计文档 §11（当前 **36/36**）。**启停插件需要 admin 会话**：共用夹具
+  `scripts/acceptance/lib/session.mjs` 自动在三条路径里选（启动实例时设 `GEEWIKI_ADMIN_TOKEN=<任意值>`
+  走 break-glass、无账号时 `POST /api/auth/setup`、固定验收账号登录），并自动带 `cookie` 与 `x-gw-csrf`；
+  拿不到凭据时依赖鉴权的用例**明确跳过**（写进结果 JSON），不记失败也不记通过。
+  `plugin-ui-cdp.mjs`（插件 UI 加载链路）已按同一夹具修复并跑通。
+
+### 4.10 其它已核对事实
 
 - **插槽名的单一真源**：`packages/core/src/slots.ts`（浏览器安全子集，前端经 `@geewiki/core/slots` 导入；此前 `web/src/lib/slots.tsx` / `pluginUiPlan.ts` / `SINGLE_OCCUPANCY_SLOTS` 的手抄镜像**已删除**——镜像漂移是静默故障，别再抄回去）。除 7 个内置名外，**插件自定义插槽名也合法**：须匹配 `PLUGIN_SLOT_NAME = /^[a-z][a-z0-9-]*(?:\/[a-z][a-z0-9-]*)+$/`（**至少含一个 `/`**）；不可信来源用 `SlotName`，宿主自己固定的渲染点用 `BuiltinSlotName`（编译期挡住写错）。守卫为 `packages/manager/test/slots.test.ts` + `packages/web/test/slotPropsMirror.test.ts`。**后端插槽链路** = 清单 `geewiki.slots: SlotName[]` 由管理器在激活时登记 + 运行期 `ctx.get('slot').contribute(owner, slot, meta?)`，**无 `ctx.slot()` 方法糖**；提供者 `@geewiki/slot`（`packages/manager/src/slot-plugin.ts`）必须在管理器之前注册（根因见 §5.2 的 provide 时序陷阱）。`GET /api/plugins/slots` 读端点**刻意 public**、写端点 admin。前端只认 effective（被抑制者不得注册组件，因为后端在生效集合为空时会省略 `slots` 键）。
 - **`packages/server/src/index.ts` 的 `/plugins-ui` 静态分支注释已过时**：注释写"交给前端 `?v=<rev>` 自行击穿缓存"，真实行为是 `cache-control: no-cache`，而前端**已彻底不使用 `?v=`**（见 §4.5）。**登记为待代码批清理项**。
