@@ -1,5 +1,13 @@
-import { registerExtensionByName, registerSlotByName, type AnySlotComponent } from './slots'
+import {
+  registerExtensionByName,
+  registerSlotByName,
+  unregisterSlotFrom,
+  type AnySlotComponent,
+} from './slots'
 import { registerRoute, unregisterRoutes, type PluginRouteProps } from './routes'
+import { registerClientTool, unregisterClientTools } from './clientTools'
+import { registerMarkdownExtension, unregisterMarkdownExtensions } from './markdownExt'
+import { registerTheme, unregisterThemes } from './pluginTheme'
 import { hostSdk, type GeeWikiHostSdk } from './hostSdk'
 import { errorDetail } from './errorText'
 import type { ExtMode } from '@geewiki/core/extensions'
@@ -53,9 +61,22 @@ import {
  *   enable 会命中模块缓存、复用同一实例（`register` 重跑，不累积实例）。
  * - 未做入口完整性/签名校验与版本协商。
  */
-export interface PluginUiHost {
-  readonly React: unknown
-  readonly jsxRuntime: { jsx: unknown; jsxs: unknown; Fragment: unknown }
+/**
+ * **按插件作用域的宿主**：`export function register(host)` 的参数，**也是加载期间
+ * `window.__GEEWIKI_HOST__` 指向的那个对象**（P13，见 {@link installPluginScope}）。
+ *
+ * ## 为什么它现在 `extends GeeWikiHostSdk`（P13）
+ * P12 之前它是**手写的一份子集**（只有 `React` / `jsxRuntime` / `registerSlot` / …），
+ * 于是"受限宿主"与"全局 SDK"是两个形状不同的对象、各缺一半能力：走 `register(host)` 的插件
+ * 用不了 `registerExtension` 的模式参数，改用全局 SDK 又丢掉归属与闸门（详见 `registerExtension`
+ * 的说明）。**两个对象形状不同这件事本身就是缺陷源**——每加一个 SDK 成员就多一处要同步的副本，
+ * 漏掉的症状是"插件里那个字段是 undefined"，只在真正调用时才炸。
+ *
+ * 现在改为**摊开基础 SDK 再覆盖注册/注销两类**（`{ ...sdk, … }`）：形状由构造保证一致，
+ * 不可能漂移。因此 `registerRoute` / `registerTool` / `registerTheme` / `registerMarkdownExtension`
+ * / `t` / `ReactDOM` / `PluginSlotOutlet` … 全都在这个对象上，且**注册一律归属到插件名**。
+ */
+export interface PluginUiHost extends GeeWikiHostSdk {
   registerSlot(name: string, component: AnySlotComponent): () => void
   /**
    * **以指定模式往宿主节点贡献界面**（P12 新增到受限宿主上）。
@@ -92,9 +113,13 @@ export interface PluginUiHost {
    * 的决策，未声明的 id 没有加载依据（详见实现处的说明）。
    */
   registerRoute(id: string, component: ComponentType<PluginRouteProps>): () => void
-  /** 注销某来源的全部路由（卸载/重载的统一出口） */
+  /** 注销**本插件**的全部路由（卸载/重载的统一出口；传别的来源会被拒绝并告警） */
   unregisterRoutes(source: string): void
-  readonly version: string
+  /**
+   * 本插件名。**"我是谁"的唯一来源**：作用域宿主上的注册一律以它作为 `source`，
+   * 因此插件的**模块求值期**代码也能据此判断当前是谁在加载（例如只在某个插件名下注册
+   * 演示贡献的夹具）。全局 SDK 上**没有**这个字段——它是作用域宿主独有的。
+   */
   readonly pluginName: string
 }
 
@@ -168,10 +193,32 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
     return null
   }
 
+  /**
+   * 注销类成员**只能作用于本插件自己的来源**（P13）。
+   *
+   * 全局 SDK 上 `unregisterThemes('other-plugin')` 是合法调用，于是任何插件都能拆掉别的插件的
+   * 主题 / 路由 / 工具——被拆的一方只看到"我的界面/主题不见了"，查不到是谁干的。
+   * 作用域的意义正是"你只能动你自己的"，故传别的来源时**告警并拒绝**（不静默放行、
+   * 也不静默忽略：作者必须知道这条调用没生效）。
+   */
+  const scopedUnregister = (source: string, run: (owner: string) => void, api: string): void => {
+    if (source !== name) {
+      console.warn(
+        `[geewiki-plugin-ui] 插件 ${name} 调用了 ${api}("${source}")，已忽略：作用域宿主只允许注销自己的来源。`,
+      )
+      return
+    }
+    run(name)
+  }
+
   return {
-    React: sdk.React,
-    jsxRuntime: sdk.jsxRuntime,
-    version: sdk.version,
+    /*
+      先摊开基础 SDK 的**全部**成员，再覆盖"注册 / 注销"这两类。
+      为什么是摊开而不是逐项转发：逐项转发意味着 SDK 每加一个成员就多一处必须同步的副本，
+      而漏掉的症状是"插件里那个字段是 undefined"——只在真正调用时才炸，错误现场离原因很远
+      （`packages/web/test/hostSdkSurface.test.ts` 的文件头记着同一类坑）。
+    */
+    ...sdk,
     pluginName: name,
     registerSlot: (slot, component) => {
       const reason = gate(slot, 'slot')
@@ -195,7 +242,35 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
       disposers.push(off)
       return off
     },
-    unregisterSlot: sdk.unregisterSlot,
+    /*
+      以下三类在 P13 之前**只存在于全局 SDK**（来源写死 `'host-sdk'`）：插件用它们注册的东西
+      既收不回、也不过闸门。现在它们与 `registerSlot` / `registerExtension` / `registerRoute`
+      走同一条路——来源 = 插件名、注销函数收进 `disposers`、卸载时统一执行。
+    */
+    registerTool: (toolName, execute) => {
+      const off = registerClientTool(toolName, execute, name)
+      disposers.push(off)
+      return off
+    },
+    registerMarkdownExtension: (ext) => {
+      const off = registerMarkdownExtension(name, ext)
+      disposers.push(off)
+      return off
+    },
+    registerTheme: (contribution) => {
+      const off = registerTheme(name, contribution)
+      disposers.push(off)
+      return off
+    },
+    unregisterSlot: (slot, token) => {
+      // 传了 token（通常就是上面返回的注销函数）就按那条精确注销，否则**只清自己的来源**。
+      // 旧写法是直接转发全局 `unregisterSlot`：不带 token 时它会删掉该节点上所有插件的贡献。
+      if (typeof token === 'function') {
+        ;(token as () => void)()
+        return
+      }
+      unregisterSlotFrom(slot, name)
+    },
     renderMarkdown: (markdown: string) => sdk.renderMarkdown(markdown),
     registerRoute: (id, component) => {
       const declared = meta.routes ?? []
@@ -211,7 +286,11 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
       disposers.push(off)
       return off
     },
-    unregisterRoutes: (source) => unregisterRoutes(source),
+    unregisterRoutes: (source) => scopedUnregister(source, unregisterRoutes, 'unregisterRoutes'),
+    unregisterTools: (source) => scopedUnregister(source, unregisterClientTools, 'unregisterTools'),
+    unregisterMarkdownExtensions: (owner) =>
+      scopedUnregister(owner, unregisterMarkdownExtensions, 'unregisterMarkdownExtensions'),
+    unregisterThemes: (owner) => scopedUnregister(owner, unregisterThemes, 'unregisterThemes'),
   }
 }
 
@@ -538,6 +617,57 @@ function injectCss(name: string, href: string): HTMLLinkElement | undefined {
   return link
 }
 
+/**
+ * 加载期间的**按插件 SDK 作用域**（P13）。
+ *
+ * ## 为什么必须临时替换全局对象
+ * 插件 bundle 有两种写法（设计文档 §8.3.1）：`export function register(host)`，与**模块求值时**
+ * 直接调 `window.__GEEWIKI_HOST__`。后者走的是全局对象，而全局对象上的注册函数把来源写死成
+ * `'host-sdk'` ⇒ ① `unloadPluginUi` 收不回这些贡献（插件停用后界面 / 主题 / 路由 / 工具残留），
+ * ② 完全绕过两道越权闸门。两者都是**静默失效**。
+ *
+ * 修法是让**加载期间的全局对象就是那个按插件作用域构造的宿主**——于是"用全局"与"用参数"
+ * 拿到的是**同一个对象**，归属与闸门由构造保证，不依赖作者写对哪一种形态。
+ *
+ * ## 为什么是栈而不是"存旧值、还原旧值"
+ * `import()` 是异步的。今天的调用点都是顺序 `await`（那是**调用方的性质**，不是本函数的保证），
+ * 一旦两次加载在 await 处交错，"还原成我进来时看到的那个"会把**先装的那层**也一起抹掉
+ * （外层作用域消失 ⇒ 那段时间里插件注册的东西又落回全局 SDK 名下）。
+ * 栈的语义是"撤销我这一层，回到栈顶"：无论交错顺序如何，全部撤销后必然回到基础 SDK。
+ *
+ * ## 为什么用 `globalThis` 而不是 `window`
+ * 浏览器里 `window === globalThis`（`hostSdk.ts` 写的也是同一个对象），而 `globalThis` 让这段
+ * 逻辑在 Node 单测里可以直接验证（`packages/web/test/pluginUiHost.test.ts` 真的把它装/卸一遍）。
+ */
+const scopeStack: PluginUiHost[] = []
+
+export function installPluginScope(host: PluginUiHost, base: GeeWikiHostSdk): () => void {
+  const glob = globalThis as { __GEEWIKI_HOST__?: GeeWikiHostSdk }
+  scopeStack.push(host)
+  glob.__GEEWIKI_HOST__ = host
+  let restored = false
+  return () => {
+    // 幂等：成功路径、失败路径与 finally 都会调它，重复调用必须是空操作
+    if (restored) return
+    restored = true
+    const index = scopeStack.indexOf(host)
+    if (index >= 0) scopeStack.splice(index, 1)
+    const top = scopeStack.length > 0 ? scopeStack[scopeStack.length - 1] : undefined
+    glob.__GEEWIKI_HOST__ = top ?? base
+  }
+}
+
+/** 执行并清空一批注销函数（注册失败 / 迟到 / 入口抛错时的回滚） */
+function rollbackDisposers(disposers: Array<() => void>): void {
+  for (const off of disposers.splice(0)) {
+    try {
+      off()
+    } catch (err) {
+      console.debug('[geewiki-plugin-ui] 回滚注册时出错：', err)
+    }
+  }
+}
+
 async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSdk): Promise<void> {
   if (loaded.has(name)) return
   // 同一个 rev 已经失败过就不再重试（否则 15s 轮询会反复 import + 反复打日志）
@@ -550,57 +680,81 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
   }
   // 记下本次加载所属的代次：await 期间若发生卸载（epoch 自增），这次加载必须作废
   const epoch = epochs.get(name) ?? 0
-  let mod: PluginUiModule
-  try {
-    // 注意：这里**不能**加 `?v=` 之类的 query（已被实测证伪，见 pluginUiPlan.ts 文件头）
-    mod = (await import(/* @vite-ignore */ `${base}/${meta.entry}`)) as PluginUiModule
-  } catch (err) {
-    // 入口已声明却加载失败属于真实故障（作者漏发产物的典型症状），但不该打断宿主启动
-    console.warn(`[geewiki-plugin-ui] 插件界面加载失败：${name}`, err instanceof Error ? err.message : err)
-    failed.set(name, meta.rev)
-    /*
-      记进**要给人看的那一份**并广播：否则界面上的表现只是"这块功能不见了"，
-      用户既不知道原因，也不知道该去插件管理里检查产物。emitState 必须显式调用 ——
-      失败路径上没有任何插槽注册发生，不广播就永远不会有订阅者重渲染。
-      存的是**排障摘要**（`errorDetail`），它只会落在 console 与 `data-*` 上：
-      给用户看的正文是 `slots.tsx` 里那句固定中文（原始串可能含英文/路径，不能直接展示）。
-    */
-    failedLoads.set(name, errorDetail(err))
-    emitState()
-    return
-  }
-  // 迟到检查：await 期间该插件可能已被卸载，或已不再被入口表需要（例如用户刚点了停用）
-  if ((epochs.get(name) ?? 0) !== epoch || !(name in desired) || loaded.has(name)) {
-    console.debug(`[geewiki-plugin-ui] 丢弃迟到的插件界面加载：${name}`)
-    return
-  }
-  const register =
-    typeof mod.register === 'function'
-      ? (mod.register as (host: PluginUiHost) => unknown)
-      : typeof mod.default === 'function'
-        ? (mod.default as (host: PluginUiHost) => unknown)
-        : undefined
-  if (!register) {
-    console.debug(`[geewiki-plugin-ui] 插件 bundle 未导出 register(host)，跳过：${name}`)
-    return
-  }
+  /*
+    作用域宿主**必须在 `import()` 之前构造并装上**：bundle 的**模块求值期**就会注册（顶层形态），
+    晚一步装上，那批注册仍然落在全局 SDK 名下 —— 既收不回、也不过闸门，正是本批要修的缺陷。
+    于是"用全局 SDK"与"用 `register(host)` 的参数"是**同一个对象**，两种形态由构造统一，
+    不依赖作者写对哪一种。
+  */
   const disposers: Array<() => void> = []
   const host = createPluginUiHost({ name, sdk, meta, suppressed: suppressedOwners, disposers })
+  const restoreScope = installPluginScope(host, sdk)
   try {
-    const cleanup = register(host)
-    if (typeof cleanup === 'function') disposers.push(cleanup as () => void)
-  } catch (err) {
-    // 插件入口自身执行失败：回滚它已经注册的部分，避免留下半截 UI
-    console.warn(`[geewiki-plugin-ui] 插件 ${name} 的客户端入口执行失败，已回滚：`, err)
-    for (const off of disposers.splice(0)) off()
-    return
+    let mod: PluginUiModule
+    try {
+      // 注意：这里**不能**加 `?v=` 之类的 query（已被实测证伪，见 pluginUiPlan.ts 文件头）
+      mod = (await import(/* @vite-ignore */ `${base}/${meta.entry}`)) as PluginUiModule
+    } catch (err) {
+      // 入口已声明却加载失败属于真实故障（作者漏发产物的典型症状），但不该打断宿主启动
+      console.warn(`[geewiki-plugin-ui] 插件界面加载失败：${name}`, err instanceof Error ? err.message : err)
+      failed.set(name, meta.rev)
+      /*
+        记进**要给人看的那一份**并广播：否则界面上的表现只是"这块功能不见了"，
+        用户既不知道原因，也不知道该去插件管理里检查产物。emitState 必须显式调用 ——
+        失败路径上没有任何插槽注册发生，不广播就永远不会有订阅者重渲染。
+        存的是**排障摘要**（`errorDetail`），它只会落在 console 与 `data-*` 上：
+        给用户看的正文是 `slots.tsx` 里那句固定中文（原始串可能含英文/路径，不能直接展示）。
+      */
+      failedLoads.set(name, errorDetail(err))
+      emitState()
+      /*
+        模块求值期可能已经注册了一部分（顶层形态）：必须回滚，否则"加载失败"的插件会留下半截 UI。
+        装上作用域之前这不可能发生 —— 那批注册会落到全局 SDK 名下，只是更难发现而已。
+      */
+      rollbackDisposers(disposers)
+      return
+    }
+    // 迟到检查：await 期间该插件可能已被卸载，或已不再被入口表需要（例如用户刚点了停用）
+    if ((epochs.get(name) ?? 0) !== epoch || !(name in desired) || loaded.has(name)) {
+      console.debug(`[geewiki-plugin-ui] 丢弃迟到的插件界面加载：${name}`)
+      // 同上：模块求值期的注册必须跟着这次作废的加载一起回滚
+      rollbackDisposers(disposers)
+      return
+    }
+    const register =
+      typeof mod.register === 'function'
+        ? (mod.register as (host: PluginUiHost) => unknown)
+        : typeof mod.default === 'function'
+          ? (mod.default as (host: PluginUiHost) => unknown)
+          : undefined
+    if (!register) {
+      /*
+        顶层注册形态（bundle 在模块求值时注册、**不导出** `register(host)`）：以前这里直接 return ——
+        于是这类插件的贡献既没进 `loaded`（停用时收不回），也不受 `failed` / `loaded` 短路保护
+        （每轮轮询重复 import）。现在照样登记：它注册的东西已经在 `disposers` 里了。
+      */
+      console.debug(`[geewiki-plugin-ui] 插件 bundle 未导出 register(host)，按其模块顶层注册登记：${name}`)
+    } else {
+      try {
+        const cleanup = register(host)
+        if (typeof cleanup === 'function') disposers.push(cleanup as () => void)
+      } catch (err) {
+        // 插件入口自身执行失败：回滚它已经注册的部分，避免留下半截 UI
+        console.warn(`[geewiki-plugin-ui] 插件 ${name} 的客户端入口执行失败，已回滚：`, err)
+        rollbackDisposers(disposers)
+        return
+      }
+    }
+    const link = meta.css ? injectCss(name, `${base}/${meta.css}`) : undefined
+    loaded.set(name, { plugin: name, rev: meta.rev, disposers, link })
+    // 成功即自愈：清掉这个插件此前可能留下的失败记录，否则提示条会在问题已解决后继续挂着
+    failedLoads.delete(name)
+    emitState()
+    console.debug(`[geewiki-plugin-ui] 已加载插件界面：${name}`)
+  } finally {
+    // 所有出口（含上面每个 return）都还原全局对象：作用域绝不能跨过本次加载存活
+    restoreScope()
   }
-  const link = meta.css ? injectCss(name, `${base}/${meta.css}`) : undefined
-  loaded.set(name, { plugin: name, rev: meta.rev, disposers, link })
-  // 成功即自愈：清掉这个插件此前可能留下的失败记录，否则提示条会在问题已解决后继续挂着
-  failedLoads.delete(name)
-  emitState()
-  console.debug(`[geewiki-plugin-ui] 已加载插件界面：${name}`)
 }
 
 /** 卸载某插件的界面贡献（注销插槽注册 + 移除 CSS）。ESM 模块本身无法从模块图中卸载。 */

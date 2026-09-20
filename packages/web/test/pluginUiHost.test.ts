@@ -16,8 +16,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { createPluginUiHost, type PluginUiHostContext } from '../src/lib/pluginUi'
-import { slotContributors, slotSummary, unregisterSlot } from '../src/lib/slots'
+import { createPluginUiHost, installPluginScope, type PluginUiHostContext } from '../src/lib/pluginUi'
+import { registerSlotByName, slotContributors, slotSummary, unregisterSlot } from '../src/lib/slots'
+import { clientToolSummary } from '../src/lib/clientTools'
+import { markdownExtensions } from '../src/lib/markdownExt'
+import { themeContributors } from '../src/lib/pluginTheme'
 import type { GeeWikiHostSdk } from '../src/lib/hostSdk'
 
 /** 只实现被用到的成员：整个 SDK 的其余部分与本文件无关（多写只会变成需要同步维护的镜像） */
@@ -236,4 +239,110 @@ test('★ P12：生效节点集合 = slots ∪ extNodes（两类可同时存在�
   assert.equal(slotSummary()['ui-button'], 1)
   unregisterSlot('editor')
   unregisterSlot('ui-button')
+})
+
+/*
+  ========================= P13：按插件 SDK 作用域 =========================
+  这一批修的是"**模块求值期**直接调 `window.__GEEWIKI_HOST__`"那条路（设计文档 §8.3.1 的顶层形态）：
+  它的注册来源恒为 `'host-sdk'` ⇒ 插件停用后收不回、且不过越权闸门。
+  修法是加载期间把"作用域宿主"装成全局对象，于是两种形态拿到同一个对象。
+*/
+
+test('★ P13：作用域宿主摊开基础 SDK 的**全部**成员（形状不可能漂移）', () => {
+  const marker = { kind: 'react-dom-marker' }
+  const sdk = { ...SDK, ReactDOM: marker, t: (key: string) => key } as unknown as GeeWikiHostSdk
+  const disposers: Array<() => void> = []
+  const host = createPluginUiHost({
+    name: '@demo/a',
+    sdk,
+    meta: { entry: 'client.js', rev: 'r' },
+    suppressed: new Map(),
+    disposers,
+  })
+  assert.equal(
+    (host as unknown as { ReactDOM: unknown }).ReactDOM,
+    marker,
+    '非注册类成员必须原样转发——逐项转发的写法会在这里漏掉，症状是插件里那个字段是 undefined',
+  )
+  assert.equal(host.pluginName, '@demo/a', 'pluginName 是作用域宿主独有的"我是谁"')
+  assert.equal(host.version, sdk.version, 'version 从基础 SDK 透出')
+})
+
+test('★ P13：registerTheme / registerTool / registerMarkdownExtension 归属插件名且可回收', () => {
+  const { host, disposers } = makeHost()
+  host.registerTheme({ name: 'demo', light: { '--gw-accent': '#123456' } })
+  host.registerTool('demo.echo', () => 'ok')
+  host.registerMarkdownExtension({ name: 'demo-fence', marked: {} })
+  assert.ok(
+    themeContributors().some((c) => c.owner === '@demo/a'),
+    '主题贡献的来源必须是插件名（写成 host-sdk 就收不回）',
+  )
+  assert.ok(clientToolSummary().some((t) => t.source === '@demo/a'), '客户端工具同理')
+  assert.ok(markdownExtensions().some((e) => e.owner === '@demo/a'), 'markdown 扩展同理')
+  assert.equal(disposers.length, 3, '三条注销函数都必须进 disposers（unloadPluginUi 靠它清理）')
+  for (const off of disposers.splice(0)) off()
+  assert.ok(!themeContributors().some((c) => c.owner === '@demo/a'), '执行 disposers 后主题贡献必须消失')
+  assert.ok(!clientToolSummary().some((t) => t.source === '@demo/a'), '工具同理')
+  assert.ok(!markdownExtensions().some((e) => e.owner === '@demo/a'), 'markdown 扩展同理')
+})
+
+test('★ P13：注销类成员只作用于自己的来源（跨插件注销被拒并告警）', () => {
+  const other = makeHost({ name: '@demo/other' })
+  other.host.registerTheme({ name: 'other', light: { '--gw-accent': '#654321' } })
+  const mine = makeHost({ name: '@demo/a' })
+  const cap = captureWarn()
+  try {
+    mine.host.unregisterThemes('@demo/other')
+  } finally {
+    cap.restore()
+  }
+  assert.ok(
+    themeContributors().some((c) => c.owner === '@demo/other'),
+    '别的插件的主题不得被拆掉——被拆的一方只会看到"我的主题不见了"，查不到是谁干的',
+  )
+  assert.equal(cap.warns.length, 1, `应当恰好告警一次，实际：${cap.warns.join(' | ')}`)
+  assert.match(cap.warns[0]!, /只允许注销自己的来源/)
+
+  // 反向对照：注销**自己**的来源照常生效（拒绝跨来源不能顺手把正常用法也拦掉）
+  mine.host.registerTheme({ name: 'mine', light: { '--gw-accent': '#abcdef' } })
+  mine.host.unregisterThemes('@demo/a')
+  assert.ok(!themeContributors().some((c) => c.owner === '@demo/a'))
+  other.host.unregisterThemes('@demo/other')
+})
+
+test('★ P13：unregisterSlot 不带 token 时只清自己的来源（不误删别的插件）', () => {
+  unregisterSlot('ui-card')
+  // 另一来源的同节点贡献：旧写法（直接转发全局 unregisterSlot）会把它一起删掉
+  registerSlotByName('ui-card', C, '@demo/other')
+  const { host } = makeHost()
+  host.registerSlot('ui-card', C)
+  assert.deepEqual([...slotContributors('ui-card')].sort(), ['@demo/a', '@demo/other'])
+  host.unregisterSlot('ui-card')
+  assert.deepEqual([...slotContributors('ui-card')], ['@demo/other'], '只该删掉自己那一条')
+  unregisterSlot('ui-card')
+})
+
+test('★ P13：installPluginScope 装上/还原全局对象；非 LIFO 撤销也收敛回基础 SDK', () => {
+  const glob = globalThis as { __GEEWIKI_HOST__?: GeeWikiHostSdk }
+  const saved = glob.__GEEWIKI_HOST__
+  const base = { ...SDK } as GeeWikiHostSdk
+  glob.__GEEWIKI_HOST__ = base
+  try {
+    const a = makeHost({ name: '@demo/a' }).host
+    const b = makeHost({ name: '@demo/b' }).host
+    const restoreA = installPluginScope(a, base)
+    assert.equal(glob.__GEEWIKI_HOST__, a, '装上后全局就是作用域宿主')
+    const restoreB = installPluginScope(b, base)
+    assert.equal(glob.__GEEWIKI_HOST__, b, '后装的在栈顶')
+    // 非 LIFO：先撤**内层**。若实现是"还原成我进来时看到的那个"，这里会把 b 一起抹掉
+    restoreA()
+    assert.equal(glob.__GEEWIKI_HOST__, b, '撤销一层后应回到栈顶（b）')
+    restoreB()
+    assert.equal(glob.__GEEWIKI_HOST__, base, '全部撤销后回到基础 SDK')
+    restoreB()
+    assert.equal(glob.__GEEWIKI_HOST__, base, '重复撤销是空操作（成功/失败/finally 三处都会调）')
+  } finally {
+    if (saved === undefined) delete glob.__GEEWIKI_HOST__
+    else glob.__GEEWIKI_HOST__ = saved
+  }
 })

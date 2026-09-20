@@ -137,6 +137,32 @@
     **数字勘误**：P11b 那一轮本文一度写成 28/28，**实测是 27/27**（静态 `check(` 29 处，
     减去 P9 场景 `if/else` 二选一 ⇒ 28，再减去当时尚未存在的 P11c ⇒ 27）；当前以脚本输出的
     `ok` 行数为准 = **28**。
+  - **P13 按插件 SDK 作用域（修掉"顶层注册无归属"这个静默缺陷）**：插件 bundle 有两种写法，
+    `export function register(host)` 与**模块求值期**直接调 `window.__GEEWIKI_HOST__`；后者的注册
+    来源恒为 `'host-sdk'` ⇒ 插件停用后**收不回**（贡献残留、重新启用叠加），且**不过**越权闸门。
+    做法不是"让插件改用参数"（顶层形态没有别的入口可用），而是**加载期间把按插件作用域构造的宿主
+    临时装成全局对象**（`pluginUi.ts` 的 `installPluginScope`）：两种形态拿到的是**同一个对象**，
+    归属与闸门由构造保证、不依赖作者写对哪一种。要点：
+    ① 作用域**必须在 `import()` 之前装上**（模块求值期就会注册），并覆盖到 `register(host)`；
+    `finally` 保证失败 / 迟到 / 入口抛错每个出口都还原；
+    ② 安装是**栈式**的——`import()` 异步，两次加载在 await 处交错时"还原成我进来时看到的那个"
+    会把先装的那层一起抹掉；栈的语义是"撤销我这层、回到栈顶"（单测覆盖**非 LIFO** 撤销）；
+    ③ 作用域宿主补成**完整 SDK**：`{ ...sdk, …覆盖注册与注销两类 }`——**摊开**而不是逐项转发
+    （逐项转发每加一个 SDK 成员就多一处要同步的副本，漏掉的症状是"插件里那个字段是 undefined"）；
+    另加全局 SDK 没有的 `pluginName`（"我是谁"，模块求值期即可用）；
+    ④ **注销只作用于自己的来源**：`unregisterThemes('other')` 这类调用告警并拒绝（全局 SDK 上它一直
+    合法 ⇒ 任何插件都能拆掉别人的主题 / 路由 / 工具），`unregisterSlot(node)` 不带 token 时也只清
+    自己的来源（旧写法会删掉该节点上**所有**插件的贡献，为此给插槽注册表加了 `unregisterSlotFrom`）；
+    ⑤ 不导出 `register(host)` 的 bundle 现在**照样登记**（以前直接 `return`：既没进 `loaded` ⇒
+    停用时收不回，也不受 `failed` / `loaded` 短路保护 ⇒ 每轮轮询重复 import）；失败 / 迟到路径会
+    回滚模块求值期已注册的部分，不留半截 UI。`'host-sdk'` 只剩"没有插件作用域时"（宿主代码，
+    或插件在加载结束之后才注册）这一种含义。
+    **验证读数**：`packages/web` **976/976**（+5 条 `pluginUiHost.test.ts` 守卫：形状摊开、
+    三类注册的归属与回收、跨来源注销被拒、`unregisterSlot` 只清自己、栈式安装 / 还原）；
+    夹具新增**顶层注册演示件**（`[data-fixture="toplevel"]`，只在 ui-demo 名下注册，以免污染同一份
+    夹具构建出的另外几个产物），CDP 新增 2 条 ⇒ **39/39 全绿**：`{"toplevel":true,"toplevelInHeader":true}`
+    （归属生效）与 `{"toplevel":false}`（停用后回收——**修复前这个标记会残留**）。
+    `HOST_SDK_VERSION` 0.11.0 → **0.12.0**。
   - **未做 / 已知缺口（如实登记）**：① ~~`scripts/acceptance/plugin-ui-cdp.mjs` 已陈旧~~
     —— **已于 P12b 修复**（共用夹具 `lib/session.mjs` + 断言更新，见上）；
     ② ~~插件 bundle → `registerExtension(mode)` 这条端到端链只有单测覆盖~~
@@ -146,7 +172,9 @@
     （见本文件上方的「P11 外壳节点收尾」：五个接线并登记，`shell-sidebar` 经核实不存在该元素而移除）；
     ④ portal 类组件（Dialog / ConfirmDialog / DropdownMenu / Tooltip）有意不接（`wrap` 会在调用处
     留下空包裹元素）；
-    ⑤ **顶层直接调全局 SDK 的注册没有归属**（P12 时发现并登记 roadmap 第 0 项第 5 件）：
+    ⑤ ~~**顶层直接调全局 SDK 的注册没有归属**（P12 时发现并登记 roadmap 第 0 项第 5 件）~~
+    —— **已于同日 P13 修复**（见上：加载期间全局对象即作用域宿主，顶层注册同样归属插件名、
+    过闸门、可回收）。以下为**当时的登记原文**，保留作为缺陷描述：
     `window.__GEEWIKI_HOST__` 上的 `registerSlot` / `registerExtension` / `registerRoute` / `registerTool` /
     `registerTheme` / `registerMarkdownExtension` 一律以 `'host-sdk'` 为来源 ⇒ `unloadPluginUi(name)`
     **收不回**它们（停用后贡献残留、重新启用会叠加），也**不经过越权闸门**。走

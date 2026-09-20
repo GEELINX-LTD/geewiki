@@ -661,9 +661,11 @@ async function unregister(token) {
     走这条正规形态的插件根本用不了 `replace`/`wrap`/`shadow`。
 
     这里启用真实的示例插件（`plugins/ui-demo`，其产物由 `build:fixtures` 构建到 `plugins/<名>/dist`），
-    断言三件事：① 它的 `registerSlot` 贡献（页头计数器）出现；② 它的 **`wrap shell-brand-text`**
-    贡献出现且**没有弄丢**宿主品牌字样（wrap 的意义）；③ 停用后三样都干净消失
-    —— 最后这条同时验证了"贡献归属到插件名 ⇒ 能按 owner 回收"（全局 SDK 那条路收不回）。
+    断言四件事：① 它的 `registerSlot` 贡献（页头计数器）出现；② 它的 **`wrap shell-brand-text`**
+    贡献出现且**没有弄丢**宿主品牌字样（wrap 的意义）；③ **P13**：它**在模块求值期**用
+    `window.__GEEWIKI_HOST__` 注册的顶层贡献（`[data-fixture="toplevel"]`）也归属到插件名；
+    ④ 停用后三样都干净消失 —— 最后这条同时验证了"贡献归属到插件名 ⇒ 能按 owner 回收"
+    （P13 之前顶层那条路的来源是 `'host-sdk'`，**收不回**，这个标记会残留）。
   */
   const UI_DEMO = '@geewiki-plugin/ui-demo'
   const auth = await ensureAdminSession(pageUrl)
@@ -680,19 +682,22 @@ async function unregister(token) {
       const counter = document.querySelector('[data-fixture="counter"]')
       const tag = document.querySelector('.gw-fixture-brand-tag')
       const wordmark = document.querySelector('.text-wordmark')
+      const toplevel = document.querySelector('[data-fixture="toplevel"]')
       return {
         loaded: window.__GEEWIKI_PLUGIN_UI__.loaded(),
         counter: !!counter,
         counterInHeader: counter ? !!counter.closest('[data-slot="app-header"]') : false,
         brandTag: !!tag,
         brandTagInHeader: tag ? !!tag.closest('header') : false,
+        toplevel: !!toplevel,
+        toplevelInHeader: toplevel ? !!toplevel.closest('[data-slot="app-header"]') : false,
         wordmark: wordmark ? wordmark.textContent : null,
         links: [...document.querySelectorAll('link[data-plugin-ui]')].map((l) => l.dataset.pluginUi),
       }
     })()`
 
     let on = await evaluate(probe)
-    for (let i = 0; i < 25 && !(on.counter && on.brandTag); i++) {
+    for (let i = 0; i < 25 && !(on.counter && on.brandTag && on.toplevel); i++) {
       await sleep(400)
       on = await evaluate(probe)
     }
@@ -705,6 +710,11 @@ async function unregister(token) {
       'P12b 插件 bundle 的 registerExtension(wrap) 贡献出现（品牌字样被包一层）',
       on.brandTag === true && on.brandTagInHeader === true,
       JSON.stringify({ brandTag: on.brandTag, brandTagInHeader: on.brandTagInHeader }),
+    )
+    check(
+      'P13 模块求值期（顶层形态）用全局 SDK 的注册归属到插件名并渲染',
+      on.toplevel === true && on.toplevelInHeader === true,
+      JSON.stringify({ toplevel: on.toplevel, toplevelInHeader: on.toplevelInHeader }),
     )
     check(
       'P12b wrap 没有弄丢宿主品牌字样（default 仍在）',
@@ -721,7 +731,7 @@ async function unregister(token) {
     check('P12b 停用示例插件返回 200', disableStatus === 200, `status=${disableStatus}`)
     await evaluate(`window.__GEEWIKI_PLUGIN_UI__.sync()`)
     let off = await evaluate(probe)
-    for (let i = 0; i < 25 && (off.counter || off.brandTag); i++) {
+    for (let i = 0; i < 25 && (off.counter || off.brandTag || off.toplevel); i++) {
       await sleep(400)
       off = await evaluate(probe)
     }
@@ -729,6 +739,11 @@ async function unregister(token) {
       'P12b 停用后贡献被按 owner 回收（计数器与 wrap 都消失）',
       off.counter === false && off.brandTag === false,
       JSON.stringify({ counter: off.counter, brandTag: off.brandTag }),
+    )
+    check(
+      'P13 停用后**顶层形态**的注册也被回收（修复前来源是 host-sdk，这个标记会残留）',
+      off.toplevel === false,
+      JSON.stringify({ toplevel: off.toplevel }),
     )
     check(
       'P12b 停用后品牌字样逐字还原、CSS <link> 被移除',
