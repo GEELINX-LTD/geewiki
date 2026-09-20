@@ -66,6 +66,10 @@ test('replace / wrap 的开放口径是一条规则，不是"哪个节点被点�
   /*
    * 口径（设计文档 §3）：
    * - `kind: 'ui'` / `kind: 'shell'` / `kind: 'page'`：叶子元素，三种模式全开；
+   * - **`portal: true` 的 ui 节点**：**不含 `wrap`** —— 宿主的默认实现渲染在 portal 里、
+   *   **不在包装元素的 DOM 子树内**，包装元素既包不住它也传不进样式（跨不过 portal 边界）
+   *   ⇒ 那是静默失效，不是"少个能力"。`replace`（接管渲染）与 `extend`（在调用处追加，
+   *   看得见、位置可预期）仍然成立。
    * - `kind: 'slot'`：**单占用**的（editor / app-dock / article-summary）允许整体替换，
    *   **多占用**的（app-header / app-footer / editor-toolbar / account-identities）
    *   只允许追加——它们的价值就在于"多方共存"，替换掉等于宿主不再有那个语义。
@@ -76,7 +80,16 @@ test('replace / wrap 的开放口径是一条规则，不是"哪个节点被点�
   const problems: string[] = []
   for (const [id, spec] of SPECS) {
     const has = (m: ExtMode): boolean => spec.modes.includes(m)
-    if (spec.kind === 'ui' || spec.kind === 'shell' || spec.kind === 'page') {
+    if (spec.portal === true) {
+      if (spec.kind !== 'ui') problems.push(`${id}：portal 标记只能出现在 kind: 'ui' 上`)
+      if (has('wrap')) {
+        problems.push(
+          `${id}（portal）不得允许 wrap——宿主默认实现在 portal 里，包装元素的子树装不下它，` +
+            '样式与作用域都进不去 ⇒ 静默失效',
+        )
+      }
+      if (!has('replace')) problems.push(`${id}（portal）应当允许 replace：接管渲染，真正能生效且自由度最高`)
+    } else if (spec.kind === 'ui' || spec.kind === 'shell' || spec.kind === 'page') {
       if (!has('replace') || !has('wrap')) problems.push(`${id}（${spec.kind}）应当允许 replace 与 wrap`)
     } else if (spec.kind === 'slot') {
       const single = extendCardinalityOf(id) === 'single'
@@ -88,9 +101,14 @@ test('replace / wrap 的开放口径是一条规则，不是"哪个节点被点�
   }
   assert.deepEqual(problems, [], `\n  ${problems.join('\n  ')}`)
 
-  // 非空洞自证：确实存在"允许"与"不允许"两类（否则上面每条 if 都可能恒不触发）
+  // 非空洞自证：三类"允许 / 不允许"都必须真的存在（否则上面每条 if 都可能恒不触发）
   assert.ok(SPECS.some(([, s]) => s.modes.includes('replace')), '应当存在允许 replace 的节点')
   assert.ok(SPECS.some(([, s]) => !s.modes.includes('replace')), '应当存在不允许 replace 的节点')
+  assert.ok(SPECS.some(([, s]) => s.portal === true), '应当存在 portal 节点（否则 portal 那条规则恒不触发）')
+  assert.ok(
+    SPECS.some(([, s]) => s.kind === 'ui' && s.portal !== true && s.modes.includes('wrap')),
+    '应当存在**非 portal** 的 ui 节点且允许 wrap（反向对照）',
+  )
 })
 
 test('kind: "slot" 的条目不得自带 extendCardinality（基数唯一真源是 SLOT_CARDINALITY）', () => {

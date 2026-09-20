@@ -84,7 +84,8 @@ interface HostNodeSpec {
    元素与 `app-header` / `app-footer` 插槽出口**由宿主独占**，`replace` 只换内容——
    这是"单个插件不可能删掉其他插件贡献"的结构保证（**初版接线把整个 `<header>` 交给 replace，
    被用户当场驳回**）。
-   后两个同时是"portal 类组件不接 `ui-*`"的补偿路径（§9.4）。
+   后两个仍然是"要自定义**整套对话框流程**"时的补偿路径——替换**使用对话框的宿主节点**
+   （`shell-status-dialog` / `shell-command-palette`，§9.4）。
    原候选里的 **`shell-sidebar` 已移除**：宿主外壳里**没有这个元素**（桌面导航在 `<header>` 的
    `<nav>` 里、阅读页右栏由 `wiki-toc` 覆盖），为不存在的元素登记名字比拒绝更坏（§9.7）。
    ★ `extend` 的追加语义：`Ext` 把 extend 条目渲染为被包裹节点的**兄弟**，而在容器节点上
@@ -100,9 +101,15 @@ interface HostNodeSpec {
    `ui-loading-state`、`ui-skeleton`、`ui-spinner`（完整名单以 `HOST_NODE_CATALOG` 为准）。
    这一组是「一切元素」的关键杠杆：**在组件定义处包一层，全站所有调用点同时生效**
    （`packages/web/src/ui/*.tsx` 末尾的 `withExt('ui-x', XBase)`），不需要逐页改。
-   **portal 类组件（Dialog / ConfirmDialog / DropdownMenu / Tooltip）有意不接**：
-   Radix Portal 的根不在调用处 DOM 上，`wrap` 会留下一个空的包裹元素（决策由
-   `packages/web/test/uiExt.test.ts` 的一条断言钉住）。
+   **portal 类（`ui-dialog-content` / `ui-dropdown-menu-content` / `ui-confirm-dialog` /
+   `ui-tooltip`）已接线，但只开放 `extend` + `replace`**（`PORTAL_UI_MODES`）：它们的可见内容
+   经 Radix `<Portal>` 渲染到 `document.body` 附近、**不在调用处的 DOM 子树里**，而 `wrap` 的契约
+   是"把你的元素包在宿主默认实现外面"——包装元素**装不下** portal 的内容，样式与选择器也跨不过
+   portal 边界，作者看到的是"我明明包住了，什么都没变"。**砍掉它是不提供陷阱，不是限制能力**：
+   `replace`（接管渲染，自由度最高）与 `extend`（在调用处追加，看得见、位置可预期）都成立。
+   目录里标 `portal: true`（**事实标记**），守卫按规则钉住"标了 portal 的节点不得含 `wrap`"。
+   节点名对应**真正渲染内容的导出**：`Dialog` / `DropdownMenu` 只是 Radix `Root` 的再导出
+   （渲染不出 DOM、也不是可见元素），故不进目录。
 
 ---
 
@@ -447,6 +454,7 @@ P12 之前，受限宿主上**只有 `registerSlot`**（= 只会 `extend`）⇒ 
 | **P12** | **越权闸门补全 + 受限宿主提供 `registerExtension`**（入口表新增 `extNodes`） | ✅ 修两个真缺陷：① 受限宿主只有 `registerSlot` ⇒ 走正规形态的插件用不了 `replace`/`wrap`/`shadow`；② 闸门只认插槽裁决 ⇒ 非插槽节点的被抑制 `replace` 仍会注册（"赢家 A、渲染 B"）。落盘：`PluginUiTableEntry.extNodes`、`buildPluginUiTable` 的 `extAssignments`、`parseSuppressedOwners` 合并 `extensions[]`、`createPluginUiHost`（抽出、可单测）、示例插件演示 `wrap shell-brand-text`。守卫：`pluginUiHost.test.ts` 8 条（含三条反向对照）、`pluginUiPlan.test.ts` +3、`plugin-ui.test.ts` +1。**读数 web 971/971、manager 290/290、CDP 28/28** |
 | **P12b** | **验收层补齐**：`lib/session.mjs` 鉴权夹具 + 修陈旧的 `plugin-ui-cdp.mjs` + P12b 真浏览器场景 | ✅ 起因：`plugin-ui-cdp.mjs` 断言 `loaded()` 含 `@geewiki/wiki`（夹具早已搬到 `ui-demo`）且裸 `fetch` 调启停端点（要求 admin 会话 ⇒ 实测 401），**整脚本跑不动**。新增共用夹具（break-glass / setup / 验收账号三条路径 + `x-gw-csrf`）；`ui-extension-cdp.mjs` 加 **P12b 8 条**（真插件产物经受限宿主带 mode 注册 → 渲染 → 停用按 owner 回收）。修复中还抓到两个脚本自身的真问题：`Runtime.enable` **重放** console 历史、首屏断言假设"默认有启用的夹具插件"。**读数 `ui-extension-cdp` 36/36、`plugin-ui-cdp` 全通过（2 项按鉴权模式显式跳过）** |
 | **P13** | **按插件 SDK 作用域**：加载期间全局对象 = 按插件作用域构造的宿主（栈式安装 / 还原、覆盖 `import()` 与 `register(host)` 两段、`finally` 兜底）；作用域宿主补成**完整 SDK** + `pluginName`；注销类成员只作用于自己的来源（新增 `unregisterSlotFrom`）；不导出 `register(host)` 的 bundle 也登记 | ✅ 修掉"顶层注册无归属"这个**静默**缺陷（收不回 + 不过闸门）。读数：`packages/web` **976/976**、CDP **39/39**、`HOST_SDK_VERSION` **0.12.0** |
+| **P13b** | **portal 类原语接线**：`ui-dialog-content` / `ui-dropdown-menu-content` / `ui-confirm-dialog` / `ui-tooltip` 进目录，模式为 `extend` + `replace`（`PORTAL_UI_MODES`）；目录新增**事实标记** `portal: true`，守卫按规则钉住"标了 portal 的节点不得含 `wrap`" | ✅ 关闭"portal 类不接"这个洞：`wrap` 在 portal 上**不可能生效**（包装元素装不下 portal 内容、样式跨不过边界）⇒ 不提供陷阱；`replace` / `extend` 成立。守卫 `uiExt.test.ts` 改写并加"`portal: true` 必须有源码证据"，CDP +3 条 ⇒ **42/42** |
 
 **涉及 UI 的批次一律要求浏览器端到端验收**（真实渲染，走
 `scripts/acceptance/` 的零依赖 CDP 惯例，刻意不进 `pnpm test`），且 console 零错误、无失败请求。
@@ -461,12 +469,12 @@ google-chrome --headless=new --no-sandbox --remote-debugging-port=9461 about:bla
 node scripts/acceptance/ui-extension-cdp.mjs http://127.0.0.1:3000 9461
 ```
 
-**读数**（Chrome 151 headless，2026-09 本批）：**39 项全绿**（P13 后；P12b 时 36），含
+**读数**（Chrome 151 headless，2026-09 本批）：**42 项全绿**（portal 批次后；P12b 时 36、P13 时 39），含
 
 > **勘误（2026-09-21，P11c 时核对）**：P11b 那一轮文档里写成"28/28"，**实测是 27/27**。
 > 复核方式：静态 `check(` 调用 29 处，减去 P9 场景里 `if (probe.error) … else …` 那对二选一 ⇒ 28，
 > 再减去当时尚未存在的 P11c 一条 ⇒ 27。现读数以 `node scripts/acceptance/ui-extension-cdp.mjs <url>`
-> 输出的 `ok` 行数为准（P11c 后 28，P12b 后 **36**，P13 后 **39**）。
+> 输出的 `ok` 行数为准（P11c 后 28，P12b 后 **36**，P13 后 **39**，portal 批次后 **42**）。
 >
 > **验收需要鉴权（P12b 起）**：启停插件要求 admin 会话。三条路径由 `scripts/acceptance/lib/session.mjs`
 > 自动选择：① 实例启动时设 `GEEWIKI_ADMIN_TOKEN=<任意值>`（脚本读同一环境变量走 `x-gw-admin-token`
@@ -499,6 +507,9 @@ node scripts/acceptance/ui-extension-cdp.mjs http://127.0.0.1:3000 9461
 - `P13` **模块求值期（顶层形态）用全局 SDK 注册** ⇒ 归属到插件名并渲染
   `{"toplevel":true,"toplevelInHeader":true}`；停用 ⇒ `{"toplevel":false}`
   —— **修复前这条贡献的来源是 `'host-sdk'`，这个标记会残留**（这条断言就是那个缺陷的回归）
+- `P13` **portal 类节点**：`replace ui-tooltip` ⇒ 调用点被换掉 **1 处**（定义处接线在全站生效），
+  卸载 ⇒ 残留 **0**；同一节点用 `wrap` 注册 ⇒ 渲染 **0 处**（宿主侧模式校验真的拦下来了，
+  并留下一条精确文案的告警——它本身就是断言对象，故在白名单里按精确文案放行）
 - `P9` 壳 `display: contents`；shadow 内 `.font-bold` 字重 400（宿主内 700）⇒ 工具类进不去；
   shadow 内 `var(--gw-accent)` = 宿主内同值 ⇒ 令牌跨边界继承
 - `P0` `registerTheme` 覆盖 `--gw-radius-md: 17px` ⇒ `.rounded-md` 计算值 8px → 17px → 卸载还原
@@ -507,16 +518,16 @@ node scripts/acceptance/ui-extension-cdp.mjs http://127.0.0.1:3000 9461
 
 **已知缺口（如实登记，勿当成已完成）**：
 
-1. **`scripts/acceptance/plugin-ui-cdp.mjs` 已陈旧**：它断言 `loaded()` 含 `@geewiki/wiki`、
-   并在页头找夹具的 `+1` 按钮——而那份夹具早已按 `plugins/ui-demo/README.md` 搬到
-   `@geewiki-plugin/ui-demo` 名下；它用裸 `fetch` 调 `/api/plugins/:name/enable`，而该端点
-   现在要求 **admin 会话**（实测 401 `需要登录`）。修它需要照 `p5-nav-admin/run.ts` 建主体 + 登录 +
-   `x-gw-csrf`，属独立批次。
-2. **插件 bundle → `registerExtension(mode)` 这条端到端路径没有 CDP 覆盖**：本批的 CDP 脚本用
-   `window.__GEEWIKI_HOST__.registerExtension` **直接注册**（因此无需登录），故"清单声明
-   `geewiki.extensions` → 后端放行 → 插件 bundle 里带 mode 注册 → 渲染"这条链只有单测覆盖
-   （`packages/manager/test/extensions.test.ts` + `packages/web/test/extOutlet.test.ts`）。
+1. ~~**`scripts/acceptance/plugin-ui-cdp.mjs` 已陈旧**~~ —— **已由 P12b 修复**：新增共用鉴权夹具
+   `scripts/acceptance/lib/session.mjs`（break-glass / `POST /api/auth/setup` / 固定验收账号三条路径，
+   状态变更请求自动带 `x-gw-csrf`），断言也按夹具搬家后的实际形态更新；`plugin-ui-cdp.mjs`
+   **全通过**（含 `--missing-asset` 路径；按鉴权模式显式跳过的用例会打印 `skip` 并写进结果 JSON）。
+2. ~~**插件 bundle → `registerExtension(mode)` 这条端到端路径没有 CDP 覆盖**~~ —— **已由 P12b 补齐**：
+   脚本改为启用**真实示例插件**（`@geewiki-plugin/ui-demo`，产物由 `build:fixtures` 构建到
+   `plugins/<名>/dist`），断言它的 `registerSlot` 与 `registerExtension(wrap)` 贡献出现、停用后
+   按 owner 回收；P13 又在同一场景里加了"**模块求值期**顶层形态的注册同样归属插件名、停用即回收"。
 3. **`kind: 'page'` 的整页替换仍然不做**（§9.5）。外壳候选节点**已全部接线**（7 个 `shell-*`，
    守卫 `shellChromeExt.test.ts` 9 条）；`shell-sidebar` 经核实**外壳里不存在该元素**，已从候选移除。
-   仍然**有意不接**的是 portal 类组件（Dialog / ConfirmDialog / DropdownMenu / Tooltip，§9.4）——
-   它们要自定义外观时，替换**使用它们的宿主节点**（`shell-status-dialog` / `shell-command-palette`）。
+   portal 类原语**已接线**（`extend` + `replace`，`wrap` 由规则排除，§3）；
+   要自定义**整套对话框流程**仍可替换**使用它的宿主节点**（`shell-status-dialog` /
+   `shell-command-palette`）——那是"换掉流程"，不是"换掉面板"。

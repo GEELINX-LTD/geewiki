@@ -158,6 +158,11 @@ export type UiNodeName =
   | 'ui-loading-state'
   | 'ui-skeleton'
   | 'ui-spinner'
+  // portal 类（只开放 `replace`，见 `PORTAL_UI_MODES`）
+  | 'ui-dialog-content'
+  | 'ui-dropdown-menu-content'
+  | 'ui-confirm-dialog'
+  | 'ui-tooltip'
 
 /**
  * 宿主节点 id 的联合。
@@ -191,6 +196,21 @@ export interface HostNodeSpec {
   readonly propsVersion: number
   readonly description: string
   /**
+   * 该节点的宿主默认实现**渲染在 portal 里**（Radix `Portal`），DOM 不在调用处。
+   *
+   * 为什么这是一个**事实标记**而不是注释：它决定了这个节点**不能开放 `wrap`**。
+   * `wrap` 的契约是"把你的元素包在宿主默认实现外面"，而 portal 的内容挂在 `document.body`
+   * 附近、**不在包装元素的子树里** ⇒ 包装元素落在调用处、样式与作用域都进不去，
+   * 作者看到的是"我明明包住了，什么都没生效"。这不是"少了个能力"，是**静默失效**。
+   *
+   * 另两个模式仍然成立：`replace` 接管整个渲染（自己决定 portal 与否）、
+   * `extend` 在调用处追加（看得见、位置可预期）。
+   *
+   * 守卫据此断言"标了 portal 的节点**不含 `wrap`**、且仍支持 `replace` 与 `extend`"
+   * （`extensions-catalog.test.ts`），于是新增 portal 节点时**不可能**顺手拿到 `wrap`。
+   */
+  readonly portal?: true
+  /**
    * `extend` 模式的占用基数。**仅非 slot 节点可设置**：`kind: 'slot'` 的基数
    * 一律取 `SLOT_CARDINALITY`（单一真源），在这里再写一份就是镜像。
    */
@@ -217,6 +237,29 @@ export interface HostNodeSpec {
  * `extend` 是追加。风险由宿主侧的**回退语义**兜住（贡献渲染失败 ⇒ 回退默认实现）。
  */
 const UI_MODES: readonly ExtMode[] = Object.freeze(['extend', 'wrap', 'replace'])
+
+/**
+ * **portal 类** ui 节点允许的模式：`extend` + `replace`，**不含 `wrap`**。
+ *
+ * ## 为什么不是"先不接"
+ * 这四个（`ui-dialog-content` / `ui-dropdown-menu-content` / `ui-confirm-dialog` / `ui-tooltip`）
+ * 曾经整批不接线，理由写的是"`wrap` 会在调用处留下空的包裹元素"。那个理由**不完整**：
+ * 真正的问题是 **`wrap` 在这里不可能生效**——宿主的默认实现经 Radix `Portal` 渲染到
+ * `document.body` 附近，**不在包装元素的 DOM 子树里**，所以包装元素既包不住它、
+ * 也传不进样式（CSS 继承与选择器都跨不过 portal 边界）。作者看到的是"我包住了但什么都没变"。
+ *
+ * 于是取舍变成：要么整批不接（"一切界面元素可被扩展"留一个说不清的洞），要么**只砍掉真正
+ * 坏掉的那个模式**。逐条看：
+ * - `replace`：**接管整个渲染**（自己决定要不要 portal），语义完全成立，而且是自由度最高的模式；
+ * - `extend`：在**调用处**追加一块——调用处就是"用到这个 tooltip / 对话框的地方"，
+ *   追加的东西看得见、位置可预期，不涉及"装进 portal 里"这件事，因此成立
+ *   （也满足"每个节点都必须支持 extend"这条既有不变量）；
+ * - `wrap`：唯一**静默失效**的一个，砍掉它不是限制能力，是**不提供陷阱**。
+ *
+ * 插件侧的代价与其它 `replace` 一致（无障碍、焦点陷阱、Escape 关闭都转移到作者身上），
+ * 且插件**能**做到：SDK 暴露了 `ReactDOM` / `createPortal` / `ReactDOMClient`。
+ */
+const PORTAL_UI_MODES: readonly ExtMode[] = Object.freeze(['extend', 'replace'])
 
 /**
  * `kind: 'page'` 的页面内元素级挂点允许的模式（与 {@link UI_MODES} 同口径）。
@@ -361,6 +404,39 @@ const CATALOG: Readonly<Record<HostNodeName, HostNodeSpec>> = Object.freeze({
   'ui-loading-state': { kind: 'ui', modes: UI_MODES, propsVersion: 1, description: '加载态（LoadingState）' },
   'ui-skeleton': { kind: 'ui', modes: UI_MODES, propsVersion: 1, description: '骨架屏（Skeleton）' },
   'ui-spinner': { kind: 'ui', modes: UI_MODES, propsVersion: 1, description: '转圈（Spinner）' },
+  /*
+    portal 类：只开放 `replace`（理由见 `PORTAL_UI_MODES`）。节点名对应**真正渲染内容的那个
+    导出**：`Dialog` / `DropdownMenu` 只是 Radix `Root` 的再导出（渲染不出 DOM，也不是可见元素），
+    可见的对话框 / 菜单面由 `DialogContent` / `DropdownMenuContent` 渲染，故节点挂在后者上。
+  */
+  'ui-dialog-content': {
+    kind: 'ui',
+    modes: PORTAL_UI_MODES,
+    portal: true,
+    propsVersion: 1,
+    description: '对话框面板（DialogContent，portal 渲染）',
+  },
+  'ui-dropdown-menu-content': {
+    kind: 'ui',
+    modes: PORTAL_UI_MODES,
+    portal: true,
+    propsVersion: 1,
+    description: '下拉菜单面板（DropdownMenuContent，portal 渲染）',
+  },
+  'ui-confirm-dialog': {
+    kind: 'ui',
+    modes: PORTAL_UI_MODES,
+    portal: true,
+    propsVersion: 1,
+    description: '危险操作确认框（ConfirmDialog，内含 portal 面板）',
+  },
+  'ui-tooltip': {
+    kind: 'ui',
+    modes: PORTAL_UI_MODES,
+    portal: true,
+    propsVersion: 1,
+    description: '悬浮提示（Tooltip，portal 渲染）',
+  },
 })
 
 /** 目录的只读视图（管理台与诊断端点据此下发"可用节点"） */

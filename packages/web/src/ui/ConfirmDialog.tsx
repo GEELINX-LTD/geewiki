@@ -29,6 +29,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Dialog, DialogContent } from './Dialog'
 import { Button } from './Button'
+import { withExt } from '../lib/slots'
 
 export interface ConfirmRequest {
   /** 标题：一句话说清"对什么做什么"，如「删除页面「入门」？」 */
@@ -63,7 +64,7 @@ export function useConfirm(): {
   return { request, confirm, close }
 }
 
-export function ConfirmDialog({
+function ConfirmDialogBase({
   request,
   onOpenChange,
 }: {
@@ -148,3 +149,6 @@ export function ConfirmDialog({
     </Dialog>
   )
 }
+
+/* ★ P13：宿主节点接线（portal 类**只开放 `replace`**，见 docs/design/ui-extension-platform.md） */
+export const ConfirmDialog = withExt('ui-confirm-dialog', ConfirmDialogBase)

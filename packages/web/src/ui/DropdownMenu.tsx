@@ -20,11 +20,12 @@ import * as Menu from '@radix-ui/react-dropdown-menu'
 import type { ReactNode } from 'react'
 import { cn } from './cn'
 import { focusRing, touchTarget } from './a11y'
+import { withExt } from '../lib/slots'
 
 export const DropdownMenu = Menu.Root
 export const DropdownMenuTrigger = Menu.Trigger
 
-export function DropdownMenuContent({
+function DropdownMenuContentBase({
   children,
   align = 'start',
   className,
@@ -114,3 +115,6 @@ export function DropdownMenuLabel({ children }: { children: ReactNode }): ReactN
     </Menu.Label>
   )
 }
+
+/* ★ P13：宿主节点接线（portal 类**只开放 `replace`**，见 docs/design/ui-extension-platform.md） */
+export const DropdownMenuContent = withExt('ui-dropdown-menu-content', DropdownMenuContentBase)
