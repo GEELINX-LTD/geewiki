@@ -42,9 +42,9 @@ test('schema：apiKey 是 role=secret（写一次、不可回读），provider �
   assert.equal(dict['apiKey']?.meta?.role, 'secret', '必须是 secret：否则密钥会明文回显在管理台')
   assert.equal(dict['provider']?.meta?.role, 'llm-provider', '必须是 llm-provider：选项来自运行期注册的适配器')
   assert.deepEqual(
-    Object.keys(dict).slice(0, 7),
-    ['provider', 'baseUrl', 'apiKey', 'model', 'reasoningEffort', 'contextWindow', 'maxOutputTokens'],
-    '前 7 项就是"接上一个模型"的全部必要信息，顺序即填写顺序',
+    Object.keys(dict).slice(0, 8),
+    ['provider', 'baseUrl', 'apiKey', 'model', 'supportsVision', 'reasoningEffort', 'contextWindow', 'maxOutputTokens'],
+    '前 8 项就是"接上一个模型 + 声明它收不收图"的全部必要信息，顺序即填写顺序',
   )
   assert.equal(dict['model']?.meta?.role, 'llm-model', '模型名要能被表单渲染成「清单下拉 + 手填」组合框')
   assert.equal(dict['reasoningEffort']?.meta?.role, 'llm-effort', '思考强度给候选档位，但字段本身是自由文本')
@@ -59,6 +59,8 @@ test('schema：调优四项只是被折叠，键仍在顶层', () => {
       'baseUrl',
       'apiKey',
       'model',
+      // 能力声明紧跟模型名：它是对**这个模型**的声明，换模型后就该重新确认
+      'supportsVision',
       'reasoningEffort',
       'contextWindow',
       'maxOutputTokens',

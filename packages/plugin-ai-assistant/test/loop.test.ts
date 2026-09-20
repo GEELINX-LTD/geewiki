@@ -751,3 +751,84 @@ test('grounded：提前收场的分支也带这两个字段（形状恒定，客
   assert.equal(outcome.grounded, false)
   assert.deepEqual(outcome.groundingSources, [])
 })
+
+/* ================= 工具返回的图片（2026-09-20） ================= */
+
+test('★ 工具返回的图挂在**那条 tool 消息**上，会话核心不造 user 消息（flush 是适配器的事）', async () => {
+  const png = 'iVBORw0KGgo='
+  const { svc, requests } = scriptedLlm([
+    { calls: [{ id: 'c1', name: 'read_image', arguments: '{"id":5}' }] },
+    { text: '这是一张拓扑图。' },
+  ])
+  const { outcome } = await run(
+    opts({
+      llm: svc,
+      tools: [
+        fakeTool('read_image', 'server', () => ({
+          content: '{"id":5,"note":"图片已随本条结果一并提供。"}',
+          grounding: 'kb',
+          images: [{ mime: 'image/png', data: png }],
+        })),
+      ],
+    }),
+  )
+
+  const second = requests[1]?.messages ?? []
+  const toolMessage = second.find((m) => m.role === 'tool')
+  assert.deepEqual(
+    toolMessage?.images,
+    [{ url: `data:image/png;base64,${png}` }],
+    '图片必须挂在那条 tool 消息上（内部模型说事实，协议方言归适配器）',
+  )
+  assert.equal(
+    second.filter((m) => m.role === 'user').length,
+    1,
+    '会话核心不得凭空造出一条"不是用户说的 user 消息"',
+  )
+  // 权威转录（随 done.messages 回给客户端、被原样存下、下一轮原样带回）里不能有图片
+  assert.equal(JSON.stringify(outcome.messages).includes(png), false, 'base64 不得进权威转录')
+})
+
+test('★ 工具交上来的图要过与线协议**同一份**校验：坏 MIME / 坏 base64 / 超长一律丢掉', async () => {
+  const bad = [
+    { mime: 'image/svg+xml', data: 'AAAA' },
+    { mime: 'image/png', data: 'not base64!!' },
+    { mime: 'image/png', data: '' },
+    { mime: 'image/png', data: 'A'.repeat(1_400_001) },
+    { mime: 'text/html', data: 'AAAA' },
+  ]
+  const { svc, requests } = scriptedLlm([
+    { calls: [{ id: 'c1', name: 'read_image', arguments: '{}' }] },
+    { text: '好。' },
+  ])
+  const { outcome } = await run(
+    opts({
+      llm: svc,
+      tools: [fakeTool('read_image', 'server', () => ({ content: '{"n":0}', images: bad }))],
+    }),
+  )
+  const toolMessage = requests[1]?.messages.find((m) => m.role === 'tool')
+  assert.equal(toolMessage?.images, undefined, '一张都不合规 ⇒ 一张都不该发出去')
+  // 图被丢掉**不影响**工具结果本身进上下文（一次坏图不该让整个回合失败）
+  assert.equal(toolMessage?.content, '{"n":0}')
+  assert.ok(outcome.messages.some((m) => m.role === 'tool'))
+})
+
+test('★ 工具结果超过单条上限时只留前几张，且**如实说出**少给了', async () => {
+  const many = Array.from({ length: 6 }, () => ({ mime: 'image/png', data: 'AAAA' }))
+  const { svc, requests } = scriptedLlm([
+    { calls: [{ id: 'c1', name: 'read_image', arguments: '{}' }] },
+    { text: '好。' },
+  ])
+  const { outcome } = await run(
+    opts({ llm: svc, tools: [fakeTool('read_image', 'server', () => ({ content: '{"n":6}', images: many }))] }),
+  )
+  const toolMessage = requests[1]?.messages.find((m) => m.role === 'tool')
+  assert.equal(toolMessage?.images?.length, 4, '单条工具结果最多 4 张（与单条消息的图预算同值）')
+  assert.match(
+    toolMessage?.content ?? '',
+    /只有前 4 张交给了你/,
+    '少给必须说出来：工具已在自己文本里写了给了几张，静默截断会让模型以为看到了全部',
+  )
+  assert.ok(outcome.messages.some((m) => m.role === 'tool'))
+})

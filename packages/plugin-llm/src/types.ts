@@ -9,6 +9,7 @@
 export type {
   LlmErrorCode,
   LlmRouteDescriptor,
+  LlmImagePart,
   LlmMessage,
   LlmRequest,
   LlmUsage,

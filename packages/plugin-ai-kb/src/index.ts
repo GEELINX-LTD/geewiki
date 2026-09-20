@@ -29,10 +29,13 @@
  */
 import type { Context } from 'cordis'
 import Schema from 'schemastery'
-import type { GeeWikiManifest, Principal } from '@geewiki/core'
+import type { GeeWikiManifest, LlmService, Principal } from '@geewiki/core'
 import {
+  AI_TOOL_IMAGE_MAX_BYTES,
+  AI_TOOL_IMAGE_MIME_WHITELIST,
   AI_TOOL_SERVICE_NAME,
   type AiToolContext,
+  type AiToolImage,
   type AiToolResult,
   type AiToolService,
 } from '@geewiki/ai-tools'
@@ -140,6 +143,63 @@ function readString(args: unknown, key: string): string | null {
   if (typeof raw !== 'string') return null
   const trimmed = raw.trim()
   return trimmed === '' ? null : trimmed
+}
+
+/** 取一个**正整数**参数（附件 id）。模型常把数字写成字符串，故两边都收，其余一律拒绝 */
+function readPositiveInt(args: unknown, key: string): number | null {
+  const raw = readArgs(args)[key]
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : Number.NaN
+  return Number.isInteger(n) && n >= 1 ? n : null
+}
+
+/**
+ * 当前模型收不收图 —— 由 LLM 设置里的 `supportsVision` 决定（**缺省 false，从严**）。
+ *
+ * ## 为什么工具表要跟着它变
+ * 模型看不到图时把 `read_image` 摆在工具表里，它会调、会拿到一张自己读不懂的图，
+ * 然后**凭文件名编内容**——这条链路上没有任何一处会报错。本仓在 `page.update` 上
+ * 已经定过同一条判据："这个能力不存在"比"调了才发现做不到"诚实得多。
+ *
+ * ## 为什么走 `ctx.get` 而不是 `requires`
+ * `llm-service` 对本插件是**可选**的：三条文本工具（`list_pages` / `search_kb` /
+ * `read_page`）一个都不需要它。写进 `requires` 会让"没配模型"变成"知识库工具全没了"，
+ * 那是把一个能力面收窄成了一次激活失败。`search_kb` 对 `search-service` 也是这么处理的。
+ */
+function visionEnabled(ctx: Context): boolean {
+  const llm = ctx.get('llm-service') as LlmService | undefined
+  return llm?.settings().supportsVision === true
+}
+
+/* ============================== 正文里的图片 ============================== */
+
+/**
+ * 从正文里按**出现顺序**抽出附件引用（`/api/attachments/<数字>`），去重。
+ *
+ * 三条判据：
+ * 1. **只认数字 id。** `guide/markdown-demo` 那篇"讲解 Markdown 语法"的页面里写着
+ *    `![站内附件](/api/attachments/<附件 id>)` 这种示例文字，把它当成真附件去取
+ *    只会白跑一趟。
+ * 2. **只认出现过的。** 附件面板里存着、正文却没引用的附件**不算**——本仓的可见性
+ *    判据是"出现在你看得见的正文段落里"，工具若自作主张把整页附件都捞出来，
+ *    就造出了第二套判据（下载端点那边判 404 的，这里却给模型看了）。
+ * 3. **顺序即文档顺序。** "前面几张"对模型与用户都才是有意义的说法。
+ *
+ * 为什么在**文本**上找而不是解析 Markdown：本仓的正文模型就是"Markdown 文本 + 块级投影"，
+ * 不存在一棵两边共用的 AST（编辑器与渲染器各自解析一次）。附件 URL 是上传时由编辑器
+ * **逐字写进正文**的固定形态，所以匹配到的就是真引用；而且**漏掉一张**的代价只是
+ * 模型少看一张图，**多认一张**的代价只是一次取不到就跳过的查询。两个方向都不危险。
+ */
+export function attachmentIdsIn(content: string): number[] {
+  const out: number[] = []
+  const seen = new Set<number>()
+  const re = /\/api\/attachments\/(\d+)/g
+  for (let m = re.exec(content); m !== null; m = re.exec(content)) {
+    const id = Number(m[1] ?? '')
+    if (!Number.isInteger(id) || id < 1 || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
 }
 
 /* ============================== 插件 ============================== */
@@ -340,6 +400,34 @@ export const AiKbPlugin = {
         const truncated = full.length > cfg.maxPageChars
         const text = truncated ? full.slice(0, cfg.maxPageChars) : full
         const raw = page.contentMode === 'raw'
+
+        /*
+         * 正文里引用了多少张图 —— **只数不取**（2026-09-20）。
+         *
+         * 第一版在这里直接把字节取出来随结果交给模型。那有两个问题：① "读一页"变成一次
+         * **不可预期**的开销（一页可能引用十张图，每张一千多 token）；② 剥夺了模型
+         * "这张图我到底要不要看"的选择权。现在这里只说**有几张、怎么取**，
+         * 真正读字节的是模型自己调用的 `read_image`。
+         *
+         * 分工照搬 DSH：`read_file` 给文本、`read_image` 给图，由模型按需选择。
+         */
+        const refIds = attachmentIdsIn(text)
+        const canSee = visionEnabled(ctx)
+        const imagesNote =
+          refIds.length === 0
+            ? null
+            : canSee
+              ? `正文里引用了 ${refIds.length} 张图片（形如 \`![说明](/api/attachments/<id>)\`）。` +
+                '要**看**其中某一张，用 read_image 传它的 id —— 本次没有把图片交给你。'
+              : /*
+                 * 模型看不到图时**必须说出来**，而且不能说"用 read_image"——
+                 * 那条工具此刻根本不在工具表里（见 `visionEnabled`）。
+                 * 不说的后果是模型凭 `![部署拓扑]` 这样的替代文字编出图的内容，
+                 * 而回答读起来与真看过一模一样。
+                 */
+                `正文里引用了 ${refIds.length} 张图片，但**当前模型没有声明支持看图**` +
+                '（管理员可在 LLM 设置里打开「支持图像输入」），所以图片内容你读不到。' +
+                '**不要**根据替代文字或文件名臆测图片内容；如实告诉用户这一点。'
         return {
           content: JSON.stringify({
             slug: page.slug,
@@ -376,10 +464,101 @@ export const AiKbPlugin = {
                     '**不要**据此断言"资料里没有相关内容"——请用 search_kb 定位未被包含的段落。',
                 }
               : {}),
+            ...(imagesNote !== null ? { imagesNote } : {}),
           }),
-          data: { slug: page.slug, title: page.title, truncated, totalChars: full.length },
+          data: { slug: page.slug, title: page.title, truncated, totalChars: full.length, pageImages: refIds.length },
           // 逐字读到的正文，是本仓最强的一种依据（即便口径是投影，它仍是知识库内容）
           grounding: 'kb',
+        }
+      },
+    })
+
+    /* ---------------------------- read_image ---------------------------- */
+
+    /*
+     * ## 为什么是一条**独立的**工具，而不是让 `read_page` 顺手把图带上（2026-09-20 定）
+     *
+     * 第一版是后者：读一页就把正文里引用的图全部取出来随结果交给模型。两个问题——
+     * ① 开销**不可预期**：一页引用十张图就是十张图进上下文，而用户可能只问了一句
+     *    "这页讲了什么"；② 剥夺了模型的选择权：它没法说"这张图我不用看"。
+     *
+     * 现在照 DSH 的分工（`read_file` 给文本、`read_image` 给图）：`read_page` 只说
+     * "正文引用了 N 张图、id 是多少"，**要不要看、看哪张，由模型自己调这条工具**。
+     * 顺带的好处是这条工具的参数与 `read_page` 完全同构（都是"从正文里读到的那个标识"），
+     * 模型在正文里看到的 `![说明](/api/attachments/42)` 直接就是调用凭据。
+     *
+     * ## 权限：一条都不自己判
+     * 取字节走 `wiki-service.readAttachment`，判据（页面级 + 块级投影）与
+     * `GET /api/attachments/:id` 是**同一份实现**。本插件连"这个 id 存不存在"都不区分——
+     * 服务层一律回 `undefined`，正是为了不让这里变成一个存在性探测接口。
+     */
+    tools.contribute('@geewiki/ai-kb', {
+      descriptor: {
+        name: 'read_image',
+        description:
+          '把知识库页面正文里引用的一张图片**读出来看**（图片本身会随结果交给你）。' +
+          'id 取自 read_page 结果里的 `![说明](/api/attachments/<id>)`。' +
+          '只支持 PNG/JPEG/WebP/GIF，且**要求当前模型支持图像输入**；' +
+          '读不到时不要臆测图片内容，如实告诉用户你看不到它。',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'number', description: '附件 id —— 正文里 `/api/attachments/` 后面那个数字' },
+          },
+          required: ['id'],
+        },
+        side: 'server',
+        /*
+         * **不支持看图时这条工具根本不出现**（不是"调了才发现做不到"）：
+         * 与 `page.update` 缺 mutation journal 时不注册是同一条判据。
+         */
+        available: (): boolean => ctx.get('wiki-service') !== undefined && visionEnabled(ctx),
+      },
+      execute: async (principal: Principal, args: unknown, _context: AiToolContext): Promise<AiToolResult> => {
+        const id = readPositiveInt(args, 'id')
+        if (id === null) return toolError('缺少参数 id（附件 id，正整数）')
+
+        /*
+         * `maxBytes` 在**打开流之前**判（服务层的语义）：一张 25 MB 的附件读进内存
+         * 再判"太大"是纯粹的浪费。取值见 `AI_TOOL_IMAGE_MAX_BYTES`——
+         * 它保证按本值挑出来的图一定过得了会话核心那道 base64 长度闸。
+         */
+        const att = await wiki().readAttachment(principal, id, { maxBytes: AI_TOOL_IMAGE_MAX_BYTES })
+        if (att === undefined) {
+          /*
+           * 五类拒绝（不存在 / 页面无权 / 只出现在你看不到的段落里 / 文件缺失 / 超过体积上限）
+           * **回同一句话**。区分开就等于提供了一个存在性探测接口——附件 id 是连续整数、可枚举，
+           * 而下载端点当初把 403 改成 404 正是为了这件事。这句话把可能的原因列全，
+           * 是为了让模型能给出**可执行的**下一步（换一张、或告诉用户你看不到）。
+           */
+          return toolError(
+            `读不到附件 ${id}。可能的原因：它不存在、它只出现在你看不到的受限段落里、` +
+              '它不是图片、字节缺失，或体积超过上限。**不要臆测它的内容**——如实告诉用户你看不到它。',
+          )
+        }
+        if (!AI_TOOL_IMAGE_MIME_WHITELIST.includes(att.mime)) {
+          return toolError(
+            `附件 ${id}（${att.name}）不是能交给模型看的图片格式：${att.mime}。` +
+              `只支持 ${AI_TOOL_IMAGE_MIME_WHITELIST.join(' / ')}。`,
+          )
+        }
+        return {
+          content: JSON.stringify({
+            id: att.id,
+            name: att.name,
+            mime: att.mime,
+            bytes: att.byteSize,
+            /*
+             * 自述**必须**有：线上那条 flush 出来的 user 消息只有一句固定的引导语，
+             * 图本身不带任何文字。少了这句，模型分不清"图没给我"与"这就是全部"。
+             */
+            note: '图片本身已随本条结果一并提供（见紧随其后的那条图片消息）。',
+          }),
+          data: { attachmentId: att.id, mime: att.mime, bytes: att.byteSize },
+          // 逐字读到的知识库内容（只是形态是图），与 read_page 同一条判据
+          grounding: 'kb',
+          // 图片挂在**工具结果**上；chat-completions 表达不了它，由适配器 flush 成 user 消息
+          images: [{ mime: att.mime, data: Buffer.from(att.bytes).toString('base64') }],
         }
       },
     })

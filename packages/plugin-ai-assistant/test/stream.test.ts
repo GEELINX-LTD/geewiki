@@ -23,7 +23,7 @@ import type { HttpRouterService, Principal, RouteHandler, RouteHandlerContext } 
 import { validateFrameSequence, type SseFrame } from '@geewiki/core'
 import type { AiToolService, ResolvedTool } from '@geewiki/ai-tools'
 import type { LlmChunk, LlmProvider, LlmService } from '@geewiki/llm'
-import { createLlmService } from '@geewiki/llm'
+import { createLlmService, FALLBACK_SETTINGS } from '@geewiki/llm'
 import {
   AiAssistantPlugin,
   ASSISTANT_CAPABILITIES_PATH,
@@ -256,11 +256,16 @@ async function makeHarness(
     withHttp?: boolean
     principal?: Principal
     pluginOptions?: AiAssistantPluginOptions
+    /** 显式声明"当前模型收不收图"（LLM 设置里的那一项）；不传 = 走 `FALLBACK_SETTINGS`（false） */
+    vision?: boolean
   } = {},
 ): Promise<Harness> {
   const router = makeTestRouter({ principal: opts.principal ?? USER })
   const calls = { calls: 0 }
-  const llm: LlmService = createLlmService()
+  const llm: LlmService =
+    opts.vision === undefined
+      ? createLlmService()
+      : createLlmService({ settings: () => ({ ...FALLBACK_SETTINGS, supportsVision: opts.vision === true }) })
   if (opts.withLlm ?? true) llm.register(scriptedProvider(opts.script ?? [{ text: '好。' }], calls))
 
   const services = new Map<string, unknown>()
@@ -839,6 +844,60 @@ test('必需工具集在位时一切照常（确认上一条拒绝的是"缺席"
     const res = await post(h.port, TURN_PATH, { messages })
     assert.equal(res.status, 200)
     assert.match(res.text, /event: done/)
+  } finally {
+    await h.close()
+  }
+})
+
+/* ============ 视觉能力开关（LLM 设置里的「支持图像输入」，2026-09-20） ============ */
+
+test('★ capabilities 下发 vision：界面据此决定要不要显示图片按钮', async () => {
+  const off = await makeHarness({ tools: [fakeTool('search_kb', 'server')] })
+  try {
+    const body = JSON.parse((await get(off.port, ASSISTANT_CAPABILITIES_PATH)).text) as { vision?: boolean }
+    assert.equal(body.vision, false, '缺省从严：没声明就是不支持')
+  } finally {
+    await off.close()
+  }
+
+  const on = await makeHarness({ tools: [fakeTool('search_kb', 'server')], vision: true })
+  try {
+    const body = JSON.parse((await get(on.port, ASSISTANT_CAPABILITIES_PATH)).text) as { vision?: boolean }
+    assert.equal(body.vision, true)
+  } finally {
+    await on.close()
+  }
+})
+
+test('★ 没声明支持看图却塞了图：/api/ai/turn 明确 400，**不是**转给上游换一个难懂的报错', async () => {
+  const h = await makeHarness({ tools: [fakeTool('search_kb', 'server')] })
+  try {
+    const r = await post(h.port, TURN_PATH, {
+      messages: [
+        {
+          role: 'user',
+          content: '这是什么',
+          images: [{ mime: 'image/png', data: 'iVBORw0KGgo=' }],
+        },
+      ],
+    })
+    assert.equal(r.status, 400)
+    const body = JSON.parse(r.text) as { error?: string; message?: string }
+    assert.equal(body.error, 'vision_unsupported')
+    assert.match(body.message ?? '', /支持图像输入/, '要说清是哪一个开关、以及怎么解决')
+  } finally {
+    await h.close()
+  }
+})
+
+test('★ 打开了开关：同样的请求正常进入流式（不再被那道闸拦下）', async () => {
+  const h = await makeHarness({ tools: [fakeTool('search_kb', 'server')], vision: true })
+  try {
+    const r = await post(h.port, TURN_PATH, {
+      messages: [{ role: 'user', content: '这是什么', images: [{ mime: 'image/png', data: 'iVBORw0KGgo=' }] }],
+    })
+    assert.equal(r.status, 200)
+    assert.ok(r.text.includes('data:'), '应当是一段 SSE')
   } finally {
     await h.close()
   }

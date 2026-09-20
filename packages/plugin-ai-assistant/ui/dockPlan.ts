@@ -13,10 +13,12 @@ import {
   type DockFinishReason,
   type DoneData,
   type DockMessage,
+  type DockImage,
   type ToolActivityView,
   type TurnEvent,
   type TurnToolCallView,
 } from './sse.js'
+import { normalizeDockImages, toTurnImages, trimConversationImages, type TurnImageWire } from './imagePlan.js'
 
 /* ============================== 端点常量 ============================== */
 
@@ -234,10 +236,21 @@ function lastAssistantIndex(messages: readonly DockMessage[]): number {
 }
 
 /** 起一条用户消息并把状态推进到"正在生成"（请求发出**之前**就要显示出来） */
-export function withUserMessage(state: DockState, text: string): DockState {
+export function withUserMessage(state: DockState, text: string, images: readonly DockImage[] = []): DockState {
   return {
     ...state,
-    messages: [...state.messages, { role: 'user', content: text }],
+    /*
+     * 追加之后**整段**裁一次图片（见 `trimConversationImages` 的长注释）：
+     * 无状态协议每轮都要把整段转录发上去，不设上限的结局是"聊到第十张图时 413"。
+     * 放在这里而不是上送边界，是因为 `done.messages` 会把服务端回灌的转录
+     * **整个替换**掉——上送时才裁的话，服务端回灌的那份会把图丢掉而界面还留着，
+     * 两边从此不一致（且不报错）。
+     */
+    messages: trimConversationImages([
+      ...state.messages,
+      // 只在真有图时挂 `images`：空数组会让"有没有附图"这个判定到处都要写 `.length > 0`
+      images.length > 0 ? { role: 'user', content: text, images } : { role: 'user', content: text },
+    ]),
     streaming: true,
     answer: '',
     // 新提问 ⇒ 上一问的思考清掉（否则第二问会带着第一问的思考内容显示，像是模型在想这件事）
@@ -332,8 +345,44 @@ export interface PageHint {
   readonly title?: string
 }
 
+/**
+ * 发给服务端的消息形态：与 `DockMessage` 只差**图片那一列**——
+ * 界面存的是 data URL（好渲染），线上要的是 `{mime, data}`（好校验，见 `TurnImage`）。
+ */
+export interface WireMessage {
+  readonly role: DockMessage['role']
+  readonly content: string
+  readonly images?: readonly TurnImageWire[]
+  readonly toolCalls?: DockMessage['toolCalls']
+  readonly toolCallId?: string
+  readonly name?: string
+}
+
+/**
+ * 上送边界：把界面图片折成线上形态。
+ *
+ * **坏图在这里被丢掉**（`toTurnImages` 只收白名单 MIME 的合法 data URL），
+ * 而不是原样发出去让服务端 400：那会让整轮提问失败，而用户只是粘了一张
+ * 系统剪贴板里的奇怪东西。丢图会让模型说"我看不到图"，那是可理解的降级。
+ */
+export function toWireMessages(messages: readonly DockMessage[]): WireMessage[] {
+  const out: WireMessage[] = []
+  for (const m of messages) {
+    const images = m.images === undefined || m.images.length === 0 ? [] : toTurnImages(m.images)
+    out.push({
+      role: m.role,
+      content: m.content,
+      ...(images.length > 0 ? { images } : {}),
+      ...(m.toolCalls !== undefined ? { toolCalls: m.toolCalls } : {}),
+      ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+      ...(m.name !== undefined ? { name: m.name } : {}),
+    })
+  }
+  return out
+}
+
 export interface TurnRequestBody {
-  readonly messages: readonly DockMessage[]
+  readonly messages: readonly WireMessage[]
   readonly clientTools: readonly string[]
   readonly round: number
   readonly page: PageHint | null
@@ -362,7 +411,7 @@ export function buildTurnBody(input: {
   turnId: string
 }): TurnRequestBody {
   return {
-    messages: input.messages,
+    messages: toWireMessages(input.messages),
     clientTools: [...input.clientTools],
     round: input.round,
     page: input.page,
@@ -526,7 +575,11 @@ export function conversationsKey(userId: number | null): string {
 export function titleOf(messages: readonly DockMessage[], max = 24): string {
   const first = messages.find((m) => m.role === 'user')
   const flat = (first?.content ?? '').replace(/\s+/g, ' ').trim()
-  if (flat === '') return '新对话'
+  /*
+   * 只发了一张图、一个字都没写时，标题用「图片」而不是「新对话」：
+   * 历史列表里一段明明有内容的对话显示成"新对话"，用户会以为那段没存上。
+   */
+  if (flat === '') return (first?.images?.length ?? 0) > 0 ? '图片' : '新对话'
   return flat.length <= max ? flat : `${flat.slice(0, max)}…`
 }
 
@@ -552,6 +605,42 @@ export function relativeTime(at: number, now: number = Date.now()): string {
   const d = new Date(at)
   const pad = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/**
+ * 落盘消息的**再校验**。
+ *
+ * `localStorage` 里的东西可以被任何东西改过（旧版本、另一个标签页、用户自己），
+ * 而图片那一列会直接进 `<img src>`。与 `notGrounded` 的越界丢弃同一条纪律：
+ * **坏的那一项丢掉，而不是让整段历史读不出来**。
+ */
+function sanitizeStoredMessage(raw: unknown): DockMessage | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const o = raw as Record<string, unknown>
+  const role = o['role']
+  if (role !== 'user' && role !== 'assistant' && role !== 'tool') return null
+  const message: {
+    role: 'user' | 'assistant' | 'tool'
+    content: string
+    images?: DockImage[]
+    toolCalls?: readonly TurnToolCallView[]
+    toolCallId?: string
+    name?: string
+  } = { role, content: typeof o['content'] === 'string' ? o['content'] : '' }
+  const images = normalizeDockImages(o['images'])
+  if (images.length > 0) message.images = images
+  if (Array.isArray(o['toolCalls'])) message.toolCalls = o['toolCalls'] as readonly TurnToolCallView[]
+  if (typeof o['toolCallId'] === 'string' && o['toolCallId'] !== '') message.toolCallId = o['toolCallId']
+  if (typeof o['name'] === 'string' && o['name'] !== '') message.name = o['name']
+  return message
+}
+
+/** 丢掉一条消息里的图片（配额降级用；不改其余字段） */
+function withoutImages(m: DockMessage): DockMessage {
+  if (m.images === undefined) return m
+  const copy = { ...m }
+  delete (copy as { images?: readonly DockImage[] }).images
+  return copy
 }
 
 /**
@@ -582,7 +671,9 @@ export function loadConversations(store: MiniStore, userId: number | null): Dock
     const o = item as Record<string, unknown>
     const id = typeof o['id'] === 'string' ? o['id'] : ''
     if (id === '') continue
-    const messages = Array.isArray(o['messages']) ? (o['messages'] as DockMessage[]) : []
+    const messages = Array.isArray(o['messages'])
+      ? o['messages'].map(sanitizeStoredMessage).filter((m): m is DockMessage => m !== null)
+      : []
     /*
      * 下标越界的条目**丢弃**（而不是原样留着）：`messages` 被裁过或手改过时，
      * 一个指向不存在消息的下标会让标注落到别人的回答上——把"没依据"的标签
@@ -629,10 +720,24 @@ export function saveConversation(
     .slice(0, MAX_CONVERSATIONS)
   try {
     store.setItem(conversationsKey(userId), JSON.stringify(next))
+    return next
   } catch {
-    // 配额满 / 隐私模式：存不下就算了，绝不让"存不进去"影响对话本身
+    /*
+     * 配额满 / 隐私模式。**图片是这一批新增的主要占用**（每张几百 KB，
+     * 而 localStorage 通常只有 5 MB），故先退一步：只丢图片、不丢文字。
+     *
+     * 反过来（整段存不下就放弃）会让用户刷新后发现**整段对话都没了**——
+     * 而"图没了、话还在"是一个可用形态。这一条在加图片之前不存在，
+     * 因为纯文本的十段对话离配额还有很远。
+     */
+    const slim = next.map((c) => ({ ...c, messages: c.messages.map(withoutImages) }))
+    try {
+      store.setItem(conversationsKey(userId), JSON.stringify(slim))
+    } catch {
+      // 仍然存不下：绝不让"存不进去"影响对话本身
+    }
+    return next
   }
-  return next
 }
 
 /* ============================== 传输 ============================== */
@@ -652,6 +757,42 @@ export interface TurnTransport {
  * 为什么不直接抛：调用方（组件）在**每一条**失败路径上都要做同一件事
  * （结束 streaming、显示一句可读的错），而抛异常会逼着每个 await 点都包一层 try。
  */
+/**
+ * 从 `capabilities` 响应里读"当前模型收不收图"（`vision` 字段）。
+ *
+ * **从严**：任何不符合预期的形态（不是对象、字段缺失、字段不是 `true`）一律回 `false`。
+ * 理由与 LLM 设置里那一项的缺省一致：猜错的代价不对称——猜"支持"而实际不支持是
+ * 上游 400、整轮失败；猜"不支持"只是少一个入口。
+ */
+export function visionOf(payload: unknown): boolean {
+  if (payload === null || typeof payload !== 'object') return false
+  return (payload as { vision?: unknown }).vision === true
+}
+
+/**
+ * 探测当前模型收不收图（一次性 GET；`defaultTransport` 是流式的 POST，用不了）。
+ *
+ * 为什么由**插件自己**问、而不是让宿主把能力塞进插槽 props：
+ * 这是"本插件自己那条链路的配置"，不是宿主才有的事实（路由、身份、客户端工具名单才是）。
+ * 宿主契约每加一个字段就要同步三处镜像与两条守卫，为一件插件内部的事付那个代价不划算。
+ *
+ * 失败一律回 `false`：探测不到就不显示图片入口，而不是让用户贴了图再被拒。
+ */
+export async function fetchVision(): Promise<boolean> {
+  try {
+    const res = await fetch(CAPABILITIES_PATH, {
+      method: 'GET',
+      // 与 `defaultTransport` 同两条：CSRF 头与显式 same-origin 凭据，一个都不能少
+      headers: { 'x-gw-csrf': '1' },
+      credentials: 'same-origin',
+    })
+    if (!res.ok) return false
+    return visionOf(await res.json())
+  } catch {
+    return false
+  }
+}
+
 export const defaultTransport: TurnTransport = async (path, body, signal) => {
   try {
     const res = await fetch(path, {
@@ -1109,4 +1250,4 @@ export async function runRestoreSteps(
 /* ============================== 便捷导出 ============================== */
 
 export { createTurnDecoder }
-export type { DockFinishReason, DockMessage, ToolActivityView, TurnEvent, TurnToolCallView }
+export type { DockFinishReason, DockMessage, DockImage, ToolActivityView, TurnEvent, TurnToolCallView }

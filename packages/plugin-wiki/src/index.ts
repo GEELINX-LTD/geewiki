@@ -225,6 +225,7 @@ export const WikiConfigSchema = Schema.object({
  */
 export type {
   ResyncReport,
+  WikiAttachmentBytes,
   WikiBacklink,
   WikiNavOrder,
   WikiOutlink,
@@ -1716,6 +1717,37 @@ export const WikiPlugin = {
       get: async (slug, principal, opts) => {
         assertLive()
         return getPage(slug, principal, opts)
+      },
+      /*
+       * 附件字节。判据与 `GET /api/attachments/:id` 是**同一个** `resolveAttachmentAccess`
+       * （那个函数在下面与端点一起定义；它在 `apply()` 结算后才被调用，故不存在 TDZ 问题）。
+       *
+       * 四类拒绝一律 `undefined`、**不区分原因**——对外不区分原因是刻意的，
+       * 理由见该函数与 `WikiService.readAttachment` 的注释。
+       *
+       * `maxBytes` 在**打开流之前**判：调用方（AI 侧）常常只是"看看这份字节能不能用"，
+       * 先把 25 MB 读进内存再丢掉是纯粹的浪费。
+       */
+      readAttachment: async (principal, id, opts) => {
+        assertLive()
+        if (!Number.isInteger(id) || id < 1) return undefined
+        const found = await resolveAttachmentAccess(principal, id)
+        if (!found.ok) return undefined
+        const row = found.row
+        const limit = opts?.maxBytes
+        if (limit !== undefined && Number(row.byte_size) > limit) return undefined
+        const blob = await attachmentService().get(row.sha256, row.ext)
+        if (!blob) return undefined
+        const chunks: Buffer[] = []
+        for await (const chunk of blob.open()) chunks.push(chunk as Buffer)
+        return {
+          id: Number(row.id),
+          name: row.original_name,
+          mime: row.mime,
+          ext: row.ext,
+          byteSize: Number(row.byte_size),
+          bytes: new Uint8Array(Buffer.concat(chunks)),
+        }
       },
       save: async (slug, input) => {
         assertLive()
@@ -4811,6 +4843,91 @@ export const WikiPlugin = {
       h.json(404, { ok: false, error: 'not_found', message: `附件不存在: ${id}` })
     }
 
+    /**
+     * 「这个主体够不够得着这份附件」——`GET /api/attachments/:id` 与
+     * `wiki-service.readAttachment()` 的**同一份**实现。
+     *
+     * ## 为什么必须只有一个出口
+     * 判据是"页面级可见 ∧ 该附件出现在你看得见的正文段落里"（详见下载端点那段长注释）。
+     * 两处各写一遍必然漂移，而漂移方向一旦是"放宽"，就是**不会报错的泄漏**：
+     * 正文里看不到的段落，附件却能读。这与 `read_page` 曾经"读投影、写原文"是同一种缺陷
+     * （`WikiService.get()` 的注释记着那一次）。
+     * 抽成函数之后，HTTP 层与服务层对"什么算够得着"的看法**在结构上无法分叉**。
+     *
+     * 返回值分成"行 / 原因"而不是"行 | undefined"：HTTP 层要按**真实原因**写审计
+     * （`no_read_access` 与 `attachment_gated` 是两件事），而**对外**两者回同一个 404。
+     * 服务层把原因丢掉、一律返回 `undefined`——对外不区分原因，这是刻意的：
+     * 附件 id 是连续整数、可枚举，区分开就等于提供存在性探测。
+     */
+    type AttachmentAccess =
+      | { readonly ok: true; readonly row: AttachmentRow }
+      | { readonly ok: false; readonly reason: 'not_found' }
+      | { readonly ok: false; readonly reason: 'no_read_access' | 'gated'; readonly slug: string }
+
+    const resolveAttachmentAccess = async (p: Principal, id: number): Promise<AttachmentAccess> => {
+      /*
+       * 联查 `pages` 取**当前** slug 与正文。判定一律用现值：
+       * `attachments.page_slug` 只是"审计/排障时可读"的冗余列。已核实本仓**不存在改名路径**
+       * （`savePage` 按 slug upsert、全仓无 `UPDATE pages SET slug`），故两者当前恒等；
+       * 取现值是为了将来真出现改名时判定不会跟着陈旧。
+       */
+      const row = (
+        await adb.query<AttachmentRow>(
+          `SELECT a.id, a.page_id, a.sha256, a.ext, a.byte_size, a.mime, a.original_name, a.uploader_id,
+                  p.slug AS live_slug, p.content AS page_content
+             FROM attachments a JOIN pages p ON p.id = a.page_id
+            WHERE a.id = ?`,
+          [id],
+        )
+      )[0]
+      if (!row) return { ok: false, reason: 'not_found' }
+
+      /* ① 页面级判定 */
+      const access = await policy().resolvePage(p, row.live_slug)
+      if (access.level === 'none') return { ok: false, reason: 'no_read_access', slug: row.live_slug }
+
+      /*
+       * ② 可用性补丁：**上传者本人 + 有编辑权**时，可以读自己刚上传、但正文还来不及引用的附件。
+       *
+       * 没有它就会出现"传完刷新就破图"——上传与"把引用写进正文并保存"之间有真实的窗口
+       * （上传接口不回写正文，前端保存正文是另一次请求）。
+       *
+       * 边界必须收紧：`uploader_id` 与主体 **user id 相等**、且该主体对**这一页**有
+       * `canEdit`。于是"另一个同样能编辑该页的用户"读同一份未引用附件仍然是 404
+       * （e2e 有这条负向断言）—— 补丁放宽的只是"自己上传的字节"，不是"这一页的附件"。
+       */
+      const ownUpload =
+        access.canEdit && p.userId !== null && row.uploader_id !== null && Number(row.uploader_id) === p.userId
+      if (ownUpload) return { ok: true, row }
+
+      /* ③ 块级判定（复用自己的正文投影判据） */
+      const proj = await projectPageContentFor(adb, {
+        pageId: Number(row.page_id),
+        content: row.page_content,
+        principal: p,
+        /*
+         * 授权集合与投影必须来自**同一次**策略调用（与 `getPage` 同款要求）：
+         * 分别取两次会出现"判定用了一份授权、渲染用了另一份"的窗口。
+         */
+        grantedBlockIds: await grantedBlockIdsOf(p),
+      })
+      if (!proj.text.includes(attachmentUrl(Number(row.id)))) {
+        /*
+         * ★ T1：**与"不存在"回同一个 404**（此前是 403 `attachment_gated`）。
+         *
+         * 403 与 404 的差别本身就是信息：id 是连续整数、可枚举，于是"403"等于告诉任何
+         * 路过的人"这个 id 存在，而且它处在一个被收紧的段落里"。这条信息对有权者毫无
+         * 用处（他本来就能看），对无权者却是一次成功的侦察。要给出的唯一答案是
+         * "这个 url 没有可给你的东西"，而不是"为什么没有"。
+         *
+         * 审计**照写**（`attachment_gated` 保留为真实原因）：对外响应无差别与内部留痕
+         * 是两件事 —— 少了这条审计，"有人在逐个 id 探测受限段落"就查不出来了。
+         */
+        return { ok: false, reason: 'gated', slug: row.live_slug }
+      }
+      return { ok: true, row }
+    }
+
     /* ---------- GET /api/attachments/:id：下载（★ 判定时序是本能力最关键的安全点） ---------- */
     /*
      * ## 判定时序：页面级 → 401/404 → 块级投影 → 404 → **最后才开文件**
@@ -4851,73 +4968,19 @@ export const WikiPlugin = {
         }
         const p = requirePrincipal(h)
         /*
-         * 联查 `pages` 取**当前** slug 与正文。判定一律用现值：
-         * `attachments.page_slug` 只是"审计/排障时可读"的冗余列。已核实本仓**不存在改名路径**
-         * （`savePage` 按 slug upsert、全仓无 `UPDATE pages SET slug`），故两者当前恒等；
-         * 取现值是为了将来真出现改名时判定不会跟着陈旧。
+         * 判定一律走 `resolveAttachmentAccess`（与 `wiki-service.readAttachment` **同一份**）。
+         * 这里只负责把它的结果翻译成"对外响应 + 内部审计"：
+         * **对外**一律 404、响应体逐字节相同；**对内**按真实原因留痕。
          */
-        const row = (
-          await adb.query<AttachmentRow>(
-            `SELECT a.id, a.page_id, a.sha256, a.ext, a.byte_size, a.mime, a.original_name, a.uploader_id,
-                    p.slug AS live_slug, p.content AS page_content
-               FROM attachments a JOIN pages p ON p.id = a.page_id
-              WHERE a.id = ?`,
-            [id],
-          )
-        )[0]
-        if (!row) {
-          attachmentNotFound(h, id)
-          return
-        }
-        /* ① 页面级判定 */
-        const access = await policy().resolvePage(p, row.live_slug)
-        if (access.level === 'none') {
-          // 页存在但无权看：对外 404（不泄露存在性），内部记一次越权尝试
-          recordAccessDenied(h, row.live_slug, 'no_read_access', p)
-          attachmentNotFound(h, id)
-          return
-        }
-        /*
-         * ② 可用性补丁：**上传者本人 + 有编辑权**时，可以读自己刚上传、但正文还来不及引用的附件。
-         *
-         * 没有它就会出现"传完刷新就破图"——上传与"把引用写进正文并保存"之间有真实的窗口
-         * （上传接口不回写正文，前端保存正文是另一次请求）。
-         *
-         * 边界必须收紧：`uploader_id` 与主体 **user id 相等**、且该主体对**这一页**有
-         * `canEdit`。于是"另一个同样能编辑该页的用户"读同一份未引用附件仍然是 404
-         * （e2e 有这条负向断言）—— 补丁放宽的只是"自己上传的字节"，不是"这一页的附件"。
-         */
-        const ownUpload =
-          access.canEdit && p.userId !== null && row.uploader_id !== null && Number(row.uploader_id) === p.userId
-        /* ③ 块级判定（复用自己的正文投影判据） */
-        if (!ownUpload) {
-          const proj = await projectPageContentFor(adb, {
-            pageId: Number(row.page_id),
-            content: row.page_content,
-            principal: p,
-            /*
-             * 授权集合与投影必须来自**同一次**策略调用（与 `getPage` 同款要求）：
-             * 分别取两次会出现"判定用了一份授权、渲染用了另一份"的窗口。
-             */
-            grantedBlockIds: await grantedBlockIdsOf(p),
-          })
-          if (!proj.text.includes(attachmentUrl(Number(row.id)))) {
-            /*
-             * ★ T1：**与"不存在"回同一个 404**（此前是 403 `attachment_gated`）。
-             *
-             * 403 与 404 的差别本身就是信息：id 是连续整数、可枚举，于是"403"等于告诉任何
-             * 路过的人"这个 id 存在，而且它处在一个被收紧的段落里"。这条信息对有权者毫无
-             * 用处（他本来就能看），对无权者却是一次成功的侦察。要给出的唯一答案是
-             * "这个 url 没有可给你的东西"，而不是"为什么没有"。
-             *
-             * 审计**照写**（`attachment_gated` 保留为真实原因）：对外响应无差别与内部留痕
-             * 是两件事 —— 少了这条审计，"有人在逐个 id 探测受限段落"就查不出来了。
-             */
-            recordAccessDenied(h, row.live_slug, 'attachment_gated', p)
-            attachmentNotFound(h, Number(row.id))
-            return
+        const found = await resolveAttachmentAccess(p, id)
+        if (!found.ok) {
+          if (found.reason !== 'not_found') {
+            recordAccessDenied(h, found.slug, found.reason === 'gated' ? 'attachment_gated' : 'no_read_access', p)
           }
+          attachmentNotFound(h, id)
+          return
         }
+        const row = found.row
         /* ④ 到这里才碰存储：取对象句柄（"元数据在、字节不在"是可诊断的状态，不是 500） */
         const blob = await attachmentService().get(row.sha256, row.ext)
         if (!blob) {

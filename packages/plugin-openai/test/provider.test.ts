@@ -104,6 +104,8 @@ function settingsFixture(overrides: Partial<LlmSettings> = {}): LlmSettings {
     contextWindow: 128000,
     maxOutputTokens: 4096,
     reasoningEffort: 'off',
+    // 夹具的模型是假的；能力面从严（与 `LlmSettings.supportsVision` 的缺省一致）
+    supportsVision: false,
     timeoutMs: 5000,
     includeUsage: true,
     extraBody: '',
@@ -767,6 +769,91 @@ test('空壳工具片段（上游发 {index:0} 不带任何字段）不产生噪
       [{ type: 'text-delta', text: '好' }],
       '同一条流里的正文不受影响',
     )
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+/* ============ 工具结果带图：flush 成 user 消息（2026-09-20，照 DSH） ============ */
+
+test('★ 工具结果带图：tool 消息只发文本，图片 flush 成紧随其后的一条 user 消息', async () => {
+  const mock = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), {
+      messages: [
+        { role: 'user', content: '看看这张图' },
+        { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'read_image', arguments: '{"id":5}' }] },
+        { role: 'tool', content: '{"id":5}', toolCallId: 'c1', images: [{ url: 'data:image/png;base64,AAAA' }] },
+      ],
+    })
+    const body = JSON.parse(mock.requests[0]!) as Record<string, unknown>
+    const messages = body['messages'] as Record<string, unknown>[]
+    assert.equal(messages.length, 4, '三条内部消息 → 四条线上消息（多出的那条就是 flush 出来的 user）')
+    // chat-completions 的 tool 消息只能是字符串：图片**不得**塞进它的 content
+    assert.deepEqual(messages[2], { role: 'tool', content: '{"id":5}', tool_call_id: 'c1' })
+    assert.equal(messages[3]?.['role'], 'user', '图片走紧随其后的一条 user 消息')
+    const content = messages[3]?.['content'] as Record<string, unknown>[]
+    assert.equal(content[0]?.['type'], 'text', '引导语必须在前：它告诉模型这些图是工具结果，不是用户新发的')
+    assert.deepEqual(content[1], { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } })
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('★ flush 时机：tool 消息必须连续，一轮多张图只多出一条 user 消息', async () => {
+  const mock = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), {
+      messages: [
+        { role: 'user', content: '看这两张' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: 'c1', name: 'read_image', arguments: '{"id":1}' },
+            { id: 'c2', name: 'read_image', arguments: '{"id":2}' },
+          ],
+        },
+        { role: 'tool', content: '{"id":1}', toolCallId: 'c1', images: [{ url: 'data:image/png;base64,AAAA' }] },
+        { role: 'tool', content: '{"id":2}', toolCallId: 'c2', images: [{ url: 'data:image/png;base64,BBBB' }] },
+        { role: 'user', content: '那这两张呢' },
+      ],
+    })
+    const messages = JSON.parse(mock.requests[0]!)['messages'] as Record<string, unknown>[]
+    assert.deepEqual(
+      messages.map((m) => m['role']),
+      ['user', 'assistant', 'tool', 'tool', 'user', 'user'],
+      '两条 tool 必须**相邻**（中间插一条 user 会把 assistant.tool_calls 的配对拆开）',
+    )
+    const flushed = messages[4]?.['content'] as Record<string, unknown>[]
+    assert.equal(flushed.length, 3, '一轮里的两张图攒成一条消息（一句引导语 + 两张图）')
+    assert.deepEqual(flushed[2], { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } })
+  } finally {
+    delete process.env[name]
+    await mock.close()
+  }
+})
+
+test('★ 末尾 flush：最后一步是读图时图片不能丢（最常见的一种形态）', async () => {
+  const mock = await startMock({ frames: [DONE] })
+  const name = freshEnvName()
+  process.env[name] = 'sk-test-value-1234567890'
+  try {
+    await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }), {
+      messages: [
+        { role: 'user', content: '看图' },
+        { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'read_image', arguments: '{"id":1}' }] },
+        { role: 'tool', content: '{"id":1}', toolCallId: 'c1', images: [{ url: 'data:image/png;base64,AAAA' }] },
+      ],
+    })
+    const messages = JSON.parse(mock.requests[0]!)['messages'] as Record<string, unknown>[]
+    assert.equal(messages[messages.length - 1]?.['role'], 'user', '循环结束后必须再 flush 一次')
   } finally {
     delete process.env[name]
     await mock.close()

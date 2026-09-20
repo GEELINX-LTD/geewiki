@@ -37,6 +37,7 @@ export type {
   LlmConnectionTestResult,
   LlmCredentialSource,
   LlmErrorCode,
+  LlmImagePart,
   LlmMessage,
   LlmModelListResult,
   LlmProbeCapability,
@@ -152,6 +153,25 @@ export const LlmConfigSchema = Schema.object({
    * （灰度模型、私有别名）照样能手打。
    */
   model: Schema.string().default('').role('llm-model').description('模型名（可点「获取模型」从端点读取清单后选择，也可直接手填）'),
+  /**
+   * **当前模型是否支持图像输入**（多模态）。
+   *
+   * 为什么必须由人显式声明：OpenAI 兼容协议里**没有**任何字段能问出这件事
+   * （`/models` 只回 id 列表），而猜错的代价不对称——猜"支持"而实际不支持是
+   * 上游 400、整轮失败；猜"不支持"只是少一个能力，且这里就写着怎么打开。
+   * 故缺省 `false`（从严）。
+   *
+   * 它一处开关、三处生效：
+   * ① 输入条的图片按钮（不支持时不出现，免得用户贴了图才发现发不出去）；
+   * ② `read_image` 工具（不支持时**不进模型的工具表**——"这个能力不存在"比
+   *    "调了才发现做不到"诚实，本仓在 `page.update` 上已经定过这条）；
+   * ③ 回合端点（客户端仍塞了图时明确 400，而不是把它转给上游换一个难懂的报错）。
+   *
+   * **换模型后请重新确认这一项**：它是人对模型的声明，本仓不替你重新探测。
+   */
+  supportsVision: Schema.boolean()
+    .default(false)
+    .description('当前模型支持图像输入（多模态）：决定输入条能否发图、AI 能否用 read_image 看文章里的图'),
   /**
    * 思考强度：**自由文本**（`role: 'llm-effort'` 让表单额外给出常见档位候选）。
    *

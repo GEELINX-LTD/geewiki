@@ -91,6 +91,8 @@ export const FALLBACK_SETTINGS: LlmSettings = {
   includeUsage: true,
   extraBody: '',
   apiKeyEnv: '',
+  // 兜底路由**永远不可用**，能力面也一律从严（见 `LlmSettings.supportsVision`）
+  supportsVision: false,
 }
 
 /**

@@ -76,6 +76,13 @@ export interface LlmConfig extends LlmAdvancedConfig {
   model?: string
   /** 上下文窗口（token） */
   contextWindow?: number
+  /**
+   * 当前模型是否支持图像输入（多模态）。**缺省 false（从严）**。
+   *
+   * 为什么必须由人显式声明：OpenAI 兼容协议里没有能问出这件事的字段，
+   * 而猜错的代价不对称（详见 `LlmSettings.supportsVision` 的注释）。
+   */
+  supportsVision?: boolean
   /** 最长输出（token） */
   maxOutputTokens?: number
   /** 思考强度；`'off'` = 不下发该参数（自由文本，见 {@link REASONING_EFFORT_PRESETS}） */
@@ -147,6 +154,11 @@ export function deriveSettings(config: LlmConfig): LlmSettings {
     includeUsage: config.includeUsage ?? true,
     extraBody: extra.ok ? extra.value : '',
     apiKeyEnv,
+    /*
+     * 缺省 **false**（从严）：见 `LlmSettings.supportsVision` 的注释——
+     * 猜"支持"而实际不支持的代价是上游 400、整轮失败，方向不对称。
+     */
+    supportsVision: config.supportsVision === true,
   }
 }
 

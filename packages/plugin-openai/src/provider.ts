@@ -172,9 +172,34 @@ function usageOf(frame: Record<string, unknown>): LlmUsage | undefined {
  * 存量调用方（问答 / 辅助写作）的消息因此逐字节不变。
  */
 function serializeMessage(m: LlmMessage): Record<string, unknown> {
+  /*
+   * 有图片时把 `content` 折成 OpenAI 的内容块数组；**没有图片时保持字符串**。
+   *
+   * 后者不是省事：存量调用方（问答 / 辅助写作）的请求体因此逐字节不变，
+   * 而"给所有消息都套上 [{type:'text'}]"会让它们的前缀缓存全部失效，
+   * 也可能被只认字符串 content 的严格网关拒绝。
+   *
+   * 空正文 + 图片是合法形态（用户只发了一张图）：此时**不发空 text 块**——
+   * 一个 `{type:'text',text:''}` 在部分网关上会被判成畸形内容块。
+   *
+   * ⚠️ `role:'tool'` 的图片**不在这里处理**（chat-completions 的 tool 消息只能是字符串），
+   * 见 `serializeMessages` 的 flush。
+   */
+  const images = m.role === 'tool' ? [] : (m.images ?? [])
+  const content: unknown =
+    images.length === 0
+      ? m.content
+      : [
+          ...(m.content === '' ? [] : [{ type: 'text', text: m.content }]),
+          ...images.map((img) =>
+            img.detail === undefined
+              ? { type: 'image_url', image_url: { url: img.url } }
+              : { type: 'image_url', image_url: { url: img.url, detail: img.detail } },
+          ),
+        ]
   return {
     role: m.role,
-    content: m.content,
+    content,
     ...(m.toolCalls !== undefined && m.toolCalls.length > 0
       ? {
           tool_calls: m.toolCalls.map((c) => ({
@@ -191,6 +216,64 @@ function serializeMessage(m: LlmMessage): Record<string, unknown> {
 /** 工具定义 → 上游 `tools[]`（`{type:'function', function:{…}}` 这层包装是适配器的职责） */
 function serializeTool(t: LlmToolDef): Record<string, unknown> {
   return { type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }
+}
+
+/**
+ * 工具结果带图时，flush 出来的那条 user 消息的引导语。
+ *
+ * 上游的 chat-completions 协议里 **`tool` 角色的消息只能是字符串**，`image_url` 内容块
+ * 只允许出现在 `user` 消息上。所以"工具返回了一张图"这件事在线上只能表达成
+ * "tool 消息（纯文本）+ 紧随其后的一条 user 消息（图）"。这句话就是那条 user 消息的开头，
+ * 用来告诉模型**这些图是工具结果的一部分，不是用户新发的内容**——
+ * 少了它，模型会以为用户刚发了图，进而在回答里说"你发的这张图……"。
+ */
+const TOOL_RESULT_IMAGE_TEXT = '（以下是上面那次工具调用返回的图片，不是用户新发的内容）'
+
+/**
+ * 整段消息 → 上游 `messages[]`。
+ *
+ * ## 为什么需要一个数组级的函数（而不是继续 `map(serializeMessage)`）
+ * 「工具结果带图」在内部模型里是一件事（`role:'tool'` 且 `images` 非空），
+ * 在线上却是**两条**消息。逐条 map 表达不了"一条变两条"，所以转换必须发生在数组这一层。
+ *
+ * ## flush 的时机照搬 DSH（`packages/llm/llm-deepseek/src/serialize.ts` 的 `flushToolImages`）
+ * 图片**攒起来**，等到下一条非 tool 消息之前再发出去。这样一轮里多个工具各返回一张图时，
+ * 只会多出一条 user 消息（而不是每个工具结果后面都插一条）。末尾也要 flush 一次——
+ * 否则"最后一步是读图"这种最常见的形态会把图片丢掉。
+ *
+ * 反过来（每条 tool 消息后立刻插一条 user）也不合法：协议要求 `assistant.tool_calls`
+ * 之后的 tool 消息必须**连续**，中间插一条 user 会把配对拆开。
+ */
+function serializeMessages(messages: readonly LlmMessage[]): Record<string, unknown>[] {
+  const wire: Record<string, unknown>[] = []
+  let pending: { url: string; detail?: 'auto' | 'low' | 'high' }[] = []
+  const flush = (): void => {
+    if (pending.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: TOOL_RESULT_IMAGE_TEXT },
+        ...pending.map((img) =>
+          img.detail === undefined
+            ? { type: 'image_url', image_url: { url: img.url } }
+            : { type: 'image_url', image_url: { url: img.url, detail: img.detail } },
+        ),
+      ],
+    })
+    pending = []
+  }
+  for (const m of messages) {
+    if (m.role !== 'tool') {
+      flush()
+      wire.push(serializeMessage(m))
+      continue
+    }
+    // tool 消息只发文本（`serializeMessage` 已忽略它的 images），图攒到 flush 里
+    wire.push(serializeMessage(m))
+    for (const img of m.images ?? []) pending.push(img)
+  }
+  flush()
+  return wire
 }
 
 /** 工具选择策略 → 上游 `tool_choice`（字符串三档原样下发；指名形态要包装成 function 对象） */
@@ -302,7 +385,7 @@ export function createOpenAiProvider(options: OpenAiProviderOptions): LlmProvide
     const extra = extraBodyOf(settings.extraBody)
     const payload: Record<string, unknown> = {
       model,
-      messages: req.messages.map(serializeMessage),
+      messages: serializeMessages(req.messages),
       stream: true,
       ...(req.maxTokens !== undefined ? { max_tokens: req.maxTokens } : {}),
       // 采样温度**只在调用方显式给出时**才发：配置里没有这一项，

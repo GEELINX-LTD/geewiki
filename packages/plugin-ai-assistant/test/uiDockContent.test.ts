@@ -121,7 +121,11 @@ test('★ 中止后必须有一个**真的**「继续」按钮（文案指过不
   assert.match(ui, /state\.error\.code === 'ABORTED' && \(/, '只在"本轮中止"这一类错误下给入口')
   assert.match(ui, /<button type="button" className="gw-dock-btn gw-dock-btn-primary" onClick=\{\(\) => send\('继续'\)\}>/, '按钮必须真的发「继续」')
   assert.match(ui, /const text = \(preset \?\? input\)\.trim\(\)/, 'send 要接受预设文本（按钮与输入框共用同一条发送路径）')
-  assert.match(ui, /if \(preset === undefined\) setInput\(''\)/, '点按钮不该清空用户正在输入的内容')
+  assert.match(
+    ui,
+    /if \(preset === undefined\) \{\s*setInput\(''\)/,
+    '点按钮不该清空用户正在输入的内容（2026-09-20 起那一段还负责清掉待发图片，故从一个单句变成一个块）',
+  )
   // 文案不许指向不存在的入口：提到「继续」就说明按钮在
   assert.match(readFileSync(join(import.meta.dirname, '..', 'src', 'loop.ts'), 'utf8'), /点下面的「继续」/, '文案里的「继续」必须与按钮的位置对应（下面的按钮）')
 })

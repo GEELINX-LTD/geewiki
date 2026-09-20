@@ -16,8 +16,8 @@ import { Context } from 'cordis'
 import type { FiberLike, Principal } from '@geewiki/core'
 import { AiToolRegistry, AiToolsPlugin, type AiToolResult, type ResolvedTool } from '@geewiki/ai-tools'
 import type { SearchHit, SearchService } from '@geewiki/search'
-import type { WikiPageDetail, WikiPageSummary, WikiService } from '@geewiki/wiki'
-import { AiKbPlugin, plainSnippet, type AiKbConfig } from '../src/index.js'
+import type { WikiAttachmentBytes, WikiPageDetail, WikiPageSummary, WikiService } from '@geewiki/wiki'
+import { AiKbPlugin, attachmentIdsIn, plainSnippet, type AiKbConfig } from '../src/index.js'
 
 const MEMBER: Principal = {
   kind: 'user',
@@ -49,13 +49,18 @@ function detail(slug: string, title: string, content: string): WikiPageDetail {
   }
 }
 
-function wikiStub(pages: Record<string, { title: string; content: string }>): {
+function wikiStub(
+  pages: Record<string, { title: string; content: string }>,
+  attachments: Record<number, WikiAttachmentBytes> = {},
+): {
   svc: WikiService
   listCalls: Principal[]
   getCalls: { slug: string; principal: Principal }[]
+  readAttachmentCalls: number[]
 } {
   const listCalls: Principal[] = []
   const getCalls: { slug: string; principal: Principal }[] = []
+  const readAttachmentCalls: number[] = []
   const svc: WikiService = {
     list: async (principal) => {
       listCalls.push(principal)
@@ -95,8 +100,21 @@ function wikiStub(pages: Record<string, { title: string; content: string }>): {
      */
     homeSlug: async () => null,
     setHomeSlug: async (slug) => slug === null || Object.prototype.hasOwnProperty.call(pages, slug),
+    /*
+     * 附件字节（2026-09-20）。替身**不复制判据**——判据（页面级 + 块级投影）在
+     * `wiki-service` 里，与下载端点同一份；替身只回答"这份字节存不存在"。
+     * 但 `maxBytes` 的语义要诚实实现：真实现是在**打开流之前**判掉的（不白读一遍），
+     * 替身若忽略它，"太大就跳过"这条行为在测试里就成了假的。
+     */
+    readAttachment: async (_principal, id, opts) => {
+      readAttachmentCalls.push(id)
+      const att = attachments[id]
+      if (att === undefined) return undefined
+      if (opts?.maxBytes !== undefined && att.byteSize > opts.maxBytes) return undefined
+      return att
+    },
   }
-  return { svc, listCalls, getCalls }
+  return { svc, listCalls, getCalls, readAttachmentCalls }
 }
 
 function searchStub(result: {
@@ -141,7 +159,13 @@ interface Harness {
 }
 
 async function mount(
-  opts: { wiki?: WikiService | null; search?: SearchService | null; config?: AiKbConfig } = {},
+  opts: {
+    wiki?: WikiService | null
+    search?: SearchService | null
+    config?: AiKbConfig
+    /** 只实现 `settings()` 的最小 llm-service 替身；**不传 = 没有 llm-service** */
+    vision?: boolean
+  } = {},
 ): Promise<Harness> {
   const ctx = new Context()
   const registry = new AiToolRegistry()
@@ -149,6 +173,14 @@ async function mount(
   // 替身服务在装载 ai-kb **之前** provide：这正是"提供者的 apply 先结算"的形态
   if (opts.wiki) ctx.provide('wiki-service', opts.wiki)
   if (opts.search) ctx.provide('search-service', opts.search)
+  /*
+   * `llm-service` 只被用来读 `settings().supportsVision`（见 `visionEnabled`）。
+   * 替身只实现这一个方法：真实现有十几个方法，全实现一遍会让"这个插件到底依赖了
+   * llm-service 的什么"变得看不出来——而那正是这里最该一眼看清的事。
+   */
+  if (opts.vision !== undefined) {
+    ctx.provide('llm-service', { settings: () => ({ supportsVision: opts.vision }) } as never)
+  }
   const fork = await ctx.plugin(AiKbPlugin, opts.config ?? {})
 
   const tools = [...registry.list(MEMBER)]
@@ -174,13 +206,20 @@ async function runJson<T = Record<string, unknown>>(
   args: unknown,
   principal: Principal = MEMBER,
 ): Promise<T> {
-  /*
-   * 第三参是**轮次上下文**（P4 新增）。这三条是只读工具，用不到它——
-   * 但契约要求它们显式接住并忽略，故这里给一个明确的 null 上下文，
-   * 而不是让测试替它们"悄悄少传一个参数"。
-   */
-  const result = await tool.execute(principal, args, { conversationId: null, turnId: null })
+  /** 第三参是**轮次上下文**（P4 新增）。这三条是只读工具，用不到它——
+   *  但契约要求它们显式接住并忽略，故这里给一个明确的 null 上下文，
+   *  而不是让测试替它们"悄悄少传一个参数"。 */
+  const result = await runTool(tool, args, principal)
   return JSON.parse(result.content) as T
+}
+
+/** 与 `runJson` 同一入口，但返回**完整结果**——图片在 `images` 里，不在 `content` 文本里 */
+async function runTool(
+  tool: ResolvedTool,
+  args: unknown,
+  principal: Principal = MEMBER,
+): Promise<AiToolResult> {
+  return await tool.execute(principal, args, { conversationId: null, turnId: null })
 }
 
 /* ============================== plainSnippet ============================== */
@@ -204,11 +243,12 @@ test('plainSnippet：字面的 &lt; 不能被解成 <（&amp; 必须最后解）
 
 /* ============================== 注册 ============================== */
 
-test('装载后贡献三条工具，owner 都是本插件，且都是只读的 server 工具', async () => {
-  const h = await mount({ wiki: wikiStub({}).svc, search: searchStub({}).svc })
+test('装载后贡献四条工具，owner 都是本插件，且都是只读的 server 工具', async () => {
+  // `vision: true` 才会贡献第四条（`read_image`）——它的可用性由 LLM 设置决定，见本节末
+  const h = await mount({ wiki: wikiStub({}).svc, search: searchStub({}).svc, vision: true })
   assert.deepEqual(
     h.tools.map((t) => t.descriptor.name).sort(),
-    ['list_pages', 'read_page', 'search_kb'],
+    ['list_pages', 'read_image', 'read_page', 'search_kb'],
   )
   for (const t of h.tools) {
     assert.equal(t.owner, '@geewiki/ai-kb')
@@ -231,9 +271,9 @@ test('缺 ai-tool-service 时**明确抛错**，不静默变成一个空插件',
   )
 })
 
-test('dispose 后三条工具全部回收（按 owner 定向回收）', async () => {
-  const h = await mount({ wiki: wikiStub({}).svc, search: searchStub({}).svc })
-  assert.equal(h.registry.diagnostics().count, 3)
+test('dispose 后四条工具全部回收（按 owner 定向回收）', async () => {
+  const h = await mount({ wiki: wikiStub({}).svc, search: searchStub({}).svc, vision: true })
+  assert.equal(h.registry.diagnostics().count, 4)
   await h.dispose()
   assert.equal(h.registry.diagnostics().count, 0)
   assert.equal(h.registry.ownerOf('search_kb'), undefined)
@@ -247,10 +287,10 @@ test('依赖服务缺失时对应工具**不进工具表**（连能力都不暴�
   )
   await h.dispose()
 
-  const h2 = await mount({ wiki: wikiStub({}).svc }) // 没有 search-service
+  const h2 = await mount({ wiki: wikiStub({}).svc, vision: true }) // 没有 search-service
   assert.deepEqual(
     h2.tools.map((t) => t.descriptor.name).sort(),
-    ['list_pages', 'read_page'],
+    ['list_pages', 'read_image', 'read_page'],
   )
   await h2.dispose()
 })
@@ -458,4 +498,175 @@ test('★ grounding：list_pages 不声明依据（目录信息不是能回答�
   const r = await rawResult(h.byName('list_pages'), {})
   assert.equal(r.grounding, undefined)
   await h.dispose()
+})
+
+/* ===================== 正文里的图片（2026-09-20） ===================== */
+
+test('attachmentIdsIn：按出现顺序、去重、只认数字 id', () => {
+  const content = [
+    '![a](/api/attachments/7)',
+    '正文里又提了一次 /api/attachments/7',
+    '![b](/api/attachments/12 "标题")',
+    // 示例文字（`guide/markdown-demo` 就是一篇讲解语法的页面）：不是数字 id ⇒ 不当成附件
+    '![示例](/api/attachments/<附件 id>)',
+    '[报告.pdf](/api/attachments/3)',
+    '外链 https://example.com/a.png 不算',
+  ].join('\n')
+  assert.deepEqual(attachmentIdsIn(content), [7, 12, 3])
+  assert.deepEqual(attachmentIdsIn('这一页没有任何附件'), [])
+  assert.deepEqual(attachmentIdsIn('/api/attachments/0 与 /api/attachments/007'), [7], '0 不是合法 id，007 归一到 7')
+})
+
+test('read_page：**只数不取** —— 说清有几张图、怎么取，一个字节都不读', async () => {
+  const png = new Uint8Array([137, 80, 78, 71])
+  const wiki = wikiStub(
+    { home: { title: '主页', content: '看图：\n\n![拓扑](/api/attachments/5)\n' } },
+    { 5: { id: 5, name: '拓扑.png', mime: 'image/png', ext: '.png', byteSize: png.length, bytes: png } },
+  )
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  const r = await runTool(h.byName('read_page'), { slug: 'home' })
+
+  assert.equal(r.images, undefined, 'read_page 不该把图带上（开销不可预期，且剥夺了模型的选择权）')
+  assert.deepEqual(wiki.readAttachmentCalls, [], '连字节都不该去读')
+  const body = JSON.parse(r.content) as { imagesNote?: string; pageImages?: number }
+  assert.match(body.imagesNote ?? '', /引用了 1 张图片/)
+  assert.match(body.imagesNote ?? '', /read_image/, '要告诉模型怎么取，否则它不知道有这个能力')
+  assert.equal((r.data as { pageImages?: number }).pageImages, 1, '条数也放进 data，供界面/排障读')
+  await h.dispose()
+})
+
+test('read_page：一页没有图时不提这件事（少一句噪声）', async () => {
+  const h = await mount({ wiki: wikiStub({ home: { title: '主页', content: '纯文字' } }).svc })
+  const r = await runTool(h.byName('read_page'), { slug: 'home' })
+  assert.equal((JSON.parse(r.content) as { imagesNote?: string }).imagesNote, undefined)
+  await h.dispose()
+})
+
+test('read_image：把图交给模型，并自述"图已附上"', async () => {
+  const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
+  const wiki = wikiStub({}, { 5: { id: 5, name: '拓扑.png', mime: 'image/png', ext: '.png', byteSize: png.length, bytes: png } })
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  const r = await runTool(h.byName('read_image'), { id: 5 })
+
+  assert.equal(r.images?.length, 1, '这一条工具就是用来把图给模型的')
+  assert.equal(r.images?.[0]?.mime, 'image/png')
+  assert.equal(r.images?.[0]?.data, Buffer.from(png).toString('base64'))
+  assert.equal(r.grounding, 'kb', '逐字读到的知识库内容（只是形态是图）')
+  const body = JSON.parse(r.content) as { name?: string; note?: string }
+  assert.equal(body.name, '拓扑.png')
+  assert.match(body.note ?? '', /已随本条结果一并提供/, '图不带文字，自述只能由 content 承担')
+  assert.ok(!r.content.includes('iVBOR'), 'base64 不得混进 content 文本')
+  await h.dispose()
+})
+
+test('read_image：id 参数写成字符串也收，非法一律拒绝', async () => {
+  const png = new Uint8Array([1, 2, 3])
+  const wiki = wikiStub({}, { 5: { id: 5, name: 'a.png', mime: 'image/png', ext: '.png', byteSize: 3, bytes: png } })
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  assert.equal((await runTool(h.byName('read_image'), { id: '5' })).images?.length, 1, '模型常把数字写成字符串')
+  for (const bad of [{}, { id: 0 }, { id: -1 }, { id: 1.5 }, { id: 'abc' }, { id: null }]) {
+    const r = await runTool(h.byName('read_image'), bad)
+    assert.equal(r.images, undefined, `非法参数 ${JSON.stringify(bad)} 不该给出图`)
+    assert.match(r.content, /缺少参数 id/)
+  }
+  await h.dispose()
+})
+
+test('read_image：不是图片的附件（PDF）明确拒绝，不给图', async () => {
+  const pdf = new Uint8Array([37, 80, 68, 70])
+  const wiki = wikiStub({}, { 9: { id: 9, name: '报告.pdf', mime: 'application/pdf', ext: '.pdf', byteSize: 4, bytes: pdf } })
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  const r = await runTool(h.byName('read_image'), { id: 9 })
+  assert.equal(r.images, undefined)
+  assert.match(r.content, /不是能交给模型看的图片格式/)
+  await h.dispose()
+})
+
+test('read_image：svg 也不给（与浏览器侧同一条白名单）', async () => {
+  const svg = new Uint8Array([60, 115, 118, 103, 62])
+  const wiki = wikiStub({}, { 11: { id: 11, name: '矢量.svg', mime: 'image/svg+xml', ext: '.svg', byteSize: 5, bytes: svg } })
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  const r = await runTool(h.byName('read_image'), { id: 11 })
+  assert.equal(r.images, undefined, 'SVG 是能被解释的文档，不进多模态通道')
+  await h.dispose()
+})
+
+test('★ read_image：五类拒绝回**同一句话**（区分开就是存在性探测接口）', async () => {
+  const wiki = wikiStub({}, {})
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  const missing = await runTool(h.byName('read_image'), { id: 999 })
+  assert.equal(missing.images, undefined)
+  assert.match(missing.content, /读不到附件 999/)
+  assert.match(missing.content, /不要臆测/, '要给出可执行的下一步，而不是让模型编')
+  /*
+   * 真正的不变量不是"措辞里不许出现某些词"，而是**这句话里不能携带原因**。
+   *
+   * 判据可以直接验：工具在拒绝路径上**只有 `id` 一个输入**，所以只要证明
+   * "回复是 id 的纯函数"（把 id 替换掉之后两次回复逐字节相同），
+   * 就证明了它**在结构上无法**按原因分叉——不需要去枚举原因。
+   * 而一旦按原因分叉，附件 id 是连续整数、可枚举 ⇒ 这里就成了存在性/受限探测接口。
+   */
+  const alsoRefused = await runTool(h.byName('read_image'), { id: 1000 })
+  assert.equal(
+    alsoRefused.content.replace('1000', '<id>'),
+    missing.content.replace('999', '<id>'),
+    '拒绝回复必须是 id 的纯函数（否则它就在泄露原因）',
+  )
+  assert.match(missing.content, /可能的原因/, '列出所有可能，但不指出是哪一种')
+  await h.dispose()
+})
+
+test('read_image：超过体积上限的附件**在取字节前**就被跳过（不白读一遍）', async () => {
+  const big = new Uint8Array([1, 2, 3])
+  const wiki = wikiStub({}, { 13: { id: 13, name: '大图.png', mime: 'image/png', ext: '.png', byteSize: 99_000_000, bytes: big } })
+  const h = await mount({ wiki: wiki.svc, vision: true })
+  const r = await runTool(h.byName('read_image'), { id: 13 })
+  assert.equal(r.images, undefined, '超限的图不得交给模型')
+  assert.deepEqual(wiki.readAttachmentCalls, [13], '仍然问过它一次（判据在服务里），但拿不到字节')
+  await h.dispose()
+})
+
+/* ============ 视觉能力开关（LLM 设置里的「支持图像输入」，2026-09-20） ============ */
+
+test('★ 没声明支持看图时：read_image **不进工具表**（"这个能力不存在"比"调了才发现"诚实）', async () => {
+  const wiki = wikiStub({}, {})
+  // ① 没有 llm-service（本插件的文本工具不需要它）
+  const noLlm = await mount({ wiki: wiki.svc, search: searchStub({}).svc })
+  assert.deepEqual(
+    noLlm.tools.map((t) => t.descriptor.name).sort(),
+    ['list_pages', 'read_page', 'search_kb'],
+    'llm-service 缺席时 read_image 不出现，但三条文本工具照旧',
+  )
+  await noLlm.dispose()
+
+  // ② 有 llm-service 但显式声明不支持
+  const off = await mount({ wiki: wiki.svc, vision: false })
+  assert.equal(off.tools.some((t) => t.descriptor.name === 'read_image'), false)
+  await off.dispose()
+
+  // ③ 打开了才出现
+  const on = await mount({ wiki: wiki.svc, vision: true })
+  assert.equal(on.tools.some((t) => t.descriptor.name === 'read_image'), true)
+  await on.dispose()
+})
+
+test('★ read_page 的提示必须跟着能力走：看不了图时说"看不了"，**不能说"用 read_image"**', async () => {
+  const content = '看图：\n\n![拓扑](/api/attachments/5)\n'
+  const off = await mount({ wiki: wikiStub({ home: { title: '主页', content } }).svc, vision: false })
+  const offBody = JSON.parse((await runTool(off.byName('read_page'), { slug: 'home' })).content) as {
+    imagesNote?: string
+  }
+  assert.match(offBody.imagesNote ?? '', /没有声明支持看图/)
+  assert.ok(
+    !(offBody.imagesNote ?? '').includes('read_image'),
+    '那条工具此刻根本不在工具表里，提它就是让模型去调一个不存在的工具',
+  )
+  await off.dispose()
+
+  const on = await mount({ wiki: wikiStub({ home: { title: '主页', content } }).svc, vision: true })
+  const onBody = JSON.parse((await runTool(on.byName('read_page'), { slug: 'home' })).content) as {
+    imagesNote?: string
+  }
+  assert.match(onBody.imagesNote ?? '', /read_image/)
+  await on.dispose()
 })

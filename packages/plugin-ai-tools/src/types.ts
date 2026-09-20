@@ -132,7 +132,72 @@ export interface AiToolResult {
    * 反过来的偏差（该标没标）才是需求 ⑥ 要消灭的东西。
    */
   readonly grounding?: AiToolGrounding
+  /**
+   * 可选：随本次结果一起交给模型的**图片**（如 `read_page` 读到的正文里引用的图）。
+   *
+   * ## 为什么它不是 `content` 的一部分
+   * OpenAI 兼容协议里 `image_url` 内容块**只允许出现在 `user` 消息上**，`tool` 角色的
+   * messages 必须是纯文本。所以图片不可能"跟着 tool 消息走"——会话核心会把它们折成
+   * 一条**紧随该轮工具结果之后的 `user` 消息**（见 `@geewiki/ai-assistant` 的 `loop.ts`）。
+   *
+   * ## 三条纪律
+   * 1. **只读工具才该带图。** 图片进上下文是有成本的（一张 1280px 的图约一千多 token），
+   *    而"检索/定位"类工具（`search_kb` / `list_pages`）的用途是找页面，不是看图。
+   * 2. **宁可少给、不可超给。** 会话核心还有一道硬闸（条数 / MIME / base64 长度），
+   *    但那是**兜底**，不是让调用方随便塞的理由：被兜底丢掉的图，模型会以为它已经看到了
+   *    而实际没有——除非调用方在 `content` 里如实写出自己给了几张。
+   * 3. **`content` 必须自述。** 给了图就要在 `content` 文本里写明给了几张、分别是什么
+   *    （文件名 / 尺寸），因为**图本身不带任何文字**：线上那条 flush 出来的 user 消息
+   *    只有一句固定的引导语。模型分不清"这页没图"与"图没给我"，全靠 `content` 里的这句话。
+   */
+  readonly images?: readonly AiToolImage[]
 }
+
+/**
+ * 工具交给模型的一张图。
+ *
+ * 形态刻意与线协议（`TurnImage`）**同构**：`{ mime, data }`、`data` 是**不含 data: 前缀**的
+ * base64。这样"浏览器上送的图"与"工具读出来的图"在会话核心里走同一条校验与折叠路径，
+ * 不会出现两套"什么算合法图片"的判据。
+ */
+export interface AiToolImage {
+  /** 图片 MIME。**必须命中 {@link AI_TOOL_IMAGE_MIME_WHITELIST}**，否则会被核心丢弃 */
+  readonly mime: string
+  /** base64（**不含** `data:<mime>;base64,` 前缀） */
+  readonly data: string
+}
+
+/**
+ * 能进模型的图片 MIME —— **本仓关于"什么算图片"的单一真源**。
+ *
+ * 为什么放在工具契约层而不是会话核心：它同时被三处需要——
+ * ① 会话核心（线协议校验 + 工具结果的兜底校验）、② 工具实现（`read_page` 挑附件）、
+ * ③ 浏览器界面（另有一份不能 import node 模块的镜像，见 `ui/imagePlan.ts`）。
+ * 前两处都已经依赖本包，放在这里就不会多出第三份会漂移的名单。
+ *
+ * **刻意不含 `image/svg+xml`**：SVG 是"能被解释的文档"，同源内联时可带脚本
+ * （附件层已因此把它排除在内联之外）。交给上游模型既没有收益，
+ * 也让"这张图到底是不是图"变成一个需要解释的问题。
+ */
+export const AI_TOOL_IMAGE_MIME_WHITELIST: readonly string[] = [
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+]
+
+/**
+ * 工具交给模型的一张图的**字节**上限（1 MB）。
+ *
+ * 取值不是随手定的：base64 后长度 = `⌈bytes/3⌉ × 4`，1 MB ⇒ 约 1.33 M 字符，
+ * 刚好落在会话核心对单张图的字符上限（`MAX_IMAGE_BASE64_CHARS` = 1.4 M）之内。
+ * 也就是说：**按本值挑出来的图，一定过得了核心那道闸**，不会出现"工具以为给了、
+ * 核心却丢了"的分叉。两者的关系由 `@geewiki/ai-assistant` 的守卫测试钉住。
+ *
+ * 工具侧应当在**取字节之前**用它（`WikiService.readAttachment` 的 `maxBytes`），
+ * 而不是读进来再丢：一张 25 MB 的附件读进内存再判"太大"是纯粹的浪费。
+ */
+export const AI_TOOL_IMAGE_MAX_BYTES = 1_000_000
 
 /**
  * 工具的执行体。**主体是第一个参数，不是可选项**——见文件头教训二。

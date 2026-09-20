@@ -29,11 +29,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import './style.css'
-import { ChevronIcon, CollapseIcon, HistoryIcon, NewChatIcon } from './icons.js'
+import { ChevronIcon, CollapseIcon, HistoryIcon, ImageIcon, NewChatIcon, RemoveIcon } from './icons.js'
 import {
   applyTurnEvent,
   buildTurnBody,
   errorLine,
+  fetchVision,
   groundingAfterDone,
   runClientTools,
   defaultTransport,
@@ -65,12 +66,25 @@ import {
   TURN_PATH,
   withUserMessage,
   type DockConversation,
+  type DockImage,
   type DockMessage,
   type DockState,
   type MiniStore,
   type PageHint,
   type TurnTransport,
 } from './dockPlan.js'
+import {
+  humanBytes,
+  IMAGE_JPEG_QUALITY,
+  IMAGE_KEEP_BYTES,
+  IMAGE_MAX_BASE64_CHARS,
+  IMAGE_MAX_EDGE,
+  IMAGE_MIME_WHITELIST,
+  MAX_IMAGES_PER_TURN,
+  scaleToFit,
+  splitDataUrl,
+} from './imagePlan.js'
+import { registerImageSaveTool, setConversationImages } from './imageSave.js'
 import { createTurnDecoder, type DoneData, type ToolActivityView, type TurnEvent } from './sse.js'
 
 /* ============================== 宿主 SDK ============================== */
@@ -80,6 +94,15 @@ interface PluginUiHost {
   readonly version?: string
   registerSlot(name: string, component: (props: AppDockSlotProps) => unknown): () => void
   renderMarkdown?(markdown: string): string
+  /**
+   * 登记一个**客户端工具**的浏览器执行体（`image.save`，见 `ui/imageSave.ts`）。
+   *
+   * **可选**，且老宿主上没有它 ⇒ 特性探测后跳过：那时这条能力就"不存在"，
+   * 模型也不会看到它（描述符虽在服务端，但没有浏览器处理器时宿主不会把它报进
+   * `clientTools`，`resolveTurnTools` 自然把它挡在工具表外）。与 `renderMarkdown`
+   * 同一条取舍：老宿主上退化，而不是崩掉。
+   */
+  registerTool?(name: string, execute: (args: unknown) => Promise<unknown> | unknown): () => void
 }
 
 /**
@@ -156,6 +179,111 @@ export interface AskDockOptions {
   readonly journalTransport?: JournalTransport
 }
 
+/* ============================== 图片读取与压缩 ============================== */
+
+/** `FileReader` 的 promise 化；读不出来返回 `null`（调用方给一句人话，不抛） */
+function readAsDataUrl(file: File): Promise<string | null> {
+  return new Promise((resolve) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null)
+    reader.onerror = () => resolve(null)
+    reader.readAsDataURL(file)
+  })
+}
+
+/**
+ * 重编码到长边 ≤ {@link IMAGE_MAX_EDGE} 的 JPEG。
+ *
+ * 失败一律返回 `null`，由调用方**退回原图**——重编码是优化，不是正确性前提：
+ * 让"canvas 拿不到 2d 上下文"（无 GPU 的无头环境、极端内存压力）变成"图片传不上去"
+ * 是把优化写成了门槛。
+ */
+function reencodeToJpeg(dataUrl: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const { width, height } = scaleToFit(img.naturalWidth, img.naturalHeight, IMAGE_MAX_EDGE)
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const c2d = canvas.getContext('2d')
+        if (c2d === null) {
+          resolve(null)
+          return
+        }
+        // 白底：PNG 的透明区在 JPEG 里会变成黑块，而截图带透明通道很常见
+        c2d.fillStyle = '#ffffff'
+        c2d.fillRect(0, 0, width, height)
+        c2d.drawImage(img, 0, 0, width, height)
+        resolve(canvas.toDataURL('image/jpeg', IMAGE_JPEG_QUALITY))
+      } catch {
+        resolve(null)
+      }
+    }
+    img.onerror = () => resolve(null)
+    img.src = dataUrl
+  })
+}
+
+/**
+ * 一个文件 → dock 的图片形态。返回**字符串即错误原因**（给人看的一句话）。
+ *
+ * 大图才重编码（判据是字节数，见 `IMAGE_KEEP_BYTES`）：一张 80 KB 的 PNG 截图
+ * 重编码成 JPEG 会更大、还会丢掉透明通道，而它本来就在预算内。
+ * **GIF 永不重编码**：canvas 只会画第一帧，用户发的动图会静默变成一张静图。
+ */
+async function prepareImageFile(file: File): Promise<DockImage | string> {
+  if (!file.type.startsWith('image/')) return '只能添加图片（png / jpeg / webp / gif）'
+  if (!IMAGE_MIME_WHITELIST.includes(file.type)) return `不支持这种图片格式：${file.type}`
+  const dataUrl = await readAsDataUrl(file)
+  if (dataUrl === null) return '读取图片失败'
+  const prepared =
+    file.size <= IMAGE_KEEP_BYTES || file.type === 'image/gif'
+      ? { url: dataUrl, name: file.name }
+      : { url: (await reencodeToJpeg(dataUrl)) ?? dataUrl, name: file.name }
+  /*
+   * 压缩之后仍超预算 ⇒ **当场拒绝**。
+   *
+   * 不在这里拦的话，它会一路走到上送边界才被丢掉（`toTurnImage`），
+   * 而那条路径的失败是**静默的**：用户看到图挂在输入条上、发出去之后模型说"没看到图"。
+   * 编码后的实际大小只有压完才知道——所以判据必须放在压完之后。
+   */
+  const wire = splitDataUrl(prepared.url)
+  if (wire !== null && wire.data.length > IMAGE_MAX_BASE64_CHARS) {
+    return `这张图太大（约 ${humanBytes(Math.round((wire.data.length * 3) / 4))}），压缩后仍然超出上限，请先裁剪一下`
+  }
+  return prepared
+}
+
+/**
+ * 从 `DataTransfer` 里挑出图片文件。
+ *
+ * 优先 `items` 而不是 `files`：粘贴时 `files` 在部分浏览器上**是空的**，
+ * 而 `items` 里那条 `kind: 'file'` 才是真正的图片。反过来（只看 files）的失败
+ * 是"粘贴截图没反应"，且没有任何报错。
+ */
+function imageFilesFromDataTransfer(dt: DataTransfer | null): File[] {
+  if (dt === null) return []
+  const out: File[] = []
+  for (const item of Array.from(dt.items ?? [])) {
+    if (item.kind !== 'file') continue
+    const f = item.getAsFile()
+    if (f !== null && f.type.startsWith('image/')) out.push(f)
+  }
+  if (out.length === 0) {
+    for (const f of Array.from(dt.files ?? [])) {
+      if (f.type.startsWith('image/')) out.push(f)
+    }
+  }
+  return out
+}
+
+/** 拖拽内容里有没有文件。没有的话**必须放行**默认行为（否则页面里的文字拖放会被吃掉） */
+function dragHasFiles(dt: DataTransfer | null): boolean {
+  return dt !== null && Array.from(dt.types ?? []).includes('Files')
+}
+
 export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
   const transport = props.transport ?? defaultTransport
   const store = useMemo(() => props.store ?? resolveStore(), [props.store])
@@ -172,6 +300,29 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
   const [journal, setJournal] = useState<JournalTurnView[]>([])
   const [undoing, setUndoing] = useState('')
   const [undoNote, setUndoNote] = useState('')
+  /**
+   * 还没发出去的图片（贴 / 拖 / 选进来的）。与 `input` 并列而不是塞进它：
+   * 图片走的是另一条上送路径（多模态内容块），而"输入框里有什么文字"必须保持纯文本。
+   */
+  const [pendingImages, setPendingImages] = useState<readonly DockImage[]>([])
+  /*
+   * 当前模型收不收图 —— 由本插件自己的 `capabilities` 端点探测（见 `fetchVision`）。
+   *
+   * 缺省 `false`（从严）：探测回来之前**不显示图片入口**。反过来（先显示再收回）会让
+   * 手快的人贴进一张图、然后收到一个 400——那个 400 是对的，但本来不必发生。
+   */
+  const [vision, setVision] = useState(false)
+  /** 图片相关的提示（超张数 / 格式不支持）。与 `state.error` 分开：它不是一次回合失败 */
+  const [attachNote, setAttachNote] = useState('')
+  /**
+   * `pendingImages` 的**同步副本**。
+   *
+   * 为什么需要：`addFiles` 是 async 的（读文件、可能还要重编码），await 之后再读
+   * `pendingImages` 拿到的是**闭包里的旧值**——连着贴两张图时第二张会覆盖第一张，
+   * 而界面上看起来只是"有一张没加进去"。
+   */
+  const pendingRef = useRef<readonly DockImage[]>([])
+  const fileRef = useRef<HTMLInputElement | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   /** 已经结束的对话才值得存；用一个 ref 记住"本轮是否已落库"，避免每帧都写 localStorage */
   const savedRef = useRef(false)
@@ -225,6 +376,149 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
   useEffect(() => {
     setHistory(loadConversations(store, props.userId))
   }, [store, props.userId])
+
+  /*
+   * 把"这段对话里有哪些图"同步给 `image.save` 的浏览器执行体。
+   *
+   * 它读的是一个**模块级变量**：登记进宿主工具表的必须是一个稳定函数（`registerTool`
+   * 不接受每次渲染都换的新函数），拿不到 React 状态。故每次转录变化都要推一次——
+   * 漏了的表现是模型调 `image.save` 时被告知"这次对话里没有任何图片"，
+   * 而用户明明刚贴过一张。
+   */
+  /*
+   * 探测"当前模型收不收图"。只在挂载时问一次：这是**配置面**的事实，
+   * 用户在设置里改了它之后重新进来就会拿到新值；为它加轮询或订阅的复杂度换不来什么。
+   * `alive` 守卫是必须的：探测是异步的，组件可能在它回来之前就卸载了。
+   */
+  useEffect(() => {
+    let alive = true
+    void fetchVision().then((v) => {
+      if (alive) setVision(v)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  useEffect(() => {
+    setConversationImages(state.messages)
+  }, [state.messages])
+
+  const setPending = useCallback((next: readonly DockImage[]) => {
+    pendingRef.current = next
+    setPendingImages(next)
+  }, [])
+
+  /**
+   * 把文件加进待发图片。
+   *
+   * 超上限时**多的一张都不加**，并明确说一句——静默丢弃会让用户以为已经发出去了，
+   * 而模型那边只会说"我看不到图"。错误只报第一条：连贴五张不支持的文件时，
+   * 五条一样的话堆在那里比一条更难看。
+   */
+  const addFiles = useCallback(
+    async (files: readonly File[]) => {
+      const images = files.filter((f) => f.type.startsWith('image/'))
+      if (images.length === 0) return
+      /*
+       * 模型收不了图时**在入口就拦下**（按钮本身也不会渲染，见 `.gw-dock-attach`）：
+       * 走到发送才拒的话，用户已经贴好图、写好了话，然后整轮发不出去。
+       */
+      if (!vision) {
+        setOpen(true)
+        setAttachNote('当前模型未声明支持看图（可在 LLM 设置里打开「支持图像输入」）')
+        return
+      }
+      // 预览条住在面板里，收着就等于"加了但看不见"，故先展开
+      setOpen(true)
+      const errors: string[] = []
+      const added: DockImage[] = []
+      for (const file of images) {
+        const result = await prepareImageFile(file)
+        if (typeof result === 'string') errors.push(result)
+        else added.push(result)
+      }
+      const room = MAX_IMAGES_PER_TURN - pendingRef.current.length
+      if (room <= 0) {
+        setAttachNote(`一次最多带 ${MAX_IMAGES_PER_TURN} 张图`)
+        return
+      }
+      const kept = added.slice(0, room)
+      if (kept.length > 0) setPending([...pendingRef.current, ...kept])
+      const overflow = added.length - kept.length
+      if (overflow > 0) setAttachNote(`一次最多带 ${MAX_IMAGES_PER_TURN} 张图，多出的 ${overflow} 张已忽略`)
+      else if (errors.length > 0) setAttachNote(errors[0] ?? '')
+      else setAttachNote('')
+    },
+    [setPending, vision],
+  )
+
+  const removePending = useCallback(
+    (index: number) => {
+      setPending(pendingRef.current.filter((_, i) => i !== index))
+      setAttachNote('')
+    },
+    [setPending],
+  )
+
+  /*
+   * 拖拽落图。
+   *
+   * 用 `addEventListener` 而不是 JSX 上的 `onDrop`：`.gw-dock` 那一行被
+   * `test/uiDockDismiss.test.ts` **逐字**钉着（"点 dock 外收起"的判据依赖它），
+   * 往里加属性会把那条守卫变成噪声。悬停态也走属性（`data-dragging`）而不是
+   * React 状态：`className` 会在展开态切换时被 React 重写，而 React 不管理这个属性。
+   *
+   * **认不出文件就放行**：拖页面里的文字/链接时 `preventDefault()` 会吃掉浏览器
+   * 自己的默认行为（比如把链接拖进地址栏）。
+   */
+  useEffect(() => {
+    const el = rootRef.current
+    if (el === null) return
+    const setDrag = (on: boolean): void => {
+      el.toggleAttribute('data-dragging', on)
+    }
+    const onDragOver = (e: DragEvent): void => {
+      if (!dragHasFiles(e.dataTransfer)) return
+      e.preventDefault()
+      setDrag(true)
+    }
+    const onDragLeave = (e: DragEvent): void => {
+      /*
+       * 只有真的离开 dock 才清高亮：`dragleave` 在进入**子元素**时也会冒到这一层，
+       * 无条件清会让轮廓在鼠标划过预览条/输入框时闪烁。
+       * `relatedTarget` 在"离开窗口"时是 null —— 那正是该清的情况。
+       */
+      const next = e.relatedTarget
+      if (next instanceof Node && el.contains(next)) return
+      setDrag(false)
+    }
+    const onDrop = (e: DragEvent): void => {
+      setDrag(false)
+      /*
+       * 认得出是"文件拖放"就**必须**拦下默认行为：不拦的话浏览器会导航去打开那个文件，
+       * 用户看到的是一次莫名其妙的重载（整个对话状态丢掉）。
+       * 故拦的依据是"这是文件拖放"，**不是**"这里面有图片"。
+       */
+      if (!dragHasFiles(e.dataTransfer)) return
+      e.preventDefault()
+      const files = imageFilesFromDataTransfer(e.dataTransfer)
+      if (files.length === 0) {
+        setOpen(true)
+        setAttachNote('只能添加图片（png / jpeg / webp / gif）')
+        return
+      }
+      void addFiles(files)
+    }
+    el.addEventListener('dragover', onDragOver)
+    el.addEventListener('dragleave', onDragLeave)
+    el.addEventListener('drop', onDrop)
+    return () => {
+      el.removeEventListener('dragover', onDragOver)
+      el.removeEventListener('dragleave', onDragLeave)
+      el.removeEventListener('drop', onDrop)
+    }
+  }, [addFiles])
 
   // 卸载即取消上游：用户关掉页面后不该继续烧 token
   useEffect(() => () => abortRef.current?.abort(), [])
@@ -470,8 +764,17 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
      * 否则用户回看会话时不知道那一轮是怎么发起的。
      */
     const text = (preset ?? input).trim()
-    if (text === '' || state.streaming) return
-    if (preset === undefined) setInput('')
+    /*
+     * 图片只跟着**用户自己发的那一句**走。`preset` 是"中止后点继续"这类按钮，
+     * 它不该顺手把用户刚贴好、还没来得及配文字的图发出去。
+     */
+    const images = preset === undefined ? pendingRef.current : []
+    if ((text === '' && images.length === 0) || state.streaming) return
+    if (preset === undefined) {
+      setInput('')
+      setPending([])
+      setAttachNote('')
+    }
     setOpen(true)
     /*
      * **强制**置回贴底：用户刚提了问题，答案马上要在下面长出来。
@@ -481,7 +784,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
     pinnedRef.current = true
     queueMicrotask(stickToBottom)
     abortRef.current?.abort()
-    const seeded = withUserMessage({ ...state, messages: state.messages }, text)
+    const seeded = withUserMessage({ ...state, messages: state.messages }, text, images)
     setState(seeded)
     /*
      * 依据账清零**必须在这里做**，不能等 `setState` 生效：下面那行 `runTurn` 在重渲染
@@ -498,7 +801,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
     savedRef.current = false
     // 新的提问 ⇒ 新的轮次 id。**逐句**换，而不是逐回合换（见 runTurn 的注释）。
     void runTurn(seeded.messages, 0, newId())
-  }, [input, state, runTurn])
+  }, [input, state, runTurn, setPending])
 
   const stop = useCallback(() => {
     abortRef.current?.abort()
@@ -828,6 +1131,40 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
               )}
             </div>
 
+            {/*
+              待发图片的预览条（2026-09-20）。
+              它**必须住在面板里**：输入行 `.gw-dock-row` 是绝对定位的 55px 盒子
+              （见 style.css 里那段实测说明），往里塞东西会撑破那个高度、
+              连带把"收起/展开是同一个盒子"这条不变量弄坏。
+              面板底部正好压在输入行上方，视觉上就是"图贴在输入框上面"。
+            */}
+            {(pendingImages.length > 0 || attachNote !== '') && (
+              <div className="gw-dock-attach-strip">
+                {pendingImages.map((img, i) => (
+                  <span className="gw-dock-attach-chip" key={`p${i}`}>
+                    <img
+                      className="gw-dock-attach-thumb"
+                      src={img.url}
+                      alt={img.name !== undefined && img.name !== '' ? img.name : `待发图片 ${i + 1}`}
+                    />
+                    <button
+                      type="button"
+                      className="gw-dock-attach-remove"
+                      onClick={() => removePending(i)}
+                      aria-label={`移除第 ${i + 1} 张图片`}
+                      title="移除"
+                    >
+                      <RemoveIcon />
+                    </button>
+                  </span>
+                ))}
+                {attachNote !== '' && (
+                  <span className="gw-dock-attach-note" role="status">
+                    {attachNote}
+                  </span>
+                )}
+              </div>
+            )}
 
           </section>
         </div>
@@ -858,12 +1195,54 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
               send()
             }}
           >
+            {/*
+              附件入口（2026-09-20）。**三个入口共用同一条处理路径**（`addFiles`）：
+              文件选择、粘贴、拖拽。三条各自实现必然漂移，而漂移的表现是
+              "截图能粘进来、拖进来不行"这类只在某一条路径上出现的怪现象。
+            */}
+            <input
+              ref={fileRef}
+              type="file"
+              accept={IMAGE_MIME_WHITELIST.join(',')}
+              multiple
+              hidden
+              onChange={(e) => {
+                const files = Array.from(e.target.files ?? [])
+                // 先清空 value：连着选同一个文件两次时，第二次不会触发 change
+                e.target.value = ''
+                void addFiles(files)
+              }}
+            />
+            {/*
+              * 模型收不了图时**这个按钮根本不渲染**：入口不存在比"点了才发现不行"诚实，
+              * 与本仓在 `page.update`（缺 journal 时不注册）上的判据一致。
+              * 隐藏的文件输入留在 DOM 里（它没有任何可见入口，也没有别的路径能触发它）。
+              */}
+            {vision && (
+              <button
+                type="button"
+                className="gw-dock-attach"
+                onClick={() => fileRef.current?.click()}
+                aria-label="添加图片"
+                title="添加图片（也可以直接粘贴或拖进来）"
+                disabled={state.streaming || pendingImages.length >= MAX_IMAGES_PER_TURN}
+              >
+                <ImageIcon />
+              </button>
+            )}
             <input
               ref={inputRef}
               className="gw-dock-input"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onFocus={() => setOpen(true)}
+              onPaste={(e) => {
+                const files = imageFilesFromDataTransfer(e.clipboardData)
+                // 只在真有图片时拦截：否则正常的文字粘贴会被吃掉
+                if (files.length === 0) return
+                e.preventDefault()
+                void addFiles(files)
+              }}
               placeholder={props.page !== null ? `问关于「${props.page.slug}」或整个知识库…` : '问关于知识库的任何问题…'}
               aria-label="对 AI 助手提问"
             />
@@ -873,7 +1252,7 @@ export function AskDock(props: AppDockSlotProps & AskDockOptions): ReactNode {
                 停止
               </button>
             ) : (
-              <button type="submit" className="gw-dock-btn gw-dock-btn-primary" disabled={input.trim() === ''}>
+              <button type="submit" className="gw-dock-btn gw-dock-btn-primary" disabled={input.trim() === '' && pendingImages.length === 0}>
                 发送
               </button>
             )}
@@ -1101,6 +1480,22 @@ function renderThread(state: DockState): ReactNode {
     if (m.role === 'user') {
       nodes.push(
         <div className="gw-dock-msg gw-dock-msg-user" key={`u${i}`}>
+          {/*
+            图片渲染在文字**上面**：用户的图往往是这句话的主语（"这张图里的流程对吗"），
+            先看到它再读问题才顺；反过来（文字在前、图在后）读起来像图是附注。
+          */}
+          {m.images !== undefined && m.images.length > 0 && (
+            <span className="gw-dock-msg-imgs">
+              {m.images.map((img, j) => (
+                <img
+                  className="gw-dock-msg-img"
+                  src={img.url}
+                  alt={img.name !== undefined && img.name !== '' ? img.name : `图片 ${j + 1}`}
+                  key={`u${i}-img${j}`}
+                />
+              ))}
+            </span>
+          )}
           {m.content}
         </div>,
       )
@@ -1213,7 +1608,17 @@ function WebGroundedNotice(): ReactNode {
 export function register(host: PluginUiHost): () => void {
   // 特性探测，**不比版本字符串**（老宿主上没有这个函数，退化路径是纯文本而不是抛错）
   markdownRenderer = typeof host.renderMarkdown === 'function' ? host.renderMarkdown.bind(host) : null
-  return host.registerSlot('app-dock', AskDock)
+  const offSlot = host.registerSlot('app-dock', AskDock)
+  /*
+   * `image.save` 的浏览器执行体（见 `ui/imageSave.ts`）。描述符由 `@geewiki/ai-pages`
+   * 在服务端以 `side: 'client'` 声明——**两半点名同一个名字**，任何一半缺席时
+   * 模型都看不到这条工具（`resolveTurnTools` 只认"服务端已声明 ∩ 客户端已登记"的交集）。
+   */
+  const offTool = registerImageSaveTool(host)
+  return () => {
+    offSlot()
+    offTool()
+  }
 }
 
 export default register

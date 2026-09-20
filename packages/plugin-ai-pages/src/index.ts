@@ -1,6 +1,12 @@
 /**
  * `@geewiki/ai-pages` —— AI 的**页面写工具**（P4 起步，决策 2 的"页面管理"档）。
  *
+ * 本包贡献**两条不同类的工具**：
+ * - `page.update`（`side:'server'`、`mutating`）——改页面正文，走本文下面那三条硬纪律；
+ * - `image.save`（`side:'client'`）——把用户贴在输入条里的图片存成页面附件。
+ *   本包**只声明它存在**，执行体在浏览器（`@geewiki/ai-assistant/ui/imageSave.ts`），
+ *   理由见该条贡献处的长注释；它**不是** `mutating`（只新增附件行，正文由 `page.update` 改）。
+ *
  * ## 为什么这个包必须存在，而不是把写工具塞进 `ai-kb`
  * `ai-kb` 的文件头写着它的三条工具**全是只读**，"故不受 mutation journal 与自锁护栏约束"。
  * 往那里加一条写工具会让那句注释当场变成谎话，而这类"注释与代码不一致"正是本仓
@@ -44,8 +50,36 @@ import {
 /** 域标识：撤销执行体按它挑选（页面正文） */
 export const PAGE_DOMAIN = 'page'
 
-/** 工具名（写工具）。读工具在 `ai-kb`，此处只放写。 */
+/** 服务端写工具名（真正在服务端执行的那条）。读工具在 `ai-kb`，此处只放写。 */
 export const PAGE_TOOL_NAMES = ['page.update'] as const
+
+/**
+ * 图片工具名。**浏览器侧 `packages/plugin-ai-assistant/ui/imageSave.ts` 的
+ * `IMAGE_SAVE_TOOL_NAME` 是它的镜像**（服务端不能 import 浏览器模块），
+ * 一致性由 `test/imageTool.test.ts` 读两侧源码逐字比对钉住——
+ * 照 `@geewiki/ai-nav` 的 `NAV_TOOL_NAMES` 与宿主 `navTools.ts` 的既有做法。
+ *
+ * ⚠️ 与 {@link PAGE_TOOL_NAMES} **不是同一类**：这条是 `side:'client'`，
+ * 本包只声明它的存在，执行体在浏览器（见 `browserSide` 与 `image.save` 贡献处的注释）。
+ */
+export const IMAGE_TOOL_NAMES = ['image.save'] as const
+
+/**
+ * `side: 'client'` 的工具执行体**不可能在服务端跑**。
+ *
+ * 那为什么还要填一个 `execute`：`AiToolContribution` 把它声明成必填，而"必填"在这里
+ * 是**对的**——它逼着本插件显式写出"这一半不归我"，而不是留一个没填的洞让读者猜。
+ * 真被调到即抛错：这是**代码错**（服务端不该执行客户端工具），不是用户输入错。
+ * （与 `@geewiki/ai-nav` 的 `browserSide` 逐字同形。）
+ */
+function browserSide(name: string) {
+  return (_principal: Principal, _args: unknown): never => {
+    throw new Error(
+      `[${manifest.name}] ${name} 是 side:'client' 工具，执行体在浏览器（@geewiki/ai-assistant 的 UI 登记），` +
+        '服务端不得执行它——出现这条说明工具表被错误地当成了可本地执行的服务端工具',
+    )
+  }
+}
 
 /** 撤销执行体需要的服务面（只声明用到的部分，避免把整包类型拖进来） */
 interface PolicyServiceLike {
@@ -162,7 +196,7 @@ export const manifest: GeeWikiManifest = {
   version: '0.1.0',
   geewiki: {
     displayName: 'AI 页面写工具',
-    description: '让 AI 能修改页面正文（每次改动都记入变更日志，可一键回退）',
+    description: '让 AI 能修改页面正文、并把对话里的图片存成页面附件（正文改动记入变更日志，可一键回退）',
     // 纯贡献者：不 provide 服务、没有端点、没有前端产物
     provides: undefined,
     /*
@@ -404,8 +438,51 @@ export const AiPagesPlugin = {
       },
     })
 
+    /* ------------------------------ image.save ------------------------------ */
+
+    /*
+     * 这一条是**客户端工具**（`side: 'client'`）：本文件只声明"它存在"，
+     * 真正跑它的是浏览器（`packages/plugin-ai-assistant/ui/imageSave.ts` 登记到宿主工具表）。
+     *
+     * 为什么执行体必须在浏览器：**图片字节只在用户那一侧**。用户完全可能在这一轮说
+     * "把刚才那张图存进 xx 页"，而那张图在**上一轮**的消息里——服务端手上的请求体
+     * 只覆盖当前这一回合。另一半理由同样重要：上传走的是既有的
+     * `PUT /api/attachments/:slug`（带会话 cookie + CSRF，权限判据在 HTTP 层），
+     * 不为 AI 另开一条写入通道。
+     *
+     * 为什么**不标 `mutating`**：它只新增一条附件行，不改动任何既有内容。
+     * 用户真正要的"插进文章"由 `page.update` 落笔，而那一条已经进日志、可回退。
+     * 标成 mutating 会让回退 UI 上多出一条点了没反应的条目（同 `open_page` 的判据）。
+     */
+    const releaseImageTool = tools.contribute(manifest.name, {
+      descriptor: {
+        name: 'image.save',
+        description:
+          '把用户这次对话里贴出的图片存进知识库，成为某个页面的附件。' +
+          '当用户说"把这张图存起来""把图片插进 xx 页面"时用它。' +
+          'index 是这次对话里图片的序号（从 1 开始、按出现顺序），省略表示最新一张。' +
+          '它会返回一段 Markdown 图片引用；要真正写进正文，还要用 page.update 把它插到合适的位置。',
+        parameters: {
+          type: 'object',
+          properties: {
+            slug: { type: 'string', description: '图片要挂到哪一页（先用 list_pages / read_page 拿到）' },
+            index: { type: 'integer', description: '这次对话里图片的序号（1 起，按出现顺序）；省略 = 最新一张' },
+            name: { type: 'string', description: '保存时的文件名（含扩展名，如 arch.png）；省略则按图片类型自动生成' },
+            alt: { type: 'string', description: '插入正文时的替代文字（一句话说明图里是什么）' },
+          },
+          required: ['slug'],
+          additionalProperties: false,
+        },
+        side: 'client',
+        // 匿名主体没有编辑能力，也就没有上传附件的权限：挡在工具表之外，模型不会去调一个注定 401 的工具
+        available: (principal: Principal): boolean => principal.kind !== 'anonymous',
+      },
+      execute: browserSide('image.save'),
+    })
+
     return () => {
       releaseTool()
+      releaseImageTool()
       releaseUndoer()
       releaseProbe()
     }
