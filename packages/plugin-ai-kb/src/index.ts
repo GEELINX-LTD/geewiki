@@ -35,7 +35,6 @@ import {
   AI_TOOL_IMAGE_MIME_WHITELIST,
   AI_TOOL_SERVICE_NAME,
   type AiToolContext,
-  type AiToolImage,
   type AiToolResult,
   type AiToolService,
 } from '@geewiki/ai-tools'

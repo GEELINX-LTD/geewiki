@@ -96,7 +96,20 @@ test('出厂配置：默认基础层清单**不得**启用会顶掉内置编辑�
    * 再把它的名字从下面的清单里删掉。
    */
   const editorPlugins = ['@geewiki/editor-plain']
-  const configPath = join(repoRoot(), 'config', 'plugins.base.json')
+  /*
+   * 读**随版本发布**的那一份（`plugins.base.example.json`），不是本机 live 文件。
+   *
+   * `config/plugins.base.json` 被 `.gitignore` 整个拒绝（保存一次配置就会重写它），
+   * 所以它在**干净检出里根本不存在**——本测试曾经因此在 CI 里必然以
+   * `ENOENT: ... config/plugins.base.json` 失败，而在开发者本机（那份文件恰好在）通过。
+   * 一条只在某些机器上能过的守卫，比没有守卫更坏：它把"没人跑过"伪装成"已经验过"。
+   *
+   * 而本测试要钉的是**出厂**配置，那正是 example 那份：manager 的 `readBaseList`
+   * （`packages/manager/src/index.ts`，live 文件缺失时回退读 example）意味着
+   * **新部署实际装配的就是它**。本机 live 文件里启用什么是这台机器的选择，
+   * 不该让一条测试在别人机器上变红。
+   */
+  const configPath = join(repoRoot(), 'config', 'plugins.base.example.json')
   const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as { enabled: { name: string }[] }
   const names = cfg.enabled.map((e) => e.name)
 
