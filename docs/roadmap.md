@@ -83,6 +83,46 @@
 
 ## 接下来做什么
 
+### 0. 界面扩展平台的收尾（2026-09-21 新增，优先级最高）
+
+平台本体（P0–P12）已落地并端到端验收通过（契约 [design/ui-extension-platform.md](./design/ui-extension-platform.md)，
+读数见其 §11：`scripts/acceptance/ui-extension-cdp.mjs` **36/36 全绿**、`plugin-ui-cdp.mjs` 亦已修复并跑通）。
+**明确剩下的两件事**：
+
+1. ~~**修 `scripts/acceptance/plugin-ui-cdp.mjs`**~~ —— **已完成（2026-09-21）**：新增共用夹具
+   `scripts/acceptance/lib/session.mjs`（三条鉴权路径：`GEEWIKI_ADMIN_TOKEN` break-glass / 无账号时
+   `POST /api/auth/setup` / 固定验收账号登录；自动带 `cookie` 与 `x-gw-csrf`），脚本内所有启停改为
+   经该夹具发起，并把陈旧的"wiki 有界面"断言换成"入口表列 `skipped(inactive)` + wiki 不再出现在
+   `loaded()`"。修复过程中还抓到两个**脚本自身的**真问题：`Runtime.enable` 会**重放**上次的 console
+   历史（把"console 零错误"弄成假失败）；首屏断言假设"默认有启用的夹具插件"（该前提早已消失）。
+   拿不到凭据时依赖鉴权的用例**明确跳过**（不记失败、也不记通过），跳过的名单写进结果 JSON。
+2. ~~**补"插件 bundle → `registerExtension(mode)`"的 CDP 覆盖**~~ —— **已完成（2026-09-21）**：
+   P12 先把链条本身修通（受限宿主补上 `registerExtension`），随后在 `ui-extension-cdp.mjs` 增加
+   **P12b 场景 8 条**：启用真实示例插件 → 断言其 `registerSlot` 贡献（页头计数器）与
+   **`registerExtension(wrap)`** 贡献（品牌字样被包一层、且 `default` 没丢）都出现、产物与 CSS 经入口表
+   加载 → 停用后贡献**按 owner 回收**、字样逐字还原、`<link>` 移除。这条同时是"归属到插件名 ⇒ 可回收"
+   的端到端证据（走全局 SDK 那条路收不回）。
+3. ~~**接线剩余外壳节点**~~ —— **已完成（2026-09-21 收尾）**：`shell-header`、`shell-footer`、
+   `shell-theme-toggle`、`shell-command-palette`、`shell-status-dialog` 五个已接线并登记进目录，
+   守卫 `packages/web/test/shellChromeExt.test.ts`（9 条，含"目录 ⇄ 源码双向比对"与
+   "extend 的追加落在节点之后、空页脚仍不占位"的 SSR 断言）；CDP 加 6 条外壳断言（当时读数 22/22）。
+   **同日追加（用户当场驳回后修正）**：`shell-header` / `shell-footer` 改为**容器节点**——
+   外壳元素与内层插槽出口由宿主独占，`replace` 只换内容，贡献者用 `props.slots[名]` 摆放
+   （设计文档 §4.5）；守卫 `shellChromeExt.test.ts` 增至 10 条 + CDP 4 条（P11b，当时读数 27/27）。
+   **再追加（P11c，先实测后修）**：容器节点 × Shadow DOM —— 隔离根内的挂载点会被忽略
+   （否则别人的贡献被拖进隔离根、丢掉宿主样式，且宿主视角与"消失"无异）；CDP +1 条（读数 **28/28**）。
+   **`shell-sidebar` 经核实外壳里不存在该元素，已从候选移除**（不是漏做）——桌面导航在
+   `<header>` 的 `<nav>` 里、阅读页右栏由 `wiki-toc` 覆盖。
+4. **portal 类组件是否接**（Dialog / ConfirmDialog / DropdownMenu / Tooltip）：当前有意不接
+   （`wrap` 会在调用处留下空包裹元素）。若要接，先解决"包装元素落在哪里"这个问题。
+5. **顶层直接调全局 SDK 的注册没有归属**（2026-09-21 P12 时发现并登记）：`window.__GEEWIKI_HOST__`
+   上的 `registerSlot` / `registerExtension` / `registerRoute` / `registerTool` / `registerTheme` /
+   `registerMarkdownExtension` 一律以 `'host-sdk'` 为来源，于是 `unloadPluginUi(name)` **收不回**
+   它们（插件停用后贡献残留、重新启用会叠加），也**不经过越权闸门**。
+   走 `export function register(host)` 的插件不受影响（P12 已给受限宿主补上 `registerExtension`）。
+   正解：加载期间临时装一个"按插件归属的 SDK 作用域"（`Proxy` 只覆盖注册类方法即可），
+   属独立批次——它同时会改掉 `registerTool` / `registerTheme` 的既有生命周期语义，需要自己的验收。
+
 ### 1. `admin-page-slots` 扩展点
 
 后端 `SlotService` 已支持插件用 `define(owner, slot, meta?)` **自开扩展点**（含声明/贡献分离、`undeclared` 诊断），宿主自带的白名单稳定在 7 个内置槽；**宿主侧的 `admin-page-slots` 仍是候选、尚未提供**。（`editor-toolbar-slots` 这个候选名**从未存在过**——白名单里落地的是 `editor-toolbar`。）见 architecture §6 已知边界第 1 条。
@@ -113,4 +153,4 @@
 
 ### 8. 插件平台仍成立的已知限制
 
-样式无隔离（无 Shadow DOM、无前缀改写）、**ESM 模块实例不回收**（产物更新需整页刷新）、无版本协商与完整性之外的信任机制、`on-demand` 插槽的若干踩坑边界、"插件产物更新需整页刷新"等——完整清单见 [plugin-platform.md](./plugin-platform.md)。
+样式**默认**无隔离（无前缀改写；P9 起 `replace` 可显式选 Shadow DOM）、**ESM 模块实例不回收**（产物更新需整页刷新）、无版本协商与完整性之外的信任机制、`on-demand` 插槽的若干踩坑边界、"插件产物更新需整页刷新"等——完整清单见 [plugin-platform.md](./plugin-platform.md) §4.9/§5 与 [architecture.md](./architecture.md) §6。
