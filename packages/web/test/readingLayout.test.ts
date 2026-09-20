@@ -118,7 +118,7 @@ test('阅读栅格：没有右栏时正文按 measure 封顶，且与有右栏�
   assert.match(noRail, /width:\s*min\(100%,\s*var\(--spacing-measure\)\)/, '无右栏的单列页必须把正文封顶在 --spacing-measure（否则超宽屏上会拉成一条长文）')
   assert.doesNotMatch(noRail, /margin-inline/, '不得居中：居中会让"有目录 / 没目录"两种页面左右错开 123px（切文章时看着像闪）')
   const measure = read('../src/styles/tokens.css')
-  assert.match(measure, /--spacing-measure:\s*min\(84rem,\s*92em\)/, '行宽上限被改过：有右栏时它不生效，改动要先想清楚单列页')
+  assert.match(measure, /--gw-spacing-measure:\s*min\(84rem,\s*92em\)/, '行宽上限被改过：有右栏时它不生效，改动要先想清楚单列页')
 })
 
 test('阅读卡片：仍不自己限宽/居中（否则同列卡片错开成阶梯）', () => {

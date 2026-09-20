@@ -141,6 +141,73 @@
 }
 
 /* ---------------------------------------------------------------------------
+ * 1b. 尺度 / 动效 / 层级 —— 统一到 --gw-*（主题统一化，2026-09-19）
+ *
+ *    为什么必须收进 --gw-*：第 4 节的 @theme inline 里，字号、圆角、阴影、动效曲线、
+ *    z-index 这几类原先写的是**字面值**（如 --radius-md: 8px）。字面值等于**插件改不动**：
+ *    registerTheme 只接受 --gw-* 名字（见 lib/pluginTheme.ts 的 TOKEN_NAME），于是
+ *    「统一主题」在字号 / 圆角 / 阴影 / 动效 / 层级这五类上根本不成立 —— 一个换主题的
+ *    插件能改颜色却改不了圆角，这正是分裂的根源。
+ *
+ *    两段式与语义色完全一致：本块声明真值，第 4 节（Tailwind 工具类）与第 4b 节
+ *    （插件引用的旧名字）**都只写 var(--gw-*) 别名**。于是插件覆盖一次 --gw-*，
+ *    工具类（text-wordmark / rounded-md / shadow-lg / ease-move / z-modal）、宿主手写
+ *    CSS、插件 CSS 里的旧名字**同时**跟着变，不存在「只改了一半」的状态。
+ *
+ *    ⚠️ 这些值不随深浅色变化，故只在 :root 声明一次。若某个主题需要按模式给不同阴影，
+ *    在 registerTheme 的 light / dark 两份 map 里分别给即可：注入的 :root.light /
+ *    :root.dark 选择器优先级高于本块，不需要在这里再抄一遍。
+ * ------------------------------------------------------------------------- */
+
+:root {
+  /* 字号刻度（rem：跟随用户根字号，口径见第 4 节） */
+  --gw-text-3xs: 0.625rem; /* 10px */
+  --gw-text-2xs: 0.6875rem; /* 11px */
+  --gw-text-note: 0.8125rem; /* 13px */
+  --gw-text-md: 0.9375rem; /* 15px */
+  --gw-text-wordmark: 1.1875rem; /* 19px — 仅品牌字标 */
+
+  /* 圆角阶 */
+  --gw-radius-xs: 4px;
+  --gw-radius-sm: 6px;
+  --gw-radius-md: 8px;
+  --gw-radius-lg: 10px;
+  --gw-radius-xl: 14px;
+  --gw-radius-full: 999px;
+
+  /* 阴影阶 */
+  --gw-shadow-xs: 0 1px 2px rgb(16 24 40 / 6%);
+  --gw-shadow-sm: 0 1px 3px rgb(16 24 40 / 8%);
+  --gw-shadow-md: 0 2px 6px rgb(16 24 40 / 10%);
+  --gw-shadow-lg: 0 8px 24px rgb(16 24 40 / 14%);
+  --gw-shadow-xl: 0 16px 48px rgb(16 24 40 / 22%);
+
+  /*
+   * 动效曲线。三条各有分工，**不能互相凑**：前两条都是给 150ms 的颜色与小位移调的，
+   * 前段极陡；--gw-ease-move 专给抽屉 / 面板的展开收起（峰值 1.6 倍 vs 2.9 / 6.2 倍），
+   * 详细实测见第 4b 节那条注释。
+   */
+  --gw-ease-standard: cubic-bezier(0.2, 0, 0.13, 1);
+  --gw-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --gw-ease-move: cubic-bezier(0.15, 0.08, 0.5, 1);
+
+  /* z-index 阶（集中管理，避免各处随手写 20/30/40 造成层叠打架） */
+  --gw-z-base: 0;
+  --gw-z-sticky: 20;
+  --gw-z-dropdown: 40;
+  --gw-z-overlay: 50;
+  --gw-z-modal: 60;
+  --gw-z-toast: 70;
+
+  /* 产品语义尺寸（**不是刻度**：Tailwind v4 的 --spacing 是单个动态乘数，
+     4px 栅格上的任意倍数已可用；这里只是几个具名尺寸 + 外壳上限） */
+  --gw-spacing-gutter: 22px;
+  --gw-spacing-header: 56px;
+  --gw-spacing-measure: min(84rem, 92em);
+  --gw-spacing-wide: 1840px;
+}
+
+/* ---------------------------------------------------------------------------
  * 2. 语义色 —— 浅色模式（默认）
  * ------------------------------------------------------------------------- */
 
@@ -480,40 +547,40 @@
    * ⚠️ 刻意**不**为这些档位配对 `--text-*-line-height`：原先的 `text-[13px]` 只设字号、
    * 行高继承；配上行高会改变现有排版。需要独立行高处请显式写 `leading-*`。
    */
-  --text-3xs: 0.625rem; /* 10px — 极小辅助文字 */
-  --text-2xs: 0.6875rem; /* 11px — 徽标 / 标签 */
-  --text-note: 0.8125rem; /* 13px — 按钮、通知、代码、密排正文 */
-  --text-md: 0.9375rem; /* 15px — 卡片标题（Tailwind 无 md 档，故补） */
-  --text-wordmark: 1.1875rem; /* 19px — 仅品牌字标（顶栏 GeeWiki 字样） */
+  --text-3xs: var(--gw-text-3xs); /* 10px — 极小辅助文字 */
+  --text-2xs: var(--gw-text-2xs); /* 11px — 徽标 / 标签 */
+  --text-note: var(--gw-text-note); /* 13px — 按钮、通知、代码、密排正文 */
+  --text-md: var(--gw-text-md); /* 15px — 卡片标题（Tailwind 无 md 档，故补） */
+  --text-wordmark: var(--gw-text-wordmark); /* 19px — 仅品牌字标（顶栏 GeeWiki 字样） */
 
   /* 圆角阶 */
-  --radius-xs: 4px;
-  --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 10px;
-  --radius-xl: 14px;
-  --radius-full: 999px;
+  --radius-xs: var(--gw-radius-xs);
+  --radius-sm: var(--gw-radius-sm);
+  --radius-md: var(--gw-radius-md);
+  --radius-lg: var(--gw-radius-lg);
+  --radius-xl: var(--gw-radius-xl);
+  --radius-full: var(--gw-radius-full);
 
   /* 阴影阶 */
-  --shadow-xs: 0 1px 2px rgb(16 24 40 / 6%);
-  --shadow-sm: 0 1px 3px rgb(16 24 40 / 8%);
-  --shadow-md: 0 2px 6px rgb(16 24 40 / 10%);
-  --shadow-lg: 0 8px 24px rgb(16 24 40 / 14%);
-  --shadow-xl: 0 16px 48px rgb(16 24 40 / 22%);
+  --shadow-xs: var(--gw-shadow-xs);
+  --shadow-sm: var(--gw-shadow-sm);
+  --shadow-md: var(--gw-shadow-md);
+  --shadow-lg: var(--gw-shadow-lg);
+  --shadow-xl: var(--gw-shadow-xl);
 
   /* 动效 */
-  --ease-standard: cubic-bezier(0.2, 0, 0.13, 1);
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-standard: var(--gw-ease-standard);
+  --ease-out: var(--gw-ease-out);
   /* 大位移（抽屉/面板展开收起）。前两条都是给 150ms 的颜色·小位移调的，见第 4b 节 */
-  --ease-move: cubic-bezier(0.15, 0.08, 0.5, 1);
+  --ease-move: var(--gw-ease-move);
 
   /* z-index 阶（集中管理，避免各处随手写 20/30/40 造成层叠打架） */
-  --z-base: 0;
-  --z-sticky: 20;
-  --z-dropdown: 40;
-  --z-overlay: 50;
-  --z-modal: 60;
-  --z-toast: 70;
+  --z-base: var(--gw-z-base);
+  --z-sticky: var(--gw-z-sticky);
+  --z-dropdown: var(--gw-z-dropdown);
+  --z-overlay: var(--gw-z-overlay);
+  --z-modal: var(--gw-z-modal);
+  --z-toast: var(--gw-z-toast);
 }
 
 /* ---------------------------------------------------------------------------
@@ -567,20 +634,22 @@
   --color-suspended-line: var(--gw-suspended-line);
   --color-suspended-ink: var(--gw-suspended-ink);
   /* 尺度档：--text-xxx 与 --radius-xxx 眼下确实被输出，但那是 Tailwind 裁剪的副产品
-     （恰好被某条工具类捎带上），不是承诺。既然插件 CSS 已经在用，就一并纳入契约。 */
-  --text-3xs: 0.625rem;
-  --text-2xs: 0.6875rem;
-  --text-note: 0.8125rem;
-  --text-md: 0.9375rem;
-  --radius-xs: 4px;
-  --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 10px;
+     （恰好被某条工具类捎带上），不是承诺。既然插件 CSS 已经在用，就一并纳入契约。
+     **值是别名，不是字面值**：真值统一在第 1b 节的 --gw-*（主题统一化）——
+     写回字面值会让插件主题改了 --gw-radius-* 却在这条旧名字上不生效。 */
+  --text-3xs: var(--gw-text-3xs);
+  --text-2xs: var(--gw-text-2xs);
+  --text-note: var(--gw-text-note);
+  --text-md: var(--gw-text-md);
+  --radius-xs: var(--gw-radius-xs);
+  --radius-sm: var(--gw-radius-sm);
+  --radius-md: var(--gw-radius-md);
+  --radius-lg: var(--gw-radius-lg);
   /* 动效曲线。第 4 节的 `--ease-standard` 只在 `@theme inline` 里，**不进产物**，
      而插件界面已经开始做过渡（`@geewiki/ai-assistant` 的 dock 展开/收起）。曲线是
      宿主的设计决定，插件不该各抄一份——抄出来的那份会在宿主改曲线时悄悄与宿主不一致。
      与颜色同理：值只是"指向同一个曲线"，故深浅色、主题切换都不影响它。 */
-  --ease-standard: cubic-bezier(0.2, 0, 0.13, 1);
+  --ease-standard: var(--gw-ease-standard);
   /* 大位移专用（抽屉/面板的展开收起）。**不能拿上面两条凑**——两条都是给 150ms 的
      颜色变化与小位移调的，前段极陡：`--ease-standard` 在 25% 的时间里就走完了 50% 的
      距离、峰值速度是平均值的 2.9 倍（184px 的位移 ⇒ 单帧 37px）；`--ease-out`
@@ -588,7 +657,7 @@
      本条：峰值 1.6 倍（同样 184px/240ms ⇒ 单帧 20.5px，降 44%），
      25/50/75% 时间走过 35/70/92% 距离——起步仍然跟手（25% 走 35%），
      尾巴却不再"爬"，这是大位移读起来"丝滑"的关键。 */
-  --ease-move: cubic-bezier(0.15, 0.08, 0.5, 1);
+  --ease-move: var(--gw-ease-move);
 }
 
 /*
@@ -621,9 +690,9 @@
  * 的「行距至少为字号的 1.5 倍」；clreq 亦只要求「基字尺寸 1.5 倍以上」，故中文无需额外抬高。
  */
 @theme {
-  --spacing-gutter: 22px; /* 外壳左右内边距，与既有 styles.css 的 22px 对齐 */
-  --spacing-header: 56px; /* 顶栏高度，跳过链接与 sticky 定位都要用它 */
-  --spacing-measure: min(84rem, 92em); /* 正文行宽上限：14px 正文下 92em = 1288px。
+  --spacing-gutter: var(--gw-spacing-gutter); /* 外壳左右内边距，与既有 styles.css 的 22px 对齐 */
+  --spacing-header: var(--gw-spacing-header); /* 顶栏高度，跳过链接与 sticky 定位都要用它 */
+  --spacing-measure: var(--gw-spacing-measure); /* 正文行宽上限：14px 正文下 92em = 1288px。
                                 2026-09-13 第二版由 `min(70rem, 66em)`（924px）放宽 —— 用户选定
                                 "正文列吃满侧栏与目录之间的全部宽度、行宽上限同步放宽"。
                                 有右栏时它**不会生效**（正文列最宽 1278px，见 styles.css 的
@@ -648,7 +717,7 @@
   可读性硬指标（中文 50 字/行）一点没动。
 */
 @theme {
-  --spacing-wide: 1840px; /* 外壳上限（阅读态与扫描态同值）：1280 + 2×136，宽屏下把空白让给内容。
+  --spacing-wide: var(--gw-spacing-wide); /* 外壳上限（阅读态与扫描态同值）：1280 + 2×136，宽屏下把空白让给内容。
                              实际由 App.tsx 以同值内联样式施加（见那里的注释），
                              `test/contrastPlan.test.ts` 盯着两处必须同值。 */
 }
