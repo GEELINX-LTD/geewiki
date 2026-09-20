@@ -247,6 +247,21 @@ export interface GeeWikiMeta {
    */
   slots?: SlotName[]
   /**
+   * **声明本插件以哪种「模式」占用哪些扩展点**（界面扩展平台，P3 新增）。
+   *
+   * 与 `slots` 的关系：`slots: ['editor']` 等价于 `extensions: [{ node: 'editor', mode: 'extend' }]`
+   * ——`slots` 是"追加"这一种模式的简写，因此**继续完全有效**，不是弃用字段。
+   * 需要 `wrap`（包一层，不弄丢宿主控件）或 `replace`（整体接管）时才用本字段。
+   *
+   * 非法项（未知节点名、该节点不允许的模式）由管理器**忽略并告警**，不阻断激活——
+   * 与 `slots` 的既有口径一致（放宽键空间没有牺牲拼写错误的可见性）。
+   *
+   * 为什么模式必须显式声明而不是"贡献时就知道了"：`replace` 会让宿主的默认实现
+   * **整个不渲染**（无障碍、键盘可达的责任随之转移给插件）。这是必须由作者写下来的决定，
+   * 而不是运行期第一次渲染时才暴露的副作用。
+   */
+  extensions?: ExtDeclaration[]
+  /**
    * **声明本插件提供的页面路由**（F2 新增，见 {@link PluginRouteDecl}）。
    *
    * 为什么必须声明在清单里：入口表据此把该插件的产物标为**不可推迟**——
@@ -1214,9 +1229,11 @@ export interface HttpRouterService {
  * 不会把名字带进本文件作用域。
  */
 import type { CapabilityDecl, CapabilityName, PageVisibility, PluginPermission } from './domain.js'
+import type { ExtMode } from './extensions.js'
 import type { SlotDeclaration, SlotName } from './slots.js'
 
 export * from './slots.js'
+export * from './extensions.js'
 export * from './services.js'
 export * from './llm.js'
 export * from './domain.js'
@@ -1520,6 +1537,27 @@ export interface SlotContribution {
   readonly via: 'manifest' | 'runtime'
   readonly lazy: boolean
   readonly importPath?: string
+  /**
+   * 贡献模式（界面扩展平台，P3 新增）。
+   *
+   * **每个 `(owner, node)` 只有一条贡献**，模式是它的属性：同一个插件对同一个节点
+   * 既 `replace` 又 `extend` 在界面上无法解释（谁是宿主默认？），因此后登记的覆盖先前的，
+   * 并告警。缺省 `'extend'` ⇒ 既有行为逐字不变。
+   */
+  readonly mode: ExtMode
+}
+
+/**
+ * 清单里的一条扩展声明（`geewiki.extensions` 的条目）。
+ *
+ * 刻意与 {@link SlotContribution} 分开：这是**声明式**输入（插件写死在清单里，
+ * 可被静态检查、在插件代码跑起来之前就生效），而后者是注册表里登记后的记录。
+ */
+export interface ExtDeclaration {
+  /** 宿主节点 id（{@link HostNodeName}）或插件自定义扩展点（含 `/`） */
+  readonly node: SlotName
+  /** 占用模式；缺省 `'extend'` */
+  readonly mode?: ExtMode
 }
 
 /**
@@ -1551,6 +1589,24 @@ export interface SlotService {
    *   两者都不满足 ⇒ 忽略并告警（返回空操作注销函数）：这保住了"宿主插槽名写错有反馈"。
    */
   contribute(owner: string, slot: SlotName, meta?: SlotContributionMeta): () => void
+  /**
+   * 登记一条**指定模式**的扩展贡献（界面扩展平台，P3 新增）。
+   *
+   * `contribute()` 是本方法 `mode: 'extend'` 的简写；需要 `wrap` / `replace` 时必须走本方法
+   * （或清单里的 `geewiki.extensions`）。
+   *
+   * 拒绝并告警的情况（**不抛**，与 `contribute` 同风格）：
+   * - 节点名既不是宿主节点、也不是合法的自定义扩展点名（笔误可见）；
+   * - 节点**不允许**该模式（例如对 `app-header` 声明 `replace`）——宿主是唯一知道
+   *   "这个位置能不能被整体换掉"的一方，作者猜不到；
+   * - 插件自定义扩展点上的 `replace` / `wrap`：别的插件的扩展点契约由它自己定义，
+   *   宿主不为它背书。
+   *
+   * @param owner 贡献者（插件名）；管理器按此在卸载时定向注销
+   * @param node 宿主节点 id 或插件自定义扩展点名
+   * @param mode 占用模式；同一 `(owner, node)` 只有一条贡献，重复登记覆盖模式并告警
+   */
+  extend(owner: string, node: SlotName, mode: ExtMode, meta?: SlotContributionMeta): () => void
   /**
    * **声明一个插件自定义扩展点**（插件把自己的界面开放给别的插件扩展）。
    *

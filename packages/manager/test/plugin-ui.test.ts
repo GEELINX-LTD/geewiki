@@ -23,6 +23,7 @@ import {
   type UiStatFile,
 } from '../src/plugin-ui.js'
 import type { RegisteredPlugin } from '../src/deps.js'
+import type { ExtNodeAssignment } from '../src/slots.js'
 
 /* ------------------------------ 夹具 ------------------------------ */
 
@@ -404,6 +405,63 @@ test('slots：贡献者的 slots 字段计入 revision（否则 304 会隐藏"�
     onlyA.revision,
     onlyB.revision,
     '插槽归属变化必须改变 revision，否则前端 If-None-Match 会拿到 304 而静默沿用旧编辑器',
+  )
+})
+
+test('extNodes：非插槽节点的生效贡献下发；**不含插槽**（与 slots 互不重叠）且计入 revision', () => {
+  /*
+   * 前端拿 `slots ∪ extNodes` 做越权闸门（P12）。这里钉三件事：
+   * ① 缺省/空裁决 ⇒ 键不出现、revision 与改动前逐字节相同（既有部署不被平白触发全量重取）；
+   * ② 生效的非插槽节点出现在 `extNodes`，**插槽不重复出现在这里**（同一事实两份表示必然漂移）；
+   * ③ 归属变化必须改变 revision——否则 304 会隐藏"谁接管了这个节点"。
+   */
+  const stat = fakeStat({ '/p/a/dist/client.js': [1, 2], '/p/b/dist/client.js': [1, 2] })
+  const registry = [pluginOf('@t/a', { dir: '/p/a', client: {} }), pluginOf('@t/b', { dir: '/p/b', client: {} })]
+  const base = {
+    registry,
+    activeNames: new Set(['@t/a', '@t/b']),
+    webDist: '/w',
+    statFile: stat,
+    dirExists: anyDirExists,
+  }
+  const extNode = (node: string, owner: string): ExtNodeAssignment => ({
+    node,
+    kind: 'ui',
+    cardinality: 'single',
+    modes: ['extend', 'wrap', 'replace'],
+    propsVersion: 1,
+    owners: [owner],
+    effective: [{ owner, mode: 'replace', via: 'manifest', lazy: false }],
+    suppressed: [],
+    byMode: { replace: owner, extend: [] },
+    suppressedDetail: [],
+  })
+
+  const none = buildPluginUiTable(base)
+  assert.equal('extNodes' in (none.plugins['@t/a'] as object), false, '无贡献时不应出现 extNodes 键')
+  assert.equal(
+    none.revision,
+    buildPluginUiTable({ ...base, extAssignments: [] }).revision,
+    '空裁决结果不得改变 revision',
+  )
+
+  const withExt = buildPluginUiTable({
+    ...base,
+    // 同一次裁决里既有插槽（kind slot）又有非插槽节点：只有后者进 extNodes
+    slotAssignments: [{ slot: 'app-header', cardinality: 'multi', owners: ['@t/a'], effective: ['@t/a'], suppressed: [] }],
+    extAssignments: [
+      extNode('ui-button', '@t/a'),
+      { ...extNode('app-header', '@t/a'), kind: 'slot' },
+      { ...extNode('ui-card', '@t/b'), kind: 'slot' },
+    ],
+  })
+  assert.deepEqual(withExt.plugins['@t/a']?.extNodes, ['ui-button'], 'kind=slot 的裁决不得混进 extNodes')
+  assert.deepEqual(withExt.plugins['@t/a']?.slots, ['app-header'], '插槽仍由 slots 字段承担')
+  assert.equal(withExt.plugins['@t/b']?.extNodes, undefined, '未被列出的 owner 不应带 extNodes')
+  assert.notEqual(
+    withExt.revision,
+    none.revision,
+    '扩展节点归属变化必须改变 revision，否则 304 会让前端沿用旧的越权判据',
   )
 })
 
