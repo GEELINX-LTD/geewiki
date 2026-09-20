@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_LOCALE, isMessageKey } from '@geewiki/core/domain'
+import { DEFAULT_LOCALE, OVERRIDABLE_HOST_KEYS, isMessageKey } from '@geewiki/core/domain'
 import en from '../src/locales/en.json' with { type: 'json' }
 import zhCN from '../src/locales/zh-CN.json' with { type: 'json' }
 import {
@@ -152,4 +152,63 @@ test('★ F15：宿主与插件共用一套键空间 —— 插件不得提供�
 
   const good = checkPluginCatalog('@geewiki-plugin/demo', { 'plugin.demo.title': '演示' })
   assert.deepEqual(good, [])
+})
+
+/* --------------------------- P8：品牌文案可覆盖 --------------------------- */
+
+test('★ P8：品牌名走 t()，且插件可覆盖它（白名单内）；界面语义键仍被拒绝', () => {
+  /*
+   * 本目标的起点是"改左上角 geewiki 字样"。P5 给了 replace/wrap 的**结构**改法；
+   * P8 补上**文案**改法：`host.app.title` 在 `OVERRIDABLE_HOST_KEYS` 内，
+   * 插件在自己的文案目录里提供它即可（服务端 mergeCatalogs 放行、前端 catalogsNow
+   * 按「宿主 → 插件」顺序让插件值覆盖宿主值）。
+   *
+   * 反向对照必须同时存在：白名单**外**的宿主键仍然被拒绝——否则这条测试只证明了
+   * "插件能覆盖宿主文案"，而那是我们明确不要的（防"把'确认删除'改成'继续'"）。
+   */
+  assert.ok(
+    OVERRIDABLE_HOST_KEYS.includes('host.app.title'),
+    '品牌名必须在可覆盖白名单内（否则插件只能用 replace 节点改字样，改不了语言切换后的那份）',
+  )
+
+  // 白名单内的键：放行
+  const ok = checkPluginCatalog('@geewiki-plugin/brand', { 'host.app.title': 'Acme 知识库' })
+  assert.deepEqual(ok, [], `白名单内的宿主键应当被放行，实际被拒：${ok.join('；')}`)
+
+  // 白名单外的宿主键：仍然拒绝（反向对照）
+  const stillBad = checkPluginCatalog('@geewiki-plugin/brand', { 'host.app.tagline': '点我删除' })
+  assert.equal(stillBad.length, 1, '白名单外的宿主键必须仍被拒绝')
+  assert.match(stillBad[0]!, /host\.app\.tagline/)
+
+  // 非空洞：白名单不是空的，也不是"所有宿主键"
+  assert.ok(OVERRIDABLE_HOST_KEYS.length >= 1)
+  assert.ok(
+    OVERRIDABLE_HOST_KEYS.length < hostKeys.length,
+    '白名单不得等于全部宿主键（那就等于取消了命名空间强制）',
+  )
+})
+
+test('★ P8：白名单里每个键都必须在源码里真的被渲染（否则插件会"声明成功、界面毫无变化"）', () => {
+  /*
+   * 准入纪律见 `packages/core/src/domain.ts` 的 `OVERRIDABLE_HOST_KEYS` 注释：
+   * 允许一个宿主从不渲染的键，等于给插件一个静默无效的旋钮。这里用与
+   * "源码里出现的 host.* 键必须存在" 同一套扫描方式做**反向**检查。
+   */
+  const files: string[] = []
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name)
+      if (statSync(full).isDirectory()) walk(full)
+      else if (/\.tsx?$/.test(name)) files.push(full)
+    }
+  }
+  walk(WEB_SRC)
+  const source = files.map((f) => readFileSync(f, 'utf8')).join('\n')
+
+  for (const key of OVERRIDABLE_HOST_KEYS) {
+    assert.ok(
+      source.includes(`t('${key}')`) || source.includes(`t("${key}")`),
+      `${key} 在白名单里但源码里没有 t('${key}') —— 插件覆盖它不会有任何可见效果`,
+    )
+  }
 })

@@ -32,7 +32,7 @@ import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from
 import { Badge, Button, Card, CardBody, CardHeader, ErrorNotice, ErrorState, Input, LoadingState } from '../ui'
 import { api } from '../api'
 import { useAuth } from '../lib/authStore'
-import { AccountIdentitiesSlotOutlet } from '../lib/slots'
+import { AccountIdentitiesSlotOutlet, Ext } from '../lib/slots'
 import { ensureSlotLoaded } from '../lib/pluginUi'
 
 /** 后端 `PASSWORD_MIN`（`packages/plugin-auth/src/index.ts`）：前后端各持一份，改后端时必须同步 */
@@ -205,6 +205,8 @@ export function AccountPage(): ReactNode {
     <div className="mx-auto flex w-full max-w-[40rem] flex-col gap-4 py-6">
       <h1 className="m-0 text-lg font-semibold text-ink">账号</h1>
 
+      {/* ★ P6：「资料」卡是一个宿主节点（`account-profile`）——三种模式都开 */}
+      <Ext id="account-profile">
       <Card>
         <CardHeader
           title="资料"
@@ -270,6 +272,7 @@ export function AccountPage(): ReactNode {
           </form>
         </CardBody>
       </Card>
+      </Ext>
 
       <Card>
         <CardHeader title="本地密码" description="用邮箱与密码登录这个账号" />

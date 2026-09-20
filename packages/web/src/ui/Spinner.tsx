@@ -10,8 +10,9 @@
  */
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
-export function Spinner({ className, label }: { className?: string; label?: string }): ReactNode {
+function SpinnerBase({ className, label }: { className?: string; label?: string }): ReactNode {
   const ring = (
     <span
       className={cn(
@@ -28,3 +29,6 @@ export function Spinner({ className, label }: { className?: string; label?: stri
     </span>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const Spinner = withExt('ui-spinner', SpinnerBase)

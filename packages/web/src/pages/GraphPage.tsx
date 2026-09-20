@@ -22,6 +22,9 @@ import { describeError, errorLine } from '../lib/errorText'
 import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
 import { syncPluginUi, subscribePluginUiState, pluginUiState } from '../lib/pluginUi'
+import { Ext } from '../lib/slots'
+import { themeContrastIssues } from '../lib/pluginTheme'
+import { AA_TEXT_MIN } from '../lib/contrastPlan'
 import { classifyUiSkips, UI_SKIP_HELP, UI_SKIP_LABEL } from '../lib/pluginUiPlan'
 import {
   descriptionOf,
@@ -738,6 +741,8 @@ export function GraphPage(): ReactNode {
   const pluginToShow = plugins?.find((p) => p.name === configFor) ?? null
   /** 入口表跳过项按严重度分组：`attention` 是本该可见却没出现（或清单有问题），`normal` 是设计使然 */
   const uiSkips = classifyUiSkips(uiState.skipped)
+  /** ★ P10：主题贡献里低于 AA 的对比度组合（渲染期现算，见下面告警块的注释） */
+  const themeIssues = themeContrastIssues()
   const rowBusyOf = (name: string): RowAction | null => (busyRow?.name === name ? busyRow.action : null)
 
   return (
@@ -753,6 +758,8 @@ export function GraphPage(): ReactNode {
             那根线；它的直接依赖清单在弹窗里仍完整列出。
           </p>
         </div>
+        {/* ★ P6：插件管理页的工具条是一个宿主节点（`graph-toolbar`）——刷新与全局操作区 */}
+        <Ext id="graph-toolbar">
         <div className="flex shrink-0 items-center gap-2">
           {notice && (
             <span
@@ -775,6 +782,7 @@ export function GraphPage(): ReactNode {
             刷新
           </Button>
         </div>
+        </Ext>
       </header>
 
       {/* ---------- 需要用户注意的问题（保留既有四个专门区块，换新原语） ---------- */}
@@ -826,6 +834,45 @@ export function GraphPage(): ReactNode {
                     {UI_SKIP_LABEL[item.reason]}
                   </Badge>
                   <div className="text-xs text-muted">{UI_SKIP_HELP[item.reason]}</div>
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      )}
+
+      {/*
+        ★ P10：主题贡献的对比度告警。
+        与上面两块的区别：这里**不是故障**，是一个"能用但读起来费劲"的取舍——
+        故用 warn 色但措辞克制，且**不阻断注册**（设计文档 §7.4：糟糕主题的最终判据是运维）。
+        为什么要在这里显示：插件把 `--gw-ink` 改成浅灰之后，用户只会看到"字看不清"，
+        既不知道是谁干的、也没有任何出口——这条告警就是那个出口。
+        读数在渲染期现算：GraphPage 已订阅插件 UI 状态（`subscribePluginUiState`），
+        插件主题注册/卸载会触发重渲染，故不需要第二套订阅。
+      */}
+      {themeIssues.length > 0 && (
+        <Card className="border-warn-line bg-warn-bg">
+          <CardHeader
+            as="h2"
+            title={
+              <span className="flex items-center gap-1.5 text-warn-ink">
+                <AlertTriangle className="size-3.5" aria-hidden="true" />
+                有 {themeIssues.length} 处主题配色对比度低于 {AA_TEXT_MIN}:1
+              </span>
+            }
+            description="WCAG 2.2 SC 1.4.3 AA 要求正文文字与背景的对比度不低于 4.5:1。这些主题仍然生效（宿主不替运维决定），但正文可能读起来费劲。"
+          />
+          <CardBody>
+            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              {themeIssues.map((issue) => (
+                <li key={`${issue.owner}:${issue.mode}:${issue.text}:${issue.background}`}>
+                  <span className="text-xs font-medium text-ink">{issue.name}</span>
+                  <Badge tone="warn" className="ml-2">
+                    {issue.mode === 'dark' ? '深色' : '浅色'} {issue.ratio.toFixed(2)}:1
+                  </Badge>
+                  <div className="font-mono text-2xs text-muted">
+                    {issue.text} 落在 {issue.background} 上（要求 ≥ {issue.required}:1）
+                  </div>
                 </li>
               ))}
             </ul>

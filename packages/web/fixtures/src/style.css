@@ -1,14 +1,21 @@
 /* 夹具自带样式：验证「插件 CSS 由宿主集中注入 <link>」这条路径（lib 模式不会自动注入样式） */
+/*
+  ⚠️ P10：颜色**只能**经 `var(--gw-*)` 取（此处带回退值，因为插件不假定宿主 token 一定存在；
+  名字存在性由 `packages/web/test/fixtureTokens.test.ts` 守卫）。原先这里是硬编码的
+  `#3b82f6` / `#eff6ff` / `#1d4ed8`：深色模式下它不会变、主题插件覆盖 `--gw-*` 时它也不跟着变，
+  而且对比度告警（`themeContrastIssues`）看不见它。硬编码守卫见
+  `packages/web/test/pluginCssGuard.test.ts`。
+*/
 .gw-fixture-widget {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   margin-left: 10px;
   padding: 2px 10px;
-  border: 1px solid #3b82f6;
+  border: 1px solid var(--gw-accent-soft-line, #bfdbfe);
   border-radius: 999px;
-  background: #eff6ff;
-  color: #1d4ed8;
+  background: var(--gw-accent-soft, #eff6ff);
+  color: var(--gw-accent-soft-ink, #1d4ed8);
   font-size: 12px;
   line-height: 20px;
 }
@@ -34,4 +41,22 @@
 
 .gw-fixture-throw {
   text-decoration: underline;
+}
+
+/* P12：`wrap shell-brand-text` 演示件的样式（同样只经 --gw-* 取色，见文件头说明） */
+.gw-fixture-brand {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.gw-fixture-brand-tag {
+  padding: 0 4px;
+  border: 1px solid var(--gw-accent-soft-line, #bfdbfe);
+  border-radius: 4px;
+  background: var(--gw-accent-soft, #eff6ff);
+  color: var(--gw-accent-soft-ink, #1d4ed8);
+  font-size: 10px;
+  line-height: 14px;
+  vertical-align: super;
 }

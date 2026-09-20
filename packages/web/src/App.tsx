@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { Button } from './ui/Button'
 import { ErrorState, SkeletonTable } from './ui'
+import { t } from './lib/i18n'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -36,7 +37,7 @@ import { pluginUiRoutes, subscribePluginUiState } from './lib/pluginUi'
 import { PluginRouteOutlet, registeredRoute, useRouteEntries } from './lib/routes'
 import { applyTheme, readStoredTheme, resolveTheme, storeTheme, type ThemeChoice } from './lib/theme'
 import { AppDock } from './components/AppDock'
-import { SlotOutlet } from './lib/slots'
+import { Ext, NestedSlotOutlet } from './lib/slots'
 import { useDocumentTitle } from './lib/useDocumentTitle'
 import { AccessPage } from './pages/AccessPage'
 import { OrgPage } from './pages/OrgPage'
@@ -569,6 +570,15 @@ export function App(): ReactNode {
         跳到主内容
       </a>
 
+      {/*
+        ★ P11：顶栏是宿主节点 `shell-header`（replace / wrap / extend 全开），
+        但它**只覆盖顶栏内容**（品牌、导航、搜索 / 外观 / 身份区）——`<header>` 元素本身与
+        `app-header` 插槽出口**由宿主独占**，见下面的 `NestedSlotOutlet`。
+        这条边界是被用户当场驳回后定下的：`replace` 若接管整棵子树，单个插件就能删掉其他
+        所有插件在页头的贡献。现在它只能决定那些贡献**落在哪**（`props.slots['app-header']`），
+        结构上不可能删掉它们（`packages/core/src/extensions.ts` 的"容器节点"一节）。
+        `Ext` 在**没有贡献时直接返回 children**，故下面的 DOM 与接线前逐字一致。
+      */}
       <header
         className={cn(
           /*
@@ -584,123 +594,92 @@ export function App(): ReactNode {
           'shadow-[var(--gw-header-shadow)] sm:gap-6',
         )}
       >
-        {/* 品牌：可点回首页。用 <a href="#/wiki"> 而非带 onClick 的 div——
-            链接有原生语义（可中键新开、可被屏幕阅读器识别为链接） */}
-        <a
-          href="#/wiki"
-          className={cn(
-            // py-0.5 让点击区达到 24px 高（WCAG 2.5.8 触控目标下限）：
-            // 品牌链接是独立链接、不在句子里，不适用"内联目标"豁免
-            'flex shrink-0 items-baseline gap-2 rounded-sm py-0.5 no-underline',
-            focusRing,
-          )}
-        >
-          <span aria-hidden="true" className="self-center text-accent">
-            <BookText className="size-5" />
-          </span>
-          <span className="text-wordmark leading-none font-bold tracking-[0.3px] text-header-ink">GeeWiki</span>
-        </a>
-
-        {/* 主导航（≥md 显示）。窄屏折叠进右侧的「菜单」下拉 */}
-        <nav aria-label="主导航" className="hidden flex-1 items-center gap-1 md:flex">
-          <NavTab item={WIKI_ITEM} active={active === WIKI_ITEM.id} onNavigate={nav} />
+        <Ext id="shell-header">
           {/*
-            F2：声明 `group: 'main'` 的插件页面与「知识库」平级。
-            判据同样是 `visibleDests`（`requires` 缺省 = 所有人可见，含未登录）——
-            插件页面因此可以既是匿名可读的公开页，也可以是要 `administer` 的台面页。
-          */}
-          {pluginDestsToNavItems(
-            visibleDests(
-              pluginNavDests(declaredRoutes).filter((d) => d.group === 'main'),
-              auth.capabilities,
-            ),
-          ).map((item) => (
-            <NavTab key={item.id} item={item} active={active === item.id} onNavigate={nav} />
-          ))}
+            品牌：可点回首页。用 <a href="#/wiki"> 而非带 onClick 的 div——
+            链接有原生语义（可中键新开、可被屏幕阅读器识别为链接）。
 
-          {/*
-            运维台面入口。**`adminDests` 为空时整个下拉不渲染** —— 这正是本次要修的
-            缺陷："无权的「管理 ▾」仍会渲染"。空下拉比不渲染更坏：它在告诉访客
-            "这里有个你进不去的运维面"。
+            ★ P5：这一整块是宿主节点 `shell-brand`（replace / wrap / extend 三种模式都开放）。
+            `replace` 的插件要对**整块品牌标记**负责（含链接语义与焦点环）——这是"换个牌子"的正规入口；
+            只想改字样的插件用下面的 `shell-brand-text`，不必重写整个链接。
           */}
-          {adminDests.length > 0 && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  className={cn(
-                    'inline-flex h-8 items-center gap-1.5 rounded-md px-4 text-sm',
-                    'transition-colors duration-150 ease-standard',
-                    adminActive
-                      ? 'bg-header-active font-semibold text-header-ink'
-                      : 'text-header-dim hover:bg-header-hover hover:text-header-ink',
-                    focusRing,
-                  )}
-                >
-                  <MonitorSmartphone className="size-4" aria-hidden="true" />
-                  管理
-                  <span aria-hidden="true" className="text-3xs opacity-70">
-                    ▾
-                  </span>
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent>
-                <DropdownMenuLabel>运维台面</DropdownMenuLabel>
-                <NavMenuItems
-                  dests={adminDests}
-                  active={active}
-                  nav={nav}
-                  onOpenStatus={() => setStatusOpen(true)}
-                />
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-        </nav>
-
-        <div className="ml-auto flex items-center gap-1">
-          {/* 搜索入口：窄屏也保留（它是产品主功能），并提示快捷键。
-              点击 = 打开命令面板（与 ⌘K 同一入口），而不是"跳到列表页再聚焦搜索框" */}
-          <Button
-            variant="ghost"
-            size="sm"
-            icon={<Search className="size-4" />}
-            onClick={openPalette}
-            className="hidden text-header-dim hover:bg-header-hover hover:text-header-ink sm:inline-flex"
-            aria-label="打开命令面板（快捷键 ⌘K 或 /）"
-            aria-haspopup="dialog"
-            title="搜索页面或执行命令（⌘K 或 /）"
-          >
-            搜索
-          </Button>
-          <ThemeToggle key={themeEpoch} />
-          {/* 身份区（P1）：登录入口 / 当前身份与登出 */}
-          <AuthArea auth={auth} active={active} nav={nav} />
-          {/* 窄屏导航降级：把全部目的地收进一个菜单 */}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="sm"
-                iconOnly
-                icon={<MenuIcon className="size-4" />}
-                aria-label="打开导航菜单"
-                className="text-header-dim hover:bg-header-hover hover:text-header-ink md:hidden"
-              />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem active={active === WIKI_ITEM.id} onSelect={() => nav(WIKI_ITEM.id)}>
-                {WIKI_ITEM.icon}
-                {WIKI_ITEM.label}
-              </DropdownMenuItem>
+          <Ext id="shell-brand">
+            <a
+              href="#/wiki"
+              className={cn(
+                // py-0.5 让点击区达到 24px 高（WCAG 2.5.8 触控目标下限）：
+                // 品牌链接是独立链接、不在句子里，不适用"内联目标"豁免
+                'flex shrink-0 items-baseline gap-2 rounded-sm py-0.5 no-underline',
+                focusRing,
+              )}
+            >
+              <span aria-hidden="true" className="self-center text-accent">
+                <BookText className="size-5" />
+              </span>
               {/*
-                与桌面端**同一判据**（同一个 `adminDests`）：无可见的运维目的地时，
-                连分组标题与「系统状态」都不出现。窄屏曾经是这段清单的**复制粘贴**，
-                两处各自演化正是"桌面看不到、窄屏却看得到"的来源 —— 现在两处都走
-                `NavMenuItems` 这一个渲染函数。
+                ★ P5：品牌**字样**是独立节点 `shell-brand-text`。
+                为什么把"整块链接"与"这串字"分成两个节点：最常见的需求是"改掉左上角那串字"，
+                而为此替换整块 `<a>` 会连带丢掉链接与图标语义——窄节点让责任与需求对齐。
+
+                ★ P8：字样走 `t('host.app.title')`，于是它同时有**三条**正规改法，按侵入性递增：
+                ① 换语言（locale catalog 里改这一条）；② 插件用 `registerExtension` replace/wrap
+                这个节点；③ 插件在**自己的**文案目录里提供 `host.app.title`——该键在
+                `OVERRIDABLE_HOST_KEYS`（`packages/core/src/domain.ts`）白名单内，是宿主**唯一**
+                允许插件覆盖的文案键（其余宿主键仍被拒绝，理由见那里的注释）。
+                三条路都不需要插件去改 DOM 或注入全局 CSS。
               */}
-              {adminDests.length > 0 && (
-                <>
-                  <DropdownMenuSeparator />
+              <Ext id="shell-brand-text">
+                <span className="text-wordmark leading-none font-bold tracking-[0.3px] text-header-ink">
+                  {t('host.app.title')}
+                </span>
+              </Ext>
+            </a>
+          </Ext>
+
+          {/* 主导航（≥md 显示）。窄屏折叠进右侧的「菜单」下拉 */}
+          <nav aria-label="主导航" className="hidden flex-1 items-center gap-1 md:flex">
+            <NavTab item={WIKI_ITEM} active={active === WIKI_ITEM.id} onNavigate={nav} />
+            {/*
+              F2：声明 `group: 'main'` 的插件页面与「知识库」平级。
+              判据同样是 `visibleDests`（`requires` 缺省 = 所有人可见，含未登录）——
+              插件页面因此可以既是匿名可读的公开页，也可以是要 `administer` 的台面页。
+            */}
+            {pluginDestsToNavItems(
+              visibleDests(
+                pluginNavDests(declaredRoutes).filter((d) => d.group === 'main'),
+                auth.capabilities,
+              ),
+            ).map((item) => (
+              <NavTab key={item.id} item={item} active={active === item.id} onNavigate={nav} />
+            ))}
+
+            {/*
+              运维台面入口。**`adminDests` 为空时整个下拉不渲染** —— 这正是本次要修的
+              缺陷："无权的「管理 ▾」仍会渲染"。空下拉比不渲染更坏：它在告诉访客
+              "这里有个你进不去的运维面"。
+            */}
+            {adminDests.length > 0 && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className={cn(
+                      'inline-flex h-8 items-center gap-1.5 rounded-md px-4 text-sm',
+                      'transition-colors duration-150 ease-standard',
+                      adminActive
+                        ? 'bg-header-active font-semibold text-header-ink'
+                        : 'text-header-dim hover:bg-header-hover hover:text-header-ink',
+                      focusRing,
+                    )}
+                  >
+                    <MonitorSmartphone className="size-4" aria-hidden="true" />
+                    管理
+                    <span aria-hidden="true" className="text-3xs opacity-70">
+                      ▾
+                    </span>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
                   <DropdownMenuLabel>运维台面</DropdownMenuLabel>
                   <NavMenuItems
                     dests={adminDests}
@@ -708,27 +687,105 @@ export function App(): ReactNode {
                     nav={nav}
                     onOpenStatus={() => setStatusOpen(true)}
                   />
-                </>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </nav>
 
-        {/* 插件插槽：已激活插件可在此贡献界面（见 lib/slots.tsx 与 lib/pluginUi.ts） */}
-        <SlotOutlet name="app-header" />
+          <div className="ml-auto flex items-center gap-1">
+            {/* 搜索入口：窄屏也保留（它是产品主功能），并提示快捷键。
+                点击 = 打开命令面板（与 ⌘K 同一入口），而不是"跳到列表页再聚焦搜索框" */}
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<Search className="size-4" />}
+              onClick={openPalette}
+              className="hidden text-header-dim hover:bg-header-hover hover:text-header-ink sm:inline-flex"
+              aria-label="打开命令面板（快捷键 ⌘K 或 /）"
+              aria-haspopup="dialog"
+              title="搜索页面或执行命令（⌘K 或 /）"
+            >
+              搜索
+            </Button>
+            {/* ★ P11：外观切换控件是宿主节点 `shell-theme-toggle`。
+                插件可以整体换掉这个控件（`replace`），也可以给它加角标（`wrap`）；
+                宿主默认实现仍是浅 / 深切换按钮，插件缺席时行为不变。
+                `key={themeEpoch}` 的重挂载语义**照旧**（见上面的 themeEpoch 注释）。 */}
+            <Ext id="shell-theme-toggle">
+              <ThemeToggle key={themeEpoch} />
+            </Ext>
+            {/* 身份区（P1）：登录入口 / 当前身份与登出 */}
+            <AuthArea auth={auth} active={active} nav={nav} />
+            {/* 窄屏导航降级：把全部目的地收进一个菜单 */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  iconOnly
+                  icon={<MenuIcon className="size-4" />}
+                  aria-label="打开导航菜单"
+                  className="text-header-dim hover:bg-header-hover hover:text-header-ink md:hidden"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem active={active === WIKI_ITEM.id} onSelect={() => nav(WIKI_ITEM.id)}>
+                  {WIKI_ITEM.icon}
+                  {WIKI_ITEM.label}
+                </DropdownMenuItem>
+                {/*
+                  与桌面端**同一判据**（同一个 `adminDests`）：无可见的运维目的地时，
+                  连分组标题与「系统状态」都不出现。窄屏曾经是这段清单的**复制粘贴**，
+                  两处各自演化正是"桌面看不到、窄屏却看得到"的来源 —— 现在两处都走
+                  `NavMenuItems` 这一个渲染函数。
+                */}
+                {adminDests.length > 0 && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuLabel>运维台面</DropdownMenuLabel>
+                    <NavMenuItems
+                      dests={adminDests}
+                      active={active}
+                      nav={nav}
+                      onOpenStatus={() => setStatusOpen(true)}
+                    />
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+
+        {/*
+          内层插槽出口：**由宿主渲染、且刻意留在 `shell-header` 节点之外**。
+          它在容器内部 ⇒ 顶栏被 `replace` 时，其他插件在页头的贡献仍然照常渲染；
+          贡献者若想把它摆进自己的标记里，渲染 `props.slots['app-header']` 即可
+          （宿主在绘制前搬运，见 lib/slots.tsx 的 `NestedSlotOutlet` / `ExtSlotMount`）。
+        */}
+        </Ext>
+        <NestedSlotOutlet node="shell-header" slot="app-header" />
       </header>
 
-      {/* 系统状态对话框（受控，见上面的 statusOpen 注释） */}
-      <SystemStatusDialog open={statusOpen} onOpenChange={setStatusOpen} />
+      {/* 系统状态对话框（受控，见上面的 statusOpen 注释）
+          ★ P11：它是宿主节点 `shell-status-dialog`。这也正是"portal 类组件不接 `ui-*`
+          节点"的补偿路径（见 packages/core/src/extensions.ts 的 UiNodeName 注释）：
+          要自定义对话框外观，替换**使用它的那个宿主节点**，而不是替换 Dialog 原语。 */}
+      <Ext id="shell-status-dialog">
+        <SystemStatusDialog open={statusOpen} onOpenChange={setStatusOpen} />
+      </Ext>
 
-      {/* 命令面板（受控）：⌘K / Ctrl+K / `/` 或点击顶栏「搜索」打开 */}
-      <CommandPalette
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onNavigate={nav}
-        onToggleTheme={toggleTheme}
-        restoreFocusTo={paletteReturnFocus}
-      />
+      {/* 命令面板（受控）：⌘K / Ctrl+K / `/` 或点击顶栏「搜索」打开
+          ★ P11：它是宿主节点 `shell-command-palette`。`replace` 者要自己负责
+          "受控开关 + 焦点归还"（宿主把 `paletteOpen` 提升到 App 层就是为了两个触发点，
+          见上面的注释）；只加命令的插件不必碰它，用 `registerTool` 即可。 */}
+      <Ext id="shell-command-palette">
+        <CommandPalette
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          onNavigate={nav}
+          onToggleTheme={toggleTheme}
+          restoreFocusTo={paletteReturnFocus}
+        />
+      </Ext>
 
       {/*
         主内容区：`id="main"` 是「跳到主内容」的目标；`tabIndex={-1}` 让锚点跳转后
@@ -751,13 +808,22 @@ export function App(): ReactNode {
       </main>
 
       {/*
-        页脚只作为 app-footer 插槽的宿主：没有插件贡献界面时整条**不占位**。
+        页脚：`<footer class="app-footer">` **由宿主独占**——没有插件贡献界面时整条**不占位**。
         保留 `app-footer` 这个类名，是因为该行为由 styles.css 里的
         `.app-footer:has(> .slot-outlet[data-count='0']:only-child){display:none}` 实现
         （legacy 层），在这里重复实现会分散这条规则的所有权。
+
+        ★ P11：页脚**内容**是宿主节点 `shell-footer`（replace / wrap / extend 全开），
+        而 `<footer>` 元素与 `app-footer` 插槽出口**由宿主独占**——与顶栏同一条"容器节点"规则
+        （core 的 `nestedSlots`）：单个插件的 `replace` 不可能删掉其他插件在页脚的贡献。
+        上面那条 CSS 契约因此**逐字成立**：无贡献时 footer 的唯一子元素仍是那个 `.slot-outlet`
+        （`shellChromeExt.test.ts` 用 SSR 钉住）；一旦有贡献，`extend` 的追加落在节点之后、
+        而节点就在 footer **内部**，故 footer 自然显形。
       */}
       <footer className="app-footer">
-        <SlotOutlet name="app-footer" />
+        {/* 宿主默认内容为空：页脚的全部内容都由 `shell-footer` 节点与 `app-footer` 插槽贡献 */}
+        <Ext id="shell-footer">{null}</Ext>
+        <NestedSlotOutlet node="shell-footer" slot="app-footer" />
       </footer>
 
       {/*

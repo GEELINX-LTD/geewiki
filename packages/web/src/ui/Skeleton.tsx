@@ -12,8 +12,9 @@
  */
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
-export function Skeleton({ className }: { className?: string }): ReactNode {
+function SkeletonBase({ className }: { className?: string }): ReactNode {
   return (
     <span
       aria-hidden="true"
@@ -47,3 +48,6 @@ export function SkeletonTable({ rows = 4, cols = 4 }: { rows?: number; cols?: nu
     </div>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const Skeleton = withExt('ui-skeleton', SkeletonBase)

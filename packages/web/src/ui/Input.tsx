@@ -12,13 +12,14 @@
 import type { InputHTMLAttributes, ReactNode, Ref, TextareaHTMLAttributes } from 'react'
 import { cn } from './cn'
 import { focusRing } from './a11y'
+import { withExt } from '../lib/slots'
 
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   /** 校验失败：加红边 + `aria-invalid` */
   invalid?: boolean
 }
 
-export function Input({ className, invalid, ...rest }: InputProps): ReactNode {
+function InputBase({ className, invalid, ...rest }: InputProps): ReactNode {
   return (
     <input
       aria-invalid={invalid || undefined}
@@ -46,7 +47,7 @@ export function Input({ className, invalid, ...rest }: InputProps): ReactNode {
  * 于是调用方在文本域上写 `rows`/`onKeyDown` 时事件类型对不上
  * （本仓库接入管理台时实测报 TS2322）。
  */
-export function Textarea({
+function TextareaBase({
   className,
   invalid,
   ...rest
@@ -76,3 +77,7 @@ export function Textarea({
     />
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const Input = withExt('ui-input', InputBase)
+export const Textarea = withExt('ui-textarea', TextareaBase)

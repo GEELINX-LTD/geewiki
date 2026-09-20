@@ -114,6 +114,17 @@ test('parseUiTable：css 可缺省', () => {
   assert.deepEqual(parsed?.entries['wiki'], { entry: 'client.js', rev: 'r' })
 })
 
+test('parseUiTable：extNodes 从宽解析（它是非插槽节点的越权判据，坏了不该让整条界面消失）', () => {
+  const parsed = parseUiTable(
+    table({ wiki: { entry: 'client.js', rev: 'r', extNodes: ['ui-button', 'ui-button', 'bad name', 42] } }),
+  )
+  assert.deepEqual(parsed?.entries['wiki']?.extNodes, ['ui-button'], '去重、丢弃非法名')
+  // 非数组 ⇒ 按缺省处理（与 slots 同一条从宽规则），不拖垮整条
+  const lenient = parseUiTable(table({ wiki: { entry: 'client.js', rev: 'r', extNodes: 'boom' } }))
+  assert.equal(lenient?.entries['wiki']?.extNodes, undefined)
+  assert.equal(lenient?.entries['wiki']?.entry, 'client.js', '坏字段不得让整条条目消失')
+})
+
 test('parseUiTable：整体不可信时返回 undefined（调用方据此既不加载也不卸载）', () => {
   const bad: unknown[] = [
     null,
@@ -392,6 +403,37 @@ test('parseSuppressedOwners：响应不可信时返回 undefined（调用方据�
   assert.equal(parseSuppressedOwners(null), undefined)
   assert.equal(parseSuppressedOwners([]), undefined)
   assert.equal(parseSuppressedOwners({ ok: true }), undefined, 'slots 不是数组 ⇒ 不可信')
+  assert.equal(
+    parseSuppressedOwners({ slots: [], extensions: 'boom' }),
+    undefined,
+    'extensions 存在但不是数组 ⇒ 同样不可信（缺省才是"后端版本较旧"，那是允许的）',
+  )
+})
+
+test('parseSuppressedOwners：也读 extensions（非插槽节点的抑制，P12）', () => {
+  /*
+   * 只读 `slots` 会让"两个插件抢同一个 `ui-button`"里的被抑制者蒙混过关：
+   * 前端照样注册，而 `Ext` 按注册顺序取第一个 ⇒ 可能渲染出后端判为被抑制的那一个。
+   * 两类节点的键空间相同（都是节点名），故合并进同一张表。
+   */
+  const map = parseSuppressedOwners({
+    ok: true,
+    slots: [{ slot: 'editor', suppressed: ['@loser'] }],
+    extensions: [
+      { node: 'ui-button', kind: 'ui', effective: [{ owner: '@a' }], suppressed: ['@b'] },
+      { node: 'app-header', kind: 'slot', suppressed: [] },
+      { node: 'bad name', suppressed: ['@x'] },
+    ],
+  })
+  assert.ok(map)
+  assert.deepEqual([...(map.get('editor') ?? [])], ['@loser'])
+  assert.deepEqual([...(map.get('ui-button') ?? [])], ['@b'], '非插槽节点的抑制必须被读出')
+  assert.equal(map.get('app-header'), undefined, '无抑制者不出现')
+  assert.equal(map.has('bad name' as never), false, '非法节点名逐条丢弃')
+  // 兼容性：后端版本较旧、没有 extensions 字段时，行为与改动前逐字一致
+  const legacy = parseSuppressedOwners({ ok: true, slots: [{ slot: 'editor', suppressed: ['@loser'] }] })
+  assert.ok(legacy)
+  assert.deepEqual([...(legacy.get('editor') ?? [])], ['@loser'])
 })
 
 test('parseSuppressedOwners：未知插槽名与坏 owner 逐条丢弃，不影响其它条目', () => {

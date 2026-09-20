@@ -1,7 +1,9 @@
-import { registerSlotByName, type AnySlotComponent } from './slots'
+import { registerExtensionByName, registerSlotByName, type AnySlotComponent } from './slots'
 import { registerRoute, unregisterRoutes, type PluginRouteProps } from './routes'
 import { hostSdk, type GeeWikiHostSdk } from './hostSdk'
 import { errorDetail } from './errorText'
+import type { ExtMode } from '@geewiki/core/extensions'
+import { isBuiltinSlotName } from '@geewiki/core/slots'
 import type { ComponentType } from 'react'
 import {
   PLUGIN_UI_TABLE_PATH,
@@ -55,6 +57,25 @@ export interface PluginUiHost {
   readonly React: unknown
   readonly jsxRuntime: { jsx: unknown; jsxs: unknown; Fragment: unknown }
   registerSlot(name: string, component: AnySlotComponent): () => void
+  /**
+   * **以指定模式往宿主节点贡献界面**（P12 新增到受限宿主上）。
+   *
+   * ## 为什么必须补上它（这是一个真缺陷，不是"更全的 API"）
+   * `registerExtension` 早就在**全局 SDK**（`window.__GEEWIKI_HOST__`）上了，但受限宿主
+   * ——也就是 bundle 的 `export function register(host)` 拿到的那个对象——**只有 `registerSlot`**。
+   * 于是走这条**正规形态**的插件（本仓的示例 `plugins/ui-demo` 就是）**根本用不了**
+   * `replace` / `wrap` / `shadow`，只能用默认的 `extend`；而改用全局 SDK 直接注册虽然能带模式，
+   * 却有两个代价：注册来源是 `'host-sdk'`（**卸载时无法按 owner 回收**，插件停用后贡献会残留），
+   * 且完全绕过下面两道越权闸门。两个形态各缺一半，等于"带模式注册"没有一条既受管辖、
+   * 又能被回收的路。
+   *
+   * 现在这条路径：来源 = 插件名（卸载即回收）、过同一套闸门、`opts.shadow` 与全局 SDK 同义。
+   */
+  registerExtension(
+    node: string,
+    component: AnySlotComponent,
+    opts?: { readonly mode?: ExtMode; readonly shadow?: boolean },
+  ): () => void
   unregisterSlot(name: string, token?: unknown): void
   /**
    * 把 markdown 渲染成**已消毒**的 HTML（宿主 `lib/sanitize.ts` 的同一条管线）。
@@ -80,6 +101,118 @@ export interface PluginUiHost {
 interface PluginUiModule {
   register?: (host: PluginUiHost) => unknown
   default?: unknown
+}
+
+/**
+ * {@link createPluginUiHost} 的上下文（P12 抽出）。
+ *
+ * 为什么把它抽成显式参数而不是继续闭包捕获模块状态：越权闸门是**最容易写错、且错了完全静默**
+ * 的一段（漏拦的后果是"后端说 A 生效、界面却渲染了 B"）。内联在 `loadPluginUi` 里就只能靠
+ * E2E 覆盖；抽出来之后单测可以拿假 `meta` / 假 `suppressed` 把每条闸门走一遍。
+ */
+export interface PluginUiHostContext {
+  /** 插件名。同时作为注册来源（`source`）——卸载时靠它按 owner 回收贡献 */
+  readonly name: string
+  /** 宿主 SDK（`React` / `jsxRuntime` / `renderMarkdown` / `unregisterSlot` 都转发自它） */
+  readonly sdk: GeeWikiHostSdk
+  /** 该插件在入口表里的条目（生效插槽 / 生效扩展节点 / 生效路由的真源） */
+  readonly meta: UiTableEntry
+  /** 被后端抑制的声明者（插槽与扩展节点**共用同一份**解析结果） */
+  readonly suppressed: SuppressedOwners
+  /** 收集本插件注册产生的注销函数（卸载时统一执行） */
+  readonly disposers: Array<() => void>
+}
+
+/**
+ * 构造**按插件作用域的受限宿主**：插件 bundle 的 `export function register(host)` 拿到的就是它。
+ *
+ * ## 两道越权闸门（`registerSlot` 与 `registerExtension` 共用同一套判据）
+ * 单占用节点的权威裁决在后端，被抑制的插件**仍然是 active 的**——它的 bundle 照样加载、
+ * 照样调注册。不拦的后果是两个实现同时渲染（两个编辑器 / 两个顶栏）。
+ *
+ * ① **权威仲裁**（`GET /api/plugins/slots` 的 `suppressed`，插槽与扩展节点共用）：**主判据**。
+ *    不能只靠入口表字段——后端在生效集合为空时**省略该键**，于是"声明了但被抑制"与
+ *    "根本没声明"无法区分，被抑制者会蒙混过关（E2E 抓到过：赢家是 A，界面却渲染了 B）。
+ * ② **入口表的生效节点**（`meta.slots` ∪ `meta.extNodes`）：**次判据**，挡住"声明了 `editor`
+ *    却去注册 `app-header`"这种越界。**两个字段都缺省 ⇒ 不校验**：那是纯浏览器侧注册的插件
+ *    （不在后端 owners 里，例如 `plugins/hello-geewiki` 的产物），既有行为必须保留。
+ *
+ * 两处入口共用同一个 `gate()`：分成两份实现必然漂移，而漂移的表现是
+ * "插槽被拦住了、扩展节点没被拦住"——最难被发现的那种半失效。
+ */
+export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
+  const { name, sdk, meta, suppressed, disposers } = ctx
+  /**
+   * 越权判定：返回**告警文案**（该忽略这条注册）或 `null`（放行）。
+   *
+   * `space` 决定用入口表的哪个字段做**次判据**（`slot` = `meta.slots`，`ext` = `meta.extNodes`）。
+   * **两个字段刻意不合并**：次判据的语义是**逐字段**的——"该字段缺省 ⇒ 不校验"，因为缺省意味着
+   * 这是纯浏览器侧注册的插件（不在后端 owners 里，例如 `plugins/hello-geewiki` 的产物）。
+   * 若取并集，一个只声明了 `geewiki.extensions` 的插件，它**既有**的插槽注册会被突然拦下
+   * ——插件没改一行，界面却少一块（`packages/web/test/pluginUiHost.test.ts` 有专门的反向对照）。
+   */
+  const gate = (node: string, space: 'slot' | 'ext'): string | null => {
+    if (suppressed.get(node as SlotName)?.has(name) === true) {
+      return (
+        `[geewiki-plugin-ui] 插件 ${name} 是节点 "${node}" 的**被抑制**声明者（单占用节点已被` +
+        '激活顺序更早的插件占用），其注册已忽略——否则会出现两个实现同时渲染。'
+      )
+    }
+    const declared = space === 'slot' ? meta.slots : meta.extNodes
+    if (declared !== undefined && !declared.includes(node as SlotName)) {
+      return (
+        `[geewiki-plugin-ui] 插件 ${name} 尝试注册未获生效的节点 "${node}"，已忽略` +
+        `（该插件生效${space === 'slot' ? '插槽' : '扩展节点'}：${declared.join(', ') || '无'}）`
+      )
+    }
+    return null
+  }
+
+  return {
+    React: sdk.React,
+    jsxRuntime: sdk.jsxRuntime,
+    version: sdk.version,
+    pluginName: name,
+    registerSlot: (slot, component) => {
+      const reason = gate(slot, 'slot')
+      if (reason !== null) {
+        console.warn(reason)
+        return () => {}
+      }
+      const off = registerSlotByName(slot, component, name)
+      disposers.push(off)
+      return off
+    },
+    registerExtension: (node, component, opts) => {
+      // 空间由名字本身决定：内置插槽名走插槽字段，其余（宿主节点 / 自定义扩展点）走扩展节点字段。
+      // 不能一律当扩展节点——`registerExtension('app-header', c)` 是合法用法（模式化注册插槽）。
+      const reason = gate(node, isBuiltinSlotName(node) ? 'slot' : 'ext')
+      if (reason !== null) {
+        console.warn(reason)
+        return () => {}
+      }
+      const off = registerExtensionByName(node, component, name, opts?.mode ?? 'extend', opts?.shadow ?? false)
+      disposers.push(off)
+      return off
+    },
+    unregisterSlot: sdk.unregisterSlot,
+    renderMarkdown: (markdown: string) => sdk.renderMarkdown(markdown),
+    registerRoute: (id, component) => {
+      const declared = meta.routes ?? []
+      if (!declared.some((r) => r.id === id)) {
+        console.warn(
+          `[geewiki-plugin-ui] 插件 ${name} 尝试注册未声明的路由 "${id}"，已忽略` +
+            `（该插件生效路由：${declared.map((r) => r.id).join(', ') || '无'}）。` +
+            '路由必须先在 package.json#geewiki.routes 里声明，否则宿主没有加载该产物的依据。',
+        )
+        return () => {}
+      }
+      const off = registerRoute(id, component, name)
+      disposers.push(off)
+      return off
+    },
+    unregisterRoutes: (source) => unregisterRoutes(source),
+  }
 }
 
 interface LoadedUi {
@@ -452,75 +585,7 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
     return
   }
   const disposers: Array<() => void> = []
-  const host: PluginUiHost = {
-    React: sdk.React,
-    jsxRuntime: sdk.jsxRuntime,
-    version: sdk.version,
-    pluginName: name,
-    registerSlot: (slot, component) => {
-      /*
-       * **越权拦阻（两道）**。单占用插槽（editor）的权威裁决在后端，被抑制的插件**仍然是
-       * active 的**——它的 bundle 照样加载、照样调 registerSlot。不拦的后果是两个编辑器同时渲染。
-       *
-       * ① 权威仲裁（`GET /api/plugins/slots` 的 suppressed）：这是**主判据**。
-       *    不能只靠入口表的 `slots` 字段——实测证明那条路是漏的：后端在生效插槽为空时
-       *    **省略该键**，于是"声明了但被抑制"与"根本没声明插槽"无法区分，被抑制者会蒙混过关
-       *    （E2E 抓到过：赢家是 A，界面却渲染了被抑制的 B）。
-       * ② 入口表的生效插槽（次判据）：只有当该插件**声明过**插槽（字段存在）时才校验，
-       *    用于挡住"声明了 editor 却去注册 app-header"这种越界。
-       *    字段缺失 ⇒ 不校验：那是**纯浏览器侧注册**的插件（如 `plugins/ui-demo` 在 client.js 里
-       *    注册 app-header/app-footer），它们不在后端 owners 里，既有行为必须保留。
-       */
-      const suppressed = suppressedOwners.get(slot as SlotName)
-      if (suppressed?.has(name) === true) {
-        console.warn(
-          `[geewiki-plugin-ui] 插件 ${name} 是插槽 "${slot}" 的**被抑制**声明者（单占用插槽已被` +
-            `激活顺序更早的插件占用），其注册已忽略——否则会出现两个编辑器同时渲染。`,
-        )
-        return () => {}
-      }
-      if (meta.slots !== undefined && !meta.slots.includes(slot as SlotName)) {
-        console.warn(
-          `[geewiki-plugin-ui] 插件 ${name} 尝试注册未获生效的插槽 "${slot}"，已忽略` +
-            `（该插件生效插槽：${meta.slots.join(', ') || '无'}）`,
-        )
-        return () => {}
-      }
-      const off = registerSlotByName(slot, component, name)
-      disposers.push(off)
-      return off
-    },
-    unregisterSlot: sdk.unregisterSlot,
-    renderMarkdown: (markdown: string) => sdk.renderMarkdown(markdown),
-    /*
-     * F2：插件页面路由的组件注册。
-     *
-     * **必须按清单已声明的 id 注册**：入口表里的 `routes` 是真源（后端已裁决冲突、
-     * 且据此把该插件标为不可推迟加载）。这里再挡一道"该 id 是否真在本插件的生效声明里"——
-     * 否则插件可以注册一个它没声明过的 id，而后端从未为它把产物标成"必须加载"，
-     * 于是那个页面在某些加载路径下会是空白（与 `slots` 的次判据完全同一条理由）。
-     *
-     * 放宽的情形：入口表**没有** `routes` 键（后端在空值时省略）⇒ 说明该插件未声明路由 ⇒ 拒绝。
-     * 但纯浏览器侧注册的插件（不在后端 owners 里）会因此被拒——这是**刻意的**：
-     * 路由参与"要不要加载这个产物"的决策，不走声明的路由没有加载保证，
-     * 允许它注册只会制造"有时能打开、有时打不开"的不确定。
-     */
-    registerRoute: (id, component) => {
-      const declared = meta.routes ?? []
-      if (!declared.some((r) => r.id === id)) {
-        console.warn(
-          `[geewiki-plugin-ui] 插件 ${name} 尝试注册未声明的路由 "${id}"，已忽略` +
-            `（该插件生效路由：${declared.map((r) => r.id).join(', ') || '无'}）。` +
-            '路由必须先在 package.json#geewiki.routes 里声明，否则宿主没有加载该产物的依据。',
-        )
-        return () => {}
-      }
-      const off = registerRoute(id, component, name)
-      disposers.push(off)
-      return off
-    },
-    unregisterRoutes: (source) => unregisterRoutes(source),
-  }
+  const host = createPluginUiHost({ name, sdk, meta, suppressed: suppressedOwners, disposers })
   try {
     const cleanup = register(host)
     if (typeof cleanup === 'function') disposers.push(cleanup as () => void)
@@ -784,13 +849,22 @@ declare global {
   }
 }
 
-window.__GEEWIKI_PLUGIN_UI__ = {
-  refresh: refreshPluginUi,
-  sync: syncPluginUi,
-  unload: unloadPluginUi,
-  loaded: loadedPluginUi,
-  revision: pluginUiRevision,
-  base: pluginUiBase,
-  deferred: deferredPluginUi,
-  ensureSlot: ensureSlotLoaded,
+/*
+ * 验收脚本用的调试出口 —— **只在浏览器里**挂。
+ *
+ * 与 `hostSdk.ts` 的安装同一理由（P7）：`src/ui/*` 的原语在定义处接了 `<Ext>`，
+ * 于是 Node 测试直接 import 那些原语时会牵进本模块，模块求值期读 `window` 会当场炸，
+ * 而报错点看起来完全不在被测代码上。守卫之后 Node 下 import 本模块是安全的。
+ */
+if (typeof window !== 'undefined') {
+  window.__GEEWIKI_PLUGIN_UI__ = {
+    refresh: refreshPluginUi,
+    sync: syncPluginUi,
+    unload: unloadPluginUi,
+    loaded: loadedPluginUi,
+    revision: pluginUiRevision,
+    base: pluginUiBase,
+    deferred: deferredPluginUi,
+    ensureSlot: ensureSlotLoaded,
+  }
 }

@@ -1,6 +1,9 @@
 import {
   Component,
   useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
   useState,
   useSyncExternalStore,
   type ClipboardEvent,
@@ -8,6 +11,7 @@ import {
   type DragEvent,
   type ReactNode,
 } from 'react'
+import { createPortal } from 'react-dom'
 /*
   ⚠️ 这里与 `pluginUi.ts` 是**双向 import**（那边要 `registerSlotByName`），刻意接受：
   两边的引用都只发生在**函数体内**（本文件只在渲染时读失败清单，那边只在加载完成时注册插槽），
@@ -40,6 +44,22 @@ import {
   type BuiltinSlotName,
   type SlotName,
 } from '@geewiki/core/slots'
+/*
+ * ★ P4：界面扩展平台的**宿主节点目录**（浏览器安全子路径，与 slots 同一真源体系）。
+ * 为什么要 import 目录而不是继续用 `isBuiltinSlotName || isPluginSlotName`：
+ * 目录把"宿主节点"从 7 个插槽扩到了 `shell-*` / `ui-*` 等**不带 `/`** 的名字上，
+ * 只认插槽白名单会把 `ui-button` 当成笔误拒掉（那正是本轮要实现的能力）。
+ */
+import {
+  HOST_NODE_NAMES,
+  extModesOf,
+  hostNodeSpec,
+  isExtName,
+  nestedSlotsOf,
+  supportsExtMode,
+  type ExtMode,
+  type HostNodeName,
+} from '@geewiki/core/extensions'
 /* ★ F5：`PageVisibility` 与 `EditorSlotProps.blockTiers` 同刻度，真源在 core 的浏览器安全子路径 */
 import type { PageVisibility } from '@geewiki/core/domain'
 
@@ -287,15 +307,34 @@ export interface SlotEntry {
   readonly component: AnySlotComponent
   /** 注册来源（插件名或 'host'），用于排障与注销 */
   readonly source: string
+  /**
+   * 贡献模式（P4）：`extend` 追加、`wrap` 包一层、`replace` 整体接管。
+   *
+   * 缺省 `'extend'` ⇒ 所有既有调用点行为逐字不变。模式只在 {@link Ext} 出口里被解释；
+   * `SlotOutlet` / `PluginSlotOutlet` 一律按追加处理（它们服务的是"只有追加语义"的老契约）。
+   */
+  readonly mode: ExtMode
+  /**
+   * 是否渲染进 **Shadow Root**（P9，仅 `replace` 模式有意义）。
+   *
+   * 由贡献者显式声明（`registerExtension(node, c, { mode: 'replace', shadow: true })`）。
+   * 两种模式（`wrap` / `extend`）上声明它会被**忽略并告警**——`wrap` 要把宿主默认元素
+   * 放进 `default`，而宿主默认元素在 shadow 边界之外，隔离只隔离得了自己；
+   * `extend` 是"追加在宿主元素旁边"，隔离一个追加块没有意义。
+   *
+   * 语义（设计文档 §7.3）：CSS 自定义属性（`--gw-*`）**跨 shadow 边界继承**，
+   * 故主题令牌自动生效；宿主的 Tailwind 工具类**进不去**，因此声明者必须自带样式。
+   */
+  readonly shadow: boolean
 }
 
 const EMPTY: readonly SlotEntry[] = Object.freeze([])
 const registry = new Map<SlotName, readonly SlotEntry[]>()
 const listeners = new Set<() => void>()
 
-/** 名字是否可接受：内置 ∪ 插件自定义扩展点语法（**不含**"任意字符串"这条退路）。 */
+/** 名字是否可接受：宿主节点目录 ∪ 插件自定义扩展点语法（**不含**"任意字符串"这条退路）。 */
 function isSlotName(name: string): name is SlotName {
-  return isBuiltinSlotName(name) || isPluginSlotName(name)
+  return isExtName(name)
 }
 
 function emit(): void {
@@ -317,7 +356,9 @@ function entriesOf(name: SlotName): readonly SlotEntry[] {
 /** 只读快照：供宿主自身与测试观察当前插槽占用情况。 */
 export function slotSummary(): Record<string, number> {
   const out: Record<string, number> = {}
-  for (const name of SLOT_NAMES) out[name] = entriesOf(name).length
+  // 宿主节点目录（插槽 + shell-* + ui-* …）在前——它们是宿主固定渲染点，
+  // 快照要能回答"这个位置当前有没有人贡献"，而不只是"7 个插槽"。
+  for (const name of HOST_NODE_NAMES) out[name] = entriesOf(name).length
   // 自定义扩展点也要报出来，否则"插件开了扩展点但当前无人贡献"在快照里完全不可见，
   // 排障时看不出这个扩展点存在（内置在前、自定义按字典序附在其后）。
   for (const name of [...registry.keys()].filter((n) => !isBuiltinSlotName(n)).sort()) {
@@ -343,8 +384,24 @@ export function registerSlot<K extends BuiltinSlotName>(
   source?: string,
 ): () => void
 export function registerSlot(name: SlotName, component: AnySlotComponent, source?: string): () => void
-export function registerSlot(name: SlotName, component: AnySlotComponent, source = 'host'): () => void {
-  const entry: SlotEntry = { component, source }
+/** ★ P4：带模式的注册（`replace` / `wrap` 必须由作者显式写出，见 `registerSlotByName` 的校验） */
+export function registerSlot(name: SlotName, component: AnySlotComponent, source?: string, mode?: ExtMode): () => void
+/** ★ P9：再带 Shadow DOM 隔离（仅 `replace` 有意义，见 {@link SlotEntry.shadow}） */
+export function registerSlot(
+  name: SlotName,
+  component: AnySlotComponent,
+  source?: string,
+  mode?: ExtMode,
+  shadow?: boolean,
+): () => void
+export function registerSlot(
+  name: SlotName,
+  component: AnySlotComponent,
+  source = 'host',
+  mode: ExtMode = 'extend',
+  shadow = false,
+): () => void {
+  const entry: SlotEntry = { component, source, mode, shadow }
   registry.set(name, [...entriesOf(name), entry])
   emit()
   let disposed = false
@@ -366,15 +423,74 @@ export function registerSlot(name: SlotName, component: AnySlotComponent, source
  * 与 {@link registerSlot} 的分工：后者靠类型保证（宿主自己的代码），前者靠运行期校验
  * （不可信来源）。未知插槽名忽略并告警、返回空操作注销函数——与既有"不阻断插件加载"一致。
  */
-export function registerSlotByName(name: string, component: AnySlotComponent, source = 'host'): () => void {
+export function registerSlotByName(
+  name: string,
+  component: AnySlotComponent,
+  source = 'host',
+  mode: ExtMode = 'extend',
+  shadow = false,
+): () => void {
   if (!isSlotName(name)) {
     console.warn(
-      `[geewiki-slot] 未知插槽名 "${name}"，已忽略（内置：${SLOT_NAMES.join(', ')}；` +
+      `[geewiki-slot] 未知扩展点名 "${name}"，已忽略（宿主节点见 @geewiki/core/extensions 的目录；` +
         '自定义扩展点须形如 "命名空间/名字"：小写 kebab 且至少含一个 `/`）',
     )
     return () => {}
   }
-  return registerSlot(name, component, source)
+  /*
+    `shadow` 只在 `replace` 上成立（见 `SlotEntry.shadow`）：其余模式**丢弃这个标志并告警**，
+    但**不丢弃整条贡献**——"隔离没生效"与"我的组件根本没渲染"是两个严重程度完全不同的结果，
+    后者会让作者去查一个并不存在的加载失败。
+  */
+  const isolated = mode === 'replace' && shadow
+  if (shadow && !isolated) {
+    console.warn(
+      `[geewiki-slot] 节点 "${name}" 的 ${mode} 模式忽略 shadow: true（Shadow DOM 只对 replace 有意义：` +
+        'wrap 的宿主默认元素在 shadow 之外、extend 只是追加一块）',
+    )
+  }
+  if (!supportsExtMode(name, mode)) {
+    /*
+      模式校验**必须在这里再做一次**（后端已经拒过一遍）：前端拿到的可能是
+      ① 一个手写 registerSlot 的插件（不走后端声明）、② 后端版本较旧、③ 缓存里的旧入口表。
+      静默接受的后果是"插件 replace 了页头，于是整个页头消失"——那是必须被挡下的。
+    */
+    console.warn(
+      `[geewiki-slot] 节点 "${name}" 不允许 ${mode} 模式（允许：${JSON.stringify(extModesOf(name)) || '[]'}），已忽略`,
+    )
+    return () => {}
+  }
+  /*
+    容器节点 + shadow 的**提前告知**（P11c）：隔离本身仍然生效，但 `props.slots` 给出的挂载点
+    会被忽略（出口必须留在 light DOM，否则其他插件的贡献被拖进隔离根、丢掉宿主样式）。
+    在这里说，作者才知道"我摆了挂载点却没反应"不是宿主坏了。
+    位置刻意在模式校验**之后**：被拒的注册不该再收到第二条告警（那是噪声）。
+  */
+  const nested = nestedSlotsOf(name)
+  if (isolated && nested.length > 0) {
+    console.warn(
+      `[geewiki-slot] 节点 "${name}" 是容器节点（内层出口：${nested.join('、')}）：shadow: true 仍然生效，` +
+        '但 props.slots 里的挂载点会被忽略——内层出口必须留在 light DOM，' +
+        '否则其他插件的贡献会被拖进隔离根并丢掉宿主样式。',
+    )
+  }
+  return registerSlot(name, component, source, mode, isolated)
+}
+
+/**
+ * **扩展点注册入口**（宿主 SDK 的 `registerExtension` 实现，P4；P9 增加 `shadow`）。
+ *
+ * 与 {@link registerSlotByName} 的关系：后者是它的兼容前身（模式固定 `extend`），
+ * 这里多一层"节点是否允许该模式"的判断，并把告警文案指向目录真源。
+ */
+export function registerExtensionByName(
+  node: string,
+  component: AnySlotComponent,
+  source = 'host',
+  mode: ExtMode = 'extend',
+  shadow = false,
+): () => void {
+  return registerSlotByName(node, component, source, mode, shadow)
 }
 
 /**
@@ -395,6 +511,93 @@ export function unregisterSlot(name: string, token?: unknown): void {
 
 interface BoundaryState {
   error: string | null
+}
+
+/**
+ * **回退记录**（`replace` / `wrap` 的贡献渲染失败时）。
+ *
+ * ## 为什么要有这份记录，而不是只 console.error
+ * `replace` / `wrap` 的失败语义是**回退宿主默认实现**（用户拍板：插件渲染失败不能让控件消失）。
+ * 但"控件还在"恰恰意味着**失败是不可见的**——页头看起来完全正常，只是插件没生效。
+ * 于是必须有第二个出口：管理台读取这份记录并把"N 个扩展点回退到默认实现"显示出来。
+ *
+ * 快照引用稳定（`useSyncExternalStore` 的 `getSnapshot` 要求），变更时才换新数组。
+ */
+export interface ExtFailure {
+  readonly node: string
+  readonly source: string
+  readonly mode: ExtMode
+  readonly message: string
+}
+
+const extFailureLog = new Map<string, ExtFailure>()
+let extFailureSnapshot: readonly ExtFailure[] = Object.freeze([])
+
+/** 当前的回退记录（新增在前；无记录时返回稳定的空数组） */
+export function extFailures(): readonly ExtFailure[] {
+  return extFailureSnapshot
+}
+
+/** 清空回退记录（管理台"我知道了"与单测用） */
+export function clearExtFailures(): void {
+  if (extFailureLog.size === 0) return
+  extFailureLog.clear()
+  extFailureSnapshot = Object.freeze([])
+  emit()
+}
+
+function recordExtFailure(failure: ExtFailure): void {
+  const key = `${failure.node}#${failure.source}`
+  const prev = extFailureLog.get(key)
+  // 同一条重复失败（父组件重挂）不重复播报，避免日志刷屏
+  if (prev && prev.message === failure.message) return
+  extFailureLog.set(key, failure)
+  extFailureSnapshot = Object.freeze([...extFailureLog.values()])
+  emit()
+}
+
+/**
+ * **回退边界**：`replace` / `wrap` 的贡献抛错时，渲染 `fallback`（宿主默认实现）。
+ *
+ * ## 为什么不用 {@link SlotErrorBoundary}
+ * 那个边界渲染的是"插件界面渲染失败"占位文案——对**追加**语义是诚实的（少一块看得见），
+ * 但对 `replace` / `wrap` 是**灾难**：控件本身会消失（用户拍板的失败语义正是"不能消失"）。
+ *
+ * ## 为什么不加 `data-ext-fallback` 标记元素
+ * 设计文档初稿写了"外层元素带 `data-ext-fallback`"。实现时放弃：那需要一个包裹元素，
+ * 而宿主默认实现可能处在**对子元素有要求**的位置（`<tr>`、flex 行、`<ul>` 等），
+ * 插一个 `<span>` 轻则样式错位、重则 HTML 结构非法。代价大于收益，故改用
+ * {@link extFailures} 的**记录**（管理台可见、可断言）＋ console.error。
+ *
+ * ## 为什么导出（`export`）
+ * React 的**错误边界只在客户端生效**：`react-dom/server` 下子组件抛错会直接冒泡，
+ * `componentDidCatch` 根本不会被调用。因此"回退到宿主默认实现"这条**用户拍板的语义**
+ * 在 SSR 路径上无法被渲染测试覆盖，只能白盒实例化本类来钉（见 `test/extOutlet.test.ts`）。
+ * 这是宿主内部组件，**不属于插件 API**（插件拿不到它）。
+ */
+export class ExtBoundary extends Component<
+  { readonly node: string; readonly source: string; readonly mode: ExtMode; readonly fallback: ReactNode; readonly children: ReactNode },
+  BoundaryState
+> {  state: BoundaryState = { error: null }
+
+  static getDerivedStateFromError(error: unknown): BoundaryState {
+    return { error: error instanceof Error ? error.message : String(error) }
+  }
+
+  componentDidCatch(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(
+      `[geewiki-ext] ${this.props.mode} 贡献渲染失败（节点：${this.props.node}，来源：${this.props.source}）：` +
+        '已回退宿主默认实现',
+      error,
+    )
+    recordExtFailure({ node: this.props.node, source: this.props.source, mode: this.props.mode, message })
+  }
+
+  render(): ReactNode {
+    if (this.state.error !== null) return this.props.fallback
+    return this.props.children
+  }
 }
 
 /** 单个插件 UI 的错误边界：捕获渲染期异常，替换为占位块。 */
@@ -423,10 +626,17 @@ class SlotErrorBoundary extends Component<{ source: string; children: ReactNode 
 
 /** 插槽出口：渲染该插槽下所有已注册组件（各自独立错误边界）。**宿主固定渲染点**。 */
 export function SlotOutlet({ name }: { name: BuiltinSlotName }): ReactNode {
+  /*
+    server snapshot 与 client snapshot 指向**同一个**注册表快照（与 `Ext` 同口径）。
+    本仓是纯 SPA（没有 SSR，见设计文档 §9.6），因此不存在水合不一致；反过来，
+    若这里传 `() => EMPTY`，则"容器节点被 replace 时其他插件的贡献仍然渲染"这条契约
+    在单测里**根本断言不了**（`renderToStaticMarkup` 是服务端路径），只能靠浏览器 CDP。
+    这条契约是用户当场驳回缺陷后定下的，值得有单元级的回归保护。
+  */
   const entries = useSyncExternalStore(
     subscribe,
     () => entriesOf(name),
-    () => EMPTY,
+    () => entriesOf(name),
   )
   /*
     插件界面**加载期**失败的可见提示（本批 T4）。
@@ -461,6 +671,153 @@ export function SlotOutlet({ name }: { name: BuiltinSlotName }): ReactNode {
       })}
     </div>
   )
+}
+
+/* ==================== P11b：容器节点的内层插槽出口（挂载点 + 承运者） ==================== */
+
+/*
+  ## 要解决的问题（用户当场驳回的缺陷）
+  `shell-header` / `shell-footer` 的 DOM 里嵌着**多方共存**的插槽出口（`app-header` /
+  `app-footer`）。若 `replace` 让单个插件接管整棵子树，它就获得了"删掉其他所有插件贡献"的
+  权力——这与"`multi` 插槽不得 `replace`"是同一条纪律，只是藏在了一层 DOM 嵌套里。
+
+  ## 解法：宿主渲染，插件只决定"落在哪"
+  出口**永远由宿主渲染恰好一次**（`NestedSlotOutlet`），贡献者拿到的 `props.slots[名]` 只是
+  一个**挂载点元素**（`ExtSlotMount`）：在自己的输出里渲染它，出口就搬到那里。于是
+  "贡献丢失"在结构上不可能发生，最坏情况只是位置不合意（插件没渲染挂载点 ⇒ 留在宿主位置）。
+
+  ## 为什么用"登记表 + 订阅"而不是在渲染期嗅探 DOM
+  搬运必须在**绘制前**完成，否则会看到一次跳动。挂载点用 `useLayoutEffect` 在提交后、
+  绘制前登记自己并通知；承运者经 `useSyncExternalStore` 同步重渲染后 portal 过去——
+  整条链在一次绘制内完成。反过来（先按宿主位置渲染、提交后再嗅探有没有挂载点）也能做到
+  "不丢"，但**插件内部 state 变化**导致挂载点出现/消失时承运者不会重渲染，
+  会出现"重复渲染"或"漏兜底"两种失准；登记表把这两个方向都封死了。
+*/
+const mountRegistry = new Map<string, Set<HTMLElement>>()
+const mountListeners = new Set<() => void>()
+let mountTargets: ReadonlyMap<string, HTMLElement> = new Map()
+
+/**
+ * 挂载点是否可用：必须在文档里、且必须位于 **light DOM**（不能落在 Shadow Root 内）。
+ *
+ * ## 为什么 Shadow Root 内的挂载点必须被忽略（P11c，**先实测再修**）
+ * 容器节点（`shell-header` / `shell-footer`）的内层出口装的是**其他插件**的贡献。
+ * 若贡献者用 `{ mode: 'replace', shadow: true }` 接管外壳、又把 `props.slots[…]` 渲染在隔离根里，
+ * 出口就会被 portal 进 Shadow Root：那些贡献随即丢掉全部宿主 Tailwind 样式，
+ * 而且从宿主视角看**与"贡献消失了"完全一样**——`document.querySelector` 不穿透 shadow，
+ * 于是 CDP 探针第一次读到的就是 `counterLight:false, outletsLight:0`。
+ * 这是"单个插件在不知情中破坏别人"，与 `replace` 删掉他人贡献同类，故一律拒绝：
+ * 挂载点被忽略、出口留在宿主位置（light DOM），并告警一次。
+ *
+ * `doc` 只为可测性存在（Node 下没有 `document`），生产调用不传。
+ */
+export function isUsableMountTarget(
+  /*
+    形参是**结构化**的（只用到这两个成员）而不是 `HTMLElement`：这个判据只做同一性比较，
+    收窄成完整元素类型既没有表达力上的好处，又让 Node 下的单测必须造一整个假 `Node`
+    （假对象还要伪造 46 个属性），最后逼出 `as unknown as Node` 这种把断言变成噪音的写法。
+  */
+  el: { readonly isConnected: boolean; getRootNode(): unknown },
+  doc: unknown = typeof document === 'undefined' ? undefined : document,
+): boolean {
+  if (!el.isConnected) return false
+  if (doc === undefined) return false
+  return el.getRootNode() === doc
+}
+
+/** 每个插槽只告警一次：挂载点的 layout effect 会随插件重渲染反复触发，不去重就是刷屏 */
+const warnedShadowMounts = new Set<string>()
+
+function notifyMounts(): void {
+  const next = new Map<string, HTMLElement>()
+  for (const [slot, elements] of mountRegistry) {
+    for (const el of elements) {
+      // 卸载中的元素静默跳过（正常瞬态，不是错误用法）
+      if (!el.isConnected) continue
+      if (!isUsableMountTarget(el)) {
+        if (!warnedShadowMounts.has(slot)) {
+          warnedShadowMounts.add(slot)
+          console.warn(
+            `[geewiki-slot] 内层插槽出口 "${slot}" 的挂载点落在 Shadow Root 内，已忽略：` +
+              '出口必须留在 light DOM，否则其他插件的贡献会被拖进隔离根、丢掉宿主样式。' +
+              '若你的 replace 贡献开了 shadow: true，请把 props.slots[…] 渲染在隔离标记之外。',
+          )
+        }
+        continue
+      }
+      next.set(slot, el)
+      break
+    }
+  }
+  mountTargets = next
+  for (const listener of mountListeners) listener()
+}
+
+function subscribeMounts(listener: () => void): () => void {
+  mountListeners.add(listener)
+  return () => {
+    mountListeners.delete(listener)
+  }
+}
+
+function mountTargetOf(slot: string): HTMLElement | null {
+  return mountTargets.get(slot) ?? null
+}
+
+/*
+  `useLayoutEffect` 在服务端渲染里不执行且会告警。本仓是纯 SPA，但**单测**用
+  `renderToStaticMarkup`（服务端路径）跑渲染断言，故按环境选一次：服务端退化为 `useEffect`
+  （不执行，也就没有搬运——与"SSR 下先按宿主位置渲染"的期望一致）。
+*/
+const useIsomorphicLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect
+
+/**
+ * **内层插槽出口的挂载点**：贡献者把它渲染在自己标记里的任意位置，宿主承载的出口就搬过去。
+ *
+ * 只渲染一个 `<span style="display: contents">`：`display: contents` 让它**不生成盒子**，
+ * 于是被搬进来的出口在布局上等同于直接写在该位置（与 `ShadowHost` 同一个纪律：
+ * 扩展点不该改变宿主布局）。渲染多次时**第一个仍在文档里的**生效（其余留空）。
+ */
+export function ExtSlotMount({ slot }: { slot: SlotName }): ReactNode {
+  const ref = useRef<HTMLSpanElement | null>(null)
+  useIsomorphicLayoutEffect(() => {
+    const el = ref.current
+    if (el === null) return
+    const elements = mountRegistry.get(slot) ?? new Set<HTMLElement>()
+    mountRegistry.set(slot, elements)
+    elements.add(el)
+    notifyMounts()
+    return () => {
+      elements.delete(el)
+      if (elements.size === 0) mountRegistry.delete(slot)
+      notifyMounts()
+    }
+  }, [slot])
+  return <span ref={ref} data-ext-slot-mount={slot} style={{ display: 'contents' }} />
+}
+
+/**
+ * **容器节点的内层插槽出口**（宿主渲染点）：`<header>` / `<footer>` 里那个由宿主独占的出口。
+ *
+ * 默认渲染在宿主位置（与接线前的 DOM 逐字一致）；若某贡献者渲染了对应挂载点，
+ * 则在**绘制前** portal 过去。**永远恰好渲染一次**：搬运的是同一个出口，不是复制。
+ *
+ * @param node 所属容器节点（只用于校验声明，见 `nestedSlotsOf`）
+ * @param slot 内层插槽名（必须是该节点在目录里声明过的 `nestedSlots`）
+ */
+export function NestedSlotOutlet({ node, slot }: { node: HostNodeName; slot: BuiltinSlotName }): ReactNode {
+  const declared = nestedSlotsOf(node)
+  if (!declared.includes(slot)) {
+    // 声明与渲染不一致是**宿主自己的**接线错误（插件无法触发），故只告警不抛：
+    // 抛出去会让整页白屏，而这条错误的真实后果只是"这个出口没被声明过"。
+    console.warn(
+      `[geewiki-slot] ${node} 未在目录里声明内层出口 ${slot}（nestedSlots），` +
+        `请在 packages/core/src/extensions.ts 补上声明；当前仍按宿主位置渲染。`,
+    )
+  }
+  const target = useSyncExternalStore(subscribeMounts, () => mountTargetOf(slot), () => null)
+  const outlet = <SlotOutlet name={slot} />
+  return target === null ? outlet : createPortal(outlet, target)
 }
 
 /* ==================== 插件自定义扩展点出口（A1：把"格子"交给插件自己开） ==================== */
@@ -522,12 +879,210 @@ export function PluginSlotOutlet({
 }
 
 /**
+ * **在组件定义处接线**的助手（P7）：把 `packages/web/src/ui/*` 的基础原语接成宿主节点。
+ *
+ * ## 为什么用 HOC 而不是在每个组件里手写 `<Ext>`
+ * 逐个组件手写要把整块 JSX 再缩进一层（十来个文件、几百行 diff），而收益完全相同：
+ * 两种写法在**无贡献时产出的 DOM 逐字相同**（`Ext` 无贡献时直接返回 `children`）。
+ * HOC 还带来一条纪律：接线点只有一处（`withExt('ui-button', ButtonBase)`），
+ * 一眼能看出"这个原语是不是宿主节点"。
+ *
+ * ## 为什么"全站所有调用点同时生效"
+ * `Button` 被全仓几十处**直接** import（`../ui/Button`，不走 barrel），因此接线必须在**定义处**——
+ * 在 `ui/index.ts` 桶文件里包一层会漏掉所有直接 import 的调用点。
+ *
+ * ## 契约
+ * - 节点的 props = 组件自己的 props（原样转发给贡献者，含 `children`）；
+ * - 贡献者另外收到 `default`（宿主默认元素，`wrap` 用）与 `propsVersion`；
+ * - 贡献失败 ⇒ 回退宿主默认实现（{@link Ext} 的语义，用户拍板）。
+ */
+export function withExt<P extends object>(
+  id: HostNodeName,
+  Component: ComponentType<P>,
+): ComponentType<P> {
+  const Wrapped: ComponentType<P> = (props: P) => (
+    <Ext id={id} props={props as Record<string, unknown>}>
+      <Component {...props} />
+    </Ext>
+  )
+  // 便于 React DevTools / 报错栈里看出这是哪个原语（不参与任何逻辑判定）
+  Wrapped.displayName = `Ext(${Component.displayName ?? Component.name ?? String(id)})`
+  return Wrapped
+}
+
+/**
  * 某扩展点当前的贡献者名单（快照）。非法名返回空数组。
  * 给"声明扩展点的插件"渲染空态/计数用（例如"还没有插件扩展这里"）。
  */
 export function slotContributors(name: string): readonly string[] {
   if (!isSlotName(name)) return []
   return entriesOf(name).map((entry) => entry.source)
+}
+
+/* ==================== ★ P4：模式化出口 <Ext>（replace / wrap / extend） ==================== */
+
+/** {@link Ext} 的属性 */
+export interface ExtProps {
+  /**
+   * 宿主节点 id（`HostNodeName`：编译期枚举目录里的名字）。
+   *
+   * 为什么是 {@link HostNodeName} 而不是 `string`：这是**宿主自己**的渲染点，
+   * 写错一个字母就应该编译不过（与 `SlotOutlet` 的 `BuiltinSlotName` 同一条纪律）。
+   * 插件侧注册走字符串路径（`registerExtension`），由 `isExtName` 运行期校验。
+   */
+  readonly id: HostNodeName
+  /** 转发给贡献组件的属性（含 `default` 与 `propsVersion`，见下） */
+  readonly props?: Record<string, unknown>
+  /** **宿主默认实现**：无贡献时渲染它；`replace` 接管后由它决定渲染什么；失败时回退到它 */
+  readonly children: ReactNode
+}
+
+/**
+ * **Shadow DOM 隔离壳**（P9）：把 `replace` 贡献渲染进一个 Shadow Root。
+ *
+ * ## 为什么包一层 `<span style="display: contents">`
+ * `attachShadow` 必须挂在一个**元素**上，于是宿主无论如何都要引入一个包装元素。
+ * `display: contents` 让这个元素**不生成盒子**（它的子树在布局上直接参与父容器），
+ * 因此包装元素对栅格 / flex 行 / `<tr>` 里的排版没有影响——这与"扩展点不应改变宿主布局"
+ * 是同一条纪律。⚠️ 该性质由 `scripts/acceptance/plugin-ui-cdp.mjs` 在真实浏览器里复验
+ * （Node 下没有 DOM，单测只能钉住"贡献没有被内联渲染"这一半）。
+ *
+ * ## 为什么 SSR 下是空的（刻意，不是缺陷）
+ * Shadow Root 只能由 DOM API 创建，而服务端渲染没有 DOM。本仓是**纯 SPA**
+ * （设计文档 §9.6：`GET /` 的首屏 HTML 不含插件内容），因此这条路径下"先空后挂载"
+ * 与其它插件内容的可见时机一致。用"先内联渲染再搬进 shadow"来掩盖它，反而会
+ * 造成一次真实的重复渲染与闪烁，并让"隔离是否生效"变得难以断言。
+ *
+ * ## 能穿透与不能穿透（设计文档 §7.3）
+ * - **能**：CSS 自定义属性（`--gw-*`）跨 shadow 边界继承 ⇒ 主题令牌自动生效，
+ *   这正是选「令牌 + Shadow DOM」而不是「类名 + Shadow DOM」的原因；
+ * - **不能**：宿主的 Tailwind 工具类进不去 shadow root ⇒ 声明者必须自带样式
+ *   （`<style>` 元素或内联样式），否则会渲染出裸 HTML。
+ */
+function ShadowHost({ children }: { children: ReactNode }): ReactNode {
+  const hostRef = useRef<HTMLSpanElement | null>(null)
+  const [root, setRoot] = useState<ShadowRoot | null>(null)
+
+  useEffect(() => {
+    const el = hostRef.current
+    if (!el) return
+    // 复用已有 root：React 19 的 StrictMode 会双跑 effect，重复 attachShadow 会抛
+    const shadow = el.shadowRoot ?? el.attachShadow({ mode: 'open' })
+    setRoot(shadow)
+    return () => {
+      setRoot(null)
+    }
+  }, [])
+
+  return (
+    <span ref={hostRef} data-ext-shadow="" style={{ display: 'contents' }}>
+      {root === null ? null : createPortal(children, root)}
+    </span>
+  )
+}
+
+/**
+ * **模式化扩展点出口**（界面扩展平台 P4）。
+ *
+ * ## 渲染规则（与设计文档 §4 一一对应）
+ * ```
+ * 结果 = extend( wrap( replace( 默认实现 ) ) )
+ * ```
+ * 1. `replace` 胜出者渲染 ⇒ 默认实现不渲染（它拿到 `default: undefined`）；
+ * 2. `wrap` 胜出者渲染 ⇒ 它拿到 `default: <上一步的结果>` 作为属性；
+ * 3. `extend` 贡献按注册顺序**追加**在结果之后（各自独立错误边界，与插槽行为一致）。
+ *
+ * ## 容器节点（`nestedSlots` 非空的节点）
+ * `shell-header` / `shell-footer` 内部嵌着多方共存的插槽出口，它们**由宿主渲染**
+ * （{@link NestedSlotOutlet}），**不在本组件的子树里**——因此上面的 `replace` 无论如何都删不掉
+ * 其他插件的贡献。本组件额外把 {@link ExtSlotMount} 作为 `props.slots[插槽名]` 交给贡献者，
+ * 让它决定那个出口落在自己标记里的哪一处（见文件头"容器节点"一节）。
+ *
+ * ## 失败语义（用户拍板）
+ * `replace` / `wrap` 抛错 ⇒ **回退宿主默认实现**（控件不消失），并在 {@link extFailures} 留记录；
+ * `extend` 抛错 ⇒ 只丢弃那一条，渲染既有的 `.slot-error` 占位（少一块是看得见的）。
+ *
+ * ## 为什么"单占用"的裁决不在这里做
+ * 裁决（`replace`/`wrap` 至多一个生效者）由后端 `resolveExtensions` 完成，被抑制者
+ * **根本不会注册**（前端只认 effective）。前端如果自己再判一次，就会出现
+ * "后端说 A 生效、前端渲染 B"的两套真相——本仓在 `resolvePluginUiHit` 上已经吃过一次。
+ * 这里只按注册顺序取第一条，作为"后端没给出裁决时"的**确定性兜底**。
+ */
+export function Ext({ id, props, children }: ExtProps): ReactNode {
+  /*
+    server snapshot 与 client snapshot 指向**同一个**注册表快照。
+    本仓是纯 SPA（没有 SSR，见设计文档 §9.6），因此不存在"服务端渲染一份、客户端再变"的
+    水合不一致；反过来说，若这里传 `() => EMPTY`，则 SSR 路径下**任何贡献都渲染不出来**，
+    于是这条链路的测试只能靠白盒——收益远小于代价。（`subscribe` 的第三个参数是
+    React 的 `getServerSnapshot`，它必须返回缓存过的引用，`entriesOf` 正是稳定引用。）
+  */
+  const snapshot = useCallback(() => entriesOf(id), [id])
+  const entries = useSyncExternalStore(subscribe, snapshot, snapshot)
+  const spec = hostNodeSpec(id)
+  const propsVersion = spec?.propsVersion ?? 1
+  const replaceEntry = entries.find((e) => e.mode === 'replace')
+  const wrapEntry = entries.find((e) => e.mode === 'wrap')
+  const extendEntries = entries.filter((e) => e.mode === 'extend')
+  /*
+    ★ P11b：容器节点（`shell-header` / `shell-footer`）的内层插槽出口以**挂载点**形式交给贡献者
+    （见上面 `NestedSlotOutlet` / `ExtSlotMount` 的说明）。出口本身由宿主渲染，
+    这里给出的只是"可以把它摆在哪"的能力 —— 因此贡献者**不渲染它也绝不会丢**。
+    三种模式都注入：规则只有一条"拿到 props 的贡献者就能摆放"，不必逐模式记忆。
+  */
+  const nestedSlots = nestedSlotsOf(id)
+  const sharedProps: Record<string, unknown> = {
+    ...(props ?? {}),
+    ...(nestedSlots.length === 0
+      ? {}
+      : {
+          slots: Object.fromEntries(
+            nestedSlots.map((slot) => [slot, <ExtSlotMount key={slot} slot={slot} />]),
+          ),
+        }),
+  }
+
+  let node: ReactNode = children
+  if (replaceEntry) {
+    const Replace = replaceEntry.component as ComponentType<Record<string, unknown>>
+    const contribution = <Replace {...sharedProps} default={undefined} propsVersion={propsVersion} />
+    /*
+      ★ P9：声明了 `shadow: true` 的 replace 贡献渲染进 Shadow Root。
+
+      顺序是**边界在外、隔离壳在内**（不是反过来）：边界的 `fallback` 是宿主默认实现，
+      若把壳套在边界外面，一旦贡献抛错，回退出来的宿主默认元素也会被塞进 shadow root ——
+      那是"控件还在、样式全丢"，比不隔离更坏。壳在边界内则失败路径完全走宿主原有渲染。
+      跨 shadow 的 portal 抛错同样会被最近的错误边界接住（React 的错误沿 React 树冒泡，
+      而不是沿 DOM 树），故这条顺序不会漏掉隔离壳里的异常。
+    */
+    node = (
+      <ExtBoundary node={id} source={replaceEntry.source} mode="replace" fallback={children}>
+        {replaceEntry.shadow ? <ShadowHost>{contribution}</ShadowHost> : contribution}
+      </ExtBoundary>
+    )
+  }
+  if (wrapEntry) {
+    const Wrap = wrapEntry.component as ComponentType<Record<string, unknown>>
+    const inner = node
+    node = (
+      <ExtBoundary node={id} source={wrapEntry.source} mode="wrap" fallback={inner}>
+        <Wrap {...sharedProps} default={inner} propsVersion={propsVersion} />
+      </ExtBoundary>
+    )
+  }
+  if (extendEntries.length === 0) return node
+  return (
+    <>
+      {node}
+      {extendEntries.map((entry, index) => {
+        const C = entry.component as ComponentType<Record<string, unknown>>
+        return (
+          <SlotErrorBoundary key={`${entry.source}#${index}`} source={entry.source}>
+            <C {...sharedProps} propsVersion={propsVersion} />
+          </SlotErrorBoundary>
+        )
+      })}
+    </>
+  )
 }
 
 /**

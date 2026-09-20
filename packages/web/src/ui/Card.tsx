@@ -7,8 +7,9 @@
  */
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
-export function Card({ className, children }: { className?: string; children: ReactNode }): ReactNode {
+function CardBase({ className, children }: { className?: string; children: ReactNode }): ReactNode {
   return (
     <section
       className={cn(
@@ -57,3 +58,6 @@ export function CardHeader({
 export function CardBody({ className, children }: { className?: string; children: ReactNode }): ReactNode {
   return <div className={cn('px-4 py-3', className)}>{children}</div>
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const Card = withExt('ui-card', CardBase)

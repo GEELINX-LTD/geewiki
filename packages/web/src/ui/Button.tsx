@@ -14,6 +14,7 @@ import type { ButtonHTMLAttributes, ReactNode, Ref } from 'react'
 import { cn } from './cn'
 import { focusRing, touchTarget } from './a11y'
 import { Spinner } from './Spinner'
+import { withExt } from '../lib/slots'
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
 export type ButtonSize = 'sm' | 'md'
@@ -81,7 +82,7 @@ export function buttonClassName(options: {
   )
 }
 
-export function Button({
+function ButtonBase({
   variant = 'secondary',
   size = 'md',
   loading = false,
@@ -117,3 +118,6 @@ export function Button({
     </button>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const Button = withExt('ui-button', ButtonBase)

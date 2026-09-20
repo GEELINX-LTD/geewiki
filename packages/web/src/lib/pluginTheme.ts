@@ -46,6 +46,7 @@
  * 一个 `;` 就能闭合声明并追加任意规则（`--gw-x:red;}body{display:none}:root{`）。
  * 详见 {@link isSafeTokenValue}。
  */
+import { AA_TEXT_MIN, contrastRatio } from './contrastPlan'
 
 /**
  * 允许被插件覆盖的 token 名：**只放行 `--gw-`**（理由见文件头）。
@@ -55,7 +56,6 @@
  * 与其静默接受一个永远不生效的名字，不如当场拒绝并告警。
  */
 const TOKEN_NAME = /^--gw-[a-z0-9]+(-[a-z0-9]+)*$/
-
 /**
  * token 值是否可安全拼进样式表。
  *
@@ -306,6 +306,121 @@ export function themeTokens(): { light: Record<string, string>; dark: Record<str
     for (const [k, v] of e.dark) if (!(k in dark)) dark[k] = v
   }
   return { light, dark }
+}
+
+/* ==================== ★ P10：主题贡献的对比度告警 ==================== */
+
+/**
+ * 会被主题贡献覆盖的**正文文字** token。
+ *
+ * 与 `contrastPlan.ts` 的 `LIGHT_TEXT_BACKGROUNDS` 同一用途（无障碍审计收敛到的那几个），
+ * 但**按 token 名**而不是按字面值——插件覆盖的是 token，宿主才有默认值。
+ */
+export const THEME_TEXT_TOKENS: readonly string[] = Object.freeze([
+  '--gw-ink',
+  '--gw-ink-soft',
+  '--gw-ink-muted',
+  '--gw-accent-soft-ink',
+])
+
+/** 会被主题贡献覆盖的**背景** token（正文文字可能落在其上） */
+export const THEME_BACKGROUND_TOKENS: readonly string[] = Object.freeze([
+  '--gw-bg',
+  '--gw-surface',
+  '--gw-surface-sunken',
+  '--gw-surface-hover',
+  '--gw-accent-soft',
+])
+
+/** 一组文字/背景 token 的对比度读数（`ratio < required` 即不达标） */
+export interface ThemeContrastPair {
+  readonly text: string
+  readonly background: string
+  readonly ratio: number
+  readonly required: number
+}
+
+/** 某个主题贡献导致的对比度问题（管理台据此告警） */
+export interface ThemeContrastIssue extends ThemeContrastPair {
+  readonly owner: string
+  readonly name: string
+  readonly mode: 'light' | 'dark'
+}
+
+/**
+ * **纯函数**：给一组 token 取值，列出所有低于 AA 的文字/背景组合。
+ *
+ * 只有两侧都能解析成 `#rrggbb` 字面值时才会计算：`var()` 链、`color-mix()`、
+ * 具名色在 `contrastRatio` 里会得到 `NaN`，而**报告一个算不出来的失败**会让告警
+ * 迅速变成噪声（用户学会忽略它），比漏报更坏。故这里**跳过**它们，
+ * 由 `pluginCssGuard.test.ts` 的硬编码守卫负责"别写死颜色"那一半。
+ */
+export function contrastIssuesIn(
+  values: Readonly<Record<string, string>>,
+  required: number = AA_TEXT_MIN,
+): ThemeContrastPair[] {
+  const out: ThemeContrastPair[] = []
+  const literal = (v: string | undefined): string | undefined =>
+    v !== undefined && /^#[0-9a-fA-F]{6}$/.test(v.trim()) ? v.trim() : undefined
+  for (const text of THEME_TEXT_TOKENS) {
+    const tv = literal(values[text])
+    if (tv === undefined) continue
+    for (const background of THEME_BACKGROUND_TOKENS) {
+      const bv = literal(values[background])
+      if (bv === undefined) continue
+      const ratio = contrastRatio(tv, bv)
+      if (Number.isNaN(ratio) || ratio >= required) continue
+      out.push({ text, background, ratio, required })
+    }
+  }
+  return out
+}
+
+/**
+ * 从文档里读一个 token 并**沿 `var()` 链解析**到字面值。
+ *
+ * 为什么需要它：`getComputedStyle` 对自定义属性返回的是**指定值**（如 `var(--gw-gray-50)`），
+ * 不是最终颜色。不解析链就只能检查"贡献自己同时给了文字与背景"这一种情形，
+ * 而最常见的坏主题恰恰是**只改了一个文字色**、落在宿主原有的背景上。
+ *
+ * 无 DOM（Node 单测）时返回 undefined —— 那条路径由 {@link contrastIssuesIn} 的纯函数覆盖。
+ */
+function readDomToken(token: string, seen: Set<string> = new Set()): string | undefined {
+  if (typeof document === 'undefined' || seen.has(token)) return undefined
+  seen.add(token)
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(token).trim()
+  if (raw === '') return undefined
+  const m = /^var\(\s*(--[a-zA-Z0-9-]+)\s*(?:,[\s\S]*)?\)$/.exec(raw)
+  return m === null ? raw : readDomToken(m[1] as string, seen)
+}
+
+/**
+ * 当前注册表里**低于 AA** 的主题贡献（管理台告警用）。
+ *
+ * 为什么告警而**不阻断注册**（设计文档 §7.4）：糟糕主题的最终判据是运维——
+ * 宿主替用户决定"这个主题不许用"会把"深色品牌色恰好差一点"这种可接受的取舍也挡掉。
+ * 但**必须可见**：否则用户只会看到"字看不清"，而不知道该找谁。
+ */
+export function themeContrastIssues(): readonly ThemeContrastIssue[] {
+  const effective = themeTokens()
+  const out: ThemeContrastIssue[] = []
+  for (const e of entries) {
+    for (const mode of ['light', 'dark'] as const) {
+      const own = e[mode]
+      if (own.size === 0) continue
+      const values: Record<string, string> = {}
+      for (const token of [...THEME_TEXT_TOKENS, ...THEME_BACKGROUND_TOKENS]) {
+        const v = own.get(token) ?? effective[mode][token] ?? readDomToken(token)
+        if (v !== undefined) values[token] = v
+      }
+      for (const pair of contrastIssuesIn(values)) {
+        // 只报"与这条贡献有关"的组合：它至少改动了其中一侧
+        if (!own.has(pair.text) && !own.has(pair.background)) continue
+        out.push({ owner: e.owner, name: e.name, mode, ...pair })
+      }
+    }
+  }
+  return out
 }
 
 /** 仅测试用：清空注册表（避免用例间串味） */

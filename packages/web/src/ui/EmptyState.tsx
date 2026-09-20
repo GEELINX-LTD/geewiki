@@ -9,8 +9,9 @@
  */
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
-export function EmptyState({
+function EmptyStateBase({
   icon,
   title,
   hint,
@@ -39,3 +40,6 @@ export function EmptyState({
     </div>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const EmptyState = withExt('ui-empty-state', EmptyStateBase)
