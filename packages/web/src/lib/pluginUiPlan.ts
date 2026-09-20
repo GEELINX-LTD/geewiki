@@ -78,6 +78,16 @@ export interface UiTableEntry {
    */
   slots?: SlotName[]
   /**
+   * 该插件**生效的扩展节点**（`shell-*` / `page` / `ui-*` / 插件自定义扩展点；**不含插槽**）。
+   *
+   * 与 `slots` 配合构成**越权拦阻**的完整依据（P12）：`slots` 覆盖插槽节点，这里覆盖其余节点。
+   * 缺了它，"声明了 `ui-button` 但被抑制"与"根本没声明"在前端无法区分，被抑制的 `replace`
+   * 会照常注册，而 `Ext` 按注册顺序取第一个 ⇒ 可能渲染出后端判为被抑制的那一个。
+   *
+   * 后端在无生效节点时省略该键（理由同 `slots`：保持既有部署的 `revision` 不变）。
+   */
+  extNodes?: SlotName[]
+  /**
    * 该插件**生效的**页面路由声明（F2，后端经 `resolveRouteDecls` 裁决后下发）。
    *
    * 用途是 {@link isLazyOnlyEntry} 的反向判据：声明了路由的插件**不得被推迟加载**——
@@ -121,11 +131,21 @@ import {
   type BuiltinSlotName,
   type SlotName,
 } from '@geewiki/core/slots'
+import { isExtName } from '@geewiki/core/extensions'
 import { PLUGIN_UI_PREFIX, isPluginUiEntryPath } from '@geewiki/core/domain'
 
 export { PLUGIN_SLOT_NAME, SLOT_NAMES }
 export type { BuiltinSlotName, SlotName }
 
+/**
+ * **插槽名**的判定（内置插槽 ∪ 插件自定义扩展点）。⚠️ 它**不认** `ui-button` 这类宿主节点
+ * ——那是 `@geewiki/core/extensions` 的 `isExtName`（= 目录 ∪ 自定义扩展点）。
+ *
+ * 两个名字空间必须各用各的判据：manager 侧的 `isSlotName` **委托的是 `isExtName`**（它要
+ * 同时接受宿主节点），web 侧这个函数不是。混用的后果不是报错而是**静默失效**——
+ * 例如把 `ui-button` 判成非法名逐条丢弃 ⇒ 越权闸门的依据恒为空 ⇒ 闸门整体形同不存在。
+ * （P12 的 `readExtNodes` 第一版正是这么写的，被 `pluginUiPlan.test.ts` 当场抓到。）
+ */
 function isSlotName(value: unknown): value is SlotName {
   return (
     typeof value === 'string' &&
@@ -143,6 +163,27 @@ function readSlots(raw: unknown): SlotName[] | undefined {
   for (const item of raw) {
     if (!isSlotName(item)) {
       console.debug(`[geewiki-plugin-ui] 入口表插槽名未知，已忽略：${String(item)}`)
+      continue
+    }
+    if (!out.includes(item)) out.push(item)
+  }
+  return out
+}
+
+/**
+ * 入口表的 `extNodes` 字段（P12）：与 {@link readSlots} **同一条从宽规则**（非数组按缺省、
+ * 未知节点名逐条丢弃），但**判据不同**：这里是宿主节点空间，必须用 `isExtName`
+ * （目录 ∪ 自定义扩展点）。用 {@link isSlotName} 会把 `ui-button` 这类名字全部丢掉。
+ */
+function readExtNodes(raw: unknown): SlotName[] | undefined {
+  if (!Array.isArray(raw)) {
+    if (raw !== undefined) console.debug('[geewiki-plugin-ui] 入口表 extNodes 不是数组，按缺省处理')
+    return undefined
+  }
+  const out: SlotName[] = []
+  for (const item of raw) {
+    if (!isExtName(item)) {
+      console.debug(`[geewiki-plugin-ui] 入口表扩展节点名未知，已忽略：${String(item)}`)
       continue
     }
     if (!out.includes(item)) out.push(item)
@@ -255,20 +296,38 @@ export type SuppressedOwners = ReadonlyMap<SlotName, ReadonlySet<string>>
 /** 解析 `GET /api/plugins/slots` 响应，取出"被抑制的声明者"。整体不可信时返回 undefined。 */
 export function parseSuppressedOwners(payload: unknown): SuppressedOwners | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
-  const body = payload as { slots?: unknown }
+  const body = payload as { slots?: unknown; extensions?: unknown }
   if (!Array.isArray(body.slots)) return undefined
+  /*
+    `extensions`（P3 新增字段）也要读：它才是 `ui-*` / `shell-*` / `page` 这些**非插槽节点**的
+    抑制来源。只读 `slots` 会让"两个插件抢同一个 `ui-button`"里的被抑制者蒙混过关
+    ——前端照样注册，而 `Ext` 按注册顺序取第一个，可能就渲染了被抑制的那一个。
+
+    不可信判定沿用同一条纪律：**缺省 = 后端版本较旧 ⇒ 跳过**（行为与改动前一致）；
+    **存在但不是数组 = 响应坏了 ⇒ 整体不可信**（返回 undefined，调用方保留上一份快照）。
+  */
+  if (body.extensions !== undefined && !Array.isArray(body.extensions)) return undefined
   const out = new Map<SlotName, Set<string>>()
-  for (const raw of body.slots) {
-    if (typeof raw !== 'object' || raw === null) continue
-    const item = raw as { slot?: unknown; suppressed?: unknown }
-    if (!isSlotName(item.slot)) continue
-    if (!Array.isArray(item.suppressed) || item.suppressed.length === 0) continue
-    const set = out.get(item.slot) ?? new Set<string>()
-    for (const owner of item.suppressed) {
-      if (typeof owner === 'string' && owner) set.add(owner)
+  const merge = (rows: unknown, key: 'slot' | 'node'): void => {
+    if (!Array.isArray(rows)) return
+    // 两类行的名字空间不同：`slots` 是插槽名，`extensions` 是宿主节点名（`ui-button` 这类）。
+    // 用同一个判据会把后者的每一行都丢掉——而且是**静默**丢掉（闸门形同不存在）。
+    const accepts = key === 'slot' ? isSlotName : isExtName
+    for (const raw of rows) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const item = raw as Record<string, unknown>
+      const name = item[key]
+      if (!accepts(name)) continue
+      if (!Array.isArray(item.suppressed) || item.suppressed.length === 0) continue
+      const set = out.get(name) ?? new Set<string>()
+      for (const owner of item.suppressed) {
+        if (typeof owner === 'string' && owner) set.add(owner)
+      }
+      if (set.size > 0) out.set(name, set)
     }
-    if (set.size > 0) out.set(item.slot, set)
   }
+  merge(body.slots, 'slot')
+  merge(body.extensions, 'node')
   return out
 }
 
@@ -351,7 +410,7 @@ export function pluginUiBase(name: string, origin: string): string | undefined {
 
 function readEntry(raw: unknown): UiTableEntry | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
-  const item = raw as { entry?: unknown; css?: unknown; rev?: unknown; slots?: unknown }
+  const item = raw as { entry?: unknown; css?: unknown; rev?: unknown; slots?: unknown; extNodes?: unknown }
   /*
    * entry 缺失或路径非法 → 整条丢弃（后端保证不会发生，这里防的是中间层/旧版本）。
    *
@@ -372,6 +431,9 @@ function readEntry(raw: unknown): UiTableEntry | undefined {
   // 坏掉的 slots 不该让整条 UI 加载失败——按缺省（无生效插槽）处理，
   // 后果只是"该插件不能注册插槽 / 不被推迟"，而不是"界面消失"。
   const slots = readSlots(item.slots)
+  // extNodes 同理从宽（P12）：它是 `ui-*` / `shell-*` / `page` 的越权闸门依据，
+  // 坏掉只该让"这些节点不被校验"，不该让整个插件的界面消失。
+  const extNodes = readExtNodes(item.extNodes)
   // routes 同样从宽（F2）：坏掉的路由声明只该让"这个插件不被特殊对待 / 导航里没有它"，
   // 不该让整个插件的界面消失。
   const routes = readRoutes((raw as { routes?: unknown }).routes)
@@ -380,6 +442,7 @@ function readEntry(raw: unknown): UiTableEntry | undefined {
     rev: item.rev,
     ...(item.css === undefined ? {} : { css: item.css }),
     ...(slots === undefined ? {} : { slots }),
+    ...(extNodes === undefined ? {} : { extNodes }),
     ...(routes === undefined ? {} : { routes }),
   }
 }

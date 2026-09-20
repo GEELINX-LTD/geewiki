@@ -40,7 +40,7 @@ import {
 import { MarkdownBody, useRenderedMarkdown } from '../components/MarkdownBody'
 import { MarkdownEditorLazy } from '../components/MarkdownEditorLazy'
 import { DEFAULT_EDITOR_MIN_HEIGHT } from '../lib/editorHeightPlan'
-import { ArticleSummarySlotOutlet, EditorSlotOutlet, EditorToolbarSlotOutlet, type EditorHandle, type EditorToolbarSelection, useEditorSlot } from '../lib/slots'
+import { ArticleSummarySlotOutlet, EditorSlotOutlet, EditorToolbarSlotOutlet, Ext, type EditorHandle, type EditorToolbarSelection, useEditorSlot } from '../lib/slots'
 import {
   ReadonlyHistoryButton,
   VersionBadge,
@@ -2281,6 +2281,13 @@ function WikiDetail(props: {
 
       {/* 操作条：默认操作（编辑）在最右，破坏性操作（删除）用 danger 变体且与主操作隔开 */}
       <div className="gw-reader-actions flex flex-wrap items-center gap-2">
+        {/*
+          ★ P6：元信息行是一个宿主节点（`wiki-meta`）。
+          三种模式都开：插件可以只加一条（extend，如"阅读时长"）、可以加壳（wrap）、
+          也可以整块换成自己的元信息条（replace）。无贡献时 `<Ext>` 直接返回 children，
+          DOM 与接线前**逐字一致**（栅格列由 `.gw-reader-actions` 的类名决定，不受影响）。
+        */}
+        <Ext id="wiki-meta">
         <div className="flex items-center gap-1.5 text-xs text-muted">
           {/*
             有编辑权 ⇒ 可下拉选版本；无编辑权 ⇒ **纯文本徽标**（不是禁用态按钮）。
@@ -2317,6 +2324,9 @@ function WikiDetail(props: {
           {/* 快照在途：给一句可见反馈，免得"点了没反应"被当成坏了 */}
           {previewLoading && <span className="text-2xs text-muted" role="status">正在加载该版本…</span>}
         </div>
+        </Ext>
+        {/* ★ P6：操作按钮组是另一个宿主节点（`wiki-actions`）——与元信息行分开 */}
+        <Ext id="wiki-actions">
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {notice !== '' && (
             <span className="rounded-md border border-ok-line bg-ok-bg px-3 py-1 text-note text-ok-ink">
@@ -2376,6 +2386,7 @@ function WikiDetail(props: {
             </Button>
           )}
         </div>
+        </Ext>
       </div>
 
       {/*
@@ -2450,7 +2461,15 @@ function WikiDetail(props: {
           · 不要再给卡片加 `width`/`margin-inline`（历史上"卡片限宽 + 居中"造成过 86px 阶梯）。
       */}
         <div className="gw-reader-main flex min-w-0 flex-col gap-4">
-          <TableOfContents entries={shownToc} activeId={activeId} route={route} variant="inline" />
+          {/*
+            ★ P6：目录是一个宿主节点（`wiki-toc`），**两处渲染点共用同一个 id**：
+            窄屏这里是正文上方的折叠块，`xl` 以上是右栏那份。
+            共用 id 是刻意的——插件说的是"文章页的目录"，不是"某一个断点下的目录"；
+            分两个 id 会让插件作者被迫为同一件事声明两次（且很容易漏掉窄屏那份）。
+          */}
+          <Ext id="wiki-toc">
+            <TableOfContents entries={shownToc} activeId={activeId} route={route} variant="inline" />
+          </Ext>
 
           {/*
             阅读卡片：宽度**跟着栅格列走**，自己不设宽（口径见 styles.css 那段长注释）。
@@ -2532,7 +2551,9 @@ function WikiDetail(props: {
         */}
         <div className="gw-reader-rail hidden min-w-0 flex-col gap-4 xl:flex">
           {homeMode && <HomeAside pages={siblings} onNavigate={onNavigate} />}
-          <TableOfContents entries={shownToc} activeId={activeId} route={route} variant="sidebar" />
+          <Ext id="wiki-toc">
+            <TableOfContents entries={shownToc} activeId={activeId} route={route} variant="sidebar" />
+          </Ext>
         </div>
 
       {/*

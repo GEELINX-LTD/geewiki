@@ -9,6 +9,7 @@
  */
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
 export type BadgeTone = 'neutral' | 'accent' | 'ok' | 'warn' | 'danger' | 'session' | 'suspended'
 
@@ -23,7 +24,7 @@ const TONE: Record<BadgeTone, string> = {
   suspended: 'bg-suspended-bg text-suspended-ink border-suspended-line',
 }
 
-export function Badge({
+function BadgeBase({
   tone = 'neutral',
   className,
   title,
@@ -48,3 +49,6 @@ export function Badge({
     </span>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const Badge = withExt('ui-badge', BadgeBase)

@@ -20,8 +20,9 @@ import type { ReactNode } from 'react'
 import { AlertTriangle, RotateCw } from 'lucide-react'
 import { cn } from './cn'
 import { Button } from './Button'
+import { withExt } from '../lib/slots'
 
-export function ErrorState({
+function ErrorStateBase({
   title,
   hint,
   onRetry,
@@ -74,3 +75,6 @@ export function ErrorState({
     </div>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const ErrorState = withExt('ui-error-state', ErrorStateBase)

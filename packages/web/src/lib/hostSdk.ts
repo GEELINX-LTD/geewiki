@@ -11,6 +11,7 @@ import * as ReactDOM from 'react-dom'
 import * as ReactDOMClient from 'react-dom/client'
 import {
   PluginSlotOutlet as PluginSlotOutletImpl,
+  registerExtensionByName,
   registerSlotByName,
   slotContributors as slotContributorsImpl,
   unregisterSlot,
@@ -18,6 +19,7 @@ import {
   type AnySlotComponent,
   type SlotEntry,
 } from './slots'
+import type { ExtMode } from '@geewiki/core/extensions'
 import { mdToHtml } from './sanitize'
 import { getLocale, t } from './i18n'
 import {
@@ -72,8 +74,18 @@ import {
  * 插件侧应**特性探测**再用（`typeof host.renderMarkdown === 'function'`），
  * 不要按 version 字符串比大小——老宿主上没有这个函数，退化路径应当是"不注册该工具 /
  * 显示纯文本"，而不是抛错。
+ *
+ * `0.10.0` 起新增 {@link GeeWikiHostSdk.registerExtension}：
+ * **插件第一次可以"替换/包裹"宿主既有的界面元素**（而不只是往宿主预留的位置追加）。
+ * 在此之前，"改页头 GeeWiki 字样"这类需求只能靠私有类名或直接改 DOM 两个后门——
+ * 两者都在插件卸载后留下痕迹、也无法被宿主诊断。节点目录与模式契约见
+ * `docs/design/ui-extension-platform.md`。
+ * `0.11.0` 起 {@link GeeWikiHostSdk.registerExtension} 支持 `opts.shadow`（P9）：
+ * **`replace` 贡献可渲染进 Shadow Root**——`--gw-*` 令牌跨边界继承（主题照常生效），
+ * 宿主 Tailwind 类名进不去（故须自带样式）。默认不开：隔离会改变打印样式、`::selection`
+ * 等行为，应当是作者明确选择的取舍。
  */
-export const HOST_SDK_VERSION = '0.9.0'
+export const HOST_SDK_VERSION = '0.11.0'
 
 /** {@link GeeWikiHostSdk.PluginSlotOutlet} 的属性 */
 export interface PluginSlotOutletProps {
@@ -95,6 +107,58 @@ export interface GeeWikiHostSdk {
    * `registerSlotByName` 做运行期校验；组件类型是零属性与带数据插槽两种形态的联合。
    */
   registerSlot(name: string, component: AnySlotComponent): () => void
+  /**
+   * **以指定模式往宿主节点贡献界面**（`0.10.0` 起，界面扩展平台 P4）。
+   *
+   * 与 {@link registerSlot} 的关系：后者等价于 `registerExtension(node, c, { mode: 'extend' })`
+   * ——只追加、不动宿主原有元素。本方法多出来的两种模式解决的是**另一类需求**：
+   *
+   * - `wrap`：把你的组件**包在**宿主默认实现外面（`props.default` 是那个已渲染的元素）。
+   *   适合加角标、外框、右键菜单——不可能弄丢宿主控件。
+   * - `replace`：**整体接管**该节点（宿主默认实现不渲染）。适合"我要自己的页头品牌/编辑器"，
+   *   代价是宿主那部分的责任（无障碍、键盘可达）转移到你身上。
+   *
+   * 两个约束（都由宿主强制，**不是**约定）：
+   * 1. 节点必须**允许**该模式（宿主节点目录是唯一判据）。对 `app-header` 声明 `replace`
+   *    会被忽略并告警——宿主才知道哪个位置能被整体换掉。
+   * 2. 单占用：`replace` / `wrap` 同一节点全局只有一个生效者（**最早激活的插件胜出**），
+   *    被抑制者会在 `GET /api/plugins/slots` 的 `suppressed` 里可见。
+   *
+   * 渲染失败时宿主**回退到默认实现**（`replace`/`wrap` 不会让控件消失），失败记录见
+   * 管理台的扩展点诊断。
+   *
+   * `0.11.0` 起 `opts.shadow`（P9，**仅 `replace` 有意义**）：把你的组件渲染进
+   * **Shadow Root**。`--gw-*` 主题令牌**跨边界继承**（主题照常生效），而宿主的
+   * Tailwind 工具类**进不去**——所以声明它就必须自带样式（`<style>` 或内联样式）。
+   * 在 `wrap` / `extend` 上传它会被忽略并告警（不是静默生效、也不是丢弃整条贡献）。
+   * 隔离壳是一个 `display: contents` 的元素，不参与布局。
+   *
+   * **容器节点上的 `props.slots`（`shell-header` / `shell-footer`）**：这两个节点里嵌着
+   * 多方共存的插槽出口（`app-header` / `app-footer`），它们**由宿主渲染**，`replace` 只换
+   * 容器**内容**——所以单个插件**不可能**删掉其他插件的贡献（这是宿主的硬保证）。
+   * 你拿到的 `props.slots['app-header']` 是一个 `display: contents` 的**挂载点元素**：
+   * 在自己的标记里渲染它，那个出口就搬到那里（宿主在绘制前搬运，无闪烁）；**不渲染也没关系**，
+   * 它会留在宿主位置（顶栏内、页脚内）。每个出口恰好渲染一次。
+   *
+   * ⚠️ 与 `opts.shadow` 的交互（P11c）：容器节点上**可以**同时开隔离，但挂载点若落在
+   * Shadow Root 内会**被忽略**（出口留在 light DOM）并告警——挂载点装的是**别人**的贡献，
+   * 被拖进隔离根会丢掉宿主样式，而在你这边看起来与"贡献消失"一模一样。
+   * 想摆挂载点就把 `props.slots[…]` 渲染在隔离标记**之外**。
+   *
+   * 用法：
+   * ```js
+   * const { React, registerExtension } = window.__GEEWIKI_HOST__
+   * registerExtension('ui-button', (p) => React.createElement('button', { className: 'my-button', ...p }), { mode: 'replace' })
+   * // P9：完全隔离（自带样式，主题令牌仍生效）
+   * registerExtension('shell-brand-text', (p) => React.createElement('span', { style: { color: 'var(--gw-accent)' } }, 'MyWiki'),
+   *   { mode: 'replace', shadow: true })
+   * ```
+   */
+  registerExtension(
+    node: string,
+    component: AnySlotComponent,
+    opts?: { mode?: ExtMode; shadow?: boolean },
+  ): () => void
   /** 传入 token 只注销一条；不传则清空该插槽 */
   unregisterSlot(name: string, token?: unknown): void
   /**
@@ -293,6 +357,8 @@ const sdk: GeeWikiHostSdk = {
     Fragment: jsxRuntime.Fragment,
   },
   registerSlot: (name, component) => registerSlotByName(name, component, 'host-sdk'),
+  registerExtension: (node, component, opts) =>
+    registerExtensionByName(node, component, 'host-sdk', opts?.mode ?? 'extend', opts?.shadow ?? false),
   unregisterSlot,
   PluginSlotOutlet: PluginSlotOutletImpl,
   slotContributors: slotContributorsImpl,
@@ -334,10 +400,20 @@ const sdk: GeeWikiHostSdk = {
   version: HOST_SDK_VERSION,
 }
 
-if (!window.__GEEWIKI_HOST__) {
+/*
+ * 安装宿主 SDK 到 `window` —— **只在浏览器里**。
+ *
+ * ★ P7 之后这条 `typeof window` 守卫是**必需**的，不再只是保险：`src/ui/*` 的基础原语
+ * 在定义处接了 `<Ext>`（`withExt`），于是它们会牵进 `lib/slots` → 本文件。
+ * 而 `packages/web/test/` 下的 Node 测试（如 `wikiWriteGate.test.ts`）会直接 import 那些原语，
+ * 模块求值期读 `window` 会当场 `ReferenceError`（**测试文件全红，且报错点在 SDK 而不在被测代码**）。
+ * 守卫之后，"Node 下 import 本模块"是安全的：`hostSdk()` 返回 undefined，
+ * 插件注册入口由调用方自行特性探测（既有约定）。
+ */
+if (typeof window !== 'undefined' && !window.__GEEWIKI_HOST__) {
   window.__GEEWIKI_HOST__ = sdk
 }
 
 export function hostSdk(): GeeWikiHostSdk | undefined {
-  return window.__GEEWIKI_HOST__
+  return typeof window === 'undefined' ? undefined : window.__GEEWIKI_HOST__
 }

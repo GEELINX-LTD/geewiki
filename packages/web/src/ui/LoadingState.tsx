@@ -16,8 +16,9 @@
  */
 import type { ReactNode } from 'react'
 import { cn } from './cn'
+import { withExt } from '../lib/slots'
 
-export function LoadingState({
+function LoadingStateBase({
   /** 无障碍播报文本，也作为骨架屏的可见说明（sr-only 之外也显示，便于所有人） */
   label = '正在加载…',
   /** 慢请求：文案换成"仍在加载…"（由 `useSlowHint` 提供） */
@@ -44,3 +45,6 @@ export function LoadingState({
     </div>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const LoadingState = withExt('ui-loading-state', LoadingStateBase)

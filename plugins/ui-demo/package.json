@@ -18,6 +18,8 @@
     "client": {
       "entry": "client.js",
       "css": "client.css"
-    }
+    },
+    "slots": ["app-header", "app-footer"],
+    "extensions": [{ "node": "shell-brand-text", "mode": "wrap" }]
   }
 }

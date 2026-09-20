@@ -22,8 +22,9 @@ import type { ReactNode } from 'react'
 import { TriangleAlert } from 'lucide-react'
 import { cn } from './cn'
 import { cleanHint, errorLine } from '../lib/errorText'
+import { withExt } from '../lib/slots'
 
-export function ErrorNotice({
+function ErrorNoticeBase({
   error,
   role = 'status',
   className,
@@ -51,3 +52,6 @@ export function ErrorNotice({
     </span>
   )
 }
+
+/* ★ P7：宿主节点接线（`replace` / `wrap` / `extend`，见 docs/design/ui-extension-platform.md） */
+export const ErrorNotice = withExt('ui-error-notice', ErrorNoticeBase)
