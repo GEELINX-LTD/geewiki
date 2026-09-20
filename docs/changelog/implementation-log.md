@@ -14,6 +14,45 @@
 
 **当前实现状态**
 
+- **补上响应压缩（gzip / brotli）（2026-09-20）**：用户原话「开始实现吧」，承接上一轮实测出的
+  「全仓无响应压缩中间件」。
+  - **先纠正上一轮我自己的举证方向**：我当时拿 `q=架构&limit=100` 的 21688 字节说事，暗示"检索响应太肥"。
+    复核发现**该读数与 `limit` 无关**（该查询只有 2 条命中，`blocks` 把命中页的 99 + 19 个块全带回来），
+    即 21 KB 是常态而非极端值 —— 而 21 KB 在局域网上根本不算问题。**真正的成本在别处**：实测静态资源
+    响应头**没有** `Content-Encoding`，`index-*.js` **721 KB**、`MarkdownEditor-*.js` **547 KB** 原样发给
+    每个冷启动用户；而 `docs/deployment.md` 通篇**没有反向代理**（`nginx|caddy|traefik|反代|gzip|brotli`
+    零命中），也就是说**没有任何一层会替我们做这件事**。
+  - **做法**：新增 `packages/server/src/compression.ts`（用 Node 内置 `node:zlib`，**零新依赖**），
+    在 `packages/server/src/index.ts` 的 `createServer` 回调里、`router.dispatch` **之前**装一次 ——
+    API 与静态产物共用同一个 `res`，在这一层包一次两类响应一起受益。
+  - **为什么可以整段缓冲**：全仓**只有一处**流式响应（`packages/core/src/sse.ts` 的 SSE，逐帧
+    `res.write` + `flushHeaders`），它必须在 `writeHead` 当拍就被排除；其余路径一律"备好整块再 `res.end(data)`"。
+    而且**只有缓冲才知道真实体积**：阈值必须依据真实字节数，不能依据 `content-length` ——
+    `index.ts` 的 `json()` 根本不设它（静态路径设了，故那种情况可在 `writeHead` 当拍判"小于阈值"而直接旁路）。
+  - **边界条件（逐条按本仓实际写法定，故没引 `compression` 之类的通用包）**：体积下限 1 KiB（几百字节的
+    JSON 压完往往更大）；`Accept-Encoding` 的 `q=0` 视为**明确拒绝**（否则是协议违规），偏好按客户端 q 值排、
+    同 q 才用 brotli；`Vary: Accept-Encoding` 对**所有可压缩类型**都补（含客户端不接受压缩的那种 ——
+    正是它与压缩后的变体构成同一 URL 的两种表示）；HEAD / 304 / 无体状态码 / 已带 `content-encoding` /
+    图片字体等已压缩格式一律旁路。
+  - **我自己的测试抓到两个真 bug**（这正是写测试的价值，两条都曾让用例变红）：
+    ① `Vary` 漏补 —— 原先在 `encoding === null` 时就提前旁路，导致"客户端不接受压缩"的响应没有 `Vary`；
+    ② **未调 `writeHead` 直接 `end` 的响应变成畸形 HTTP**（客户端报 `Expected HTTP/`）—— 根因是 Node 的
+    `end()` 会在内部调 `_implicitHeader()` → `this.writeHead(this.statusCode)`，那一拍晚于"决定要不要缓冲"，
+    补丁若不转发则 `_header` 永远不被设置，客户端收到连状态行都没有的响应。修法是 `writeHead` 在
+    已旁路时无条件转发，且 `end` 在 `undecided` 时自己按隐式头判定一次。
+  - **验证读数**：`@geewiki/server` **98/98**（新增 `packages/server/test/compression.test.ts` **19/19**：
+    纯函数 + 真实 HTTP；用裸 `node:http` 而**非** `fetch` —— undici 会自动解压并隐去 `content-encoding`，
+    用它就永远看不到线上到底发了什么）、`pnpm typecheck` 全仓 **exit 0**、改动文件 eslint **0 error**。
+    真实服务端到端实测（隔离临时目录 + 随机空闲端口 + 新代码）：
+    `index-AnaLJdtq.js` **721322 B → gzip 226880 B（3.18×）/ br 207637 B（3.47×）**，
+    `index.html` → gzip 2348 B，`/api/search?q=架构` **21709 B → 8547 B（2.54×）**；
+    `Accept-Encoding: identity` 时原样 721322 B 但 `Vary` 仍在；gzip 响应 `gunzip` 回来是合法 JSON。
+  - **未做（有意）**：`SearchHit.blocks` 的投影裁剪（压缩已把它从 21 KB 降到 8.5 KB，再上 `?fields=`
+    等于新增一套契约协商，收益很小）；`/api/search` 限流（该端点是 `access: 'public'` 的**设计意图**，
+    且限流只在"暴露到公网"时才有意义 —— 而部署文档显示连 TLS 都没有，那种情况下 TLS 与认证的优先级
+    远高于给搜索端点限流）。压缩**不做开关**：反代（nginx/caddy）对已带 `Content-Encoding` 的响应
+    默认不会二次压缩，故应用层压着是安全的。
+
 - **修掉上一批自己引入的「死路按钮」（2026-09-19）**：用户原话「修掉」，指的是上一轮"还有什么可加强的点"
   里实测出的**我自己的回归**——上一批刚加的「改用分词匹配」引导按钮，对相当多的查询点了等于没点。
   - **症状**：短查询 0 命中时界面给出「改用分词匹配」按钮，用户点了 → 重新请求 → 拿回**一模一样**的

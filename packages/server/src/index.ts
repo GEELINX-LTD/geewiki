@@ -85,6 +85,7 @@ import {
   type DiscoveryIssue,
   type RegisteredPlugin,
 } from '@geewiki/manager'
+import { installCompression } from './compression.js'
 
 /**
  * 崩溃标记路径：与数据库文件同目录（<GEEWIKI_DATA_DIR 或 ./data>），随 data/ 一起被 gitignore。
@@ -1335,6 +1336,11 @@ export const HttpPlugin = {
     })
 
     const server: Server = createServer((req, res) => {
+      /*
+       * 压缩必须在 dispatch 之前装上：API 与静态产物共用这一个 res，
+       * 在这一层包一次两类响应一起受益（见 compression.ts 文件头）。
+       */
+      installCompression(req, res)
       const handled = router.dispatch(req, res)
       // 注册了前置钩子时 dispatch 转入异步续段（P0）：此时无法当拍判断是否交给静态层。
       // 未注册钩子时仍是同步 boolean —— 既有路径逐字不变。
