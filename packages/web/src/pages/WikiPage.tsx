@@ -3006,7 +3006,7 @@ function WikiEdit(props: {
         setErr(errorLine(e))
         setLoading(false)
       })
-  }, [slug, isNew, newMode, prefillSlug])
+  }, [slug, newMode, prefillSlug])
 
   useEffect(load, [load])
 
@@ -3124,7 +3124,7 @@ function WikiEdit(props: {
         throw e
       }
     },
-    [isNew, newMode, slug, prefillSlug],
+    [isNew, slug],
   )
 
   const save = useCallback(
@@ -3200,7 +3200,7 @@ function WikiEdit(props: {
         setSaving(false)
       }
     },
-    [content, createHomeMode, isNew, newMode, slug, slugInput, title, onDone, prefillSlug],
+    [content, createHomeMode, newMode, slug, slugInput, title, onDone, prefillSlug],
   )
 
   /** ⌘/Ctrl+S 全局保存：焦点可能在标题输入框，不能只靠编辑器的 keymap */

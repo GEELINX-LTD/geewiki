@@ -429,7 +429,7 @@ export function TimelineDialog({
     return () => {
       cancelled = true
     }
-  }, [open, slug, rows.length])
+  }, [open, slug, rows.length, canLoadMore])
 
   const listed = rows.length > 0 ? rows.length : versions.length
   const stillTruncated = total > listed

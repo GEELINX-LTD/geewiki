@@ -69,8 +69,21 @@ test('★ 两类审计各自取数，不得取 view: all 再在前端分类', ()
   assert.equal(security.length, 1, `应有且仅有一次 view="security"（实际 ${security.length}）`)
   assert.equal(acl.length, 1, `应有且仅有一次 view="acl"（实际 ${acl.length}）`)
   assert.doesNotMatch(ui, /view="all"|view: 'all'/, "不得取 view:'all' 再在前端分类")
-  // 反空洞：两个 view 必须真的走到取数函数上（只渲染不取数等于两张空表）
-  assert.match(ui, /fetchAudit\(props\.view/, '取数必须用当前分区的 view')
+  /*
+   * 反空洞：两个 view 必须真的走到取数函数上（只渲染不取数等于两张空表）。
+   *
+   * 2026-09-20：取数那行由 `fetchAudit(props.view, …)` 改成先
+   * `const { view, reloadToken, onError } = props` 再传 `fetchAudit(view, …)`。
+   * 起因是 lint：`react-hooks/exhaustive-deps` **解析不了嵌套闭包里的 `props.x`**
+   * （这个 effect 的 `.catch((e) => props.onError(e))`），会把整个 `props` 报成缺失依赖；
+   * 而把 `props` 本体塞进依赖数组更坏——它每次渲染都换身份，等于每渲染重发一次审计查询。
+   *
+   * 判据因此从"字面量长这样"改成"**数据流**长这样"：`view` 必须来自 props（分区由宿主
+   * 路由决定，不能是写死的字面量），且必须真的传给 `fetchAudit`。这比原来只钉一种拼写
+   * 更严——原先 `const view = 'all'; fetchAudit(view)` 反而能绕过第一条断言。
+   */
+  assert.match(ui, /const \{[^}]*\bview\b[^}]*\} = props/, 'view 必须解构自 props（分区由宿主路由决定）')
+  assert.match(ui, /fetchAudit\((?:props\.)?view\b/, '取数必须用当前分区的 view')
 })
 
 /*

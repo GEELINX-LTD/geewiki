@@ -12,7 +12,7 @@
 
 | 作业 | 内容 | 触发时机 |
 |---|---|---|
-| `lint` | `pnpm lint` —— ESLint 硬门禁 | push main / push tag / PR |
+| `lint` | `pnpm lint` —— ESLint 硬门禁，**警告即失败**（`--max-warnings 0`） | push main / push tag / PR |
 | `typecheck` | `pnpm typecheck` —— 28 个包 + `tsconfig.scripts.json` | 同上 |
 | `test` | `pnpm test` —— Node 内置测试运行器，177 个测试文件 | 同上 |
 | `build` | `pnpm build` —— 各包 `vite build` 等产物 | 同上 |
@@ -36,7 +36,7 @@ CI 跑的就是根 `package.json` 里的那几个脚本，本地原样执行即�
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm lint        # ESLint；pnpm lint:fix 可自动修复一部分
+pnpm lint        # ESLint，警告即失败（--max-warnings 0）；pnpm lint:fix 可自动修复一部分
 pnpm typecheck
 pnpm test
 pnpm build
