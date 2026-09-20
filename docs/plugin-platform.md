@@ -458,12 +458,13 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
   （**没有** `data-ext-fallback` 标记属性：回退可能发生在 `<tr>`/flex 行，多一层元素会造成布局错位）。  `extend` 抛错 ⇒ 只丢那一条，渲染既有 `.slot-error`。
 - **接入方式**：清单 `geewiki.extensions: [{ node, mode? }]`（与 `geewiki.slots` 并列，后者是 `extend` 简写）
   + 客户端 `window.__GEEWIKI_HOST__.registerExtension(node, component, { mode?, shadow? })`
-  （`HOST_SDK_VERSION` **0.11.0**）。`shadow: true` **仅 `replace`** 有意义：渲染进 Shadow Root，
+  （`HOST_SDK_VERSION` **0.12.0**）。`shadow: true` **仅 `replace`** 有意义：渲染进 Shadow Root，
   `--gw-*` 跨边界继承、宿主 Tailwind 类名进不去，壳是 `display: contents` 元素。
-  **bundle 有两种写法，能力已对齐（P12）**：`export function register(host)` 拿到的是**受限宿主**
-  （来源 = 插件名 ⇒ 停用即回收、过越权闸门），它也提供 `registerExtension`；
-  顶层直接调全局 SDK 也能带模式，但来源是 `'host-sdk'`（**收不回**）且**不经过闸门**
-  ——这条缺口已登记 roadmap。
+  **bundle 的两种写法行为一致（P12 + P13）**：`export function register(host)` 拿到的是**作用域宿主**
+  （来源 = 插件名 ⇒ 停用即回收、过越权闸门），它也提供 `registerExtension`；而**模块求值期**直接调
+  全局 SDK 拿到的**是同一个对象**（P13：加载期间全局被临时换成它，`installPluginScope`），
+  于是顶层注册同样归属插件名、同样过闸门、同样能被 `unloadPluginUi` 回收。
+  `'host-sdk'` 现在只剩"没有插件作用域时"（宿主代码、或插件在加载结束之后才注册）这一种含义。
 - **越权闸门（P12）**：入口表新增 `extNodes`（生效的非插槽节点，与 `slots` 互不重叠、计入 `revision`）；
   前端用它 + `GET /api/plugins/slots` 的 `suppressed`（`slots[]` 与 `extensions[]` **都要读**）拦下
   "被抑制"与"未获生效"的注册。次判据**逐字段**校验（字段缺省 ⇒ 不校验该空间），

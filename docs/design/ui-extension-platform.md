@@ -306,24 +306,51 @@ PluginSlotOutlet / useSlotEntries           // 既有
 themeContributors / registerTheme           // 既有
 ```
 
-#### 8.3.1 两个形态，以及为什么**受限宿主**也必须提供 `registerExtension`（P12）
+#### 8.3.1 两个形态，以及为什么**受限宿主**也必须提供 `registerExtension`（P12 / P13）
 
-插件 bundle 有两种写法，能力必须对齐：
+插件 bundle 有两种写法：`export function register(host)`，与**模块求值时**直接调
+`window.__GEEWIKI_HOST__`。P13 之后**两者行为完全一致**——加载期间全局对象**就是**按插件作用域
+构造的那个宿主（`pluginUi.ts` 的 `installPluginScope`）：
 
 | 形态 | 拿到什么 | 注册来源（`source`） | 卸载时能否按 owner 回收 | 越权闸门 |
 | --- | --- | --- | --- | --- |
-| `export function register(host)` | **受限宿主** `PluginUiHost` | 插件名 | ✅ 收集 disposer | ✅ 两道闸门 |
-| 顶层直接调全局 SDK | `window.__GEEWIKI_HOST__` | `'host-sdk'` | ❌ 收不回（`unloadPluginUi` 只执行自己的 disposer） | ❌ 不经过 |
+| `export function register(host)` | **作用域宿主** `PluginUiHost` | 插件名 | ✅ 收集 disposer | ✅ 两道闸门 |
+| 顶层直接调全局 SDK | **同一个对象**（加载期间被临时装上） | 插件名 | ✅ 同一份 disposer | ✅ 同一套闸门 |
 
 P12 之前，受限宿主上**只有 `registerSlot`**（= 只会 `extend`）⇒ 走这条正规形态的插件**用不了**
 `replace` / `wrap` / `shadow`；改用全局 SDK 又丢掉归属与闸门。两个形态各缺一半，等于
 "带模式注册"没有一条既受管辖、又能被回收的路。现在受限宿主也提供 `registerExtension`，
 参数与全局 SDK 同义（`opts = { mode?, shadow? }`）。
 
-> **仍存在的缺口（已登记 roadmap）**：**顶层直接调全局 SDK** 的那条路依旧不带归属——
-> 影响的不只是 `registerExtension`，还有 `registerSlot` / `registerRoute` / `registerTool` /
-> `registerTheme` / `registerMarkdownExtension`（全都以 `'host-sdk'` 为来源，插件停用后**不会**
-> 被回收）。正解是加载期间临时装一个"按插件归属的 SDK 作用域"，属独立批次。
+**为什么必须是"加载期间临时装上全局对象"，而不是"让插件改用参数"**：顶层形态没有别的入口可用
+（模块求值期宿主还没调到 `register`），而两种形态行为不一致的代价是**静默**的——作者换一种写法，
+贡献就悄悄变成收不回、不受管辖。作用域因此由**构造**保证，不依赖作者写对哪一种。
+
+**栈式安装与还原**（`scopeStack`）：`import()` 是异步的，若两次加载在 await 处交错，"还原成我
+进来时看到的那个"会把先装的那层一起抹掉（那段时间里插件注册的东西又落回 `host-sdk` 名下）。
+栈的语义是"撤销我这一层、回到栈顶"，全部撤销后必然回到基础 SDK。作用域**覆盖 `import()` 与
+`register(host)` 两段**，`finally` 保证每个出口（含失败、迟到、入口抛错）都还原。
+
+随之成立的三件事：
+
+1. **顶层注册也能被回收**：模块求值期的注册进的是**同一份** `disposers`，`unloadPluginUi` 照常
+   执行；不导出 `register(host)` 的 bundle 现在**照样登记**（以前直接 `return`：既没进 `loaded`
+   ⇒ 停用时收不回，也不受 `failed` / `loaded` 短路保护 ⇒ 每轮轮询重复 import）。失败/迟到路径
+   同样会回滚模块求值期已经注册的部分，不留半截 UI。
+2. **作用域宿主 = 完整 SDK**：`registerTool` / `registerTheme` / `registerMarkdownExtension` /
+   `unregister*` / `ReactDOM` / `t` / `PluginSlotOutlet` … 全部可用，注册一律归属插件名。
+   实现是 `{ ...sdk, …覆盖注册与注销两类 }`——**摊开**而不是逐项转发：逐项转发意味着 SDK 每加一个
+   成员就多一处必须同步的副本，而漏掉的症状是"插件里那个字段是 undefined"，只在真正调用时才炸
+   （`hostSdkSurface.test.ts` 的文件头记着同一类坑）。作用域宿主另有全局 SDK **没有**的字段
+   `pluginName`（"我是谁"，模块求值期即可用）。
+3. **注销只作用于自己的来源**：`unregisterThemes('other-plugin')` 这类调用在作用域宿主上
+   **告警并拒绝**（全局 SDK 上它一直合法 ⇒ 任何插件都能拆掉别的插件的主题 / 路由 / 工具，
+   被拆的一方只看到"我的界面不见了"、查不到是谁干的）；`unregisterSlot(node)` 不带 token 时
+   也只清自己的来源（旧写法会删掉该节点上**所有**插件的贡献）。
+
+> `'host-sdk'` 现在只剩一个含义：**没有插件作用域时的来源**（宿主自己的代码，或插件在加载结束
+> 之后才注册的东西）。它仍然可诊断——管理台里来源是 `host-sdk` 就说明这条贡献不归任何插件。
+
 
 #### 8.3.2 两道越权闸门（`registerSlot` 与 `registerExtension` 共用）
 
@@ -391,13 +418,10 @@ P12 之前，受限宿主上**只有 `registerSlot`**（= 只会 `extend`）⇒ 
    这不是缺陷而是纪律：内层出口装的是别人的贡献，被拖进隔离根会丢掉宿主样式、
    且在宿主视角与"贡献消失"无法区分。副作用是"作者摆了挂载点却没反应"——故注册时与忽略时
    各有一条点名 `props.slots` 的告警。
-11. **顶层直接调全局 SDK 的注册没有归属**（P12 时发现并登记，roadmap 第 0 项第 5 件）：
-   `window.__GEEWIKI_HOST__` 上的 `registerSlot` / `registerExtension` / `registerRoute` /
-   `registerTool` / `registerTheme` / `registerMarkdownExtension` 一律以 `'host-sdk'` 为来源 ⇒
-   `unloadPluginUi(name)` 收不回它们（停用后残留、重新启用叠加），且**不经过越权闸门**。
-   走 `export function register(host)` 的插件不受影响（P12 已给受限宿主补上 `registerExtension`）。
-   正解是加载期间临时装一个"按插件归属的 SDK 作用域"（`Proxy` 覆盖注册类方法即可），
-   它会同时改掉 `registerTool` / `registerTheme` 的既有生命周期语义，故属独立批次。
+11. ~~**顶层直接调全局 SDK 的注册没有归属**（P12 时发现并登记）~~ —— **P13 已修复**（见 §8.3.1）：
+   加载期间全局对象被换成按插件作用域的宿主，顶层形态与 `register(host)` 形态拿到的是**同一个
+   对象**（来源 = 插件名、同一份 disposer、同一套闸门）。`'host-sdk'` 只剩"没有插件作用域时"
+   这一种含义。端到端读数见 §11 的 P13 两条（渲染 + 停用后回收）。
 
 ---
 
@@ -422,6 +446,7 @@ P12 之前，受限宿主上**只有 `registerSlot`**（= 只会 `extend`）⇒ 
 | **P11c** | 容器节点 × Shadow DOM：**隔离根内的挂载点必须被忽略** | ✅ 先实测后修：未修复时 CDP 读到 `counterLight:false, outletsLight:0`（贡献被 portal 进 shadow root，宿主视角与"消失"无异）。新增纯函数 `isUsableMountTarget`、忽略时告警一次、注册时提前告知；守卫 `extShadow.test.ts` +2 条（含假对象判据）、CDP +1 条。**读数 28/28** |
 | **P12** | **越权闸门补全 + 受限宿主提供 `registerExtension`**（入口表新增 `extNodes`） | ✅ 修两个真缺陷：① 受限宿主只有 `registerSlot` ⇒ 走正规形态的插件用不了 `replace`/`wrap`/`shadow`；② 闸门只认插槽裁决 ⇒ 非插槽节点的被抑制 `replace` 仍会注册（"赢家 A、渲染 B"）。落盘：`PluginUiTableEntry.extNodes`、`buildPluginUiTable` 的 `extAssignments`、`parseSuppressedOwners` 合并 `extensions[]`、`createPluginUiHost`（抽出、可单测）、示例插件演示 `wrap shell-brand-text`。守卫：`pluginUiHost.test.ts` 8 条（含三条反向对照）、`pluginUiPlan.test.ts` +3、`plugin-ui.test.ts` +1。**读数 web 971/971、manager 290/290、CDP 28/28** |
 | **P12b** | **验收层补齐**：`lib/session.mjs` 鉴权夹具 + 修陈旧的 `plugin-ui-cdp.mjs` + P12b 真浏览器场景 | ✅ 起因：`plugin-ui-cdp.mjs` 断言 `loaded()` 含 `@geewiki/wiki`（夹具早已搬到 `ui-demo`）且裸 `fetch` 调启停端点（要求 admin 会话 ⇒ 实测 401），**整脚本跑不动**。新增共用夹具（break-glass / setup / 验收账号三条路径 + `x-gw-csrf`）；`ui-extension-cdp.mjs` 加 **P12b 8 条**（真插件产物经受限宿主带 mode 注册 → 渲染 → 停用按 owner 回收）。修复中还抓到两个脚本自身的真问题：`Runtime.enable` **重放** console 历史、首屏断言假设"默认有启用的夹具插件"。**读数 `ui-extension-cdp` 36/36、`plugin-ui-cdp` 全通过（2 项按鉴权模式显式跳过）** |
+| **P13** | **按插件 SDK 作用域**：加载期间全局对象 = 按插件作用域构造的宿主（栈式安装 / 还原、覆盖 `import()` 与 `register(host)` 两段、`finally` 兜底）；作用域宿主补成**完整 SDK** + `pluginName`；注销类成员只作用于自己的来源（新增 `unregisterSlotFrom`）；不导出 `register(host)` 的 bundle 也登记 | ✅ 修掉"顶层注册无归属"这个**静默**缺陷（收不回 + 不过闸门）。读数：`packages/web` **976/976**、CDP **39/39**、`HOST_SDK_VERSION` **0.12.0** |
 
 **涉及 UI 的批次一律要求浏览器端到端验收**（真实渲染，走
 `scripts/acceptance/` 的零依赖 CDP 惯例，刻意不进 `pnpm test`），且 console 零错误、无失败请求。
@@ -436,12 +461,12 @@ google-chrome --headless=new --no-sandbox --remote-debugging-port=9461 about:bla
 node scripts/acceptance/ui-extension-cdp.mjs http://127.0.0.1:3000 9461
 ```
 
-**读数**（Chrome 151 headless，2026-09 本批）：**36 项全绿**，含
+**读数**（Chrome 151 headless，2026-09 本批）：**39 项全绿**（P13 后；P12b 时 36），含
 
 > **勘误（2026-09-21，P11c 时核对）**：P11b 那一轮文档里写成"28/28"，**实测是 27/27**。
 > 复核方式：静态 `check(` 调用 29 处，减去 P9 场景里 `if (probe.error) … else …` 那对二选一 ⇒ 28，
 > 再减去当时尚未存在的 P11c 一条 ⇒ 27。现读数以 `node scripts/acceptance/ui-extension-cdp.mjs <url>`
-> 输出的 `ok` 行数为准（P11c 后 28，P12b 后 **36**）。
+> 输出的 `ok` 行数为准（P11c 后 28，P12b 后 **36**，P13 后 **39**）。
 >
 > **验收需要鉴权（P12b 起）**：启停插件要求 admin 会话。三条路径由 `scripts/acceptance/lib/session.mjs`
 > 自动选择：① 实例启动时设 `GEEWIKI_ADMIN_TOKEN=<任意值>`（脚本读同一环境变量走 `x-gw-admin-token`
@@ -471,6 +496,9 @@ node scripts/acceptance/ui-extension-cdp.mjs http://127.0.0.1:3000 9461
   且 `wordmark="GeeWiki"`（**`registerExtension(wrap)` 路径，且 `default` 没丢**）、产物与 CSS 经入口表加载；
   停用 ⇒ `{"counter":false,"brandTag":false}`、字样逐字还原、`<link>` 移除
   —— 最后一条同时证明"贡献归属到插件名 ⇒ 停用即按 owner 回收"
+- `P13` **模块求值期（顶层形态）用全局 SDK 注册** ⇒ 归属到插件名并渲染
+  `{"toplevel":true,"toplevelInHeader":true}`；停用 ⇒ `{"toplevel":false}`
+  —— **修复前这条贡献的来源是 `'host-sdk'`，这个标记会残留**（这条断言就是那个缺陷的回归）
 - `P9` 壳 `display: contents`；shadow 内 `.font-bold` 字重 400（宿主内 700）⇒ 工具类进不去；
   shadow 内 `var(--gw-accent)` = 宿主内同值 ⇒ 令牌跨边界继承
 - `P0` `registerTheme` 覆盖 `--gw-radius-md: 17px` ⇒ `.rounded-md` 计算值 8px → 17px → 卸载还原

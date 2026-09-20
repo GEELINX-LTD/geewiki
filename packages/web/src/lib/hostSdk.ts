@@ -84,8 +84,16 @@ import {
  * **`replace` 贡献可渲染进 Shadow Root**——`--gw-*` 令牌跨边界继承（主题照常生效），
  * 宿主 Tailwind 类名进不去（故须自带样式）。默认不开：隔离会改变打印样式、`::selection`
  * 等行为，应当是作者明确选择的取舍。
+ * `0.12.0` 起**加载期间的 `window.__GEEWIKI_HOST__` 是按插件作用域的宿主**（P13）：
+ * 以前"模块求值期直接调全局 SDK"这条路的来源恒为 `'host-sdk'` ⇒ 插件停用后贡献**收不回**、
+ * 且**不过**越权闸门。现在加载期间全局对象与 `register(host)` 的参数是**同一个对象**
+ * （来源 = 插件名、闸门同一套、注销函数同一份），两种 bundle 形态不再有行为差别。
+ * 因此**作用域宿主上多了一个全局 SDK 没有的字段**：`pluginName`（"我是谁"，见
+ * `pluginUi.ts` 的 `PluginUiHost`）。同一个 `0.12.0` 里，作用域宿主也补全为**完整 SDK**
+ * （`registerTool` / `registerTheme` / `registerMarkdownExtension` / `unregister*` 全都有），
+ * 不再是一份手写的子集。
  */
-export const HOST_SDK_VERSION = '0.11.0'
+export const HOST_SDK_VERSION = '0.12.0'
 
 /** {@link GeeWikiHostSdk.PluginSlotOutlet} 的属性 */
 export interface PluginSlotOutletProps {
@@ -349,6 +357,19 @@ declare global {
   }
 }
 
+/**
+ * **基础** SDK：`window.__GEEWIKI_HOST__` 在"没有插件正在加载"时的值。
+ *
+ * ## 这里的 `'host-sdk'` 是什么（P13 之后必须这么理解）
+ * 它是**没有插件作用域时的来源**——宿主自己的代码，或插件在**加载结束之后**（例如某个
+ * `setTimeout` 回调里）才去注册的东西。**不是**"插件用全局 SDK 注册时的来源"：加载期间
+ * 全局对象被换成按插件作用域的宿主（`pluginUi.ts` 的 `installPluginScope`），插件无论写
+ * `window.__GEEWIKI_HOST__.registerSlot(...)` 还是用 `register(host)` 的参数，来源都是**插件名**
+ * ⇒ `unloadPluginUi` 收得回、两道越权闸门也管得到。
+ *
+ * 这条区分是有意的：它让"插件在加载期之外偷偷注册"仍然可诊断（来源是 `host-sdk` 而不是某个
+ * 插件名，管理台一眼能看出这条贡献不归任何插件）。
+ */
 const sdk: GeeWikiHostSdk = {
   React,
   jsxRuntime: {

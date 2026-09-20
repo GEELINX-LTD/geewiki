@@ -509,6 +509,29 @@ export function unregisterSlot(name: string, token?: unknown): void {
   emit()
 }
 
+/**
+ * 只注销**某一来源**在某个节点上的贡献（P13，作用域宿主用）。
+ *
+ * ## 为什么不能直接用 {@link unregisterSlot}
+ * 后者**不带来源**：`unregisterSlot('app-header')` 会把该节点上**所有**插件的贡献一起删掉。
+ * 它在"宿主自己的管理动作"里是合理的（宿主有权清场），但一旦暴露给插件就是一条
+ * **跨插件破坏通道**——A 插件一行调用就能拆掉 B 插件的界面，而 B 那边表现为"我的界面不见了"。
+ * 全局 SDK 上这个接口一直在，作用域宿主（`createPluginUiHost`）改为只走这一条：
+ * 你只能注销你自己注册的东西。
+ *
+ * 语义与 `unregisterSlot` 对齐：来源被删空时删掉整个键（保持 `registry.has` 的既有含义）。
+ */
+export function unregisterSlotFrom(name: string, source: string): void {
+  if (!isSlotName(name)) return
+  const entries = registry.get(name)
+  if (entries === undefined) return
+  const kept = entries.filter((entry) => entry.source !== source)
+  if (kept.length === entries.length) return
+  if (kept.length === 0) registry.delete(name)
+  else registry.set(name, kept)
+  emit()
+}
+
 interface BoundaryState {
   error: string | null
 }

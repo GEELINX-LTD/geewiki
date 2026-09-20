@@ -115,13 +115,13 @@
    `<header>` 的 `<nav>` 里、阅读页右栏由 `wiki-toc` 覆盖。
 4. **portal 类组件是否接**（Dialog / ConfirmDialog / DropdownMenu / Tooltip）：当前有意不接
    （`wrap` 会在调用处留下空包裹元素）。若要接，先解决"包装元素落在哪里"这个问题。
-5. **顶层直接调全局 SDK 的注册没有归属**（2026-09-21 P12 时发现并登记）：`window.__GEEWIKI_HOST__`
-   上的 `registerSlot` / `registerExtension` / `registerRoute` / `registerTool` / `registerTheme` /
-   `registerMarkdownExtension` 一律以 `'host-sdk'` 为来源，于是 `unloadPluginUi(name)` **收不回**
-   它们（插件停用后贡献残留、重新启用会叠加），也**不经过越权闸门**。
-   走 `export function register(host)` 的插件不受影响（P12 已给受限宿主补上 `registerExtension`）。
-   正解：加载期间临时装一个"按插件归属的 SDK 作用域"（`Proxy` 只覆盖注册类方法即可），
-   属独立批次——它同时会改掉 `registerTool` / `registerTheme` 的既有生命周期语义，需要自己的验收。
+5. ~~**顶层直接调全局 SDK 的注册没有归属**（2026-09-21 P12 时发现并登记）~~ —— **P13 已修复**。
+   做法：加载期间把"按插件作用域构造的宿主"临时装成 `window.__GEEWIKI_HOST__`
+   （`packages/web/src/lib/pluginUi.ts` 的 `installPluginScope`，栈式安装/还原、`finally` 兜底），
+   于是顶层形态与 `register(host)` 拿到的是**同一个对象**——来源 = 插件名、同一份 disposer、
+   同一套闸门。同时把作用域宿主补成**完整 SDK**（`{ ...sdk, …覆盖注册与注销两类 }`），
+   并让注销类成员只作用于自己的来源（`unregisterThemes('other')` 告警拒绝）。
+   读数：web **976/976**、CDP **39/39**（P13 两条：顶层注册渲染 + 停用后回收）。
 
 ### 1. `admin-page-slots` 扩展点
 
