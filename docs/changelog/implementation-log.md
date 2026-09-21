@@ -14,6 +14,72 @@
 
 **当前实现状态**
 
+- **块级归属：这一段最后由谁、什么时候编辑（2026-09-21）**：用户要求「我希望能显示块在什么时候由哪一位用户编辑能标识出来」。
+  动手前先定下三条裁决：**显示位置**＝阅读页逐段悬停（不是编辑页 / 版本对比对话框 / 治理面板）、
+  **粒度**＝只记最后一次（不做块级历史）、**作者名可见范围**＝登录用户看真名、匿名访客看「另一位成员」。
+  匿名那一档与版本列表的 `authorText` 逐字一致（不另造措辞）；登录那一档**没有**沿用版本列表的
+  "自己 / owner·admin 才看真名"三档 —— 理由是 `GET /api/org/members` 本来就是 `{access:'user'}`，
+  对登录者显示真名不新增可枚举面，而对匿名者收走名字这条红线**没动**。
+  - **一列 + 一次语义收紧**（`0024_block_author.sql`，落在 db 包、两侧方言成对）：`blocks.updated_by INTEGER`，
+    **无外键、允许 NULL** —— 与 0019 `page_versions.saved_by` 逐条同款（删用户不得连坐删掉归属；
+    `syncBlocksForPage` 是**跨插件服务路径**，内置文档同步 / AI 代写 / 存量回填都经过它，代调用没有可归属的主体，
+    写 NULL 比编一个假 id 诚实）。**要害是 `updated_at` 的语义**：此前 UPDATE 分支**无条件**写 `updated_at = now`，
+    于是"一个字都没改"的块时间戳也被刷新 —— 那个值只能说"这一页被保存过"，拿它当"这一段最近被编辑于"就是撒谎。
+    现在按 `contentHash` 判：**文本没变 ⇒ 两列都不写**（保留原值）、变了或新插入 ⇒ 两列一起写成"这次 + 这个人"。
+    判据必须是 `contentHash` 而不是"复用了旧 id"：`planBlockSync` 的同序号配对与新插入**都会复用旧 id 却带着新文本**。
+    历史行**刻意不回填**（没有可靠来源能回填出正确的作者，编一个比留空更坏）⇒ 0024 之前写入的块，读侧不显示归属。
+  - **写入路径只有一个口**：`syncBlocksForPage()` 新增**必填** `actorId: number | null`（与 `existing` / `syncIndex`
+    同一条纪律：让每个调用点**显式写下**"这次是谁改的"；`null` 是合法答案，但它必须是一个写下来的决定，
+    而不是一次遗忘 —— 漏传在**编译期**报错）。5 个调用点：`savePage()` 新建 / 更新传 `actorId ?? null`、
+    存量回填传 `null`、**两条"恢复版本"路径传真实 `actorId`**（恢复是一次真实的改动，盖的是"恢复操作者 + 恢复时刻"）。
+  - **区间与正文同源，而不是让前端重新解析**：`projectBlocks()` 顺手算出每个可见块在投影后正文里的 `[start, end)`
+    （分隔符 `'\n\n'` 算在单元之间），于是 `units.map((u) => text.slice(u.start, u.end)).join('\n\n') === text`
+    是一条**恒等式** —— 它一旦不成立，此后任何逐段归属都是猜的。连续受限块合并出的那一行占位也是一个单元，
+    但 `gated: true`、归属恒为 `null`，**且不下发"它代表几个块"**（那会泄露分段方式）；单元里**也没有 `ordinal`**
+    （存储序与渲染序会因受限块合并、标题被剥而错位，下发一个会被误用的序号等于给自己埋雷）。
+  - **读路径**：`GET /api/pages/:slug` 新增 `blocks`（区间 + `gated` + `updatedAt` + `author`），作者名用**一条**
+    `SELECT … WHERE id IN (…)` 批量取回；原文模式（`?content=raw`）**不下发**（含标记的原文里块与渲染段的对应关系
+    已被标记打乱，给了也没法用）；详情照旧在 `access.project()` 这个**载荷裁剪唯一出口**过一遍，`level !== 'full'`
+    时 `blocks` 一并置空 —— 否则区间本身就是"这一页有几段、哪几段被挡"的结构信息。
+  - **阅读页两道翻译，都在无 DOM 的纯函数里**（`packages/web/src/lib/blockMetaPlan.ts`）：
+    ① 服务端区间是相对接口 `content` 的，而渲染的是 `stripDuplicateLeadingTitle()` 的结果 ⇒
+    `alignBlockSegments()` **不绑死**那个具体变换，而是量公共前后缀算出被删区间，要求"删掉的长度恰好等于长度差"
+    且"删完能逐字还原"，再在渲染文本上复验上面那条恒等式；拿不准就返回 `null`（整页不显示归属）。
+    ② 块**不总是一块一个 DOM 节点**：**松列表**（空行分隔的列表项）在 CommonMark 里是**一个** `<ul>`、
+    **链接引用定义**自己渲染成空串 —— 这两种形态下"每块一份 HTML 拼起来＝整份 HTML"**根本不成立**，
+    怎么切都切错 ⇒ `planBlockGroups()` 从左到右**贪心合并**，每一组都用"是不是整份 HTML 的下一段"来验证，
+    最终 `pos === html.length` 才算这份切分**被证明过**。三条闸门（对不齐 / 证明不了 / 段数 > `MAX_ATTRIBUTED_SEGMENTS`＝400）
+    任一不过就**原样返回整份 HTML**：正文一字不变、只是没有标签。**少给可以，给错不行。**
+  - **★ 唯一被抓到的真缺陷（浏览器验收抓的，单测没抓到，记档）**：第一版把"渲染为空串"的引用定义段并进
+    **第一个渲染非空的组**，于是定义在**中间**、被**后面**的段消费时（定义在第 2 段、`[x]` 用在第 5 段）
+    **整页失去归属**。Node 单测用的是"定义紧跟消费段"的理想形态 ⇒ 没抓到。修法是让空段进 `context`、
+    作为**所有后续组**的渲染前缀带着走（自己不占组、不参与归属），并补了错位形态的单测。
+    教训：顺序敏感的形态，单测要**同时**钉住理想形态与错位形态。
+  - **界面**：`.gw-block` 只加 `position: relative`（**不设** margin / padding / border，包裹前后排版必须逐像素一致）、
+    标签绝对定位右上、默认 `visibility: hidden`（否则每段都顶着一行标签）、`:hover` 与 `:focus-within` 显示（键盘可达）、
+    `@media (hover: none)` **常显**（触屏没有悬停态，藏起来等于没有这个功能）。文案复用既有真源
+    （`authorText.ts` / `timePlan.ts`）：`最后由 X 编辑 · 3 天前`，`title` 属性给绝对时间。
+  - **读数**：全仓 `pnpm test` **2515/2515 绿**（26 个包 `# fail 0`）、`pnpm run typecheck` 全 Done、
+    `pnpm run lint`（`--max-warnings 0`）0 问题。浏览器端到端
+    （`scripts/acceptance/block-attribution-cdp.mjs`，零依赖 CDP）**19/19 通过、console 零 error**：
+    自播种三页（三段两次保存 / 松列表 + 引用定义 / 开头重复 H1），断言接口层归属逐段差异、
+    `.md-body` 的**每个直接子元素**都是 `.gw-block`（证明逐段包裹真的发生，而不是静默的整份回退）、
+    文案与 `title`、**真 CSS `:hover` 下标签出现**、松列表仍是**一个** `<ul>`、引用定义渲染成真链接。
+    新增单测：`packages/web/test/blockMetaPlan.test.ts`（对齐三种结局 / 分组 / 文案四档 / 两条 **CSS 源码守卫**）、
+    `packages/plugin-wiki/test/blocks.test.ts` 六条盖章与投影、`packages/plugin-wiki/test/service.test.ts` 三条可见性
+    （含"受限占位段只允许 `{author,end,gated,start,updatedAt}` 五个键"）。
+  - **环境坑（记档）**：headless Chrome 默认匹配 `@media (hover: none)`，而
+    `Emulation.setEmulatedMedia({features:[{name:'hover'…}]})` 与 `--blink-settings=primaryHoverType=…`
+    **都不生效**（Chrome 151 实测）⇒ 桌面悬停那一支只能在**非 headless** 浏览器里跑：
+    `Xvfb :99 -screen 0 1280x900x24` + `DISPLAY=:99 google-chrome --no-sandbox --remote-debugging-port=9470 …`；
+    Xvfb 在带 nvidia EGL 的机器上会于 `InitExtensions` 崩溃（`drmFreeDevice` 那条 abort），
+    加 `-extension GLX` 与 mesa 的 `__EGL_VENDOR_LIBRARY_FILENAMES` 可绕过。触屏那一支由 CSS 源码守卫覆盖，不需要浏览器；
+    脚本自己会先断言 `matchMedia('(hover: hover)')`，不满足则退出 2 并打印启动参数。
+  - **未做**：**没有块级历史**（用户选定"只记最后一次"）—— 被覆盖掉的作者信息不再存在；
+    标签**只在阅读页**（编辑页、历史快照预览、导出 / 打印都没有；历史预览刻意不传 `segments`，那份正文的作者是"当时"）；
+    跨插件 `svc.save()` 写 NULL ⇒ 阅读页看不到归属（而不是记到某个人头上）。
+    设计真源见 [docs/design/block-attribution.md](../design/block-attribution.md)，与
+    [access-control.md](../design/access-control.md) §4 的两条接口（`updated_at` 语义、投影产出区间）也记在那里。
 - **AI 能读文章里的图（2026-09-20，第二批）**：用户提问「如果文章中有图，可以读到吗」——
   当时的答案是**读不到**（`read_page` 只给 Markdown 文本，图就是 `![说明](/api/attachments/42)`
   这一行），随后用户要求「找一个最优的方案来实现」，并指出「变成临时 user 消息感觉很诡异，

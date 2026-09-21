@@ -121,6 +121,61 @@
     }
   }
 
+  /* ---------- 块级归属标签（「最后由 X 编辑 · 3 天前」）---------- */
+
+  /*
+   * 0024：阅读页把每一段包进 `.gw-block`，标签浮在该段右上角，**只在悬停/聚焦时可见**
+   * （类名由 `lib/markdownRender.ts` 注入，文案来自 `lib/blockMetaPlan.ts`）。
+   *
+   * 三条必须守住的观感约束：
+   *   1. **包裹层不许改变排版**。它不设 margin / padding / border —— 子元素的外边距
+   *      照旧"穿过去"（margin collapsing），所以逐段包裹与不包裹在像素上一致；
+   *      这是"渲染层会逐字校验拼接结果"那条纪律在样式侧的对应物。
+   *   2. **标签不参与正文流**（`position: absolute`），否则每一段都会被顶下去一行，
+   *      整页的行距全变 —— 那比没有这个功能更糟。
+   *   3. **不可见时不可点**（`visibility: hidden` 而不是只给 `opacity: 0`）：
+   *      只改透明度的话，那个角落仍然吃鼠标事件（正文右上角的链接/文字会点不动），
+   *      而且屏幕阅读器仍会念出这些标签。
+   */
+  .gw-block {
+    position: relative;
+  }
+
+  .gw-block-meta {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 1;
+    max-width: 100%;
+    overflow: hidden;
+    padding: 1px calc(var(--spacing) * 2);
+    border: 1px solid var(--gw-line);
+    border-radius: var(--radius-sm);
+    background: var(--gw-surface-sunken);
+    color: var(--gw-ink-soft);
+    font-size: 11px;
+    line-height: 1.6;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 150ms var(--ease-standard);
+  }
+
+  .gw-block:hover > .gw-block-meta,
+  .gw-block:focus-within > .gw-block-meta {
+    visibility: visible;
+    opacity: 1;
+  }
+
+  /* 触屏设备没有 hover：与标题锚点同款处置 —— 常显，否则这个功能永远够不到 */
+  @media (hover: none) {
+    .gw-block-meta {
+      visibility: visible;
+      opacity: 1;
+    }
+  }
+
   /* ---------- 代码块复制按钮 ---------- */
 
   .gw-code {

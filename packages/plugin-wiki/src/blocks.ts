@@ -552,6 +552,16 @@ export async function syncBlocksForPage(
      * `planBlockSync` 里那三道守卫正是用来防编辑事故的。
      */
     restructure?: boolean
+    /**
+     * ★ 0024：本次改动的**触发者**（与 `page_versions.saved_by` 同一套语义：
+     * `savePage` 收的 `actorId` 原样传进来）。
+     *
+     * **必填**（`number | null`，不是一个可省略的可选参数）—— 与 `existing` / `syncIndex`
+     * 同一条纪律：让每个调用点**显式写下**"这次是谁改的"。`null` 是一个合法的答案
+     * （存量回填、跨插件代调用、导入脚本），但它必须是一个**写下来的决定**，
+     * 而不是一次遗忘 —— 漏传在编译期就报错。
+     */
+    actorId: number | null
   },
 ): Promise<ParsedBlock[]> {
   const { pageId, content, pageLevel, now, existing } = args
@@ -600,6 +610,17 @@ export async function syncBlocksForPage(
   /** 最终块的 id 与文本，供最后重建索引 */
   const finals: Array<{ id: number; text: string }> = []
   const newIds: Array<number | null> = new Array<number | null>(parsed.length).fill(null)
+  /*
+   * ★ 0024：判断"这一块的**文本**是不是真的变了"，靠的是**旧行的 `content_hash`**。
+   *
+   * 为什么是哈希而不是"有没有复用旧 id"：`planBlockSync` 里"复用"有三个来源 ——
+   *   · LCS 配对（`kind + contentHash` 相同 ⇒ 文本必然没变）；
+   *   · 等长缺口里的**按位置成对**（"纯文本编辑"，文本**可能变**）；
+   *   · 拆分 / 合并时把母块的 id 留给第一块（文本可能变）。
+   * 后两种都复用旧 id 却可能带着新文本 ⇒ "复用"推不出"没改"。而 `contentHash`
+   * 就是文本的 sha256（`parseBlocks` 里算的），两边一比就是判据本身，不是它的近似。
+   */
+  const prevById = new Map(existing.map((o) => [o.id, o]))
 
   for (let i = 0; i < parsed.length; i += 1) {
     const b = parsed[i] as ParsedBlock
@@ -609,24 +630,60 @@ export async function syncBlocksForPage(
        * **复用旧 id** —— 这一行是"块身份稳定"的落点：`block_grants.block_id` 不变，
        * 授权因此跨编辑存活。`tier` 一并重算（页面档位可能变了）。
        */
-      await tx.run(
-        `UPDATE blocks
-            SET ordinal = ?, kind = ?, text = ?, visibility = ?, inherit = ?, marker = ?,
-                content_hash = ?, updated_at = ?, tier = ?
-          WHERE id = ?`,
-        [
-          b.ordinal,
-          b.kind,
-          b.text,
-          b.visibility,
-          b.inherit ? 1 : 0,
-          b.marker,
-          b.contentHash,
-          now,
-          tierFor(pageLevel, b.visibility),
-          reuseId,
-        ],
-      )
+      const prev = prevById.get(reuseId)
+      const textChanged = prev === undefined || prev.contentHash !== b.contentHash
+      if (textChanged) {
+        /*
+         * 文本真的变了（或旧行读不到 —— 防御性分支，按"变了"处理）：**两列一起**写成
+         * "这次 + 这个人"。它们必须同刻写入，否则「谁 + 什么时候」这条改动就散了。
+         */
+        await tx.run(
+          `UPDATE blocks
+              SET ordinal = ?, kind = ?, text = ?, visibility = ?, inherit = ?, marker = ?,
+                  content_hash = ?, updated_at = ?, updated_by = ?, tier = ?
+            WHERE id = ?`,
+          [
+            b.ordinal,
+            b.kind,
+            b.text,
+            b.visibility,
+            b.inherit ? 1 : 0,
+            b.marker,
+            b.contentHash,
+            now,
+            args.actorId,
+            tierFor(pageLevel, b.visibility),
+            reuseId,
+          ],
+        )
+      } else {
+        /*
+         * ★★ 文本**一个字都没变** ⇒ **刻意不写 `updated_at` / `updated_by`**（保留原值）。
+         *
+         * 这是 0024 的要害：此前这里无条件 `updated_at = now`，于是"页面被保存过"被
+         * 冒名成"这一块被编辑过"—— 一次只改了第三段的保存，会把第一段的时间戳也刷新，
+         * 读侧若据此显示「最后由某人于刚才编辑」，那是一句**假话**。
+         * 注意 ordinal / visibility / tier 等**照常重写**（插入、删除、改档位都会让它们变），
+         * 变的只是"这不算一次内容改动"这一件事。
+         */
+        await tx.run(
+          `UPDATE blocks
+              SET ordinal = ?, kind = ?, text = ?, visibility = ?, inherit = ?, marker = ?,
+                  content_hash = ?, tier = ?
+            WHERE id = ?`,
+          [
+            b.ordinal,
+            b.kind,
+            b.text,
+            b.visibility,
+            b.inherit ? 1 : 0,
+            b.marker,
+            b.contentHash,
+            tierFor(pageLevel, b.visibility),
+            reuseId,
+          ],
+        )
+      }
       newIds[i] = reuseId
       finals.push({ id: reuseId, text: b.text })
       continue
@@ -641,8 +698,8 @@ export async function syncBlocksForPage(
        * ⇒ **PG 上每一个新建/保存页面的请求都 500**（实测如此）。
        * 本仓既有插件（plugin-auth / plugin-org）都遵守这条约定。
        */
-      `INSERT INTO blocks (page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, created_at, updated_at, tier)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      `INSERT INTO blocks (page_id, ordinal, kind, text, visibility, inherit, marker, content_hash, created_at, updated_at, updated_by, tier)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
       [
         pageId,
         b.ordinal,
@@ -654,6 +711,8 @@ export async function syncBlocksForPage(
         b.contentHash,
         now,
         now,
+        // 新插入的块：这次改动就是它的第一次改动 ⇒ 作者与时间同刻落上
+        args.actorId,
         tierFor(pageLevel, b.visibility),
       ],
     )
@@ -715,6 +774,48 @@ export interface ProjectableBlock {
   ordinal: number
   text: string
   visibility: BlockVisibility
+  /**
+   * ★ 0024：这个块的**文本最后一次真的被改动**的时间（与 {@link updatedById} 同刻写入）。
+   *
+   * `null`/`undefined` = 不知道，来源有三：现场解析的降级路径（`parseBlocks` 的产物）、
+   * 0024 之前写入的行、测试替身。**读侧对"不知道"不显示任何归属**，而不是拿页面保存
+   * 时间冒充它（那个值只会更晚，见 0024 迁移注释）。
+   */
+  updatedAt?: string | null
+  /**
+   * ★ 0024：做出那次改动的主体 user id。`null`/`undefined` = 无法归属
+   * （跨插件代调用、存量回填、账号已删）—— 与 `page_versions.saved_by` 同一套语义与理由。
+   */
+  updatedById?: number | null
+}
+
+/**
+ * ★ 0024：投影输出的**一个单元** —— 要么是一个可见块，要么是一段受限块合并成的占位。
+ *
+ * ## 为什么要把字符区间也吐出来（而不是只给个数组顺序）
+ *
+ * 阅读页要"逐段显示最后编辑者"，而它拿到的正文是**一整份 Markdown**（渲染成一份 HTML）。
+ * 要把归属挂到渲染后的每一段上，客户端必须知道**每个块在正文里的字符区间**。靠"重新
+ * 解析投影后的正文再数第几段"是不行的：
+ *   1. 连续受限块被合并成**一个**占位（见 `flushGated`）⇒ 渲染序号与 `ordinal` 不相等；
+ *   2. 那等于让客户端再实现一份解析器，两份判据迟早漂移（本仓已两次吃过这个亏）。
+ *
+ * 区间由服务端在 `push` 的那一刻算出，与 {@link ProjectedContent.text} **逐字同源**：
+ * `units.map((u) => text.slice(u.start, u.end)).join('\n\n') === text` 是恒等式。
+ *
+ * ⚠️ 刻意**不含** `ordinal`，也不含"这个占位代表几个块"：合并占位的全部意义就是
+ * **不泄露分段方式**，下发这些数字等于把它漏回去。
+ */
+export interface ProjectedUnit {
+  /** 该单元在 {@link ProjectedContent.text} 里的字符区间 `[start, end)` */
+  start: number
+  end: number
+  /** `true` = 这一段是占位（若干受限块合并成的一行），没有可归属的块 */
+  gated: boolean
+  /** 见 {@link ProjectableBlock.updatedAt}；占位恒为 `null` */
+  updatedAt: string | null
+  /** 见 {@link ProjectableBlock.updatedById}；占位恒为 `null` */
+  updatedById: number | null
 }
 
 export interface ProjectedContent {
@@ -722,6 +823,8 @@ export interface ProjectedContent {
   text: string
   /** 被裁剪掉的块数。**仅计数**，不含任何内容、标题或字数 */
   gatedCount: number
+  /** ★ 0024：逐单元的区间与归属，与 {@link ProjectedContent.text} 逐字同源 */
+  units: ProjectedUnit[]
 }
 
 /**
@@ -759,6 +862,23 @@ export function projectBlocks(
   reader: { tier: ReaderTier; anonymous: boolean; grantedBlockIds?: readonly number[] },
 ): ProjectedContent {
   const out: string[] = []
+  const units: ProjectedUnit[] = []
+  /*
+   * ★ 0024：`len` 是"已经拼进去的全部字符数"，用来算每个单元的区间。
+   *
+   * 分隔符 `'\n\n'`（见函数末尾的 `out.join`）**算在两个单元之间** —— 于是
+   * `text.slice(unit.start, unit.end)` 拿到的就是这个单元的原文本，一个字符不多不少。
+   * 这条恒等式是客户端逐段对齐的全部依据，故它必须在这里（唯一的拼接点上）成立。
+   */
+  let len = 0
+  /** 唯一的 push 出口：区间与归属在这里一次算清，不再有第二处 `out.push` */
+  const push = (text: string, unit: Omit<ProjectedUnit, 'start' | 'end'>): void => {
+    const start = out.length === 0 ? 0 : len + 2
+    const end = start + text.length
+    out.push(text)
+    units.push({ start, end, ...unit })
+    len = end
+  }
   let gatedRun = 0
   let gatedCount = 0
   /*
@@ -783,7 +903,9 @@ export function projectBlocks(
     // 已登录读者给"需更高权限"。这样既不泄露受限内容的档位（org 还是 granted），
     // 又让匿名访客知道该做什么。
     const suffix = reader.anonymous ? '需登录查看' : '需更高权限查看'
-    out.push(`> 🔒 此处有 ${gatedRun} 段内容${suffix}`)
+    // 占位是**服务端生成的一行文案**，不对应任何真实块 ⇒ 归属恒为"不知道"。
+    // `gated: true` 让读侧能把它与真实块区分开（真实块才可能带归属）。
+    push(`> 🔒 此处有 ${gatedRun} 段内容${suffix}`, { gated: true, updatedAt: null, updatedById: null })
     gatedRun = 0
   }
 
@@ -793,7 +915,7 @@ export function projectBlocks(
     const byGrant = granted !== null && b.id !== undefined && granted.has(b.id)
     if (byTier || byGrant) {
       flushGated()
-      out.push(b.text)
+      push(b.text, { gated: false, updatedAt: b.updatedAt ?? null, updatedById: b.updatedById ?? null })
     } else {
       gatedRun += 1
       gatedCount += 1
@@ -801,7 +923,7 @@ export function projectBlocks(
   }
   flushGated()
 
-  return { text: out.join('\n\n'), gatedCount }
+  return { text: out.join('\n\n'), gatedCount, units }
 }
 
 /** 本模块需要的执行器形状（`DatabaseExecutor` 的结构子集，便于测试替身）。 */
@@ -840,14 +962,26 @@ export interface BlockReader {
 export async function projectPageContentFor(
   db: BlockReader,
   args: { pageId: number; content: string; principal: Principal; grantedBlockIds?: readonly number[] },
-): Promise<{ text: string; gatedCount: number }> {
+): Promise<ProjectedContent> {
   /*
    * ★ P3b：**必须把 `id` 一起取出来**。授权分支是拿块 id 去查的
    * （`block_grants.block_id`），少了这一列，被授予的 `granted` 块会**对授权者也
    * 不可见** —— 症状是"授权明明写进去了却看不到"，而且不报任何错。
    */
-  const rows = await db.query<{ id: number; ordinal: number; text: string; visibility: string }>(
-    'SELECT id, ordinal, text, visibility FROM blocks WHERE page_id = ? ORDER BY ordinal',
+  const rows = await db.query<{
+    id: number
+    ordinal: number
+    text: string
+    visibility: string
+    updated_at: string | null
+    updated_by: number | null
+  }>(
+    /*
+     * ★ 0024：`updated_at` / `updated_by` 必须一起取出来 —— 它们是"这一段最后是谁、
+     * 什么时候改的"的**唯一来源**。读侧（页详情）只能从投影结果拿到归属，
+     * 因为块与渲染段的对应关系是在投影里建立的（见 `ProjectedUnit`）。
+     */
+    'SELECT id, ordinal, text, visibility, updated_at, updated_by FROM blocks WHERE page_id = ? ORDER BY ordinal',
     [args.pageId],
   )
   const blocks =
@@ -858,12 +992,23 @@ export async function projectPageContentFor(
           ordinal: r.ordinal,
           text: r.text,
           visibility: r.visibility as BlockVisibility,
+          updatedAt: r.updated_at ?? null,
+          /*
+           * `Number()` 强转：`pg` 对**整数列**返回数字，故这里不是精度问题，
+           * 而是"驱动给的是字符串还是数字"的口径统一（本仓已在 `COUNT(*)` 上踩过
+           * 一次 `+1` 变成字符串拼接）。`NULL` 原样保留 —— 它就是"无法归属"。
+           */
+          updatedById: r.updated_by === null || r.updated_by === undefined ? null : Number(r.updated_by),
         }))
       : /*
          * 现场解析的降级路径：**没有块 id** ⇒ 授权分支必然落空
          * （见 `ProjectableBlock.id` 的说明 —— 拿会漂移的 ordinal 去查权限表是错的）。
          * 也就是说，**P3a 之前保存、且尚未被回填的历史页面里，`granted` 块对被授权者
          * 也不可见**，直到该页被重新保存为止。方向是失败关闭。
+         *
+         * ★ 0024：这条路径同样**没有归属**（`ParsedBlock` 不带 updatedAt/updatedById）
+         * ⇒ 投影出的每个单元都是"不知道谁改的"，读侧因此不显示任何归属。这是正确的：
+         * 块行还没有被建出来时，作者信息也确实不存在。
          */
         parseBlocks(args.content)
   const anonymous = args.principal.kind === 'anonymous'

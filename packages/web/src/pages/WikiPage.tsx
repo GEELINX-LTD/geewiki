@@ -80,6 +80,7 @@ import {
   type PageFormErrors,
 } from '../lib/pageFormPlan'
 import { stripDuplicateLeadingTitle, titleForRoute } from '../lib/pageMeta'
+import { alignBlockSegments } from '../lib/blockMetaPlan'
 import {
   buildBreadcrumb,
   buildNavTree,
@@ -1906,11 +1907,31 @@ function WikiDetail(props: {
         : new Map(pagesState.pages.map((p) => [p.slug, p.title] as const)),
     [pagesState.pages],
   )
+  /*
+   * ★ 0024：块级归属（逐段「最后由 X 编辑 · 时间」）。
+   *
+   * 对齐是**纯函数**（`lib/blockMetaPlan.ts`），且必须拿**接口下发的 content**
+   * （`page.content`）当区间基准 —— 上面那份 `bodyMarkdown` 已经被
+   * `stripDuplicateLeadingTitle` 去掉了一段（与标题重复的 H1），区间与它不再重合。
+   * `alignBlockSegments` 自己会算出"被删掉的是哪一段"并验证映射，验不过就返回 `null`
+   * ⇒ 整页不显示归属（详见该函数的说明：少给可以，给错不行）。
+   *
+   * 为什么只在**当前正文**上做、不给历史快照预览：快照的正文与接口下发的区间不是同一份，
+   * 硬套只会把某一段的作者安到另一段上；而"这一版是谁保存的"版本下拉里已经有了。
+   */
+  const blockSegments = useMemo(
+    () =>
+      page === null || page.blocks === undefined || page.blocks.length === 0
+        ? null
+        : alignBlockSegments(page.content, bodyMarkdown, page.blocks),
+    [page, bodyMarkdown],
+  )
   const rendered = useRenderedMarkdown(bodyMarkdown, {
     route,
     pages: pageTitles,
     // 附件破图占位里的「申请访问」按**页面**提交（附件没有独立申请端点）
     attachmentSlug: slug,
+    segments: blockSegments,
   })
   /*
    * 预览态的正文**走同一条渲染管线**（同一个 `useRenderedMarkdown`）：它顺带给出 TOC 与

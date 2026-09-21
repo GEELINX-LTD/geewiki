@@ -162,3 +162,10 @@
 ### 8. 插件平台仍成立的已知限制
 
 样式**默认**无隔离（无前缀改写；P9 起 `replace` 可显式选 Shadow DOM）、**ESM 模块实例不回收**（产物更新需整页刷新）、无版本协商与完整性之外的信任机制、`on-demand` 插槽的若干踩坑边界、"插件产物更新需整页刷新"等——完整清单见 [plugin-platform.md](./plugin-platform.md) §4.9/§5 与 [architecture.md](./architecture.md) §6。
+
+### 9. 块级完整历史（有意后置）
+
+**已落地的是"只记最后一次"**：`blocks.updated_by` / `updated_at` 记最后一个改动这个块文本的主体与时刻，阅读页逐段显示（设计真源 [design/block-attribution.md](./design/block-attribution.md)）。**被覆盖掉的作者信息不再存在** —— 想知道"这一段被谁改过几轮"，目前只有页级版本时间线（`page_versions.saved_by`，0019）与 `GET /api/pages/:slug/versions/:id/diff` 的块级结构差异。
+
+**有意后置的理由**：完整的块级历史需要新表（按块 + 版本存行）与保留策略（每次保存 × 每块的写入量、清理窗口、与 `page_versions` 的快照口径如何对齐），而收益在"追溯某一段的演化"这一个场景上——它与页级历史高度重叠。真要做，必须先回答"块历史与页历史谁是快照真源"（两份都存会出现相互矛盾的复原结果）。
+

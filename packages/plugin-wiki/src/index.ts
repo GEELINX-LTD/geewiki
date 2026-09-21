@@ -75,6 +75,7 @@ import {
   type BlockVisibility,
   type ParsedBlock,
   type PageLevel,
+  type ProjectedUnit,
 } from './blocks.js'
 
 /**
@@ -971,7 +972,13 @@ export const WikiPlugin = {
        */
       const wantRaw = opts?.rawContent === true && access.canEdit
       const projectedContent = wantRaw
-        ? { text: page.content, gatedCount: 0 }
+        ? /*
+           * 原文模式：正文没走投影 ⇒ 也就没有"哪个块对应哪一段"的区间。
+           * ★ 0024：这里必须显式给出**空 units**，而不是让这个分支漏掉该字段 ——
+           * 编辑者拿到的是带 gated 标记的原文，`startsWith` 之类的区间推断在标记
+           * 参与渲染时本来就是错的，故宁可"没有归属"（下方 `blocks` 也不下发）。
+           */
+          { text: page.content, gatedCount: 0, units: [] as ProjectedUnit[] }
         : await projectPageContentFor(adb, {
         pageId: page.id,
         content: page.content,
@@ -1011,6 +1018,40 @@ export const WikiPlugin = {
         await adb.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions WHERE page_id = ?', [page.id])
       )[0] as unknown as { n: number }
       /*
+       * ★ 0024：块级归属（阅读页逐段的「最后由 X 编辑 · 时间」）。
+       *
+       * ## 为什么不在这里过滤可见性
+       *
+       * `projectedContent.units` 已经是**投影之后**的形状：受限块在 `projectBlocks` 里
+       * 就被合并成占位了，占位单元**不带任何归属**（`gated: true`）。所以这里能拿到的
+       * 只有读者本来就看得见的那些段落的作者 —— 泄漏面为零，不需要第二道判据。
+       * 反过来，如果另写一份"哪些块可见"的判断，就又多了一份会漂移的判据（本仓的老教训）。
+       *
+       * ## 名字一次查回（不逐块查）
+       *
+       * 去重后一条 `IN (...)` 查询；一页几十段时逐块查会变成几十次往返。查不到的 id
+       * （账号已删 —— 0024 刻意不加外键）在 `blockAuthorFor` 里按"无法归属"处理。
+       */
+      const authorIds = [
+        ...new Set(
+          projectedContent.units
+            .filter((u) => !u.gated && u.updatedById !== null)
+            .map((u) => u.updatedById as number),
+        ),
+      ]
+      const authorNames = new Map<number, string>()
+      if (authorIds.length > 0) {
+        const placeholders = authorIds.map(() => '?').join(', ')
+        const rows = await adb.query<{ id: number; display_name: string | null }>(
+          `SELECT id, display_name FROM users WHERE id IN (${placeholders})`,
+          authorIds,
+        )
+        for (const r of rows) {
+          if (r.display_name !== null && r.display_name !== undefined) authorNames.set(Number(r.id), r.display_name)
+        }
+      }
+
+      /*
        * ★ **载荷裁剪的唯一出口**（设计文档 §2.4 约束 1）：详情对象在这里过一遍
        * `access.project(...)`，`level !== 'full'` 时正文根本不会进入响应
        * —— 这不是"前端隐藏"，而是服务端序列化之前就不存在。
@@ -1025,6 +1066,29 @@ export const WikiPlugin = {
         // 原文从未进入这个对象 ⇒ 也就不可能出现在任何响应分支里。
         // （例外只有显式的原文模式 `?content=raw`，见上面的 `wantRaw` 分支。）
         content: projectedContent.text,
+        /*
+         * ★ 0024：逐单元的区间 + 归属，与上面的 `content` **逐字同源**
+         * （区间由 `projectBlocks` 在拼接处算出，见 `ProjectedUnit`）。
+         *
+         * 原文模式**不下发**：那是给编辑者的原文（含 gated 标记），块与渲染段的对应
+         * 关系已经被标记打乱，给了也没法用；而编辑者的界面本来就有块档位控件
+         * （`GET /api/pages/:slug/blocks`），不需要这条。
+         */
+        ...(wantRaw
+          ? {}
+          : {
+              blocks: projectedContent.units.map((u) => ({
+                start: u.start,
+                end: u.end,
+                gated: u.gated,
+                updatedAt: u.updatedAt,
+                author: blockAuthorFor(
+                  principal,
+                  u.updatedById,
+                  u.updatedById === null ? null : (authorNames.get(u.updatedById) ?? null),
+                ),
+              })),
+            }),
         // 响应自述正文口径：拿到 `'raw'` 的调用方**不得**把它当读者可见的内容渲染
         ...(wantRaw ? { contentMode: 'raw' as const } : {}),
         created_at: page.created_at,
@@ -1071,7 +1135,15 @@ export const WikiPlugin = {
       }
       const projected = access.project(detail)
       if (projected === detail) return detail
-      return { ...projected, versions: [] }
+      /*
+       * ★ 0024：`blocks` 与 `content`、`versions` 一起裁掉。
+       *
+       * `access.project()` 只认 `content` 一个字段（它的类型约束就是 `{ content?: string }`），
+       * 当初这么设计是因为详情对象里只有正文是敏感的。块级归属虽然只覆盖"读者本来就看得见
+       * 的段落"，但它是一份**结构信息**（这一页有几段、哪几段是占位）—— 与 `versions`
+       * 被裁掉的理由同款。逐字段列在这里，就是让新增字段的人**必须**来这一行做决定。
+       */
+      return { ...projected, versions: [], blocks: [] }
     }
 
     /* ---------------- 反向链接索引（page_links 的读写） ---------------- */
@@ -1140,6 +1212,46 @@ export const WikiPlugin = {
       return {
         id: Number(authorId),
         displayName: viewerIsAdmin || isSelf ? displayName : null,
+      }
+    }
+
+    /**
+     * ★ 0024：**块级归属**的作者文案规则（阅读页「最后由 X 编辑」）。
+     *
+     * ## 与 `authorFor`（版本列表）的关系 —— 只差一档，且这一档是刻意的
+     *
+     * | 主体 | 版本列表（`authorFor`） | 块级归属（本函数） |
+     * | --- | --- | --- |
+     * | 匿名 | 「另一位成员」 | 「另一位成员」 |
+     * | 登录成员 | 「另一位成员」 | **真名** |
+     * | 自己 / owner·admin | 真名 | 真名 |
+     *
+     * ## 为什么登录成员这一档在块级归属上可以放宽（判据在别处，不是口味问题）
+     *
+     * `GET /api/org/members`（`packages/plugin-org/src/index.ts`）已经是
+     * `{ access: 'user' }` —— **任何登录用户**都能读到成员名单（含 `display_name` 与
+     * `email`）。放宽它的理由是"授权要按名单选人"，而那件事已经发生了。
+     * ⇒ 对已登录主体显示真名**不新增任何可枚举面**：他花一次请求就能拿到全部名字。
+     * 匿名访客仍然只有「另一位成员」——那一档确实读不到名单，放宽就等于开一条旁路。
+     *
+     * ## 为什么 `null` 的两种含义必须分开（与 `authorFor` 同款纪律）
+     *   - `updated_by IS NULL` ⇒ 无法归属（跨插件代调用 / 存量回填 / 非 HTTP 路径）
+     *     ⇒ 回 `null`，**读侧不显示任何归属**（不是「未记录」：那一句会让人以为
+     *     "已经尽力记了"，而这里连一次记录都没发生）；
+     *   - 账号已删（`display_name` 为 null，0024 刻意不加外键）⇒ **也回 `null`**，
+     *     避免渲染出"某人（名字缺失）"这种半截信息，与「另一位成员」混淆。
+     */
+    const blockAuthorFor = (
+      viewer: Principal,
+      authorId: number | null | undefined,
+      displayName: string | null | undefined,
+    ): { id: number; displayName: string | null } | null => {
+      if (authorId === null || authorId === undefined) return null
+      if (displayName === null || displayName === undefined) return null
+      const viewerIsAnonymous = viewer.kind === 'anonymous' || viewer.userId === null
+      return {
+        id: Number(authorId),
+        displayName: viewerIsAnonymous ? null : displayName,
       }
     }
 
@@ -1330,6 +1442,13 @@ export const WikiPlugin = {
                    */
                   existing: [],
                   syncIndex: blocksIndexSupported,
+                  /*
+                   * ★ 0024：存量回填**没有作者可归**（它是启动时的一次批处理，
+                   * 不是某个人触发的编辑）—— 写 `null` 而不是"第一个管理员"之类的猜测。
+                   * 读侧据 `null` **不显示任何归属**，所以这些块在被人真正改动之前
+                   * 都不会长出一句「最后由谁编辑」（这正是诚实的表现：我们确实不知道）。
+                   */
+                  actorId: null,
                 })
                 // `content_hash` 由调用方一并维护（syncBlocksForPage 只管块与索引）——
                 // 它是一致性探针 `/api/admin/blocks/verify` 的比对基准，不回填会让存量页面恒报不一致
@@ -1440,6 +1559,13 @@ export const WikiPlugin = {
              */
             existing: [],
             syncIndex: blocksIndexSupported,
+            /*
+             * ★ 0024：新建页面的全部块都是这次改动产生的 ⇒ 作者就是这次保存的触发者。
+             * `actorId` 可能是 `null`（跨插件代调用，见 `savePage` 的参数说明），
+             * 此时块照建，只是不显示归属（`?? null` 把"没传"收敛成那个显式的 NULL，
+             * 与 `page_versions.saved_by` 的写入口径一致）。
+             */
+            actorId: actorId ?? null,
           })
           await rebuildLinks(tx, slug, input.content)
           return 'created'
@@ -1495,6 +1621,11 @@ export const WikiPlugin = {
            */
           existing: await readExistingBlocks(tx as unknown as BlockReader, existing.id),
           syncIndex: blocksIndexSupported,
+          /*
+           * ★ 0024：文本真被改动的那些块盖上"这次 + 这个人"；没变的块**保留原归属**
+           * （判据在 `syncBlocksForPage` 里，靠旧行的 `content_hash` 比对）。
+           */
+          actorId: actorId ?? null,
         })
         // 出链随正文重建（同一事务内，故正文与索引不会不一致）
         await rebuildLinks(tx, slug, input.content)
@@ -2703,6 +2834,13 @@ export const WikiPlugin = {
               syncIndex: blocksIndexSupported,
               // ★ 恢复是"显式回到那个状态"，可能改变块结构 ⇒ 放行编辑路径那三道守卫
               restructure: true,
+              /*
+               * ★ 0024：恢复**是一次真实的内容改动**（点下"恢复此版本"的人做了它）⇒
+               * 被改动的块归到这个人名下。刻意不沿用历史快照里的作者：
+               * 那句「最后由 X 编辑」要回答的是"当前这段正文是谁弄成这样的"，
+               * 而把它写成几年前的原始作者，等于把这次恢复说成没发生过。
+               */
+              actorId,
             })
             return bumpAclRevision(tx, slug)
           })
@@ -2840,6 +2978,8 @@ export const WikiPlugin = {
              * 而 `restructure` 只放行"改结构"，不触及任何可见性判定。
              */
             restructure: true,
+            // ★ 0024：与上一条恢复路径同一条理由 —— 这次改动归给按下恢复的人
+            actorId,
           })
           // ④ 授予：整体替换为快照里的那一组。"恢复权限"必须包含授予 ——
           //    否则旧版本是私有的、而当前的 page_grants 仍然生效 ⇒ 恢复出的权限**更宽**。
