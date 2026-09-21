@@ -18,7 +18,7 @@
     "schemastery": "3.18.0"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
+    "@types/node": "^26.6.1",
     "@types/pg": "^8.11.10"
   }
 }

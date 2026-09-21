@@ -22,6 +22,6 @@
   "devDependencies": {
     "@geewiki/db-sqlite": "workspace:*",
     "@geewiki/wiki": "workspace:*",
-    "@types/node": "^22.0.0"
+    "@types/node": "^26.6.1"
   }
 }

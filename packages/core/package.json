@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "cordis": "^4.0.0-rc.10",
-    "@types/node": "^22.0.0"
+    "@types/node": "^26.6.1"
   },
   "dependencies": {
     "schemastery": "3.18.0"
