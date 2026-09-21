@@ -135,11 +135,25 @@ test('extractLinkTargets：去重并保持首次出现顺序', () => {
   assert.deepEqual(ex(md), ['b', 'a', 'c'])
 })
 
+test('extractLinkTargets：图片不是页面链接，但正文里的 `!` 不受影响', () => {
+  const md = [
+    '![小粒咖啡炭疽病枝条症状](/api/attachments/123)',
+    '[相邻的普通链接](real)',
+    '![](/api/attachments/456)',
+    '[文字里有感叹号!](exclaim)',
+  ].join('\n')
+  // 图片的目标是资源（典型就是附件 URL `/api/attachments/<id>`），不是页面。
+  // 当成页面链接抽取的话，`/api/attachments/123` 会被归一化成形状合法的 slug
+  // `api/attachments/123` ⇒ 页面上每张图都变成一条红链 + 一个"新建该页"按钮。
+  // 排除的是 `[` **紧邻**的那个 `!`，故显示文本里出现 `!` 的普通链接不受影响。
+  assert.deepEqual(ex(md), ['real', 'exclaim'])
+})
+
 test('extractLinkTargets：畸形输入不崩且不误抽', () => {
   const md = ['[未闭合](', '[[未闭合', '[甲](好的', '![](/x.png)', '[](empty-text)'].join('\n')
   // 未闭合的 `](` 不产生目标；中文目标因不符合 slug 字符集被丢弃；
-  // 图片链接与"空显示文本"都是合法链接（后者只是文本为空）
-  assert.deepEqual(ex(md), ['x.png', 'empty-text'])
+  // 图片（`!` 前缀）不是页面链接；"空显示文本"仍是合法链接（后者只是文本为空）
+  assert.deepEqual(ex(md), ['empty-text'])
 })
 
 test('extractLinkTargets：空正文与纯文本返回空数组', () => {
