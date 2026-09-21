@@ -63,8 +63,29 @@ RUN pnpm install --frozen-lockfile
 # 复制源码并构建前端（vite build → packages/web/dist）
 COPY . .
 
+# 内置插件的界面产物（`packages/web/dist/plugins-ui/@geewiki/**`）是**生成物**，
+# 必须在 `vite build` 之前生成，否则镜像里的 web dist 只有外壳：
+#
+#   * 该目录落在 `packages/web/public/plugins-ui/`，而 `packages/web/public/plugins-ui/`
+#     被 .gitignore 忽略（生成物不入库）⇒ **干净检出里根本不存在它**；
+#   * 唯一的生成者是 `build:builtin-ui` / `build:fixtures`，而 `build`（= `vite build`）
+#     不生成它 —— 它只负责把 publicDir 拷进 dist（见 fixtures/vite.config.ts 文件头）；
+#   * 于是从干净检出构建出的镜像，所有内置插件的界面都会报"界面产物缺失"。
+#     出厂清单默认启用 ops / ai-summary / ai-assistant 三个带界面的插件，
+#     因此这是**开箱即见**的问题，不是个别配置导致的。
+#
+# 顺序不可颠倒：本步写入 `public/`，紧随其后的 `pnpm -r run build` 才把它拷进 `dist/`。
+RUN pnpm --filter @geewiki/web run build:builtin-ui
+
 RUN pnpm -r --if-present run build \
     && test -f packages/web/dist/index.html
+
+# 回归守卫：内置插件界面产物必须齐全。宁可构建失败，也不要再出一个
+# "插件界面凭空消失"的镜像 —— 这类故障在构建期完全静默，只在用户界面上表现为缺失。
+RUN for p in ai-assistant ai-summary editor-plain oidc ops; do \
+      test -d "packages/web/dist/plugins-ui/@geewiki/$p" \
+        || { echo "缺少内置插件界面产物: $p"; exit 1; }; \
+    done
 
 # 生成生产部署树：--legacy 兼容共享 lockfile 的 workspace 结构。
 # 注意（已实测）：pnpm 11 的 legacy deploy 仍会对 better-sqlite3 执行原生安装脚本，
