@@ -364,6 +364,42 @@ export interface WikiPageDetail {
     author: { id: number; displayName: string | null } | null
   }[]
   /**
+   * ★ 0024：**块级归属** —— 阅读页逐段显示「最后由 X 编辑 · 时间」的唯一数据源。
+   *
+   * 数组与 `content` **逐字同源**：`units.map(u => content.slice(u.start, u.end))`
+   * 的顺序拼接（用 `'\n\n'` 连接）**恒等于** `content`。所以读侧不需要自己解析正文，
+   * 也不会因为"数第几段"而与服务端漂移（受限块被合并成占位，渲染序号与块序号并不相等）。
+   *
+   * ## 三个字段各自的语义边界
+   *
+   * - `gated: true` ⇒ 这一段是**受限块合并成的占位**（一行 `> 🔒 此处有 N 段内容…`），
+   *   它不对应任何真实块，`updatedAt`/`author` 恒为 `null`。占位**代表几个块**刻意不下发
+   *   （分段方式是结构信息，见 `projectBlocks` 的 `flushGated`）。
+   * - `updatedAt`：这个块的**文本最后一次真的被改动**的时刻。`null` = 不知道
+   *   （0024 之前写入的行 / 现场解析的降级路径）—— 读侧此时**不显示任何归属**，
+   *   尤其**不得**拿 `WikiPageDetail.updated_at`（页面保存时间）来顶替：那个值只会更晚，
+   *   用它说"这一段最近被编辑于此刻"是一句假话。
+   * - `author`：`null` 与 `{ id, displayName: null }` **是两件事**，读侧措辞也不同：
+   *   `null` = **无法归属**（跨插件代调用 / 存量回填 / 账号已删）⇒ 不显示归属；
+   *   有 `id` 而 `displayName` 为 `null` = 记了人、但**匿名访客**不该看真名
+   *   ⇒ 显示「另一位成员」（与版本列表对匿名的口径一致；已登录主体能读成员名单，
+   *   故给他们真名，判据见 `blockAuthorFor`）。
+   *
+   * 原文模式（`contentMode: 'raw'`）与"正文被裁剪"的分支都**不下发**这个字段
+   * （理由见 `getPage` 里那两处注释）。
+   */
+  blocks?: {
+    /** 该段在 `content` 里的字符区间 `[start, end)` */
+    start: number
+    end: number
+    /** `true` = 受限块合并成的占位（没有可归属的块） */
+    gated: boolean
+    /** 文本最后一次被改动的时刻；`null` = 不知道（读侧不显示归属） */
+    updatedAt: string | null
+    /** 做出那次改动的人；`null` = 无法归属 */
+    author: { id: number; displayName: string | null } | null
+  }[]
+  /**
    * ★ P2：当前主体对这条目的**能力**，供前端条件化渲染按钮。
    *
    * **前端隐藏只是体验，不是安全** —— 服务端在写路径上另有强制（§9 R10 反模式 5）。

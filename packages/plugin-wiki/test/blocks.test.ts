@@ -13,7 +13,15 @@ import { DatabaseSync } from 'node:sqlite'
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { BlockParseError, parseBlocks, readExistingBlocks, sha256Hex, syncBlocksForPage, tierFor } from '../src/blocks.js'
+import {
+  BlockParseError,
+  parseBlocks,
+  projectBlocks,
+  readExistingBlocks,
+  sha256Hex,
+  syncBlocksForPage,
+  tierFor,
+} from '../src/blocks.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = join(HERE, '..', '..', '..')
@@ -192,6 +200,7 @@ test('syncBlocksForPage：写 blocks 与 blocks_fts，且 granted 档的 tier �
     existing: await existingOf(db),
     // 本夹具建了 `blocks_fts`（SQLite）⇒ 与生产同一取值
     syncIndex: true,
+    actorId: null,
   })
 
   const rows = db
@@ -220,6 +229,7 @@ test('syncBlocksForPage：重复保存是**替换**而不是追加（否则块�
     now: 't1',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 2)
   // ★ 第二次保存必须传入**库里真实的块**（而不是 `[]`），否则旧块不会被复用也不会被删
@@ -230,6 +240,7 @@ test('syncBlocksForPage：重复保存是**替换**而不是追加（否则块�
     now: 't2',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
   // 索引同步收缩 —— 旧块的行必须在同一事务里删掉，否则会留下孤儿文本
@@ -245,6 +256,7 @@ test('syncBlocksForPage：pageLevel=null（失败关闭）⇒ 全部块 tier 为
     now: 't',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   const row = db.prepare('SELECT tier FROM blocks').get() as { tier: number | null }
   assert.equal(row.tier, null)
@@ -468,6 +480,7 @@ async function seedOne(db: DatabaseSync, content: string, pageLevel: 0 | 1 | nul
     // 本夹具建了 `blocks_fts`（SQLite）⇒ 与生产同一取值。
     // `syncIndex` 在 P3a 修复轮改成必填后，这一组用例（写于旧的可选签名）需逐个补齐。
     syncIndex: true,
+    actorId: null,
   })
 }
 
@@ -490,6 +503,7 @@ test('保守重解析：纯文本编辑（块数不变）⇒ 块 id 全部保留
     now: 't2',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   assert.deepEqual(ids(db), before, '块数不变时 id 必须原样保留（授权挂在 id 上）')
   assert.deepEqual(texts(db), ['a改', 'b改', 'c改'])
@@ -506,6 +520,7 @@ test('保守重解析：在某块后插入新块 ⇒ 未改动的块 id 保留�
     now: 't2',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   const after = ids(db)
   assert.equal(after.length, 3)
@@ -526,6 +541,7 @@ test('保守重解析：删除**未授权**的块 ⇒ 正常删除，其余 id �
     now: 't2',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   const after = ids(db)
   assert.deepEqual(after, [before[0], before[2]], '删掉中间那块，首尾 id 不变')
@@ -544,6 +560,7 @@ test('保守重解析：合并两个**可见性不同**的块 ⇒ 409 block_merg
       now: 't2',
       existing: await existingOf(db),
       syncIndex: true,
+      actorId: null,
     }),
     (err: Error) => {
       assert.match(err.message, /^block_merge_conflict:/)
@@ -566,6 +583,7 @@ test('保守重解析：合并两个**可见性相同**的块 ⇒ 允许（不�
     now: 't2',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM blocks').get() as { n: number }).n, 1)
   assert.deepEqual(ids(db), [before[0]], '合并保留首块的 id')
@@ -587,6 +605,7 @@ test('保守重解析：拆分一个**已授权**的块 ⇒ 两块都继承授�
     now: 't2',
     existing: await existingOf(db),
     syncIndex: true,
+    actorId: null,
   })
   const after = ids(db)
   assert.equal(after.length, 2, '拆成两块')
@@ -611,6 +630,7 @@ test('保守重解析：删除一个**已授权**的块 ⇒ 409 block_grant_orph
       now: 't2',
       existing: await existingOf(db),
       syncIndex: true,
+      actorId: null,
     }),
     (err: Error) => {
       assert.match(err.message, /^block_grant_orphan:/)
@@ -621,4 +641,161 @@ test('保守重解析：删除一个**已授权**的块 ⇒ 409 block_grant_orph
   // 关键：拒绝发生在任何写入之前 —— 两块与授权都原样还在
   assert.deepEqual(ids(db), before)
   assert.equal(grantCount(db, before[1] as number), 1)
+})
+
+/* =====================================================================
+ * 0024：块级归属（谁、什么时候改的）
+ *
+ * 这一组用例守的是**两个不会报错的失效**：
+ *   1. `updated_at` 被"页面保存过"冒名顶替 —— 一次只改了第三段的保存，
+ *      把第一段的时间戳也刷新，读侧据此说「第一段刚被某人改过」就是假话；
+ *   2. `updated_by` 在没有可归属主体时被编一个 id 出来（跨插件代调用 / 存量回填）。
+ * 两者的共同特征是**页面照常显示、日志干净**，所以必须逐条钉住。
+ * ===================================================================== */
+
+/** 该页每块的 `(ordinal, updated_at, updated_by)` —— 归属断言只用这三列 */
+function stamps(db: DatabaseSync) {
+  return (
+    db.prepare('SELECT ordinal, updated_at, updated_by FROM blocks WHERE page_id = 1 ORDER BY ordinal').all() as {
+      ordinal: number
+      updated_at: string
+      updated_by: number | null
+    }[]
+  ).map((r) => ({ ...r }))
+}
+
+test('0024：新建的块带上"这次 + 这个人"（作者是 actorId）', async () => {
+  const db = freshDb()
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: '甲\n\n乙',
+    pageLevel: 0,
+    now: 't1',
+    existing: await existingOf(db),
+    syncIndex: true,
+    actorId: 7,
+  })
+  assert.deepEqual(stamps(db), [
+    { ordinal: 0, updated_at: 't1', updated_by: 7 },
+    { ordinal: 1, updated_at: 't1', updated_by: 7 },
+  ])
+})
+
+test('★ 0024：只改了第二段 ⇒ 第一段的时间与作者**一个字都不动**', async () => {
+  const db = freshDb()
+  const tx = txOf(db)
+  await syncBlocksForPage(tx as never, {
+    pageId: 1,
+    content: '甲\n\n乙',
+    pageLevel: 0,
+    now: 't1',
+    existing: await existingOf(db),
+    syncIndex: true,
+    actorId: 7,
+  })
+  // 换一个人（8）改第二段；第一段原样
+  await syncBlocksForPage(tx as never, {
+    pageId: 1,
+    content: '甲\n\n乙改',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+    syncIndex: true,
+    actorId: 8,
+  })
+  assert.deepEqual(
+    stamps(db),
+    [
+      // ★ 这一行是本案的全部意义：没变的块保留原作者、原时刻（此前会被刷成 t2 / 8）
+      { ordinal: 0, updated_at: 't1', updated_by: 7 },
+      { ordinal: 1, updated_at: 't2', updated_by: 8 },
+    ],
+  )
+})
+
+test('0024：文本没变但位置变了（前面插入一段）⇒ 归属跟着块走，不被刷新', async () => {
+  const db = freshDb()
+  const tx = txOf(db)
+  await syncBlocksForPage(tx as never, {
+    pageId: 1,
+    content: '甲\n\n乙',
+    pageLevel: 0,
+    now: 't1',
+    existing: await existingOf(db),
+    syncIndex: true,
+    actorId: 7,
+  })
+  await syncBlocksForPage(tx as never, {
+    pageId: 1,
+    content: '新的开头\n\n甲\n\n乙',
+    pageLevel: 0,
+    now: 't2',
+    existing: await existingOf(db),
+    syncIndex: true,
+    actorId: 8,
+  })
+  assert.deepEqual(stamps(db), [
+    // 新插入的那一段是这次改动产生的 ⇒ 归 8
+    { ordinal: 0, updated_at: 't2', updated_by: 8 },
+    // 甲、乙只是被挤到后面：**位置变了不等于内容改了**
+    { ordinal: 1, updated_at: 't1', updated_by: 7 },
+    { ordinal: 2, updated_at: 't1', updated_by: 7 },
+  ])
+})
+
+test('0024：跨插件代调用（actorId: null）⇒ updated_by 是 NULL，而不是编一个 id', async () => {
+  const db = freshDb()
+  await syncBlocksForPage(txOf(db) as never, {
+    pageId: 1,
+    content: '甲',
+    pageLevel: 0,
+    now: 't1',
+    existing: await existingOf(db),
+    syncIndex: true,
+    actorId: null,
+  })
+  assert.deepEqual(stamps(db), [{ ordinal: 0, updated_at: 't1', updated_by: null }])
+})
+
+test('★ 0024：投影单元的区间与归属 —— 拼回去逐字等于正文，占位段没有归属', () => {
+  const blocks = [
+    { id: 1, ordinal: 0, text: '公开段', visibility: 'public' as const, updatedAt: 't1', updatedById: 7 },
+    { id: 2, ordinal: 1, text: '内部段', visibility: 'org' as const, updatedAt: 't2', updatedById: 8 },
+    { id: 3, ordinal: 2, text: '运维备注', visibility: 'granted' as const, updatedAt: 't3', updatedById: 9 },
+  ]
+  // 匿名读者：org / granted 两块都看不到 → 合并成一个占位
+  const anon = projectBlocks(blocks, { tier: 0, anonymous: true, grantedBlockIds: [] })
+  assert.deepEqual(
+    anon.units.map((u) => (u.gated ? 'GATED' : anon.text.slice(u.start, u.end))),
+    ['公开段', 'GATED'],
+  )
+  // 地基恒等式：按区间切出来再按 '\n\n' 拼回去，逐字等于投影文本
+  assert.equal(anon.units.map((u) => anon.text.slice(u.start, u.end)).join('\n\n'), anon.text)
+  // 占位段**不带任何归属**（它代表的块一个都没露出来）
+  assert.equal(anon.units[1]!.updatedAt, null)
+  assert.equal(anon.units[1]!.updatedById, null)
+  assert.equal(anon.units[1]!.gated, true)
+
+  // 组织成员：org 块可见，granted 块仍然不可见（没有授权）
+  const member = projectBlocks(blocks, { tier: 1, anonymous: false, grantedBlockIds: [] })
+  assert.deepEqual(
+    member.units.map((u) => (u.gated ? 'GATED' : member.text.slice(u.start, u.end))),
+    ['公开段', '内部段', 'GATED'],
+  )
+  assert.equal(member.units[1]!.updatedById, 8)
+  assert.equal(member.units[1]!.updatedAt, 't2')
+  assert.equal(member.units.map((u) => member.text.slice(u.start, u.end)).join('\n\n'), member.text)
+})
+
+test('0024：没有归属信息（现场解析的降级路径）⇒ 单元的归属是"不知道"，不是 0', () => {
+  // `parseBlocks` 的产物不带 updatedAt/updatedById ⇒ 投影必须原样给出 null
+  const parsed = parseBlocks('甲\n\n乙')
+  const projected = projectBlocks(parsed, { tier: 0, anonymous: true, grantedBlockIds: [] })
+  assert.deepEqual(
+    projected.units.map((u) => [u.updatedAt, u.updatedById]),
+    [
+      [null, null],
+      [null, null],
+    ],
+  )
 })

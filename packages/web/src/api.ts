@@ -589,6 +589,30 @@ export interface PageDetail extends PageSummary {
    * 的 `WikiEdit.load()` 与 `plugin-wiki` 的路由注释）。
    */
   contentMode?: 'raw'
+  /**
+   * ★ 0024：**块级归属**（阅读页逐段的「最后由 X 编辑 · 时间」）。
+   *
+   * 与 `content` **逐字同源**：用这些区间切出来的片段，以 `'\n\n'` 拼回去恒等于 `content`
+   * （服务端的投影就是这么拼的，见 `plugin-wiki` 的 `projectBlocks`）。
+   * 两种响应不下发这个字段：`contentMode === 'raw'`（原文，给编辑者）与正文被裁剪的响应。
+   *
+   * ⚠️ 三个"没有"必须分开读，混起来会说错话：
+   *   - `author: null` ⇒ **无法归属**（跨插件代调用 / 存量回填 / 账号已删）⇒ 不显示归属；
+   *   - `author.displayName === null` ⇒ **记了人、名字不给匿名访客** ⇒ 显示「另一位成员」；
+   *   - `updatedAt: null` ⇒ **不知道什么时候改的**（0024 之前写入的块）⇒ 同样不显示归属，
+   *     尤其**不得**拿页面级的 `updated_at` 顶替（那是"这一页被保存过"，只会更晚）。
+   *
+   * 判断一律走 `lib/authorText.ts` 与 `lib/blockMetaPlan.ts`，不要在这里另写一套。
+   */
+  blocks?: {
+    /** 该段在 `content` 里的字符区间 `[start, end)` */
+    start: number
+    end: number
+    /** `true` = 受限块合并成的占位（没有可归属的块） */
+    gated: boolean
+    updatedAt: string | null
+    author: { id: number; displayName: string | null } | null
+  }[]
 }
 
 /**

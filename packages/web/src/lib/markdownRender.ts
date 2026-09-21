@@ -31,6 +31,15 @@
  * 序列化用 `innerHTML`，同理不引入新内容。
  */
 import { mdToHtml } from './sanitize'
+import {
+  BLOCK_META_CLASS,
+  BLOCK_WRAP_CLASS,
+  MAX_ATTRIBUTED_SEGMENTS,
+  blockMetaText,
+  blockMetaTitle,
+  planBlockGroups,
+  type BlockSegment,
+} from './blockMetaPlan'
 import { buildHash } from './hashAnchor'
 import { anchorLabel, assignHeadingIds, tocEntries, type HeadingEntry } from './headingPlan'
 import {
@@ -220,6 +229,12 @@ export function buildBlockedAttachment(
  *                       「申请访问」要按页面 slug 提交申请（附件没有独立申请端点）。
  *                       未知时（历史快照预览等）传 `null`/不传 ⇒ 占位块不给申请入口，
  *                       但**仍然**如实说明"无权访问或被删除"。
+ * @param opts.segments ★ 0024 块级归属：`lib/blockMetaPlan.ts` 的 `alignBlockSegments()`
+ *                       产物（已对齐到**本函数收到的这份** Markdown）。给定时，
+ *                       每个片段会被包进 `.gw-block` 并带上「最后由 X 编辑」标签；
+ *                       校验不通过（拼接结果与原样渲染不是逐字相同）则**整份回退**成
+ *                       不包不标 —— 少给可以，给错不行（见 `applyBlockSegments`）。
+ *                       `null`/缺省 = 不做任何包裹（历史预览、访客预览等一律不传）。
  */
 /** 表格滚动容器的类名（样式在 `styles.css`；两处注入方共用同一个名字） */
 export const TABLE_SCROLL_CLASS = 'gw-table-scroll'
@@ -247,6 +262,71 @@ export function wrapTables(holder: ParentNode): void {
   }
 }
 
+/**
+ * ★ 0024：把逐段归属**包裹**进已消毒的 HTML —— 唯一的"逐段标签"落点。
+ *
+ * ## 为什么不是"渲染完之后按 `.md-body` 的子节点数一数"
+ *
+ * 因为那个数**数不准**：`marked` 会把若干块渲染成一个节点（松列表跨空行合并成一个
+ * `<ul>`、链接引用定义自己渲染成空串而由后面那段消费），这里还有 `wrapTables` /
+ * 复制按钮注入的包裹层。按序号对齐的结果是**标签挂到隔壁段落**，既不报错也不容易被发现。
+ *
+ * ## 做法：分组计划 + **切分必须覆盖整份 HTML** 才算数
+ *
+ * 分组的推导与证明在 `lib/blockMetaPlan.ts` 的 `planBlockGroups()`（纯函数、可单测）：
+ * 从左到右贪心合并，每一组都用"它的 HTML 是不是整份 HTML 的下一段"来验证，
+ * 全部组确认完且恰好走到末尾 ⇒ 这份切分是**被证明过的**。
+ *
+ * 于是本函数只做两件事：按边界切开 HTML、把每组包一层并注入标签。
+ * **正文一个字节都不会变**（切分的拼接恒等于原字符串），变的多出来的只有：
+ *   - 一层无语义的 `.gw-block`（样式上不占位，见 markdown.css）；
+ *   - 组内归属一致时的那句标签。
+ *
+ * ## 对不上就整份放弃（不是"尽力而为地错位显示"）
+ *
+ * `planBlockGroups()` 返回 `null` 时本函数**原样返回**整份 HTML：正文与改动前逐字相同，
+ * 只是没有任何标签。这是唯一的安全方向 —— 少给可以，给错不行。
+ */
+function applyBlockSegments(
+  markdown: string,
+  html: string,
+  segments: readonly BlockSegment[] | null,
+): string {
+  if (segments === null || segments.length === 0) return html
+  if (segments.length > MAX_ATTRIBUTED_SEGMENTS) return html
+
+  const groups = planBlockGroups(markdown, segments, (src) => mdToHtml(src), html)
+  if (groups === null) return html
+
+  const now = new Date()
+  let out = ''
+  for (const g of groups) {
+    /*
+     * 标签是**我们自己构造的**静态文本（作者名来自服务端，此处只做属性/文本转义），
+     * 不含任何正文里的标记 —— 与标题锚点、复制按钮同一条纪律：消毒之后只做加法。
+     * 没有归属的组（受限占位、作者未知、组内不一致）**照样包裹**（DOM 划分保持一致），
+     * 只是里面不注入标签。
+     */
+    const text = g.label === null ? null : blockMetaText(g.label, now)
+    const title = g.label === null || text === null ? null : blockMetaTitle(g.label)
+    const titleAttr = title === null ? '' : ` title="${escapeAttr(title)}"`
+    const chip =
+      text === null ? '' : `<span class="${BLOCK_META_CLASS}"${titleAttr}>${escapeText(text)}</span>`
+    out += `<div class="${BLOCK_WRAP_CLASS}">${chip}${html.slice(g.htmlStart, g.htmlEnd)}</div>`
+  }
+  return out
+}
+
+/** 转义：文本节点（`<`/`>`/`&` 三个字符足矣，引号在文本里无意义） */
+function escapeText(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/** 转义：双引号属性值（**必须含引号**，否则作者名里的 `"` 能闭合属性） */
+function escapeAttr(s: string): string {
+  return escapeText(s).replace(/"/g, '&quot;')
+}
+
 export function renderMarkdownBody(
   markdown: string,
   opts: {
@@ -254,6 +334,7 @@ export function renderMarkdownBody(
     route?: string
     pages?: ReadonlyMap<string, string> | null
     attachmentSlug?: string | null
+    segments?: readonly BlockSegment[] | null
   } = {},
 ): RenderedMarkdown {
   const withCopyButtons = opts.withCopyButtons ?? true
@@ -277,7 +358,12 @@ export function renderMarkdownBody(
     )
   }
   const holder = document.createElement('div')
-  holder.innerHTML = mdToHtml(markdown)
+  /*
+   * ★ 0024：块级归属的包裹**必须发生在这一步**（而不是渲染完之后再按 DOM 子节点去数）：
+   * 只有在这里我们才同时握着"整份 HTML"与"每个片段自己的 HTML"，因而能**证明**
+   * 逐段包裹没有改变任何一个字节（见 `applyBlockSegments`）。
+   */
+  holder.innerHTML = applyBlockSegments(markdown, mdToHtml(markdown), opts.segments ?? null)
 
   /*
    * 链接改写必须在**注入标题锚点之前**：那时 holder 里只有正文自己的 `<a>`，

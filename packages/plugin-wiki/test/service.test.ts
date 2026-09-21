@@ -566,14 +566,30 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
     const put = await h.call('PUT', '/api/pages/:slug', { slug: 'via-http' }, { title: 'HTTP 写入', content: 'v1' })
     assert.equal(put.status, 200)
     assert.equal(put.body['outcome'], 'created')
+    const viaHttp = await svc.get('via-http', MEMBER)
     assert.deepEqual(
-      (await svc.get('via-http', MEMBER)),
+      viaHttp,
       {
         slug: 'via-http',
         title: 'HTTP 写入',
         content: 'v1',
-        created_at: (await svc.get('via-http', MEMBER))?.created_at,
-        updated_at: (await svc.get('via-http', MEMBER))?.updated_at,
+        created_at: viaHttp?.created_at,
+        updated_at: viaHttp?.updated_at,
+        /*
+         * ★ 0024：块级归属随详情下发（区间 + 谁 + 什么时候）。
+         * `updatedAt` 与上面两个时间戳同款自回填（它是"这次保存"的时刻）。
+         * 值得断言的不是那个时刻，而是**作者名被真的查了出来**（`Member` 来自 users 表，
+         * 是读写两条路径接上的证据）：写入时只落了 `updated_by = 1`。
+         */
+        blocks: [
+          {
+            start: 0,
+            end: 2,
+            gated: false,
+            updatedAt: viaHttp?.blocks?.[0]?.updatedAt ?? null,
+            author: { id: 1, displayName: 'Member' },
+          },
+        ],
         version: 1,
         versions: [],
         // ★ P2：详情新增能力标志；MEMBER 对该条目有管理权，故档位字段一并下发。
@@ -591,6 +607,8 @@ test('wiki-service 与 REST 端点结果逐字段一致（服务只是把同一�
     const detail = await h.call('GET', '/api/pages/:slug', { slug: 'via-svc' })
     assert.equal(detail.status, 200)
     assert.deepEqual(Object.keys(detail.body).sort(), [
+      // ★ 0024：块级归属（区间 + 谁 + 什么时候）—— 它是详情响应的**契约字段**
+      'blocks',
       // ★ P2：详情新增能力标志与档位字段（有管理权时才带档位）
       'capabilities',
       'content',
@@ -879,10 +897,24 @@ test('同步与异步两条路径：同一操作的响应逐字段一致（避�
 
     const ga = await sync.call('GET', '/api/pages/:slug', { slug: 'dual' })
     const gb = await asyn.call('GET', '/api/pages/:slug', { slug: 'dual' })
-    // created_at/updated_at 含时间戳，逐字段比对时用同步侧的值回填（两次独立运行，时刻必然不同）
+    /*
+     * created_at/updated_at 含时间戳，逐字段比对时用同步侧的值回填（两次独立运行，时刻必然不同）。
+     *
+     * ★ 0024：`blocks[].updatedAt` 是**同一个道理**下的第三处时间戳 —— 它是块级归属的时刻，
+     * 也来自 `new Date().toISOString()`，故一并抹平再比。不抹平的话这条用例会以
+     * "两个时刻差 2 毫秒"的形式失败，而那**不是**要验的东西（要验的是两条驱动路径
+     * 给出的**字段与取值形态**一致：区间、gated、作者 id 与名字）。
+     */
+    const nullBlockTimes = (body: Record<string, unknown>): Record<string, unknown> => ({
+      ...body,
+      blocks: ((body['blocks'] as { updatedAt: string }[] | undefined) ?? []).map((x) => ({
+        ...x,
+        updatedAt: null,
+      })),
+    })
     assert.deepEqual(
-      { ...(gb.body as Record<string, unknown>), created_at: null, updated_at: null },
-      { ...(ga.body as Record<string, unknown>), created_at: null, updated_at: null },
+      nullBlockTimes({ ...(gb.body as Record<string, unknown>), created_at: null, updated_at: null }),
+      nullBlockTimes({ ...(ga.body as Record<string, unknown>), created_at: null, updated_at: null }),
       '详情响应除时间戳外应逐字段一致',
     )
 
@@ -1798,5 +1830,131 @@ test('PAGE_SAVED_EVENT：订阅者抛错**不得**让保存失败', async () => 
     assert.equal(page?.content, '正文')
   } finally {
     await h.dispose()
+  }
+})
+
+
+/* =====================================================================
+ * ★ 0024 块级归属：**读侧对谁说什么**
+ *
+ * 这一组用例只有一件事要守：作者名对**谁**显示、对**谁**收着，以及"查不到"该怎么回。
+ * 三档的分界写在 `blockAuthorFor` 的注释里，此处把它变成可执行的证据：
+ *   · 登录主体（含普通成员）⇒ 真名 —— `GET /api/org/members` 本就对登录用户开放，
+ *     显示真名不新增任何可枚举面；
+ *   · 匿名访客 ⇒ `displayName: null`（界面显示「另一位成员」），与版本列表对匿名同款；
+ *   · 没有可归属的主体 ⇒ `author: null`（界面**不显示任何归属**）。
+ *
+ * 为什么值得单独一组：这三档的差别**只体现在一个字段的取值上**，写错任何一档都不会报错，
+ * 而错的方向要么是"匿名也能看到同事真名"（旁路），要么是"明明记了、却说得像没记"
+ * （界面说假话）。两者都不会让任何既有用例变红。
+ * ===================================================================== */
+
+test('★ 0024：块级归属对登录主体回真名，对匿名回 displayName: null', async () => {
+  const h = await makeHarness()
+  try {
+    // MEMBER（users.id = 1，display_name = 'Member'）经 HTTP 写入 ⇒ 块归到他名下
+    const put = await h.call(
+      'PUT',
+      '/api/pages/:slug',
+      { slug: 'attr' },
+      { title: '归属', content: '第一段' },
+      MEMBER,
+    )
+    assert.equal(put.status, 200)
+
+    const asMember = await h.call('GET', '/api/pages/:slug', { slug: 'attr' }, undefined, MEMBER)
+    const memberBlocks = asMember.body['blocks'] as Array<Record<string, unknown>>
+    assert.equal(memberBlocks.length, 1)
+    assert.deepEqual(memberBlocks[0]?.['author'], { id: 1, displayName: 'Member' }, '登录主体看真名')
+
+    // 匿名要能看到这一页：设成 public + 已发布（未发布的 public 对任何人都不可见）
+    const vis = await h.call(
+      'PUT',
+      '/api/pages/:slug/visibility',
+      { slug: 'attr' },
+      { visibility: 'public', published: true },
+      OWNER,
+    )
+    assert.equal(vis.status, 200)
+
+    const asAnon = await h.call(
+      'GET',
+      '/api/pages/:slug',
+      { slug: 'attr' },
+      undefined,
+      anonymousPrincipal(),
+    )
+    assert.equal(asAnon.status, 200)
+    const anonBlocks = asAnon.body['blocks'] as Array<Record<string, unknown>>
+    assert.deepEqual(
+      anonBlocks[0]?.['author'],
+      { id: 1, displayName: null },
+      '匿名访客只拿到 id：留 null 而不是抹掉 author —— 界面据此显示「另一位成员」，' +
+        '那与「没有记录」是两件事',
+    )
+    // 区间与正文同源（客户端据此逐段对齐；对不上就整页不显示归属）
+    assert.equal(
+      (asAnon.body['content'] as string).slice(
+        Number(anonBlocks[0]?.['start']),
+        Number(anonBlocks[0]?.['end']),
+      ),
+      '第一段',
+    )
+  } finally {
+    h.dispose()
+  }
+})
+
+test('★ 0024：跨插件代调用写入的块 ⇒ author 为 null（无归属，而不是"未记录"的假记录）', async () => {
+  const h = await makeHarness()
+  try {
+    // 服务路径不带主体（导入脚本 / 内置文档同步就是这条路径）
+    await h.svc().save('attr-svc', { title: '服务写入', content: '一段正文' })
+
+    const got = await h.call('GET', '/api/pages/:slug', { slug: 'attr-svc' }, undefined, MEMBER)
+    const blocks = got.body['blocks'] as Array<Record<string, unknown>>
+    assert.deepEqual(blocks[0]?.['author'], null, '没有可归属的主体 ⇒ null')
+    /*
+     * ★ 时间**是知道的**，不知道的只是"谁" —— 两者不是同一件事，契约必须能分开表达。
+     *
+     * 这个"半截信息"（有时刻、没作者）由**界面**兜住：`lib/blockMetaPlan.ts` 的
+     * `blockMetaText` 在 `author === null` 时返回 `null` ⇒ 这一段**不显示任何标签**，
+     * 而不是显示「最后由 编辑 · 3 天前」这种缺主语的话（用例见
+     * `packages/web/test/blockMetaPlan.test.ts`）。
+     */
+    assert.equal(typeof blocks[0]?.['updatedAt'], 'string', '块确实是在这次写入里创建的 ⇒ 时刻可得')
+    // 反空洞：正文与区间照常下发（"没有归属"不等于"这一页没有块信息"）
+    assert.equal((got.body['content'] as string).slice(0, 2), '一段')
+  } finally {
+    h.dispose()
+  }
+})
+
+test('★ 0024：受限块被裁剪后，占位段不下发作者（归属只覆盖读者看得见的段）', async () => {
+  const h = await makeHarness()
+  try {
+    const content = ['公开段。', '', '<!--gated:granted-->', '运维备注。', '<!--/gated-->'].join('\n')
+    const put = await h.call(
+      'PUT',
+      '/api/pages/:slug',
+      { slug: 'attr-gated' },
+      { title: '遮蔽', content },
+      MEMBER,
+    )
+    assert.equal(put.status, 200)
+
+    const asMember = await h.call('GET', '/api/pages/:slug', { slug: 'attr-gated' }, undefined, MEMBER)
+    const blocks = asMember.body['blocks'] as Array<Record<string, unknown>>
+    const gated = blocks.filter((b) => b['gated'] === true)
+    assert.equal(gated.length, 1, '受限块应被合并成一个占位段')
+    assert.equal(gated[0]?.['author'], null)
+    assert.equal(gated[0]?.['updatedAt'], null)
+    // 占位段**不得**泄露"它代表几个块"（分段方式是结构信息）
+    assert.deepEqual(Object.keys(gated[0] ?? {}).sort(), ['author', 'end', 'gated', 'start', 'updatedAt'])
+    // 可见段的归属照旧
+    const visible = blocks.filter((b) => b['gated'] === false)
+    assert.deepEqual(visible[0]?.['author'], { id: 1, displayName: 'Member' })
+  } finally {
+    h.dispose()
   }
 })

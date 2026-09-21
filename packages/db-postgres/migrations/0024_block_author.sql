@@ -1,0 +1,22 @@
+-- 0024_block_author.sql —— 内容块承载「谁改的」（PostgreSQL 对偶）
+--
+-- 与 sqlite 侧 `0024_block_author.sql` 同义：给 `blocks` 增 `updated_by INTEGER`。
+--
+-- ★ 方言对照（sqlite → postgres）：
+--   `ALTER TABLE … ADD COLUMN updated_by INTEGER;` 两侧同形，无类型差异 —— `INTEGER`
+--   在 PG 是 4 字节整型，足以容纳 `users.id`（sqlite 侧 INTEGER 是动态宽度，但本仓库的
+--   id 由自增主键产生，量级一致）。与 0019 的 `saved_by INTEGER` 同款。
+--
+-- ★ 与 sqlite 侧逐条一致的四条决定（理由详见 sqlite 侧注释）：
+--   1. **无外键**：与 `pages.created_by` / `page_versions.saved_by` 同款 —— 删用户不得
+--      连坐删掉内容归属；
+--   2. **允许 NULL**：`syncBlocksForPage` 是跨插件服务路径（内置文档同步 / AI 代写 /
+--      存量回填），代调用时没有可归属的主体，写 NULL 比编一个假 id 诚实；
+--   3. **与 `updated_at` 同一时刻写入**，故读侧可把「谁 + 什么时候」当成一条改动；
+--   4. **`updated_at` 的语义在本批收紧为"这个块的文本真的变了"**（此前 UPDATE 分支
+--      无条件刷新它，那个值只说明"页面保存过"）。文本没变 ⇒ 两列都不写。
+--
+-- 注意本文件**不可重放**（重复执行报 `column "updated_by" … already exists`，
+-- SQLSTATE 42701）—— 与 0019/0020 同类。PG 的迁移失败会整体回滚并中止激活，
+-- 幂等性由 `_migrations` 控制器提供（已应用的文件不再执行）。
+ALTER TABLE blocks ADD COLUMN updated_by INTEGER;

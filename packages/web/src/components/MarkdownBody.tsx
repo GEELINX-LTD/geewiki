@@ -42,6 +42,7 @@ import {
   codeTextFromButton,
   renderMarkdownBody,
 } from '../lib/markdownRender'
+import type { BlockSegment } from '../lib/blockMetaPlan'
 import { ApplyAccessDialog } from './access/ApplyAccessDialog'
 
 /** 反馈停留时长：成功 1s（与 Docusaurus 的 1000ms 一致），失败 3s（够用户读完并按键） */
@@ -58,6 +59,12 @@ export function useRenderedMarkdown(
     pages?: ReadonlyMap<string, string> | null
     /** 正文所属页面（附件破图占位块的「申请访问」按它提交申请）；未知时不传 */
     attachmentSlug?: string | null
+    /**
+     * ★ 0024：块级归属（已对齐到**本函数收到的这份** Markdown，见 `lib/blockMetaPlan.ts`）。
+     * `null`/缺省 ⇒ 不做逐段包裹（历史快照预览、"按访客视角预览"等一律不传：
+     * 那两份正文与接口下发的区间不是同一份，硬传只会错位）。
+     */
+    segments?: readonly BlockSegment[] | null
   } = {},
 ): ReturnType<typeof renderMarkdownBody> {
   const withCopyButtons = opts.withCopyButtons ?? true
@@ -69,6 +76,7 @@ export function useRenderedMarkdown(
    */
   const pages = opts.pages ?? null
   const attachmentSlug = opts.attachmentSlug ?? null
+  const segments = opts.segments ?? null
   /*
    * ══════ 无 DOM 环境（SSR / 单测的 renderToString）══════
    *
@@ -88,9 +96,9 @@ export function useRenderedMarkdown(
   return useMemo(
     () =>
       canRender
-        ? renderMarkdownBody(markdown, { withCopyButtons, route, pages, attachmentSlug })
+        ? renderMarkdownBody(markdown, { withCopyButtons, route, pages, attachmentSlug, segments })
         : { html: '', toc: [] },
-    [canRender, markdown, withCopyButtons, route, pages, attachmentSlug],
+    [canRender, markdown, withCopyButtons, route, pages, attachmentSlug, segments],
   )
 }
 
