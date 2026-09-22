@@ -18,7 +18,7 @@ import {
   type TurnEvent,
   type TurnToolCallView,
 } from './sse.js'
-import { normalizeDockImages, toTurnImages, trimConversationImages, type TurnImageWire } from './imagePlan.js'
+import { imagesForStorage, normalizeDockImages, toTurnImages, trimConversationImages, type TurnImageWire } from './imagePlan.js'
 
 /* ============================== 端点常量 ============================== */
 
@@ -635,6 +635,16 @@ function sanitizeStoredMessage(raw: unknown): DockMessage | null {
   return message
 }
 
+/**
+ * 一条消息 → **落盘形态**：把图片换成本地副本（判据见 `imagePlan.ts` 的 `imagesForStorage`）。
+ *
+ * 不改其余字段，也不动 `state` 里的那一份——刷新后读回来的是副本，当前这一轮用的仍是原图。
+ */
+function withStoredImages(m: DockMessage): DockMessage {
+  if (m.images === undefined || m.images.length === 0) return m
+  return { ...m, images: imagesForStorage(m.images) }
+}
+
 /** 丢掉一条消息里的图片（配额降级用；不改其余字段） */
 function withoutImages(m: DockMessage): DockMessage {
   if (m.images === undefined) return m
@@ -708,6 +718,10 @@ export function loadConversations(store: MiniStore, userId: number | null): Dock
  *
  * 同 id 覆盖而不是追加：一段对话在一次会话里会被反复保存（每轮结束一次），
  * 追加会让"近 10 段"在几轮之内就被同一段对话占满。
+ *
+ * **存进去的是落盘形态，返回的是原样那份**：原图（2~8 MB）不进 localStorage，
+ * 进的是本地副本（`imagesForStorage`）。返回原样那份是因为调用方拿它更新历史入口，
+ * 而界面上"刚发出去的那张图"必须还是原图。
  */
 export function saveConversation(
   store: MiniStore,
@@ -718,13 +732,17 @@ export function saveConversation(
   const next = [conversation, ...existing]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, MAX_CONVERSATIONS)
+  const forStorage = next.map((c) => ({ ...c, messages: c.messages.map(withStoredImages) }))
   try {
-    store.setItem(conversationsKey(userId), JSON.stringify(next))
+    store.setItem(conversationsKey(userId), JSON.stringify(forStorage))
     return next
   } catch {
     /*
-     * 配额满 / 隐私模式。**图片是这一批新增的主要占用**（每张几百 KB，
+     * 配额满 / 隐私模式。**图片是这一路的主要占用**（一份副本几十~几百 KB，
      * 而 localStorage 通常只有 5 MB），故先退一步：只丢图片、不丢文字。
+     *
+     * 走到这里说明连**副本**都存不下（会话攒到 10 段、或配额被别的东西占了）——
+     * 原图那一档已经在 `imagesForStorage` 让位了，这是第二道降级。
      *
      * 反过来（整段存不下就放弃）会让用户刷新后发现**整段对话都没了**——
      * 而"图没了、话还在"是一个可用形态。这一条在加图片之前不存在，

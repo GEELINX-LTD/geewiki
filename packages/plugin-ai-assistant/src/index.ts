@@ -67,17 +67,23 @@ export const REQUIRED_TOOL_NAMES: readonly string[] = ['search_kb']
 /**
  * 请求体上限。
  *
- * 16 MB 是**被图片撑上去的**：无状态轮次协议每轮都要重发整段转录，转录里带图
- * ⇒ 请求体随对话里的图片数增长。取值与另外三个常量是一组：
- * `MAX_IMAGE_BASE64_CHARS`(1.4 MB) × `MAX_IMAGES_PER_MESSAGE`(4) ≈ 5.6 MB（单条消息的图），
- * 客户端 `MAX_CONVERSATION_IMAGES`(8) × 1.4 MB ≈ 11.2 MB（整段对话的图），
- * 余下的留给文本与工具结果（`maxRounds` 40 × `maxToolResultChars` 8000 = 320 KB）。
+ * 48 MB 是**被图片撑上去的**：无状态轮次协议每轮都要重发整段转录，而浏览器那侧
+ * **不再压缩照片**（2026-09-21 的用户要求，见 `docs/design/dock-images.md` §4）
+ * ⇒ 请求体随对话里的图片数增长，且每张是原图大小。取值与另外三个常量是一组：
+ * `MAX_IMAGE_BASE64_CHARS`(≈8.25 MB) × `MAX_IMAGES_PER_MESSAGE`(4) ≈ 44 MB（单条消息的图），
+ * 客户端 `MAX_CONVERSATION_IMAGES`(4) × 同一值 ≈ 44 MB（整段对话的图），
+ * 余下的 4 MB 留给文本与工具结果（`maxRounds` 40 × `maxToolResultChars` 8000 = 320 KB）。
  *
  * 仍然**必须有**这道闸：没有它，一个匿名请求就能拿任意大的 body 把进程内存打满
  * （body 是整体缓冲后 `JSON.parse` 的）。它与逐图上限不是重复——
  * 那条挡"一张图吃掉整个预算"，这条挡"总量"。
+ *
+ * **这条上限的代价要写明白**：body 是整体缓冲的，最坏情况是 `MAX_CONCURRENT_STREAMS`(4)
+ * 个回合同时打满，即约 200 MB 只在读 body 这一步。这是"不压照片"换来的直接成本，
+ * 部署时内存要给够；嫌贵就把这里与 `MAX_IMAGE_BASE64_CHARS` 一起降回去（两侧镜像常量
+ * 与 `ui/imagePlan.ts` 必须同步改，守卫测试会挡住只改一处的做法）。
  */
-const MAX_BODY_BYTES = 16_000_000
+const MAX_BODY_BYTES = 48_000_000
 
 /**
  * 测试专用注入口。**刻意不进 `configSchema`**——照 `@geewiki/ai-qa` 的先例：

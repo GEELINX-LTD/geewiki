@@ -52,21 +52,29 @@ export const MAX_CLIENT_TOOLS = 64
 export const MAX_IMAGES_PER_MESSAGE = 4
 
 /**
- * 单张图片的 base64 **字符**上限（1.4M 字符 ≈ 1 MB 字节）。
+ * 单张图片的 base64 **字符**上限（11M 字符 ≈ 8.25 MB 字节）。
  *
  * 为什么按字符而不是按字节：线上传输的就是 base64，而校验发生在解析前——
- * 字符数是**不解码**就能判定的量。解一次 1 MB 的 base64 只为"看看它是不是合法 base64"，
+ * 字符数是**不解码**就能判定的量。解一次 8 MB 的 base64 只为"看看它是不是合法 base64"，
  * 那正是拒绝服务最省事的入口。
  *
+ * **为什么是 8.25 MB 这个量级**（2026-09-21）：浏览器那侧**不再压缩照片**（用户要求，
+ * 见 `docs/design/dock-images.md` §4），所以这一闸是"一张图能不能进来"的**唯一**判据。
+ * 按"手机相机原图直传"取值：JPEG 原图常见 2~5 MB，高分辨率 PNG 截图能到 8 MB。
+ * 再往上就不是"照片"而是"任意大的载荷"了，而 body 是整体缓冲后 `JSON.parse` 的。
+ *
  * 取值不是随手定的：它与**另外两道闸**构成一组自洽的数字——
- * `MAX_IMAGES_PER_MESSAGE`(4) × 本值 ≈ 5.6 MB ≤ `MAX_BODY_BYTES`(16 MB)，
- * 而客户端 `MAX_CONVERSATION_IMAGES`(8) × 本值 ≈ 11.2 MB ≤ 16 MB。
+ * `MAX_IMAGES_PER_MESSAGE`(4) × 本值 ≈ 44 M 字符 ≤ `MAX_BODY_BYTES`(48 MB)，
+ * 而客户端 `MAX_CONVERSATION_IMAGES`(4) × 本值同样 ≈ 44 M ≤ 48 MB。
  * 三者的关系由 `test/uiDockImage.test.ts` 的镜像守卫钉住；
  * 改任意一个而不同步另外两个，症状是"某张图在某一层被 413/400，而界面说它已发出"。
  *
+ * 上游还有一道**本仓管不着**的闸：各家 OpenAI 兼容网关对单请求体 / 单图另有上限，
+ * 具体值未实测（`docs/design/dock-images.md` §9 L12）。撞上了表现为上游 400。
+ *
  * 浏览器侧的镜像常量是 `ui/imagePlan.ts` 的 `IMAGE_MAX_BASE64_CHARS`。
  */
-export const MAX_IMAGE_BASE64_CHARS = 1_400_000
+export const MAX_IMAGE_BASE64_CHARS = 11_000_000
 
 /**
  * 允许的图片 MIME 白名单。

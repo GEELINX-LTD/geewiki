@@ -4,20 +4,42 @@
  * ## 为什么单独一层
  * 与 `dockPlan.ts` 同一条理由：凡是"能在没有 DOM、没有网络的情况下判定的东西"
  * 都要能从组件里抽出来，否则它只能靠真浏览器验收。这里的每一条判据（data URL 拆解、
- * 参数校验、压缩尺寸计算）都能被 `node --test` 直接钉住。
+ * 参数校验、副本尺寸计算）都能被 `node --test` 直接钉住。
  *
- * ## 两个形态，一次转换
- * - **界面形态** `{url}`：data URL，可直接喂给 `<img src>`，也直接进 `localStorage`；
+ * ## 一条硬规矩：上送的那一份是**原图**
+ * 浏览器**不碰**用户上传的字节（不缩放、不重编码）。唯一的尺寸判据是
+ * {@link IMAGE_MAX_BASE64_CHARS}：超了就当场拒绝并说清是哪张，绝不"帮你压一下"。
+ * 缩放与重编码只服务**本地副本**（{@link DockImage.preview}），而副本只进 localStorage。
+ *
+ * ## 三个形态，两次转换
+ * - **界面形态** `{url, preview?, name?}`：`url` 是原图的 data URL，喂 `<img src>` 也发给模型；
+ * - **落盘形态** `{url, name}`：`url` 位置上是副本（{@link imagesForStorage}）——
+ *   localStorage 装不下原图；
  * - **线上形态** `{mime, data}`（服务端 `TurnImage`）：校验友好的裸 base64。
  *
- * 转换只发生在**上送边界**（`toTurnImages`）与**接收边界**（`fromTurnImages`）。
- * 让两者共用同一个 data URL 拼接格式，就不会出现"存的是 png、发出去变成 jpeg"这种
- * 只在图片上才看得见的漂移。
+ * 转换只发生在**落盘边界**（`imagesForStorage`）、**上送边界**（`toTurnImages`）与
+ * **接收边界**（`fromTurnImages`）。让后两者共用同一个 data URL 拼接格式，就不会出现
+ * "存的是 png、发出去变成 jpeg"这种只在图片上才看得见的漂移。
  */
 
-/** 界面里的图片形态。`url` 是 **data URL**（`data:image/png;base64,…`） */
+/**
+ * 界面里的图片形态。
+ *
+ * 一张图在 dock 里有**两份**，各自只有一个用途，绝不能互相顶替：
+ * - `url`：**原图**（用户上传的那份字节，base64 后放进 data URL）。它是**上送**给模型的那一份，
+ *   也是 `image.save` 存进知识库的那一份（刷新之后这一格里剩的是副本，见
+ *   `docs/design/dock-images.md` §6）——上传路径**不做任何重编码**；
+ * - `preview`：**本地副本**（缩到 {@link IMAGE_PREVIEW_MAX_EDGE} 的 JPEG）。它**只用于落盘**
+ *   （localStorage 只有 5 MB 配额，装不下原图），永远不进请求体。
+ *
+ * 少了 `preview` 会发生什么：一张 3 MB 的手机照片就能把整段历史挤进配额降级分支
+ * （只丢图、不丢文字），症状是"刷新之后历史里的图全没了"。
+ */
 export interface DockImage {
+  /** 原图的 data URL（`data:image/png;base64,…`）。上送与存档读的都是它 */
   readonly url: string
+  /** 可选：本地副本的 data URL。**只进 localStorage**，不参与上送 */
+  readonly preview?: string
   /** 可选：原始文件名。只用于展示与上传时的 `name` 参数，不参与任何判定 */
   readonly name?: string
 }
@@ -45,23 +67,27 @@ export const MAX_IMAGES_PER_TURN = 4
 export const MAX_IMAGE_INDEX = 40
 
 /**
- * 重编码后的长边上限（px）。
+ * **本地副本**的长边上限（px）。
  *
- * 1280 是"够模型看清"与"localStorage 装得下"之间的取舍点：截图里的正文在这个尺寸下
- * 仍可读，而一张 4K 截图（~5 MB）压完通常落在 150~350 KB。
+ * 它**不参与上送**，只服务两件事：刷新后在历史里还能看见那张图、以及 localStorage 配额。
+ * 1280 是"预览气泡里能认出是什么"与"一份副本几十~几百 KB"之间的折点。
  */
-export const IMAGE_MAX_EDGE = 1280
+export const IMAGE_PREVIEW_MAX_EDGE = 1280
 
-/** JPEG 重编码质量。0.82 是肉眼与体积的常见折点，再高体积涨得比清晰度快 */
-export const IMAGE_JPEG_QUALITY = 0.82
+/** 本地副本的 JPEG 质量。0.82 是肉眼与体积的常见折点，再高体积涨得比清晰度快 */
+export const IMAGE_PREVIEW_JPEG_QUALITY = 0.82
 
 /**
- * 小于这个字节数的原图**不重编码**。
+ * 大于这个字节数的原图**额外生成一份本地副本**（`DockImage.preview`）。
  *
- * 为什么不是"一律重编码"：一张 80 KB 的 PNG 截图重编码成 JPEG 会变大、还会丢透明通道，
- * 而它本来就在预算内。判据是**字节数**而不是尺寸——用户真正在意的是"传得上去"。
+ * 为什么要这一份：`url` 现在是**原图**（手机照片 2~5 MB 很常见），而 localStorage 通常只有
+ * 5 MB 配额——一张原图就能把整段历史挤进降级分支（只丢图、不丢文字），症状是"刷新之后
+ * 历史里的图没了"。有了副本，落盘的是副本、上送的是原图，两边都不将就。
+ *
+ * 判据是**字节数**而不是尺寸：小图不生成副本——一张 80 KB 的 PNG 转成 JPEG 副本会更大、
+ * 还会丢透明通道，而它本来就在配额里。
  */
-export const IMAGE_KEEP_BYTES = 400 * 1024
+export const IMAGE_PREVIEW_KEEP_BYTES = 512 * 1024
 
 /** 允许的图片 MIME（与服务端 `IMAGE_MIME_WHITELIST` 是镜像；刻意不含 `image/svg+xml`） */
 export const IMAGE_MIME_WHITELIST: readonly string[] = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
@@ -69,11 +95,17 @@ export const IMAGE_MIME_WHITELIST: readonly string[] = ['image/png', 'image/jpeg
 /**
  * 单张图 base64 载荷的字符上限（与服务端 `MAX_IMAGE_BASE64_CHARS` 是镜像）。
  *
- * 1.4M 字符 ≈ 1 MB 二进制。它比"压缩目标"宽、比"请求体上限"窄：
- * 客户端在 {@link toTurnImage} 与 `prepareImageFile` 两处据此提前拒绝，
- * 用户当场看到"这张图太大"，而不是发出去之后收一个 400。
+ * 11M 字符 ≈ **8.25 MB 二进制**，取值口径是"手机相机原图直传"：JPEG 原图常见 2~5 MB，
+ * 高分辨率 PNG 截图能到 8 MB。
+ *
+ * 上传路径**不做重编码**（2026-09-21 的决定，见 `docs/design/dock-images.md` §4），
+ * 所以这道闸是尺寸的唯一判据：超了**当场拒绝并说清是哪张**，而不是悄悄压一遍——
+ * 用户要的就是原来那份字节。
+ *
+ * 它与另外三个常量构成一组自洽的数字（由 `test/uiDockImage.test.ts` 钉住）：
+ * `MAX_IMAGES_PER_TURN`(4) × 本值 ≈ 44M 字符 ≤ `MAX_BODY_BYTES`(48 MB)。
  */
-export const IMAGE_MAX_BASE64_CHARS = 1_400_000
+export const IMAGE_MAX_BASE64_CHARS = 11_000_000
 
 /**
  * **整段对话**里保留的图片张数上限。
@@ -81,8 +113,13 @@ export const IMAGE_MAX_BASE64_CHARS = 1_400_000
  * ## 为什么必须有这一条（否则功能会自己在几轮之后坏掉）
  * 无状态轮次协议里，客户端每轮都要把**整段转录**发上去（服务端是唯一真源，
  * 它只回灌、不存储）。转录里带图 ⇒ 请求体随对话里的图片数**线性增长**：
- * 每张压缩后约 0.2~0.5 MB，而回合端点的请求体上限是有限的。不设上限的结局是
+ * 原图直传之后每张是 2~8 MB，而回合端点的请求体上限是有限的。不设上限的结局是
  * "聊到第十张图时突然 413"，而那时用户完全不知道自己做错了什么。
+ *
+ * ## 为什么是 4（曾经是 8）
+ * 8 是"每张压到 0.2~0.5 MB"时代定的。改成原图直传之后，**4 张原图的字节量就等于当年
+ * 8 张压缩图**——张数减半、每轮重发的总量不变，这条上限的原始意图（挡住请求体线性膨胀）
+ * 没有被削弱。真要聊很多张图，正确动作是当场让助手 `image.save` 存进知识库。
  *
  * ## 为什么是"丢掉最旧的"而不是"报错"
  * 旧图被丢掉时**文字仍在**，对话看起来仍然完整；而一个"不能再发图了"的报错
@@ -91,10 +128,10 @@ export const IMAGE_MAX_BASE64_CHARS = 1_400_000
  * 因此它既不会再发给模型，也不能再被存进知识库。
  * 用户真想留住某张图时，正确的动作是**当场**让助手 `image.save` 存下来。
  *
- * 8 × {@link IMAGE_MAX_BASE64_CHARS} ≈ 11 MB，与 `MAX_BODY_BYTES` 的关系见
+ * 4 × {@link IMAGE_MAX_BASE64_CHARS} ≈ 44 MB（base64 字符），与 `MAX_BODY_BYTES` 的关系见
  * `@geewiki/ai-assistant` 的 `src/index.ts`（那边留了余量给文本与工具结果）。
  */
-export const MAX_CONVERSATION_IMAGES = 8
+export const MAX_CONVERSATION_IMAGES = 4
 
 /** 把线上形态拼成界面形态。**唯一一处**拼接 data URL 的地方 */
 export function dataUrlOf(mime: string, data: string): string {
@@ -153,7 +190,14 @@ export function fromTurnImages(raw: unknown): DockImage[] {
   return out
 }
 
-/** 从 `localStorage` 读回来的任意值里挑出合法图片（坏数据一律丢弃，绝不抛） */
+/**
+ * 从 `localStorage` 读回来的任意值里挑出合法图片（坏数据一律丢弃，绝不抛）
+ *
+ * **`preview` 字段刻意不在这里读**：落盘时副本已经顶掉了 `url`（见
+ * {@link imagesForStorage}），所以存储里根本不该出现 `preview`；真出现（手改过的数据、
+ * 或旧版本写下的）就丢掉——一份原图的 base64 值得让它在 localStorage 里多存一份吗？
+ * 不值得，那正是配额被挤爆的形状。
+ */
 export function normalizeDockImages(raw: unknown): DockImage[] {
   if (!Array.isArray(raw)) return []
   const out: DockImage[] = []
@@ -167,6 +211,29 @@ export function normalizeDockImages(raw: unknown): DockImage[] {
     out.push(typeof name === 'string' && name !== '' ? { url, name } : { url })
   }
   return out
+}
+
+/**
+ * 一张图**落盘时该写什么**：有本地副本就写副本，没有就写原图。
+ *
+ * ## 为什么落盘的不是原图
+ * `url` 是原图（2~8 MB 很常见），而 localStorage 通常只有 5 MB。把原图写进去的结局不是
+ * "存下来了"，是**配额降级把整段历史的图全丢掉**（`withoutImages`）——用户刷新之后
+ * 发现所有图都没了，而那本来只该是一张图的大小问题。
+ *
+ * ## 为什么存成 `url` 而不是另开一个字段
+ * 存储形态保持 `{url, name}` 不变：`normalizeDockImages` 与所有读侧（消息气泡、
+ * `image.save`）都不用认识"副本"这个概念，旧数据也照常读得回来。代价是**刷新之后**
+ * 那一格里是副本，于是刷新后的 `image.save` 存的是副本——这与改成原图直传之前的行为
+ * 逐字相同，不是新增的退化；要在刷新后还拿到原图，就在这一轮里当场存。
+ */
+export function imagesForStorage(images: readonly DockImage[] | undefined): DockImage[] {
+  // 一律重建对象：原样返回 `img` 会把 `preview` 一起写进存储——那等于让原图与副本各占一份配额
+  return (images ?? []).map((img) =>
+    img.name === undefined
+      ? { url: img.preview ?? img.url }
+      : { url: img.preview ?? img.url, name: img.name },
+  )
 }
 
 /**
@@ -285,12 +352,12 @@ export function parseImageSaveArgs(args: unknown): ImageSaveArgs | string {
 }
 
 /**
- * 等比缩放到长边不超过 `maxEdge`。
+ * 等比缩放到长边不超过 `maxEdge`。**只有本地副本走这里**（上送的那一份不缩放）。
  *
  * 原图已经够小时**原样返回**（连 1px 都不放大）：放大只会让文件更大、也更模糊。
  * 非有限值一律退回 `1×1`，避免 `canvas.width = NaN` 这种"画布静默变成 0 宽"的失败。
  */
-export function scaleToFit(width: number, height: number, maxEdge = IMAGE_MAX_EDGE): { width: number; height: number } {
+export function scaleToFit(width: number, height: number, maxEdge = IMAGE_PREVIEW_MAX_EDGE): { width: number; height: number } {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     return { width: 1, height: 1 }
   }

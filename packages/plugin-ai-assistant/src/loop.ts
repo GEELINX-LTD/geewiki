@@ -202,8 +202,10 @@ const MAX_TOOL_IMAGES_PER_RESULT = MAX_IMAGES_PER_MESSAGE
 /**
  * 一回合最多把几张图折进上下文。
  *
- * 与浏览器侧的 `MAX_CONVERSATION_IMAGES` 同值不是巧合：那是本仓对"一段对话里能有多少张图"
- * 的既有判断，这里是它的服务端对偶——模型可以在一回合里连读好几张图，不设总量的话
+ * 数字沿用浏览器侧当年对"一段对话里能有多少张图"的判断（`MAX_CONVERSATION_IMAGES`，
+ * 当年是 8）。**两边现在已经不是同一件事**：那一边管原图直传（每张可达 8 MB），
+ * 这一边管工具读出来的图（每张 ≤ `AI_TOOL_IMAGE_MAX_BYTES` = 1 MB），所以本值不跟着
+ * 那一边降到 4——模型可以在一回合里连读好几张图，不设总量的话
  * 40 轮 × 每轮一张就是 40 张图进了上下文（每张约一千多 token）。
  */
 const MAX_TURN_TOOL_IMAGES = 8
