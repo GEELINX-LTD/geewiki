@@ -11,13 +11,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readdir, readFile, rm, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
 import {
   ATTACHMENT_EXT_WHITELIST,
-  DEFAULT_MAX_BYTES,
+  NO_SIZE_LIMIT,
   attachmentRelPath,
   attachmentUrl,
   dispositionKindOf,
@@ -60,7 +62,13 @@ test('白名单：与规格逐项一致（且不含可执行的 html/js）', () 
   for (const bad of ['.html', '.htm', '.js', '.php', '.sh']) {
     assert.ok(!ATTACHMENT_EXT_WHITELIST.includes(bad), `${bad} 不该在白名单里`)
   }
-  assert.equal(DEFAULT_MAX_BYTES, 25 * 1024 * 1024)
+  /*
+   * 有意更新的既有守卫：这里原先断言 `DEFAULT_MAX_BYTES === 25 MiB`。2026-09-21 起
+   * 附件的两道大小闸**出厂即不限**（用户要求"把附件上传的大小上限也去掉"），
+   * 那个常量随之变成 `NO_SIZE_LIMIT = 0`。保留这一行是为了让"默认值变了"这件事
+   * 留在测试里可见，而不是悄悄消失。
+   */
+  assert.equal(NO_SIZE_LIMIT, 0, '「不限」的表示值必须是 0——判据一律写成 limit > 0 && …')
 })
 
 test('normalizeExt：只取最后一个点，白名单外一律 null', () => {
@@ -372,5 +380,72 @@ test('storeStream：写入目标不可写时不得挂死（必须带错误返回
     )
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+/* ==================== 2026-09-21：附件大小闸默认「不限」 ==================== */
+
+test('storeStream：maxBytes = 0 表示**不限**，比旧默认上限（25 MiB）更大的文件照样收', async () => {
+  const root = await tmpRoot()
+  try {
+    const dataDir = join(root, 'data')
+    const tmpDir = join(root, 'tmp')
+    /*
+     * 取 26 MiB —— 刻意**越过**旧的 25 MiB 默认值，否则这条用例证明不了"上限真的没了"。
+     * 内容随机化没必要：sha256 逐块算，这里要的是"收得下、算得对、落得全"。
+     */
+    const big = Buffer.alloc(26 * 1024 * 1024, 0x41)
+    const res = await storeStream(bodyOf([big]), {
+      dataDir,
+      tmpDir,
+      maxBytes: NO_SIZE_LIMIT,
+      ext: '.zip',
+      expectedBytes: big.length,
+    })
+    assert.equal(res.byteSize, big.length, '不限时也要如实回报实收字节数（元数据与审计要用）')
+    assert.equal(res.sha256, createHash('sha256').update(big).digest('hex'))
+    const st = await stat(resolveAttachmentPath(dataDir, res.sha256, '.zip'))
+    assert.equal(st.size, big.length, '落盘字节数必须与回报一致')
+    assert.deepEqual(await readdir(tmpDir), [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('★ 出厂默认是「不限」，且每一道判据都自带 `> 0` 守卫（0 绝不能变成"拒收一切"）', () => {
+  const src = (f: string): string =>
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', f), 'utf8')
+  const index = src('index.ts')
+  const store = src('attachment-store.ts')
+
+  // ① 两个配置项的出厂默认值
+  assert.match(index, /attachmentMaxBytes: Schema\.number\(\)\s*\.default\(NO_SIZE_LIMIT\)/)
+  assert.match(index, /attachmentPageQuotaBytes: Schema\.number\(\)\s*\.default\(NO_SIZE_LIMIT\)/)
+  // ② 三处比较各自的守卫形态（改写法可以，但守卫必须还在同一处）
+  assert.match(store, /o\.maxBytes > 0 && byteSize > o\.maxBytes/, '流式计数的守卫')
+  assert.match(index, /attachmentMaxBytes > 0 && declared > attachmentMaxBytes/, '单文件前置闸的守卫')
+  assert.match(
+    index,
+    /attachmentPageQuotaBytes > 0 && usedBytes \+ declared > attachmentPageQuotaBytes/,
+    '单页配额前置闸的守卫',
+  )
+  // ③ 事务内的**权威**判定（并发上传只有这里拦得住），守卫形态与前置闸一致
+  assert.match(
+    index,
+    /attachmentPageQuotaBytes > 0 && total \+ i\.byteSize > attachmentPageQuotaBytes/,
+    '写入事务里的配额判定丢了，或守卫被改没了',
+  )
+  /*
+   * ④ 反面：不允许出现**裸**的单文件比较（守卫漏一次 = 默认配置下上传全挂）。
+   * 按行判定：任何拿这两个配置值做上界的行，同一行里必须出现 `> 0`。
+   */
+  for (const [label, text] of [['index.ts', index], ['attachment-store.ts', store]] as const) {
+    for (const line of text.split('\n')) {
+      const code = line.trim()
+      // 只看代码行：注释里出现 `declared > attachmentMaxBytes` 是在**解释**守卫，不是漏守卫
+      if (code.startsWith('*') || code.startsWith('/*') || code.startsWith('//')) continue
+      if (!/> (attachmentMaxBytes|attachmentPageQuotaBytes|o\.maxBytes)\b/.test(line)) continue
+      assert.match(line, /> 0 &&|> 0\s*\?/, `${label} 里有一处裸的大小比较（缺 \`limit > 0\` 守卫）：${line.trim()}`)
+    }
   }
 })

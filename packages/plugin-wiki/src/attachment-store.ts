@@ -115,7 +115,10 @@ export type StoreStreamResult = StoredAttachment
  * @param src 字节来源（HTTP 场景下就是 `h.req`）。
  * @param o.dataDir 数据目录（附件落在它的 `attachments/` 子目录下）。
  * @param o.tmpDir 临时目录（**必须与最终路径同一文件系统**，否则 `rename` 会退化成跨设备拷贝）。
- * @param o.maxBytes 字节上限：累计超出即中断并抛 `payload_too_large`。
+ * @param o.maxBytes 字节上限：累计超出即**中断收流**并抛 `payload_too_large`。
+ *   **0 = 不限**（`NO_SIZE_LIMIT`，附件端点默认传的就是它）：此时这条判据整体跳过。
+ *   判据必须写成 `maxBytes > 0 && byteSize > maxBytes`——反过来写会让"没配限额"
+ *   表现成"传什么都超限"，那是在默认路径上制造的故障。
  * @param o.ext 已过白名单的扩展名（落盘路径需要它；非法值由 `attachmentRelPath` 断言拒绝）。
  * @param o.expectedBytes **声明**的字节数（HTTP 场景即 `Content-Length`）。给了就必须
  *   与实收一致，否则抛 `length_mismatch`；不传则不做这项校验（纯函数层的既有用例不受影响）。
@@ -178,7 +181,8 @@ export async function storeStream(
       if (writeError !== null) throw writeError
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
       byteSize += buf.length
-      if (byteSize > o.maxBytes) {
+      // `maxBytes === 0` = 不限（默认）。见函数头：这一道判据必须整体跳过，而不是拿 0 去比。
+      if (o.maxBytes > 0 && byteSize > o.maxBytes) {
         throw new AttachmentServiceError(
           'payload_too_large',
           `附件超过上限（${o.maxBytes} 字节）`,

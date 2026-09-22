@@ -13,6 +13,10 @@
 #     不支持的类型 **415 `unsupported_media_type`**（X2：此前实现回 400 `unsupported_ext`，
 #     与前端注释/设计文档不一致 ⇒ 统一到语义更准的 415）、错误扩展名不落盘、
 #     同内容二次上传 dedup=true 且磁盘只有一份
+#     （超限/配额两条靠**脚本自带的窄配置**触发 —— 出厂默认已不限大小，见下）
+#   - **出厂默认两道大小闸都不限**（阶段 U，2026-09-21）：单文件 26 MiB 与同页累计 216 MiB
+#     都收得下、下载回来字节数一致；而把 `attachmentMaxBytes` 配回 1 MiB，**同一个文件**立刻
+#     413 —— 证明"默认不限"是闸门打开，不是闸门被拆掉（附件大小上限曾是 25 MiB / 200 MiB）
 #   - **截断上传**（X6）：声明 100KB、实发 50KB ⇒ 400 且 `attachments/` 与 `tmp/` 零残留、
 #     不落成"自洽但残缺"的元数据行（内容寻址下最难发现的一类静默错误）
 #   - **网关层拒绝也是完整响应**（X3）：匿名 401 与缺 CSRF 403 都发生在**处理器之前**，
@@ -689,6 +693,53 @@ else
   CFG_SVG_ID=$(field id)
   check "T3b 下载 svg → 200" "200" "$(dl "$JAR" "$CFG_SVG_ID")"
   check_present "T3c **开启 attachmentInlineSvg 后 svg 才 inline**（默认是 attachment，见 D9d）" "$TMP/dl.head" "content-disposition: inline"
+fi
+
+echo
+echo "=== 阶段 U：出厂默认 = **两道大小闸都不限**（2026-09-21）==="
+if [[ "$EXTERNAL" == "1" ]]; then
+  skip "U1-U6：BASE 指向外部实例时不能改它的配置并重启"
+else
+  stop_server
+  # 空配置 ⇒ 插件用**出厂默认**。这是本阶段的关键：验的不是"配了 0 会怎样"，
+  # 而是"什么都不配的部署到底受不受大小限制"。
+  WIKI_CFG='{}'
+  start_server
+  check "U0 出厂默认配置下服务就绪 → 200" "200" "$(anon GET /api/health)"
+  check "U1 建页 att-nolimit → 200" "200" "$(put_page att-nolimit '不限上限测试')"
+
+  # 26 MiB 与 190 MiB：分别**越过**旧的单文件默认上限（25 MiB）与旧的每页配额（200 MiB）。
+  # 用小于旧默认值的文件证明不了"上限真的没了"——那正是这条阶段存在的理由。
+  dd if=/dev/zero of="$TMP/big26.zip" bs=1M count=26 status=none
+  dd if=/dev/zero of="$TMP/big190.zip" bs=1M count=190 status=none
+  # -T（--upload-file）而不是 upload() 的 --data-binary：后者会把整个文件先读进 curl 内存，
+  # 几百 MiB 的断言就不该再顺手多要一份内存副本
+  upload_big() { # upload_big <slug> <文件> <原始名>
+    curl -s -o "$TMP/body" -w '%{http_code}' -X PUT \
+      "http://127.0.0.1:$PORT/api/attachments/$(urlenc "$1")?name=$(qenc "$3")" \
+      -b "$JAR" -c "$JAR" -H 'x-gw-csrf: 1' -H 'content-type: application/zip' -T "$2"
+  }
+  check "U2 **单文件 26 MiB（> 旧默认上限 25 MiB）→ 201**" "201" "$(upload_big att-nolimit "$TMP/big26.zip" 'big26.zip')"
+  check "U2b 响应带回附件 id" "true" "$(body_expr 'Number(o.id) > 0')"
+  BIG_ID=$(field id)
+  check "U3 **同页累计 216 MiB（> 旧每页配额 200 MiB）→ 201**" "201" "$(upload_big att-nolimit "$TMP/big190.zip" 'big190.zip')"
+  check "U4 下载 26 MiB 附件 → 200" "200" "$(dl "$JAR" "$BIG_ID")"
+  # 流式路径最容易悄悄丢尾字节：把下载回来的字节数与源文件逐项对上
+  check "U4b **下载回来的字节数与原文件一致**（流式落盘没截断）" \
+    "$(stat -c%s "$TMP/big26.zip")" "$(stat -c%s "$TMP/dl.body")"
+  check "U4c tmp 目录不留残渣（大文件也一样）" "0" "$(tmp_count)"
+
+  # ★ 反向：阀门必须还灵。**同一个文件**在不配限额时 201、配了 1 MiB 就 413 —
+  # 这才证明"默认不限"是"闸门打开"，不是"闸门被拆掉了"（日后磁盘吃紧要能立刻收口）
+  stop_server
+  WIKI_CFG='{ "attachmentMaxBytes": 1048576 }'
+  start_server
+  check "U5 **配回上限后同一个 26 MiB 文件 → 413**（阀门仍在）" "413" "$(upload_big att-nolimit "$TMP/big26.zip" 'big26.zip')"
+  check "U5b 错误码 payload_too_large" "payload_too_large" "$(field error)"
+
+  # 复原给后面的清理阶段用（与阶段 T 同款做法）
+  WIKI_CFG='{ "attachmentMaxBytes": 1048576, "attachmentPageQuotaBytes": 2097152 }'
+  rm -f "$TMP/big26.zip" "$TMP/big190.zip"
 fi
 
 echo

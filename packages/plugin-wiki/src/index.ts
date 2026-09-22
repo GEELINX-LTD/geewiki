@@ -53,7 +53,7 @@ import { AttachmentServiceError, type AttachmentService } from '@geewiki/core'
 import { extractLinkTargets } from './links.js'
 import {
   ATTACHMENT_EXT_WHITELIST,
-  DEFAULT_MAX_BYTES,
+  NO_SIZE_LIMIT,
   attachmentUrl,
   dispositionKindOf,
   effectiveMime,
@@ -142,9 +142,9 @@ export const WIKI_MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)),
 export interface WikiConfig {
   /** 页面详情中返回的最近版本历史条数上限 */
   recentVersions?: number
-  /** 单个附件的字节上限（默认 25MB） */
+  /** 单个附件的字节上限（**0 = 不限，默认不限**；2026-09-21 之前是 25 MiB） */
   attachmentMaxBytes?: number
-  /** 单页附件总字节配额（默认 200MB） */
+  /** 单页附件总字节配额（**0 = 不限，默认不限**；2026-09-21 之前是 200 MiB） */
   attachmentPageQuotaBytes?: number
   /** 允许的附件扩展名（**只能收窄内置白名单**，不能放宽） */
   attachmentAllowedExt?: string[]
@@ -168,19 +168,24 @@ export const WikiConfigSchema = Schema.object({
     .max(100)
     .description('页面详情返回的最近版本历史条数上限'),
   /*
-   * 附件四项（本批 M2）。**上界 200MB 是硬编码的**：单文件上限越大，"一个并发上传打满
-   * 内存/磁盘"的代价越高，而这一层没有独立的限流设施 —— 所以把可用上限写死在
-   * 插件里，而不是让配置随手调到几个 GB。
+   * 附件四项（本批 M2）。**两道大小闸默认都不设上限**（2026-09-21，用户要求"把附件上传的
+   * 大小上限也去掉"）：0 = 不限，磁盘余量成为唯一下限。原口径是"单文件 25 MiB、
+   * 配置上界硬编码 200 MiB、每页配额 200 MiB"，那道硬编码上界的理由是"并发上传打满
+   * 内存/磁盘"——而字节是**流式写盘**的（`storeStream` 逐块写 + 背压），打不满内存，
+   * 真实代价只有磁盘。于是闸门交给运维：**设成正数即恢复限额**，代码里不再放一个
+   * "默认就拦"的数值。
+   *
+   * 原先的 `.max(200 * 1024 * 1024)` 随之删除：默认既是"不限"，再给配置值设上界就自相矛盾
+   * （想设一个比 200 MiB 更大的限额本来也是合法的运维决定）。
    */
   attachmentMaxBytes: Schema.number()
-    .default(DEFAULT_MAX_BYTES)
-    .min(1)
-    .max(200 * 1024 * 1024)
-    .description('单个附件的字节上限（默认 25MB，最大 200MB）'),
+    .default(NO_SIZE_LIMIT)
+    .min(0)
+    .description('单个附件的字节上限（0 = 不限；默认不限，设成正数即恢复限额）'),
   attachmentPageQuotaBytes: Schema.number()
-    .default(200 * 1024 * 1024)
-    .min(1)
-    .description('单个页面的附件总字节配额（默认 200MB）'),
+    .default(NO_SIZE_LIMIT)
+    .min(0)
+    .description('单个页面的附件总字节配额（0 = 不限；默认不限）'),
   /*
    * ⚠️ 这个配置**只能收窄**内置白名单（apply 里取交集），不能放宽：
    * 放宽会让 `.html` 这类同源可执行内容进得来，而落盘路径的 `attachmentRelPath`
@@ -673,9 +678,13 @@ export const WikiPlugin = {
      * 断言的正是 `$TMP/data/tmp`，是这条口径的实测证据。
      */
     const attachmentTmpDir = join(attachmentDataRoot, 'tmp')
-    /** 单文件字节上限与单页配额（`Schema.number()` 已保证是正整数） */
-    const attachmentMaxBytes = config.attachmentMaxBytes ?? DEFAULT_MAX_BYTES
-    const attachmentPageQuotaBytes = config.attachmentPageQuotaBytes ?? 200 * 1024 * 1024
+    /**
+     * 单文件字节上限与单页配额。**0 = 不限**（`NO_SIZE_LIMIT`，默认就是 0），
+     * 所以下游每一道判据都必须写成 `limit > 0 && …`——见 `attachments.ts` 的 `NO_SIZE_LIMIT`。
+     * 配置项经 `Schema.number().min(0)` 保证非负，故这里不需要再兜底。
+     */
+    const attachmentMaxBytes = config.attachmentMaxBytes ?? NO_SIZE_LIMIT
+    const attachmentPageQuotaBytes = config.attachmentPageQuotaBytes ?? NO_SIZE_LIMIT
     /**
      * 生效的扩展名白名单 = **内置白名单 ∩ 配置**（只收窄、不放宽，理由见配置项注释）。
      * 空集是合法的（等于关掉上传），故不在这里兜底成内置白名单。
@@ -4661,16 +4670,27 @@ export const WikiPlugin = {
            * 配额在同一事务里**再判一次**（端点在读流之前已用 Content-Length 判过一次）：
            * 前置那次是为了"不浪费一次上传"，这次才是权威判据 —— 两个并发上传都通过前置检查
            * 时，只有事务内的累计值能拦住超额。
+           *
+           * `attachmentPageQuotaBytes` 为 0 = **不限**（默认），此时这条判据不成立：
+           * 守卫写成块（`if (quota > 0) { … }`）也许可，但仓里三处判据统一成
+           * **同一行内的 `quota > 0 && …`**，这样"漏掉守卫"是可以用一条按行的源码守卫
+           * 查出来的（见 `test/attachments.test.ts` 的 ④）。不限时连那次 `SUM` 都不查：
+           * 它是纯开销，少一次查询也少一个可失败的环节。
            */
-          const total = Number(
-            (
-              await tx.query<{ n: number | string }>(
-                'SELECT COALESCE(SUM(byte_size), 0) AS n FROM attachments WHERE page_id = ?',
-                [i.pageId],
-              )
-            )[0]?.n ?? 0,
-          )
-          if (total + i.byteSize > attachmentPageQuotaBytes) return { kind: 'quota', id: 0 }
+          const total =
+            attachmentPageQuotaBytes > 0
+              ? Number(
+                  (
+                    await tx.query<{ n: number | string }>(
+                      'SELECT COALESCE(SUM(byte_size), 0) AS n FROM attachments WHERE page_id = ?',
+                      [i.pageId],
+                    )
+                  )[0]?.n ?? 0,
+                )
+              : 0
+          if (attachmentPageQuotaBytes > 0 && total + i.byteSize > attachmentPageQuotaBytes) {
+            return { kind: 'quota', id: 0 }
+          }
           const ins = await tx.run(
             `INSERT INTO attachments (page_id, page_slug, sha256, ext, byte_size, mime, original_name, uploader_id, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
@@ -4788,11 +4808,19 @@ export const WikiPlugin = {
           h.json(413, {
             ok: false,
             error: 'length_required',
-            message: '上传必须带 Content-Length（本端点不接受长度未知的裸 body：上限无法前置判定）',
+            message: '上传必须带 Content-Length（本端点不接受长度未知的裸 body：无法与实收字节数对照）',
           })
           return
         }
-        if (declared > attachmentMaxBytes) {
+        /*
+         * 单文件上限的前置闸。`attachmentMaxBytes === 0` 是**默认**，含义是"不限"，
+         * 所以这一整块要跳过 —— 判据写成 `declared > attachmentMaxBytes` 会让默认配置
+         * 变成"任何非空文件都 413"。
+         *
+         * 保留它的理由与"为什么 `Content-Length` 仍然必填"同源：能在读体之前拒掉的，
+         * 就不要收完一遍字节再拒（那时已经没法回一个干净的 413 响应体）。
+         */
+        if (attachmentMaxBytes > 0 && declared > attachmentMaxBytes) {
           closeAfterResponse(h)
           h.json(413, {
             ok: false,
@@ -4804,16 +4832,22 @@ export const WikiPlugin = {
         /*
          * 单页配额前置检查（用声明长度当上界；权威判定在 `writeAttachmentRow` 的事务里）。
          * 前置这一层的作用是"不为一必然失败的请求写盘"。
+         *
+         * `attachmentPageQuotaBytes === 0`（默认 = 不限）时**连那次 SUM 都不查**：
+         * 不限的时候它是纯开销，而且少一次查询也少一个可失败的环节。
          */
-        const usedBytes = Number(
-          (
-            await adb.query<{ n: number | string }>(
-              'SELECT COALESCE(SUM(byte_size), 0) AS n FROM attachments WHERE page_id = ?',
-              [page.id],
-            )
-          )[0]?.n ?? 0,
-        )
-        if (usedBytes + declared > attachmentPageQuotaBytes) {
+        const usedBytes =
+          attachmentPageQuotaBytes > 0
+            ? Number(
+                (
+                  await adb.query<{ n: number | string }>(
+                    'SELECT COALESCE(SUM(byte_size), 0) AS n FROM attachments WHERE page_id = ?',
+                    [page.id],
+                  )
+                )[0]?.n ?? 0,
+              )
+            : 0
+        if (attachmentPageQuotaBytes > 0 && usedBytes + declared > attachmentPageQuotaBytes) {
           closeAfterResponse(h)
           h.json(413, {
             ok: false,

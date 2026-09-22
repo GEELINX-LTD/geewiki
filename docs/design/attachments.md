@@ -54,7 +54,7 @@
 | **N4** | **附件版本化** | 覆盖 = 上传一份**新**附件（内容寻址 ⇒ 新 sha256 ⇒ 新文件），旧附件按孤儿回收；**不**进 `page_versions` 快照（U7） |
 | **N5** | **图片处理**（缩略图 / 压缩 / 转码 / EXIF 清洗） | 不做任何图像处理；⇒ 上传者相机里的 GPS 会随原图保留（§5.12 残余风险） |
 | **N6** | **病毒扫描 / 内容魔数校验** | 本期不做（U4：若做，需自带魔数表，约 30 行常量，仍零依赖） |
-| **N7** | **音视频与大文件分发** | 不做 Range / 断点续传 / 转码；单文件上限默认 25 MiB（§6） |
+| **N7** | **音视频与大文件分发** | 不做 Range / 断点续传 / 转码；**单文件默认不限**（2026-09-21，原默认 25 MiB，§6） |
 | **N8** | **公开门户（`/portal`）的附件直链** | 门户是服务端匿名渲染；附件 URL 在匿名可见的页面上自然可用，**但不额外**为门户做 CDN / 签名直链 |
 | **N9** | **附件级 ACL（逐个文件授权）** | 附件的可见性**完全继承**"页面档位 + 引用它的块档位"；不新造 `attachment_grants` 表 |
 
@@ -330,7 +330,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON attachments(sha256);
 | 请求体 | **文件字节本身**（流式读取，不整体进内存） |
 | 查询参数 | `name`（**必填**：它决定扩展名 ⇒ 决定白名单是否通过、落盘扩展名、响应 `content-type`）；`block`（可选，块 ordinal 归属提示，仅落 `attachments.block_id` 的候选） |
 | 必带头 | 浏览器场景：`x-gw-csrf: 1`（`packages/web/src/api.ts:75` 已统一带）+ 会话 cookie |
-| 上限 | `content-length > attachmentMaxBytes` **立即 413**（省流量）；实际字节数**边读边计数**，超限同样 413（§5.7）。⇒ M1 的实现是 `packages/plugin-wiki/src/attachment-store.ts:141-153` 的 `for await (const chunk of src)` 累加计数 |
+| 上限 | **默认不限**（2026-09-21：`attachmentMaxBytes` 出厂默认 0 = 不限，见 §6.1）。配成正数时才生效：`content-length > attachmentMaxBytes` **立即 413**（省流量）；实际字节数**边读边计数**，超限同样 413（§5.7）。两道判据一律写成 `limit > 0 && …` —— 反过来写会让「没配限额」变成「拒收一切」。⇒ M1 的实现是 `packages/plugin-wiki/src/attachment-store.ts:141-153` 的 `for await (const chunk of src)` 累加计数 |
 | 落盘 | **先写 `<attachments>/tmp/att-<pid>-<ts>-<rand>.tmp`，收完再原子 `rename`**（同文件系统）。M1 的 `storeStream`（`packages/plugin-wiki/src/attachment-store.ts:114-189`）：`createWriteStream(tmpPath)`（`:133`）→ 边收边 `hash.update`（`:150`）→ `ws.end()` 等真正落盘（`:155-157`）→ `exists(finalPath)` 判去重（`:170`）→ `rename`（`:176`）；出错时 `src.destroy()` + `ws.destroy()` + 删 tmp（`:159-162`） |
 
 **路径语义（评审要点，非阻塞）**：`PUT /api/attachments/:slug` 表达的是"**替换 `:slug` 这个资源**"，而实际上 `:slug` 只是**归属页**、真正的资源是"该页下新增的某个附件"。⇒ 两次不同内容的上传到同一 slug 是同一 URL、不同 body，**服务端并不把 URL 当资源身份**（它只是存下字节）。两条可选改进：① 改成 `POST`（集合语义更准）；② 真正的幂等 PUT：`PUT /api/attachments/:slug/:sha256`（**内容寻址让哈希天然就是幂等键**，但那要求前端先算哈希 —— `crypto.subtle.digest` 是浏览器内置，零依赖）。**保留现状也可接受**（服务端本来就按内容哈希去重，`§4.2` 的响应 `deduplicated` 已经把幂等表达清楚了）⇒ 记为 **U18**。
@@ -372,8 +372,8 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON attachments(sha256);
 | 404 | `not_found` | `:3195`（页面不存在）与 `:3200` 一类的页面级不可见分支（**不区分"不存在"与"无权"**，与详情读路径同款） |
 | 409 | **`attachment_conflict`** | `:3245-3253`：**同一页 + 同一 `sha256` 但扩展名不同**（"同一内容的扩展名不能中途改变"）。⇒ 这是 409 在本能力里的**唯一用法**；删除端点**不产生 409**（见 §4.5） |
 | 413 | **`length_required`** | `:3205-3213`：**请求没带可解析的 `Content-Length`（例如 chunked）⇒ 直接拒绝**（并 `closeAfterResponse(h)`）。⇒ 本能力**要求显式长度** —— 这更保守（也更好算配额） |
-| 413 | `payload_too_large` | ① `:3181-3189` 声明的 `Content-Length` 超 `attachmentMaxBytes`（**先于读体**拒绝）；② 实际字节数超上限（存储层抛 `payload_too_large`，`packages/plugin-wiki/src/attachment-store.ts:144-149`）。⇒ 统一用既有码（与 `packages/plugin-wiki/src/index.ts:1640`、`:2005` 同款） |
-| 413 | `page_quota_exceeded` | ① `:3191-3207` 用声明长度做的**前置预检**；② `:3260-3266` 写入事务里的**权威判定**（`SELECT COALESCE(SUM(byte_size),0) …`）。⇒ 键名与默认值见 §6.1（`attachmentPageQuotaBytes`，200 MiB） |
+| 413 | `payload_too_large` | **仅在 `attachmentMaxBytes > 0` 时才可能发生**（默认 0 = 不限，2026-09-21）。① `:3181-3189` 声明的 `Content-Length` 超 `attachmentMaxBytes`（**先于读体**拒绝）；② 实际字节数超上限（存储层抛 `payload_too_large`，`packages/plugin-wiki/src/attachment-store.ts:144-149`）。⇒ 统一用既有码（与 `packages/plugin-wiki/src/index.ts:1640`、`:2005` 同款） |
+| 413 | `page_quota_exceeded` | **仅在 `attachmentPageQuotaBytes > 0` 时才可能发生**（默认 0 = 不限，2026-09-21）。① `:3191-3207` 用声明长度做的**前置预检**；② `:3260-3266` 写入事务里的**权威判定**（`SELECT COALESCE(SUM(byte_size),0) …`）。⇒ 键名与默认值见 §6.1（`attachmentPageQuotaBytes`，**默认 0 = 不限**） |
 | 401 | `unauthorized` | 闸门（`judgeAccess`）：未登录且存在凭据来源 |
 | 403 | `forbidden` | 已认证但对该页**没有编辑能力**（`resolvePage(...).canEdit === false`）；或 `judgeAccess` 的 owner/admin 判定未过 |
 | 403 | `csrf_rejected` | 三道 CSRF 判据之一未过（`packages/plugin-auth/src/http.ts:108-145`） |
@@ -561,7 +561,7 @@ M1 把"**哪些扩展名允许**"（`ATTACHMENT_EXT_WHITELIST`，`packages/plugi
 ### T4 超大文件与慢速上传（[P0] / [P1]）
 
 - **攻击者能做什么**：① 反复上传 1 GiB 把磁盘打满；② 用极慢的 body（每 30 秒 1 字节）占住连接与 `tmp` 文件（slowloris 变体）；③ 并发 200 个上传把 fd / 句柄耗尽。
-- **对策**：① 单文件上限（默认 25 MiB）+ 每页/全库配额（§6.3）+ **边读边计数**（不信任 `Content-Length`）；② 上传超时 `req.setTimeout(uploadTimeoutMs)`（**必须显式请求，因为 HTTP 层没有任何超时** —— §0.1 事实 6）+ 超时/异常时**必须删 `tmp` 文件**（`finally` 里删，且 `unlink` 失败只记日志）；③ 并发上传闸门：进程内计数器（`Map<owner, count>` 或单个 `let inflight`），超限返回 **429 `too_many_uploads`**（或 503，见 U8）。
+- **对策**：① 单文件上限（**默认 0 = 不限**，2026-09-21；原默认 25 MiB）+ 每页/全库配额（§6.3，同样默认不限）+ **边读边计数**（不信任 `Content-Length`）；② 上传超时 `req.setTimeout(uploadTimeoutMs)`（**必须显式请求，因为 HTTP 层没有任何超时** —— §0.1 事实 6）+ 超时/异常时**必须删 `tmp` 文件**（`finally` 里删，且 `unlink` 失败只记日志）；③ 并发上传闸门：进程内计数器（`Map<owner, count>` 或单个 `let inflight`），超限返回 **429 `too_many_uploads`**（或 503，见 U8）。
 - **残余风险**：① **多实例部署下进程内计数器无效**（但仓库既有的"多实例必然失败"结论已存在 —— 工程约定见 `docs/development.md`「环境、沙箱与运行约束」：OIDC 状态存进程内，方向是失败关闭；附件同理，**在部署文档里写明"附件能力不支持多实例共享目录"**）；② 配额是**软约束**：并发上传可在配额检查与落盘之间超发（§5.11、U5）。
 
 ### T5 multipart 解析边界（[P0]，**本设计的对策是"不引入"**）
@@ -637,8 +637,8 @@ export const WikiConfigSchema = Schema.object({
 
 | 配置键 | Schema | 默认值 | 状态 |
 |---|---|---|---|
-| `attachmentMaxBytes` | `Schema.number().min(1).max(200*1024*1024)` | **`DEFAULT_MAX_BYTES` = 25 MiB**（`packages/plugin-wiki/src/attachments.ts:59-60`） | ✅ **已落地**（`:154-158`）。**上界 200MB 是硬编码的**（注释 `:149-152`：单文件上限越大，"一个并发上传打满内存/磁盘"的代价越高，而这一层没有独立限流设施 ⇒ 把可用上限写死在插件里，不让配置随手调到几个 GB） |
-| `attachmentPageQuotaBytes` | `Schema.number().min(1)` | **200 MiB** | ✅ **已落地**（`:159-162`）。这就是"每页配额"。上传端点在读体**之前**用声明长度预检（`packages/plugin-wiki/src/index.ts:3191-3207`，超限 ⇒ **413 `page_quota_exceeded`**），权威判定在写入事务里（`:3074-3079`） |
+| `attachmentMaxBytes` | `Schema.number().min(0)`，**`.default(NO_SIZE_LIMIT)` = 0 ⇒ 不限**（2026-09-21） | **0 = 不限**（真源：`packages/plugin-wiki/src/attachments.ts` 的 `NO_SIZE_LIMIT`）。~~原默认 `DEFAULT_MAX_BYTES` = 25 MiB~~（`packages/plugin-wiki/src/attachments.ts:59-60`） | ✅ 2026-09-21 改为**出厂不限**（用户要求「把附件上传的大小上限也去掉」）。**原口径**：`min(1).max(200*1024*1024)`、默认 25 MiB，上界硬编码的理由是「并发上传打满内存/磁盘」——但字节是**流式写盘**的（`storeStream` 逐块写 + 背压），打不满内存，真实代价只有磁盘 ⇒ 闸门交给运维：**设成正数即恢复限额**。`.max()` 随之删除：默认既是「不限」，再给配置值设上界就自相矛盾 |
+| `attachmentPageQuotaBytes` | `Schema.number().min(0)`，**`.default(NO_SIZE_LIMIT)` = 0 ⇒ 不限**（2026-09-21；原默认 200 MiB） | 0 = 不限 | ✅ 已落地。这就是"每页配额"。上传端点在读体**之前**用声明长度预检（`packages/plugin-wiki/src/index.ts:3191-3207`，超限 ⇒ **413 `page_quota_exceeded`**），权威判定在写入事务里（`:3074-3079`） |
 | `attachmentAllowedExt` | `Schema.array(Schema.string())` | `[...ATTACHMENT_EXT_WHITELIST]`（16 项） | ✅ **已落地**（`:163-172`）。**只能收窄、不能放宽**：`apply` 里取**交集**（`:628-632`），"放宽会让 `.html` 这类同源可执行内容进得来，而落盘路径的 `attachmentRelPath` 断言仍按内置白名单校验 ⇒ 要么静默失败、要么（更糟）被绕过"；**收窄只影响新的上传**（已收录附件的**下载不查这个集合**，否则一改配置历史附件会集体 404）。⇒ 这条配置**不违反** §6.2 的"白名单是安全边界"原则（它只能收紧），**已验证的 schemastery 数组写法是 `Schema.array(Schema.string())`** |
 | `attachmentInlineSvg` | `Schema.boolean()` | `false` | ✅ **已落地**（`:173-176`，描述里写明"默认关闭：同源内联 SVG 可执行脚本 = 存储型 XSS，除非另配 CSP"）。语义在 `dispositionKindOf(ext, { inlineSvg })`（`packages/plugin-wiki/src/attachments.ts:162-165`，**尚未被下载端点接上**，见下） |
 | `attachmentProvider` | `Schema.union([Schema.const('builtin'), Schema.const('none')])` | `'builtin'` | ✅ **已落地**：附件**字节存储**由谁提供。`'builtin'` = 本插件自带的本地实现（内容寻址，向后兼容）；`'none'` = 本插件**不再注册**内置实现，改用别处 `ctx.provide('attachment-service', …)` 提供的实现（换 S3/WebDAV 不必改 wiki 源码）。**为什么不自动探测"别人提供了没有"**：cordis 服务在提供者的 `apply()` 结算前对其它插件不可见（`ctx.get` 返回 undefined 且**静默**）⇒ 自动探测会在激活顺序变化时悄悄退回内置实现或悄悄拿不到服务；显式配置让这件事在配置里可见 |
@@ -655,7 +655,18 @@ export const WikiConfigSchema = Schema.object({
 2. **`tmp` 目录名 / 分片层级 = 常量**。它们与磁盘布局绑定，改了要迁移，不是"配置"。**M1 一致**（分片在 `attachmentRelPath` 里写死，`:131-139`）。
 3. **`nosniff` / `content-disposition` 策略 = 常量**（但给 `.svg` 开了一个**配置口子** `attachmentInlineSvg` —— **建议把该开关的默认值保持 `false`，并在打开时强制要求 CSP**）。
 
-**配置校验的边界**：`attachmentMaxBytes` 必须 ≤ `pageQuotaBytes` ≤ `repoQuotaBytes`（不满足时**启动即报错并拒绝激活**，而不是静默按更小的那个跑 —— 与仓库"失败关闭 + 可观测"的口味一致）。
+**两道大小闸默认不限之后，仍然拦得住大文件的四道闸（2026-09-21，评审必读）**：
+
+| 闸 | 位置 | 症状 |
+|---|---|---|
+| 磁盘余量 | 内置 provider 写盘（`storeStream`）| 写满 ⇒ `storage_unavailable` ⇒ **503**（不是 500：那会计入连续失败并可能触发熔断） |
+| **反代的 body 上限** | 部署层，**本仓管不着** | nginx `client_max_body_size` **默认 1 MB** ⇒ 大附件在**进入 Node 之前**就被 413（且响应不是本服务那个带 `error` 字段的形状）。⇒ 要真的传大文件，反代必须显式放宽；Caddy/Traefik 的默认值各不相同，**未在本仓实测** |
+| `Content-Length` 必须存在 | 上传端点入口 | 缺它 ⇒ **413 `length_required`**。不限大小之后它的理由**换了**：不再是"上限无法前置判定"，而是"无法与实收字节数对照"（`length_mismatch` ⇒ 400） |
+| 扩展名白名单 | `assertExtAllowed`（收流之前）| 白名单外 ⇒ **415**，且**不收一个字节** |
+
+⇒ **仍未实现**的三项在"不限大小"之后代价变高：**并发上传闸门**（U14 / `maxConcurrentUploads`）、**上传超时**（U8）、**全库配额**（U5 `repoQuotaBytes`）。今天一个已登录用户可以不间断地往磁盘里写；把这三项补上之前，"不限"只对**已鉴权**流量安全（匿名流量在网关层就要 401）。
+
+**配置校验的边界**：`attachmentMaxBytes` 必须 ≤ `pageQuotaBytes` ≤ `repoQuotaBytes`（0 = 不限，任何非 0 值都视为"设了闸"）（不满足时**启动即报错并拒绝激活**，而不是静默按更小的那个跑 —— 与仓库"失败关闭 + 可观测"的口味一致）。
 
 ### 6.2 扩展名白名单（M1 的实际清单就是当前真源）
 
@@ -935,7 +946,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 |---|---|---|
 | **已决（不再是未决）** | **U1**（上传体形态 ⇒ 原始字节流 `PUT`）、**U2**（落点 ⇒ `@geewiki/wiki`）、**U22**（判定路线 ⇒ **重跑投影**） | U1/U2 由实现直接选定；U22 见该条 |
 | **已修** | **U23**（403 ⇒ **一律 404** + 与"不存在"逐字节相同的信封）、**U24**（`max-age=300` ⇒ **`private, no-cache, no-transform`**） | 当前形态见 §4.3.1 / §4.5 / §4.6 |
-| **仍未做（真实待办）** | **全库配额 `repoQuotaBytes`**（只实现了**每页**配额 `attachmentPageQuotaBytes`）、**Range**（U6）、**上传限流**（U14）**与并发闸门**、**上传超时**（U8 —— HTTP 层无任何超时，见 §0.1 事实 6）、**GC / 孤儿回收端点**（`DELETE` 只删元数据行，磁盘文件留给 GC）、**`data:` URI 图片旁路**（U16）、**附件管理 UI**（列表/删除界面）与**降级 textarea、插件编辑器插槽不支持上传**（U15 的一部分）、**U21 的两表守卫测试 + `effectiveMime` 回退分支**（`packages/plugin-wiki/src/attachments.ts:201-207` 未改） | 逐条详见对应小节；GC 部分另见 §8.1/§8.2 |
+| **仍未做（真实待办）** | **全库配额 `repoQuotaBytes`**（每页配额 `attachmentPageQuotaBytes` 已实现，但 2026-09-21 起**默认 0 = 不限**）、**Range**（U6）、**上传限流**（U14）**与并发闸门**、**上传超时**（U8 —— HTTP 层无任何超时，见 §0.1 事实 6）、**GC / 孤儿回收端点**（`DELETE` 只删元数据行，磁盘文件留给 GC）、**`data:` URI 图片旁路**（U16）、**附件管理 UI**（列表/删除界面）与**降级 textarea、插件编辑器插槽不支持上传**（U15 的一部分）、**U21 的两表守卫测试 + `effectiveMime` 回退分支**（`packages/plugin-wiki/src/attachments.ts:201-207` 未改） | 逐条详见对应小节；GC 部分另见 §8.1/§8.2 |
 | **明确保留（当前就是对的）** | **`GET /api/attachments/<非数字>` 仍原样回显参数**（`packages/plugin-wiki/src/index.ts:3401-3404`；而 `attachmentNotFound` 那条路径**只回数值 id**，`:3363-3365`） | 这属"**非法输入**"分支：任何非正整数都走这里，与"某个真实 id 是否存在"无关 ⇒ **不是**存在性预言机 ⇒ 保留，不必改 |
 | **一条实测结论（写下来免得被当成 bug）** | **路由服务按 method 精确匹配，方法联合类型里没有 `HEAD`**（`packages/core/src/index.ts:692`：`'GET' \| 'POST' \| 'PUT' \| 'DELETE' \| 'PATCH'`）⇒ **`curl -I`（HEAD）实测 404**（落到 `/api` 的 404），**不是附件端点坏了** | 因此**响应头断言必须用真实 `GET` 的 `-D`**（e2e 即如此：`packages/plugin-wiki/test/e2e-attachments.sh:93`、`:102`；脚本头 `:22-23` 把这个实测结论写成了注释） |
 
@@ -979,7 +990,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 ### U5 配额是硬约束还是软约束
 
 - **候选**：A. 软（读体前预检 + 落盘前核一次，允许并发超发）；B. 硬（落盘前用"预留-提交"两阶段或一张配额表 + 行锁）；C. 请求级串行化（配额检查与落盘在同一临界区）。
-- **取舍**：B 在 SQLite 上是单写者、可行但复杂；在 PG 上需要 `SELECT … FOR UPDATE` 或 `SERIALIZABLE`。A 简单但并发下可超发 `maxConcurrentUploads × attachmentMaxBytes`（按 M1 的默认值 = 4 × 25 MiB = **100 MiB** 的越界上界）。
+- **取舍**：B 在 SQLite 上是单写者、可行但复杂；在 PG 上需要 `SELECT … FOR UPDATE` 或 `SERIALIZABLE`。A 简单但并发下可超发 `maxConcurrentUploads × attachmentMaxBytes`（按 M1 的默认值 = 4 × 25 MiB = **100 MiB** 的越界上界）。〔2026-09-21：默认已是**不限**，这条越界上界不复存在——配额只在运维显式设值时才是判据，而"不设值 ⇒ 磁盘是唯一下限"就是那次改动的口径。〕
 - **建议**：**A**，并把"越界上界 = 并发上限 × 单文件上限"写进交付说明 —— 它是有界的、可解释的。
 
 ### U6 下载是否支持 Range
@@ -1124,7 +1135,7 @@ await fetch(`/api/attachments/${encodeURIComponent(slug)}?name=${encodeURICompon
 | **D13** | 判定**必须复用** `policy-service` 与 `blockLevelOf`；**不新写第二套** | §4.3.2 |
 | **D14** | 响应头：服务端推导 `content-type`（见 U21：回退值**不得**用客户端声明）+ `nosniff` + 图片 `inline`/其余 `attachment`（`.pdf` 是否 inline 见 U20）+ `private, no-cache` + `etag` + CSP `default-src 'none'; sandbox`；**不发 `accept-ranges`** | §4.6 |
 | **D15** | 附件**只能**经 API 端点输出，**绝不**加入任何静态根 | §4.7 |
-| **D16** | 上限走**配置**（`schemastery`；M1 已定 `attachmentMaxBytes` = 25 MiB 与 `attachmentInlineSvg` = false，其余键名见 §6.1）；**白名单与安全头走代码常量** | §6.1 |
+| **D16** | 上限走**配置**（`schemastery`；2026-09-21 起 `attachmentMaxBytes` / `attachmentPageQuotaBytes` **默认都是 0 = 不限**，M1 曾定 25 MiB / 200 MiB；`attachmentInlineSvg` = false，其余键名见 §6.1）；**白名单与安全头走代码常量** | §6.1 |
 | **D17** | 扩展名白名单（**以 M1 的 16 项清单为准**，见 §6.2：图片/`.svg`/文档/`.json`/`.zip`/Office；禁 HTML/JS/可执行/无扩展名） | §6.2 |
 | **D18** | 配额：每页 + 全库；并发闸门；**PG 的 `SUM` 必须 `Number()`** | §6.3 |
 | **D19** | 前端三条路径共用 `fetch` 原始 body（带 `x-gw-csrf: 1`）+ 拖拽必须 `preventDefault` | §7.1 |
