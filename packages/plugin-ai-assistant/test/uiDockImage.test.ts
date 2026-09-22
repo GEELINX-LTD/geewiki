@@ -1,16 +1,17 @@
 /**
- * dock 图片输入的守卫（2026-09-20）。
+ * dock 图片输入的守卫（2026-09-20，2026-09-21 改为**原图直传**）。
  *
- * 这一批把**图片**加进了一条原本只跑文本的链路：剪贴板/拖拽/文件选择 → 浏览器压缩 →
- * data URL（localStorage + `<img src>`）→ 上送前折成 `{mime,data}` → 服务端校验 →
- * 上游 provider 折成 `image_url` 内容块。
+ * 这一批把**图片**加进了一条原本只跑文本的链路：剪贴板/拖拽/文件选择 → **原样**读成
+ * data URL（不缩放、不重编码）→ 上送前折成 `{mime,data}` → 服务端校验 →
+ * 上游 provider 折成 `image_url` 内容块；另有一份**本地副本**只进 localStorage。
  *
  * 每一跳都有"看起来能跑、其实静默丢掉"的失败形态，故这份用例按**边界**分组：
  *  ① 两个形态的互转（`data:<mime>;base64,…` ⇄ `{mime,data}`）——只有 base64 图片能过；
  *  ② 条数与 MIME 白名单的**两侧镜像**（浏览器与服务端各存一份，不能漂移）；
  *  ③ 上送边界：线上消息里**不得**出现 data URL 前缀；
- *  ④ 落盘：存不下时丢图保文字（不是整段放弃）；
- *  ⑤ 源码守卫：三个附件入口共用一条处理路径、工具名两半点名一致。
+ *  ④ 落盘：存的是副本、副本缺席时存不下就丢图保文字（不是整段放弃）；
+ *  ⑤ 源码守卫：三个附件入口共用一条处理路径、工具名两半点名一致；
+ *  ⑥ **上送的那一份必须是原图**：上传路径上不得出现重编码，超上限当场拒绝。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -23,10 +24,11 @@ import {
   fileNameFor,
   fromTurnImages,
   humanBytes,
-  IMAGE_KEEP_BYTES,
   IMAGE_MAX_BASE64_CHARS,
   IMAGE_MIME_WHITELIST,
+  IMAGE_PREVIEW_KEEP_BYTES,
   imageMarkdown,
+  imagesForStorage,
   MAX_CONVERSATION_IMAGES,
   MAX_IMAGES_PER_TURN,
   MAX_IMAGE_INDEX,
@@ -139,9 +141,17 @@ test('② ★ 数字自洽：单图上限 × 条数必须装得进请求体，�
   assert.ok(declared !== undefined, '读不到 MAX_BODY_BYTES（改名了？这条守卫要跟着改）')
   const body = Number(declared.replace(/_/g, ''))
   /*
-   * 这三条是**一组**数字，任何一条单独改都会造出一个"界面说已发出、服务端 413"的窗口：
+   * 这四条是**一组**数字，任何一条单独改都会造出一个"界面说已发出、服务端 413"的窗口：
    * 单条消息的图、整段对话的图，都必须装得进请求体。
+   *
+   * 2026-09-21 起这一组是：单图 11 M 字符（≈8.25 MB）/ 单条 4 张 / 整段 4 张 / body 48 MB。
    */
+  assert.ok(
+    // 按十进制 MB 判（与拒绝文案里的 `humanBytes` 同一口径的宽松版）：一张手机原图直传不能撞闸
+    Math.floor((IMAGE_MAX_BASE64_CHARS * 3) / 4) >= 8_000_000,
+    `单图上限只有 ${IMAGE_MAX_BASE64_CHARS} 字符（解出来 ${Math.floor((IMAGE_MAX_BASE64_CHARS * 3) / 4)} 字节），` +
+      `装不下一张 8 MB 的手机原图——"不压缩照片"这个承诺就是假的`,
+  )
   assert.ok(
     MAX_IMAGES_PER_TURN * IMAGE_MAX_BASE64_CHARS <= body,
     `单条消息的图（${MAX_IMAGES_PER_TURN} × ${IMAGE_MAX_BASE64_CHARS}）装不进请求体上限 ${body}`,
@@ -275,6 +285,57 @@ test('④ 超预算的单图在上送边界被丢掉（不静默发出一个注�
   assert.equal(toTurnImages([exact]).length, 1, '正好等于上限是允许的')
 })
 
+test('④ ★ `imagesForStorage`：落盘的那一份是副本，而 `preview` 字段本身绝不进存储', () => {
+  const full = dataUrlOf('image/jpeg', 'A'.repeat(4000))
+  const thumb = dataUrlOf('image/jpeg', 'B'.repeat(20))
+  assert.deepEqual(
+    imagesForStorage([{ url: full, name: 'photo.jpg', preview: thumb }]),
+    [{ url: thumb, name: 'photo.jpg' }],
+    '有副本就用副本顶掉 url，且不得把 preview 一起写下去',
+  )
+  // 没有副本的（小图、GIF、canvas 失败的）存原图——它们本来就小到存得下，或只能这样
+  assert.deepEqual(imagesForStorage([{ url: full }]), [{ url: full }])
+  assert.deepEqual(imagesForStorage(undefined), [], '没有图就是空数组，不是 undefined')
+})
+
+test('④ ★★ 落盘走副本、上送走原图：同一张图的两份各走各的路', () => {
+  /*
+   * 这是 2026-09-21 那次改动最核心的一条不变量。两个方向都可能悄悄坏：
+   *  - 落盘忘了换成副本 ⇒ 一张 8 MB 的原图进 localStorage，配额一炸，整段对话的图全丢；
+   *  - 上送误用副本 ⇒ 用户以为自己传的是原图，模型收到的却是 1280 的糊图，
+   *    `image.save` 存进知识库的也是糊图。两边都不会报错，所以必须各钉一条断言。
+   */
+  let stored: string | null = null
+  const store: MiniStore = {
+    getItem: () => stored,
+    setItem: (_key, value) => {
+      stored = value
+    },
+  }
+  const full = dataUrlOf('image/jpeg', 'A'.repeat(64))
+  const thumb = dataUrlOf('image/jpeg', 'B'.repeat(8))
+  const returned = saveConversation(store, 1, {
+    id: 'c1',
+    title: '看这张',
+    updatedAt: 1,
+    messages: [{ role: 'user', content: '看这张', images: [{ url: full, name: 'p.jpg', preview: thumb }] }],
+    notGrounded: [],
+    webGrounded: [],
+  })
+  assert.equal(
+    toTurnImages(returned[0]?.messages[0]?.images ?? [])[0]?.data.startsWith('AAAA'),
+    true,
+    '内存里那份必须是原图（原样再发时发的就是它）',
+  )
+
+  const back = loadConversations(store, 1)
+  const storedImages = back[0]?.messages[0]?.images ?? []
+  assert.equal(storedImages[0]?.url, thumb, '落盘的必须是副本')
+  assert.equal(storedImages[0]?.name, 'p.jpg', '文件名照旧存')
+  assert.ok((stored ?? '').includes('"preview"') === false, 'preview 字段进存储的话，读回来的转录里就混着两份图')
+  assert.equal(toTurnImages(storedImages)[0]?.data.startsWith('BBBB'), true, '刷新后回来的那份是副本（显示够用）')
+})
+
 /* ===================== ⑤ 参数与工具面 ===================== */
 test('⑤ `parseImageSaveArgs`：形状不对就拒绝，不猜不兜底', () => {
   assert.equal(typeof parseImageSaveArgs(null), 'string')
@@ -292,6 +353,7 @@ test('⑤ `imageMarkdown` 不会让 alt 提前闭合标签', () => {
 })
 
 test('⑤ `scaleToFit` / `humanBytes` / `fileNameFor` / `dataUrlToBlob` 的边界', () => {
+  // `scaleToFit` 如今只服务**本地副本**，上送的那一份不经过它。
   assert.deepEqual(scaleToFit(800, 600), { width: 800, height: 600 }, '没超过长边就原样（绝不放大）')
   assert.deepEqual(scaleToFit(2560, 1440), { width: 1280, height: 720 })
   assert.deepEqual(scaleToFit(1440, 2560), { width: 720, height: 1280 })
@@ -299,7 +361,7 @@ test('⑤ `scaleToFit` / `humanBytes` / `fileNameFor` / `dataUrlToBlob` 的边�
 
   assert.equal(humanBytes(512), '512 B')
   assert.equal(humanBytes(2048), '2.0 KB')
-  assert.equal(humanBytes(IMAGE_KEEP_BYTES), '400.0 KB')
+  assert.equal(humanBytes(IMAGE_PREVIEW_KEEP_BYTES), '512.0 KB')
   assert.equal(humanBytes(-1), '0 B')
 
   assert.equal(fileNameFor({ url: PNG_URL }), 'image.png')
@@ -371,14 +433,39 @@ test('⑥ 提交按钮的禁用判据同时看文字与图片', () => {
   )
 })
 
-test('⑥ 压缩之后仍超预算的图必须当场拒绝（而不是挂上去、发出去、模型说没看到）', () => {
+test('⑥ ★ 上送的那一份必须是**原图**：上传路径上不得出现重编码', () => {
   const ui = read('ui/index.tsx')
-  assert.match(
-    ui,
-    /wire\.data\.length > IMAGE_MAX_BASE64_CHARS/,
-    'prepareImageFile 必须在压完之后按 base64 长度判一次',
-  )
-  assert.match(ui, /return `这张图太大/, '拒绝时必须给一句给人看的话')
+  const previewAt = ui.indexOf('function makeImagePreview')
+  const previewEnd = ui.indexOf('\n}\n', previewAt)
+  const uploadAt = ui.indexOf('async function prepareImageFile')
+  const uploadEnd = ui.indexOf('\nfunction imageFilesFromDataTransfer')
+  assert.ok(previewAt > 0 && previewEnd > previewAt, '找不到 makeImagePreview（本地副本那一半）')
+  assert.ok(uploadAt > 0 && uploadEnd > uploadAt, '找不到 prepareImageFile（上传那一半）')
+  const previewBody = ui.slice(previewAt, previewEnd)
+  const uploadBody = ui.slice(uploadAt, uploadEnd)
+  /*
+   * 画布重编码只准出现在**副本**那一个函数里。这条守的是用户的要求本身：
+   * 照片上传后不得被压缩。一旦有人往 prepareImageFile 里塞回一次缩放，
+   * 界面照样显示得有图、模型收到的却是糊图——没人会发现。
+   */
+  assert.equal((ui.match(/toDataURL/g) ?? []).length, 1, '整份 UI 只准有一处 canvas 重编码')
+  assert.match(previewBody, /toDataURL/, '唯一那处必须就在 makeImagePreview 里')
+  assert.doesNotMatch(uploadBody, /toDataURL/, '上传路径上不得出现重编码')
+  assert.match(uploadBody, /\{ url: dataUrl, name: file\.name/, '待发那份的 url 必须是 FileReader 读出来的原样 data URL')
+  assert.match(uploadBody, /makeImagePreview\(/, '副本仍要生成——否则 localStorage 存不下原图')
+  assert.match(uploadBody, /wire\.data\.length > IMAGE_MAX_BASE64_CHARS/, '超上限必须当场判一次')
+  /*
+   * 拒绝的那句话必须**当场 return**，并且把三件事说清：是哪一张、有多大、上限是多少。
+   * 只说"太大了"是不够的——用户据此既不知道该删什么也不知道该多大，而这张图确实传不上去。
+   */
+  const rejectAt = uploadBody.indexOf('这张图太大')
+  assert.ok(rejectAt > 0, '超上限时必须给一句给人看的话')
+  const retAt = uploadBody.lastIndexOf('return', rejectAt)
+  assert.ok(retAt > 0, '必须当场 return，不能只是记一笔继续挂上去')
+  const note = uploadBody.slice(retAt, rejectAt + 320)
+  assert.ok(note.includes('IMAGE_MAX_BASE64_CHARS'), '那句人话必须报出单张上限')
+  assert.ok(note.includes('file.name'), '那句人话必须点出是哪一张')
+  assert.ok(note.includes('不会替你压缩照片'), '要说清本站不压图——否则用户会以为换个"原图模式"开关就有')
 })
 
 test('⑥ ★ 拖进**非图片**文件也必须拦下默认行为（否则浏览器会导航去打开它、页面状态全丢）', () => {

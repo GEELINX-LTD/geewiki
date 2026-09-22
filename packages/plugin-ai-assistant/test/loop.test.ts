@@ -12,7 +12,7 @@ import type { Principal } from '@geewiki/core'
 import type { AiToolResult, ResolvedTool } from '@geewiki/ai-tools'
 import type { LlmChunk, LlmErrorCode, LlmRequest, LlmService } from '@geewiki/llm'
 import { abortMessageOf, runAgentLoop, type LoopEvent, type LoopOptions } from '../src/loop.js'
-import type { TurnMessage } from '../src/types.js'
+import { MAX_IMAGE_BASE64_CHARS, type TurnMessage } from '../src/types.js'
 
 const principal: Principal = {
   kind: 'user',
@@ -794,7 +794,8 @@ test('★ 工具交上来的图要过与线协议**同一份**校验：坏 MIME 
     { mime: 'image/svg+xml', data: 'AAAA' },
     { mime: 'image/png', data: 'not base64!!' },
     { mime: 'image/png', data: '' },
-    { mime: 'image/png', data: 'A'.repeat(1_400_001) },
+    // 超长的那张必须**从常量推**出来：写死一个数字的话，闸抬高了这条守卫就悄悄失效
+    { mime: 'image/png', data: 'A'.repeat(MAX_IMAGE_BASE64_CHARS + 1) },
     { mime: 'text/html', data: 'AAAA' },
   ]
   const { svc, requests } = scriptedLlm([

@@ -75,11 +75,11 @@ import {
 } from './dockPlan.js'
 import {
   humanBytes,
-  IMAGE_JPEG_QUALITY,
-  IMAGE_KEEP_BYTES,
   IMAGE_MAX_BASE64_CHARS,
-  IMAGE_MAX_EDGE,
   IMAGE_MIME_WHITELIST,
+  IMAGE_PREVIEW_JPEG_QUALITY,
+  IMAGE_PREVIEW_KEEP_BYTES,
+  IMAGE_PREVIEW_MAX_EDGE,
   MAX_IMAGES_PER_TURN,
   scaleToFit,
   splitDataUrl,
@@ -179,7 +179,7 @@ export interface AskDockOptions {
   readonly journalTransport?: JournalTransport
 }
 
-/* ============================== 图片读取与压缩 ============================== */
+/* ============================ 图片读取与本地副本 ============================ */
 
 /** `FileReader` 的 promise 化；读不出来返回 `null`（调用方给一句人话，不抛） */
 function readAsDataUrl(file: File): Promise<string | null> {
@@ -192,18 +192,22 @@ function readAsDataUrl(file: File): Promise<string | null> {
 }
 
 /**
- * 重编码到长边 ≤ {@link IMAGE_MAX_EDGE} 的 JPEG。
+ * 一张原图的**本地副本**：缩到长边 ≤ {@link IMAGE_PREVIEW_MAX_EDGE} 的 JPEG。
  *
- * 失败一律返回 `null`，由调用方**退回原图**——重编码是优化，不是正确性前提：
+ * 副本**只进 localStorage**（见 `imagePlan.ts` 的 `imagesForStorage`），永远不进请求体——
+ * 上送的那一份始终是原图。它存在的唯一理由是配额：一张手机原图就足以把整段历史挤进
+ * "只丢图、不丢文字"的降级分支，症状是"刷新之后历史里的图全没了"。
+ *
+ * 失败一律返回 `null`，由调用方**不生成副本**——副本是优化，不是正确性前提：
  * 让"canvas 拿不到 2d 上下文"（无 GPU 的无头环境、极端内存压力）变成"图片传不上去"
- * 是把优化写成了门槛。
+ * 是把优化写成了门槛。真存不下时，既有的配额降级会接手。
  */
-function reencodeToJpeg(dataUrl: string): Promise<string | null> {
+function makeImagePreview(dataUrl: string): Promise<string | null> {
   return new Promise((resolve) => {
     const img = new Image()
     img.onload = () => {
       try {
-        const { width, height } = scaleToFit(img.naturalWidth, img.naturalHeight, IMAGE_MAX_EDGE)
+        const { width, height } = scaleToFit(img.naturalWidth, img.naturalHeight, IMAGE_PREVIEW_MAX_EDGE)
         const canvas = document.createElement('canvas')
         canvas.width = width
         canvas.height = height
@@ -216,7 +220,7 @@ function reencodeToJpeg(dataUrl: string): Promise<string | null> {
         c2d.fillStyle = '#ffffff'
         c2d.fillRect(0, 0, width, height)
         c2d.drawImage(img, 0, 0, width, height)
-        resolve(canvas.toDataURL('image/jpeg', IMAGE_JPEG_QUALITY))
+        resolve(canvas.toDataURL('image/jpeg', IMAGE_PREVIEW_JPEG_QUALITY))
       } catch {
         resolve(null)
       }
@@ -229,31 +233,40 @@ function reencodeToJpeg(dataUrl: string): Promise<string | null> {
 /**
  * 一个文件 → dock 的图片形态。返回**字符串即错误原因**（给人看的一句话）。
  *
- * 大图才重编码（判据是字节数，见 `IMAGE_KEEP_BYTES`）：一张 80 KB 的 PNG 截图
- * 重编码成 JPEG 会更大、还会丢掉透明通道，而它本来就在预算内。
- * **GIF 永不重编码**：canvas 只会画第一帧，用户发的动图会静默变成一张静图。
+ * ## 原图直传：这条路上没有任何缩放或重编码
+ * 用户传的是什么字节，模型看到的就是什么字节，`image.save` 存进知识库的也是那份字节。
+ * 唯一的尺寸判据是 {@link IMAGE_MAX_BASE64_CHARS}：超了**当场拒绝并说清是哪张、有多大**，
+ * 而不是悄悄压一遍——"我以为传的是原图"这个落差只有放大看细节时才看得见，
+ * 而看不见的失败最坏。（曾经的"超 400 KB 就转 JPEG 1280/0.82"已按用户要求撤掉。）
+ *
+ * ## 副本只为显示
+ * 超过 {@link IMAGE_PREVIEW_KEEP_BYTES} 才生成一份本地副本（只进 localStorage，见上）。
+ * **GIF 永不重编码**：canvas 只会画第一帧，用户发的动图会静默变成一张静图——
+ * 宁可让它按原图落盘、被配额降级丢掉，也不交付一张"看着是动图、存下来是静图"的图。
  */
 async function prepareImageFile(file: File): Promise<DockImage | string> {
   if (!file.type.startsWith('image/')) return '只能添加图片（png / jpeg / webp / gif）'
   if (!IMAGE_MIME_WHITELIST.includes(file.type)) return `不支持这种图片格式：${file.type}`
   const dataUrl = await readAsDataUrl(file)
   if (dataUrl === null) return '读取图片失败'
-  const prepared =
-    file.size <= IMAGE_KEEP_BYTES || file.type === 'image/gif'
-      ? { url: dataUrl, name: file.name }
-      : { url: (await reencodeToJpeg(dataUrl)) ?? dataUrl, name: file.name }
   /*
-   * 压缩之后仍超预算 ⇒ **当场拒绝**。
-   *
-   * 不在这里拦的话，它会一路走到上送边界才被丢掉（`toTurnImage`），
-   * 而那条路径的失败是**静默的**：用户看到图挂在输入条上、发出去之后模型说"没看到图"。
-   * 编码后的实际大小只有压完才知道——所以判据必须放在压完之后。
+   * 判据落在**真正会被发出去的那份载荷**上，而不是 `file.size`：正常路径上两者只差一个
+   * 4/3 的 base64 膨胀，但按 size 放行、按载荷拒绝会造出一个"挂上了却发不出去"的窗口。
    */
-  const wire = splitDataUrl(prepared.url)
-  if (wire !== null && wire.data.length > IMAGE_MAX_BASE64_CHARS) {
-    return `这张图太大（约 ${humanBytes(Math.round((wire.data.length * 3) / 4))}），压缩后仍然超出上限，请先裁剪一下`
+  const wire = splitDataUrl(dataUrl)
+  if (wire === null) return `${file.name}：浏览器没把它认成图片，换一张试试`
+  if (wire.data.length > IMAGE_MAX_BASE64_CHARS) {
+    return (
+      `${file.name}：这张图太大（约 ${humanBytes(Math.round((wire.data.length * 3) / 4))}），` +
+      `单张上限约 ${humanBytes(Math.floor((IMAGE_MAX_BASE64_CHARS * 3) / 4))}。` +
+      `本站不会替你压缩照片，请先裁剪或换一张。`
+    )
   }
-  return prepared
+  const preview =
+    file.size > IMAGE_PREVIEW_KEEP_BYTES && file.type !== 'image/gif'
+      ? await makeImagePreview(dataUrl)
+      : null
+  return preview === null ? { url: dataUrl, name: file.name } : { url: dataUrl, name: file.name, preview }
 }
 
 /**
