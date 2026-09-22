@@ -198,6 +198,19 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `./config/secrets.json` | **密钥文件**（`role: 'secret'` 字段的值，如模型 API 密钥；运行时生成，权限 `0600`，已被 `.gitignore` 忽略）。**备份它 = 备份密钥**：请与数据库同级看待——放进受控的备份位置，不要把备份产物提交进版本库。不需要它时删掉即可（配置里只留下"未配置"） |
 | `./plugins/` | 外部插件源码（每个子目录一个插件）。**不打进镜像**，容器只通过该绑定挂载发现（见第 2 节） |
 
+**附件不限大小 ⇒ 磁盘要自己盯（2026-09-21）**：`@geewiki/wiki` 的两道大小闸（`attachmentMaxBytes` 单文件、`attachmentPageQuotaBytes` 单页总量）**出厂默认都是 0 = 不限**，附件落在 `./data/attachments/` 下（内容寻址，与数据库同一挂载）。两条运维含义：
+
+1. **磁盘余量是唯一下限**。写满时上传回 **503 `storage_unavailable`**（不是 500 —— 那会计入连续失败并可能触发熔断），且**已有附件的读取不受影响**。想重新设闸就把配置项设成正数（改完立即生效，无需改代码）：
+
+   ```bash
+   # 把单文件上限收回 50 MB、单页总量收回 500 MB
+   curl -X POST "$BASE/api/plugins/@geewiki/wiki/config" -H 'content-type: application/json' \
+        -H "x-gw-csrf: $CSRF" -b "$JAR" \
+        -d '{"attachmentMaxBytes":52428800,"attachmentPageQuotaBytes":524288000}'
+   ```
+
+2. **反代的 body 上限常常比应用更早生效**。nginx 的 `client_max_body_size` **默认就是 1 MB**，超限的请求**进不到 Node**，响应也不是本服务那个带 `error` 字段的 JSON —— 表现为"上传莫名 413"。挂在 nginx 后面传大附件时必须显式放宽（`client_max_body_size 0;` = 不限，或给一个具体值）；Caddy / Traefik 的默认值各不相同，**本仓未实测**。
+
 热备份（在线，无需停机；走 SQLite backup API）：
 
 ```bash

@@ -739,7 +739,9 @@ export interface AttachmentService {
   /**
    * 把 `src` 流式写入存储。
    *
-   * @param o.maxBytes 字节上限：累计超出即中断并抛 `payload_too_large`。
+   * @param o.maxBytes 字节上限：累计超出即**中断收流**并抛 `payload_too_large`。
+   *   **0 = 不限**（附件端点默认就是 0，2026-09-21 起不再有"内置默认上限"）。实现方**必须**
+   *   把 0 当作"跳过这一道判据"——写成 `size > maxBytes` 会让默认配置拒绝一切非空文件。
    * @param o.ext 已过白名单的扩展名（内容寻址的落盘路径需要它）。
    * @param o.expectedBytes **声明**的字节数（HTTP 场景即 `Content-Length`）。给了就必须与实收
    *   一致，否则抛 `length_mismatch`；不传则不做这项校验。

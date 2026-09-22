@@ -9,7 +9,9 @@
  * （`maxBytes` 类上限只管单个 part 之外的场景），且**没有 per-file 上限** —— 即"一个匿名
  * 请求就能把进程内存打满"。而 multipart 又是**没有上限声明的格式**，手写解析器等于自己
  * 实现一遍边界状态机（历史上绝大多数上传漏洞都出在这一层）。
- * 裸 body 的上限则可以被 `Content-Length` 与流式计数双重收紧。
+ * 裸 body 的上限则可以被 `Content-Length` 与流式计数双重收紧。**2026-09-21 起两道闸默认都
+ * 不设上限**（见 {@link NO_SIZE_LIMIT}），但"`Content-Length` 必须存在"仍然成立 ——
+ * 它守的从来不只是体积，还有"实收字节数 vs 声明值"的对照（`length_mismatch`）。
  *
  * ## 磁盘上只有内容寻址的路径
  *
@@ -56,8 +58,25 @@ export const ATTACHMENT_EXT_WHITELIST: readonly string[] = [
 
 const WHITELIST_SET: ReadonlySet<string> = new Set(ATTACHMENT_EXT_WHITELIST)
 
-/** 单个附件的默认字节上限（25 MB）。配置项 `attachmentMaxBytes` 的默认值。 */
-export const DEFAULT_MAX_BYTES = 25 * 1024 * 1024
+/**
+ * 「**不设上限**」的表示值（2026-09-21）。
+ *
+ * 两个配置项 `attachmentMaxBytes`（单文件）与 `attachmentPageQuotaBytes`（单页总量）
+ * 的默认值都是它：**0 = 不限**，于是磁盘余量成为附件上传的唯一下限。
+ * 历史默认是 25 MiB / 200 MiB —— 那是"上限"还由代码兜底的年代留下的值。
+ *
+ * ## 为什么计数逻辑保留着，而不是删干净
+ *
+ * 它是**运维不改代码就能重新设闸**的唯一入口。一个完全不限的上传端点迟早会撞上
+ * 磁盘写满（`storage_unavailable` ⇒ 503），那时需要的是"立刻收口"的阀门，
+ * 而不是第二次改代码发版。删掉这条计数还会连带删掉两道与它同在一处的防线：
+ * `expectedBytes`（实收 vs 声明）对照，以及超限时**中断流**（不是收完再判）+ 临时文件清理。
+ *
+ * ★ `0` 只表示"不限"，**不表示"拒收一切"**：判据一律写成 `limit > 0 && size > limit`。
+ * 写成 `size > limit` 会让默认值变成"任何非空文件都被拒"，而失败形态是"上传全挂"，
+ * 比反向的错更难排查（配置里什么都没写，界面却什么都传不上去）。
+ */
+export const NO_SIZE_LIMIT = 0
 
 /** `sha256` 的形态：只有 **小写 hex 的 64 位** 才是合法输入（大写/短/长一律拒绝）。 */
 const SHA256_RE = /^[0-9a-f]{64}$/
