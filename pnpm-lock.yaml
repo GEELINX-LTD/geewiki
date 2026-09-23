@@ -12,8 +12,8 @@ importers:
         specifier: ^10.0.1
         version: 10.0.1(eslint@10.10.0(jiti@2.7.0))
       '@types/node':
-        specifier: ^26.5.0
-        version: 26.5.0
+        specifier: ^26.6.1
+        version: 26.6.1
       eslint:
         specifier: ^10.10.0
         version: 10.10.0(jiti@2.7.0)
@@ -40,8 +40,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
       cordis:
         specifier: ^4.0.0-rc.10
         version: 4.0.0-rc.10
@@ -62,8 +62,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.10.2
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
       '@types/pg':
         specifier: ^8.11.10
         version: 8.23.1
@@ -113,8 +113,8 @@ importers:
         version: 4.0.0-rc.10
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-assistant:
     dependencies:
@@ -135,8 +135,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-journal:
     dependencies:
@@ -151,8 +151,8 @@ importers:
         specifier: workspace:*
         version: link:../db-sqlite
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-kb:
     dependencies:
@@ -176,8 +176,8 @@ importers:
         specifier: workspace:*
         version: link:../plugin-wiki
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-nav:
     dependencies:
@@ -192,8 +192,8 @@ importers:
         version: 4.0.0-rc.10
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-pages:
     dependencies:
@@ -214,8 +214,8 @@ importers:
         specifier: workspace:*
         version: link:../db-sqlite
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-summary:
     dependencies:
@@ -242,8 +242,8 @@ importers:
         specifier: workspace:*
         version: link:../plugin-wiki
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-tools:
     dependencies:
@@ -255,8 +255,8 @@ importers:
         version: 4.0.0-rc.10
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-web-search:
     dependencies:
@@ -274,8 +274,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ai-writing:
     dependencies:
@@ -290,8 +290,8 @@ importers:
         version: 4.0.0-rc.10
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-auth:
     dependencies:
@@ -306,8 +306,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-authz:
     dependencies:
@@ -322,8 +322,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-builtin-docs:
     dependencies:
@@ -347,8 +347,8 @@ importers:
         specifier: workspace:*
         version: link:../plugin-wiki
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-echo:
     dependencies:
@@ -384,8 +384,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-oidc:
     dependencies:
@@ -403,8 +403,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-openai:
     dependencies:
@@ -422,8 +422,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-ops:
     dependencies:
@@ -435,8 +435,8 @@ importers:
         version: 4.0.0-rc.10
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-org:
     dependencies:
@@ -451,8 +451,8 @@ importers:
         version: 3.18.0
     devDependencies:
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-search:
     dependencies:
@@ -470,8 +470,8 @@ importers:
         specifier: workspace:*
         version: link:../db-sqlite
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/plugin-wiki:
     dependencies:
@@ -489,8 +489,8 @@ importers:
         specifier: workspace:*
         version: link:../plugin-authz
       '@types/node':
-        specifier: ^22.0.0
-        version: 22.20.1
+        specifier: ^26.6.1
+        version: 26.6.1
 
   packages/server:
     dependencies:
@@ -613,7 +613,7 @@ importers:
         version: 1.2.16(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
       '@tailwindcss/vite':
         specifier: 4.3.3
-        version: 4.3.3(vite@8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
+        version: 4.3.3(vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
       '@xyflow/react':
         specifier: ^12.5.0
         version: 12.11.6(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -650,13 +650,13 @@ importers:
         version: 19.3.0(@types/react@19.3.0)
       '@vitejs/plugin-react':
         specifier: ^6.1.1
-        version: 6.1.1(vite@8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
+        version: 6.1.1(vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
       typescript:
         specifier: ~6.0.3
         version: 6.0.3
       vite:
         specifier: ^8.3.0
-        version: 8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)
+        version: 8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)
 
 packages:
 
@@ -1579,11 +1579,8 @@ packages:
   '@types/json-schema@7.0.15':
     resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
 
-  '@types/node@22.20.1':
-    resolution: {integrity: sha512-EANqOCF9QFyra+4pfxUcX9STKJpCLjMbObVzljIJomAWSnuSIEAvyzEU53GaajbXJEgdh0iEcPL+DGvpUd4k1Q==}
-
-  '@types/node@26.5.0':
-    resolution: {integrity: sha512-dVSGpriSoCgz8WnDNTuSSuSv1PC/ALXihO4ulRZt7Md8k9mlbdin3lGOcDE8SnWOgf513ByWlXd7BK4azmyg/A==}
+  '@types/node@26.6.1':
+    resolution: {integrity: sha512-VqGJBMCtdhqkBUCcBLvywI0NJ+KLuVzgNnlBUNFOQjqVxzo2lxLUNg1DSey8+u2u6ktswSAxg+s68QLzWHNOuA==}
 
   '@types/pg@8.23.1':
     resolution: {integrity: sha512-fKVHpikPdg4GKks3JuLEhvwSyvwzF23hnabPy6DD8ljVbC7+6J5dQzdv4arV6jqq57djnMgs1HKBxX4P8aBI3A==}
@@ -2427,9 +2424,6 @@ packages:
     resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
     hasBin: true
-
-  undici-types@6.21.0:
-    resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
 
   undici-types@8.9.0:
     resolution: {integrity: sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==}
@@ -3371,16 +3365,16 @@ snapshots:
       '@tailwindcss/oxide-win32-arm64-msvc': 4.3.3
       '@tailwindcss/oxide-win32-x64-msvc': 4.3.3
 
-  '@tailwindcss/vite@4.3.3(vite@8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))':
+  '@tailwindcss/vite@4.3.3(vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))':
     dependencies:
       '@tailwindcss/node': 4.3.3
       '@tailwindcss/oxide': 4.3.3
       tailwindcss: 4.3.3
-      vite: 8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)
+      vite: 8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)
 
   '@types/better-sqlite3@9.6.0':
     dependencies:
-      '@types/node': 22.20.1
+      '@types/node': 26.6.1
 
   '@types/d3-color@3.1.3': {}
 
@@ -3409,17 +3403,13 @@ snapshots:
 
   '@types/json-schema@7.0.15': {}
 
-  '@types/node@22.20.1':
-    dependencies:
-      undici-types: 6.21.0
-
-  '@types/node@26.5.0':
+  '@types/node@26.6.1':
     dependencies:
       undici-types: 8.9.0
 
   '@types/pg@8.23.1':
     dependencies:
-      '@types/node': 22.20.1
+      '@types/node': 26.6.1
       pg-protocol: 1.16.0
       pg-types: 2.2.0
 
@@ -3525,10 +3515,10 @@ snapshots:
       '@typescript-eslint/types': 8.70.0
       eslint-visitor-keys: 5.0.1
 
-  '@vitejs/plugin-react@6.1.1(vite@8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))':
+  '@vitejs/plugin-react@6.1.1(vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))':
     dependencies:
       '@rolldown/pluginutils': 1.0.1
-      vite: 8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)
+      vite: 8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)
 
   '@xyflow/react@12.11.6(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
     dependencies:
@@ -4215,8 +4205,6 @@ snapshots:
 
   typescript@6.0.3: {}
 
-  undici-types@6.21.0: {}
-
   undici-types@8.9.0: {}
 
   update-browserslist-db@1.3.3(browserslist@4.28.9):
@@ -4248,7 +4236,7 @@ snapshots:
     dependencies:
       react: 19.3.0
 
-  vite@8.3.0(@types/node@26.5.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13):
+  vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13):
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.7
@@ -4256,7 +4244,7 @@ snapshots:
       rolldown: 1.2.8
       tinyglobby: 0.2.17
     optionalDependencies:
-      '@types/node': 26.5.0
+      '@types/node': 26.6.1
       esbuild: 0.28.2
       fsevents: 2.3.3
       jiti: 2.7.0
