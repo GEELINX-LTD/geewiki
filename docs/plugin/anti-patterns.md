@@ -227,7 +227,7 @@ router.register('GET', '/api/my-note', handler, { access: 'user', owner: '@geewi
 
 ```jsonc
 // config/plugins.base.json（会被复制、会被粘贴排障、会进备份）
-{ "name": "@geewiki-plugin/my-note", "config": { "apiKey": "sk-live-…", "baseUrl": "https://example.com/llm/v1" } }
+{ "name": "@geewiki-plugin/my-note", "config": { "apiKey": "sk-live-…", "baseUrl": "https://llm.internal.corp/v1" } }
 ```
 
 ✅ 正确
@@ -238,7 +238,7 @@ router.register('GET', '/api/my-note', handler, { access: 'user', owner: '@geewi
 ```
 
 **为什么**：`GET /api/plugins/:name/config` 对**普通字段明文返回**（`docs/plugin-platform.md` §5.1 的 L-20），`redact()` 是启发式的、且刻意不脱敏模型输出。密钥的正确出路有两条：只存环境变量名（`@geewiki/llm` 的 `apiKeyEnv` 就是这个范式），或在 `configSchema` 里把字段标成 `role: 'secret'`（写一次、不可回读，落 `config/secrets.json`，见 `packages/manager/src/secrets.ts` 文件头——它存在的原因正是"清单是被复制出去的东西"，历史上 `.dockerignore` 只排了 `plugins.session.json`，结果 `secrets.json` 被 `COPY config` 打进镜像层，已用探测构建实测）。
-私有端点/私有模型名同理：`config/plugins.base.example.json` 里 `@geewiki/llm` 目前硬编码了一个私有端点与模型名，这与"不绑厂商"冲突，**不要沿用**；本系列文档与你的插件一律用 `https://api.example.com/v1` 这类占位符。
+私有端点/私有模型名同理：`baseUrl` 与 `model` **只能写在清单里**（全仓无环境变量间接层，见 `docs/deployment.md`），所以它们会跟着清单被复制出去——出厂模板 `config/plugins.base.example.json` 里 `@geewiki/llm` 的默认值**已经是 `https://your-openai-compatible-endpoint/v1` / `your-model-name` 占位符**（历史上它硬编码过真实私有端点，已登记并修正，台账见 `docs/agent/backlog.md`）；你自己的内部端点**不要**写进随版本发布的清单。本系列文档与你的插件一律用 `https://api.example.com/v1` 这类占位符。
 
 **权威出处**：`packages/manager/src/secrets.ts`（文件头）、`packages/manager/src/index.ts` 的 `configOf` / `secretFieldsOf` / `hydrateSecrets`；`docs/plugin-platform.md` §5.1（L-20）。
 
