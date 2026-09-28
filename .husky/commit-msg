@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# 提交信息门禁（规则见 commitlint.config.mjs：Conventional Commits，subject 用中文）。
+# 同 pre-commit：node_modules 缺失时放行，避免 Docker/CI/未装依赖的环境被硬阻断。
+if [ ! -x node_modules/.bin/commitlint ]; then
+  echo "commit-msg：未找到 node_modules/.bin/commitlint，跳过（跑过 pnpm install 后生效）"
+  exit 0
+fi
+
+exec node_modules/.bin/commitlint --edit "$1"

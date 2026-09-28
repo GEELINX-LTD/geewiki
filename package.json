@@ -15,6 +15,9 @@
     "test": "pnpm -r --no-bail --if-present run test",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
+    "docs:links": "tsx scripts/docs-links.ts",
+    "docs:conventions": "tsx scripts/docs-conventions.ts",
+    "prepare": "husky",
     "new:plugin": "tsx scripts/create-plugin.ts",
     "clean:tmp": "tsx scripts/clean-tmp.ts",
     "backup": "tsx scripts/backup.ts",
@@ -25,11 +28,15 @@
     "node": ">=22"
   },
   "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.5.0",
     "eslint": "^10.10.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.12.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
     "tsx": "^4.23.13",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.70.0"

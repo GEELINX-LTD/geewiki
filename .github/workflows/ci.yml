@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - name: 单元测试（node:test，177 个测试文件）
+      - name: 单元测试（node:test，文件数与用例数以 `pnpm test` 输出为准）
         run: pnpm test
 
   build:
@@ -66,6 +66,22 @@ jobs:
       - uses: ./.github/actions/setup
       - name: 构建全部产物（vite build）
         run: pnpm build
+
+  # 文档门禁：只读扫 markdown，不依赖构建产物，也不参与 publish 的 needs 链。
+  # 故意不加入 publish.needs：分支保护的「必需状态检查」集合变更需人工在 GitHub 端确认。
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: 文档链接与锚点存活（阻断：死链直接红）
+        run: pnpm run docs:links
+      # docs:conventions 只报告不阻断：存量 R1/R2 违规远大于 0（见仓库内实测），
+      # 一旦逐条清完再把下一行改成 `run: pnpm run docs:conventions -- --fail-on R1,R2,R3`。
+      - name: 文档规范（R1 索引 / R2 行号引用 / R3 私有端点）—— 只报告
+        run: pnpm run docs:conventions
 
   # PR 阶段验证 Dockerfile 仍可构建，避免破坏部署路径的改动被合入。
   # 只构建不推送，并用 gha 缓存复用 main 分支已构建的层。
