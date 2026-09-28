@@ -48,3 +48,6 @@ logs/
 
 # 本地沙箱 pnpm/npm 配置（store/cache 置于仓库内，仅本地环境需要）
 .npmrc
+
+# AI 编码代理的本地临时记忆（子代理写进工作树的 scratch，不是仓库产物）
+.pi/agent-memory/
