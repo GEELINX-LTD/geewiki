@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# 只对本次 git add 过的文件跑 eslint --fix（规则见 lint-staged.config.mjs）。
+#
+# node_modules 缺失时必须静默放行：Docker 构建、CI、以及「刚 clone 还没装依赖」的工作树里
+# 都可能触发提交，钩子报错会把「装依赖」这件事变成提交失败，反而会逼人用 --no-verify 绕过门禁。
+if [ ! -x node_modules/.bin/lint-staged ]; then
+  echo "pre-commit：未找到 node_modules/.bin/lint-staged，跳过（跑过 pnpm install 后生效）"
+  exit 0
+fi
+
+exec node_modules/.bin/lint-staged
