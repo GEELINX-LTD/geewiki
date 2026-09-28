@@ -86,7 +86,7 @@ GEEWIKI_PLUGINS_DIR=/app/plugins
 GEEWIKI_WEB_DIST=/app/packages/web/dist
 ```
 
-> **`GEEWIKI_PLUGIN_UI_DIST` 镜像内刻意不设**（已只读核实 `Dockerfile:96-103` 与 `docker-compose.yml:45-52`，两处都只固化 `GEEWIKI_WEB_DIST`）：该变量**缺省即回落 `GEEWIKI_WEB_DIST`**（`packages/server/src/index.ts:1863-1870`；`ServerOptions.pluginUiDist` 的类型声明在 `:1428`），因此镜像里"前端产物根"与"内置插件 UI 资产根"**指向同一个目录** `/app/packages/web/dist`（内置插件 UI 位于其下的 `plugins-ui/<插件名>/`，由镜像内 `vite build` 从 `packages/web/public/` 拷贝而来，见 `.dockerignore` **未排除** `packages/web/public/plugins-ui/` 与 `Dockerfile:111` 的 `COPY --from=builder /src/packages/web/dist /app/packages/web/dist`；**前提**是构建上下文里已有 `packages/web/public/plugins-ui/**`，即宿主机先跑过 `pnpm --filter @geewiki/web run build:fixtures`——该目录被 `.gitignore` 排除、不入版本库。**本次未实跑镜像构建，本段为只读核实 + 推断**）。**镜像内无需显式设置**；只有当你想让插件 UI 走独立目录（如 dev 形态的 `packages/web/public`）时，才需要额外覆盖该变量。启动日志会同时打印两个根，相同的那一份带"（同静态产物根）"注记，便于核对。
+> **`GEEWIKI_PLUGIN_UI_DIST` 镜像内刻意不设**（已只读核实：`Dockerfile` 的 `ENV` 段与 `docker-compose.yml` 的 `environment:` 段两处都只固化 `GEEWIKI_WEB_DIST`）：该变量**缺省即回落 `GEEWIKI_WEB_DIST`**（`packages/server/src/index.ts` 的 `pluginUiRootsFor()`；`ServerOptions.pluginUiDist` 的类型声明在同一文件的 `webDist` 旁边），因此镜像里"前端产物根"与"内置插件 UI 资产根"**指向同一个目录** `/app/packages/web/dist`（内置插件 UI 位于其下的 `plugins-ui/<插件名>/`，由镜像内 `vite build` 从 `packages/web/public/` 拷贝而来，见 `.dockerignore` **未排除** `packages/web/public/plugins-ui/`，以及 `Dockerfile` 里那行 `COPY --from=builder /src/packages/web/dist /app/packages/web/dist`；**前提**是构建上下文里已有 `packages/web/public/plugins-ui/**`，即宿主机先跑过 `pnpm --filter @geewiki/web run build:fixtures`——该目录被 `.gitignore` 排除、不入版本库。**本次未实跑镜像构建，本段为只读核实 + 推断**）。**镜像内无需显式设置**；只有当你想让插件 UI 走独立目录（如 dev 形态的 `packages/web/public`）时，才需要额外覆盖该变量。启动日志会同时打印两个根，相同的那一份带"（同静态产物根）"注记，便于核对。
 
 镜像自带 `HEALTHCHECK`（每 30s 请求 `/api/health`），判据是 **`ok:true` 且 `db.present:true`**（即服务在跑、SQLite 已连接），满足时 `docker compose ps` 显示 `healthy`；数据目录不可写等导致数据库插件激活失败的情况会如实显示 `unhealthy`（详见第 9 节）。
 
@@ -168,7 +168,7 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `GEEWIKI_UID` / `GEEWIKI_GID` | `1000` / `1000` | 容器运行用户，用于对齐宿主目录属主 |
 | `DB_PASSWORD` | 无 | 仅 `--profile production` 的 postgres 服务需要 |
 
-应用层变量（由 `packages/server/src/index.ts` 读取，镜像已内置合理默认值）：
+应用层变量（大部分由 `packages/server/src/index.ts` 的 `startServer()` 读取，下表末尾几个分别由 `packages/manager/src/index.ts`、`packages/plugin-openai/src/provider.ts`、`packages/plugin-auth/src/index.ts` 读取；镜像已内置合理默认值）：
 
 | 变量 | 镜像内取值 | 说明 |
 | --- | --- | --- |
@@ -178,10 +178,40 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `GEEWIKI_PLUGINS_DIR` | `/app/plugins` | 外部插件发现根。**必须是绝对路径**：部署树里没有 `pnpm-workspace.yaml`，相对路径会回退到 `process.cwd()`，一旦覆盖工作目录就会**静默发现 0 个插件且不报错**（已实测：`-w /tmp` + `GEEWIKI_PLUGINS_DIR=plugins` 时发现根变为 `/tmp/plugins`、0 个插件、无任何告警） |
 | `GEEWIKI_WEB_DIST` | `/app/packages/web/dist` | **前端静态产物根**（app shell 的 `index.html`、`/assets/*`、SPA fallback；`null` = 不启用静态服务）。镜像内为绝对路径，与工作目录无关 |
 | `GEEWIKI_PLUGIN_UI_DIST` | **未设置**（= 回落 `GEEWIKI_WEB_DIST`） | **内置插件 UI 资产根**（含 `plugins-ui/<插件名>/` 的目录），是插件 UI 产物的**第二候选根**（第一候选根是插件自带的 `<插件目录>/dist`）。**缺省 = `GEEWIKI_WEB_DIST`**，故镜像内与静态产物根同值、无需设置。注意它与 `GEEWIKI_WEB_DIST` 的 **`null` 语义不同**（`pluginUiDist: null` = 不用内置根、只看插件自带产物；`webDist: null` = 不启用静态服务）——该区分只存在于 `ServerOptions`，环境变量层面留空即等同"未设置 = 回落" |
-| `GEEWIKI_HOST` | `0.0.0.0` | 后端**监听地址**（`packages/server/src/index.ts:1848`：`options.host ?? process.env.GEEWIKI_HOST ?? '0.0.0.0'`）。容器内保持默认即可；只绑 `127.0.0.1` 会让端口映射失效 |
-| `GEEWIKI_OIDC_TICKET_SECRET` | **未设置**（每进程随机） | **OIDC 登录票据的签名密钥**（`packages/plugin-auth/src/index.ts:506-511`）。多实例部署、或需要重启后票据仍有效时必须配置；未配置时每进程随机生成，重启即失效 |
+| `GEEWIKI_HOST` | `0.0.0.0` | 后端**监听地址**（`packages/server/src/index.ts` 的 `startServer()`：`options.host ?? process.env.GEEWIKI_HOST ?? '0.0.0.0'`）。容器内保持默认即可；只绑 `127.0.0.1` 会让端口映射失效 |
+| `GEEWIKI_OIDC_TICKET_SECRET` | **未设置**（每进程随机） | **OIDC 登录票据的签名密钥**（`packages/plugin-auth/src/index.ts` 的 `ticketSecretEnv` / `ticketSecret`）。⚠️ **不是"设了就用"**：判据是 `ticketSecretEnv.length >= 16` ⇒ **短于 16 字符会静默回落成每进程随机的 `randomBytes(32)`，不报错也不告警**。票据 TTL 5 分钟，失败方向是关闭（票据作废，不是放行）。多实例部署、或希望重启后已签发票据仍有效时必须配置，且**长度 ≥16** |
+| `GEEWIKI_ADMIN_TOKEN` | **未设置**（= 整条通道禁用） | **break-glass 应急访问令牌**（`packages/server/src/index.ts` 的 `ADMIN_TOKEN_ENV` / `envAdminToken()`）。判据 `raw !== undefined && raw.length > 0` ⇒ **空串与未设置等价**，没有回退默认值。请求侧两种带法：`x-gw-admin-token: <令牌>` 或 `Authorization: Bearer <令牌>`（`presentedAdminToken()`）；比对走 `secretsMatch()`——两边各做 sha256 再 `timingSafeEqual`，防时序侧信道。**每次使用都留痕**：`auditBreakGlassUse()` 往 stdout 打 `[audit] action=access.break_glass actor=break-glass method=… path=… remote=… at=…`，并经 `onBreakGlassUse` 写 `audit_log` 表（`action: 'access.break_glass'`）。它是逃生门不是运维通道，生产不应常开 |
+| `GEEWIKI_STRICT_ROUTE_ACCESS` | **未设置**（= 只告警） | 路由访问等级门禁（`packages/server/src/index.ts` 的 `STRICT_ROUTE_ACCESS_ENV` / `auditRouteAccess()`）。它点名的是 `register()` 省略第 4 个参数、从而吃到默认 `access: 'public'` 的路由（`unauditedRoutes()`）。**默认动作是把所有未声明路由合并成一条 `console.warn` 聚合告警**；**只有设成字面量 `1` 才抛错拒启**（判据 `=== '1'`，写 `true` / `yes` 一律只告警）。注意调用点在 `startServer()` 尾部（插件 boot 之后），**晚于 `server.listen()`** ⇒ 拒启表现为"端口刚起来进程就退出"，不是启动前预检 |
+| `GEEWIKI_BACKUP_DIR` | **未设置**（= `<进程工作目录>/backups`） | 备份的输出与枚举目录，唯一消费者是 `packages/manager/src/index.ts` 的 `createBackup()` 与 `listBackups()`，解析式 `opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')`，而 `repoRoot = resolve(opts.repoRoot ?? process.cwd())`。⚠️ **它是"相对路径以仓库根为基准"这条全局规则的唯一例外**（不走 `@geewiki/core` 的 `resolveProjectPath`）⇒ 换个目录启动就把备份写到别处。另两点边界：① `pnpm run backup`（`scripts/backup.ts`）**不读这个变量**，只认 `--out`，缺省 `<仓库根>/backups`；`scripts/restore.ts` 也不读它（备份目录是位置参数，它只读 `GEEWIKI_DATA_DIR`）；② **PostgreSQL 方言下备份包不含数据库**（清单里 `database.included = false`，提示改用 `pg_dump`），见 §5 |
+| `GEEWIKI_OPENAI_DEBUG` | **未设置 = 开启**（判据 `!== '0'`） | `@geewiki/openai` 的上游错误诊断日志开关（`packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()`）⇒ **只有显式设成 `0` 才关**，写 `false` / `off` 无效。它 gate 的只有一条日志：上游返回非 2xx 时的 `console.warn('[geewiki/openai] 路由 … 上游返回 <status>（已脱敏）: …')`，内容是**上游错误响应体的前 500 字符**（经 `packages/plugin-llm/src/redact.ts` 的 `redact()`），**不含请求体**。但"默认开着"本身与「敏感数据不出本机」的产品理念相冲，且 `redact` 是启发式的 ⇒ **生产建议显式 `GEEWIKI_OPENAI_DEBUG=0`**；把默认方向改成"显式开"的整改登记在 `docs/agent/backlog.md` **F7** |
 
-> **`GEEWIKI_DATABASE_URL` / `GEEWIKI_DB_PASSWORD` 不是内置变量**：它们只是 `@geewiki/postgres` 配置项 `connectionStringEnv` / `passwordEnv` 的**示例名**（`packages/db-postgres/src/index.ts:65` / `:73`）。应用本身从不读这两个名字——真正被读的是**你在插件配置里填的那个环境变量名**，填什么读什么。
+> **本表不是穷举**。全量口径以代码为准：
+> `cd /root/dev/geewiki && grep -rhoE "(GEEWIKI|GW)_[A-Z0-9_]+" packages/*/src scripts | sort -u`
+> （注意变量名常常**不写在 `process.env.` 里**，而是作为配置项的默认值或常量出现，例如 `ADMIN_TOKEN_ENV`、
+> `STRICT_ROUTE_ACCESS_ENV`；只 grep `process.env\.` 会漏掉这一整类。）
+
+**凭据类配置项填的是「环境变量名」，不是值。** 同一纪律目前有四个消费者，它们读的都是"你填进去的那个名字"：
+
+| 配置项 | 读取处 | 变量未设 / 为空时的行为 |
+| --- | --- | --- |
+| `@geewiki/postgres` 的 `passwordEnv` | `packages/db-postgres/src/index.ts` 的 `resolveConnection()` | 按**无密码**处理（传空串给驱动，见下方驱动回退） |
+| `@geewiki/llm` 的 `apiKeyEnv` | `packages/plugin-llm/src/credentials.ts` 的 `resolveCredential()` | 名字形态不合法 ⇒ `INVALID_CREDENTIAL`；未设或为空 ⇒ `MISSING_CREDENTIAL`（界面填写的密钥优先） |
+| `@geewiki/oidc` 的 `clientSecretEnv` | `packages/plugin-oidc/src/index.ts` 的 `OidcConfigSchema` + `packages/plugin-oidc/src/client.ts` | 把密钥值直接填进该字段 ⇒ 被 `ENV_VAR_NAME_FIELD_RE` 拒绝；配了名字但变量为空 ⇒ 抛 `client_secret_missing`（**失败关闭**） |
+| `@geewiki/postgres` 的 `connectionStringEnv` | **无消费者** —— 见下方 ⚠️ | — |
+
+> **`GEEWIKI_DATABASE_URL` / `GEEWIKI_DB_PASSWORD` / `GW_PG_PASSWORD` 都不是内置变量**：它们只是上面那些配置项的**示例名**（`packages/db-postgres/src/index.ts` 的 `PostgresConfigSchema` 里 `connectionStringEnv` 与 `passwordEnv` 的字段描述）。应用本身从不读这些名字——真正被读的是**你在插件配置里填的那个名字**，填什么读什么。**不存在内置的 `GEEWIKI_DB_*` 或 `PG*` 变量清单。**
+
+> ⚠️ **`connectionStringEnv` 目前是死路径**（已回源码核实）。它出现在 `PostgresConfigSchema`、`PostgresConfig` 接口、`assertEnvNameLooksLikeName()` 的名字形态校验和文件头注释里，**但全仓没有任何一处 `process.env[...]` 去读它**；`PostgresDatabase.requirePool()` 交给 `new Pool()` 的字段只有 `host` / `port` / `database` / `user` / `password` / `max` / `connectionTimeoutMillis` / `idleTimeoutMillis` / `ssl`，**从不传 `connectionString`**。⇒ 只在配置里写 `"connectionStringEnv": "GEEWIKI_DATABASE_URL"` 而不管 host/port/database/user，**不会**让应用连上那个库，它会拿着默认值（`127.0.0.1` / `5432` / `geewiki` / `geewiki`）去连。正确做法见 §7（连接参数写进清单的 `config`，只有密码走 `passwordEnv`）。这一"配置项有 schema 无实现"的差距建议转台账。
+
+> **驱动层还有一条隐式通道**（node-postgres，非本仓代码）。`pg` 的 `ConnectionParameters` 用 `val()` 取参数：**只有应用没显式给值才回退读 libpq 风格环境变量 `PG<参数大写>`**。本仓 `requirePool()` 总会给 `host`/`port`/`database`/`user` 填上非空默认值 ⇒ `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER` **实际被覆盖**；但 `passwordEnv` 未配时传下去的是**空串（falsy）** ⇒ **`PGPASSWORD` 会被驱动捡走**；`ssl` 未配（`undefined`）时驱动读 `PGSSLMODE`；`PGAPPNAME`、`PGCONNECT_TIMEOUT` 等同理由驱动读取。反过来，`PG_PASSWORD`（带下划线）**既不是应用读的也不是驱动读的**——它只是 `packages/plugin-authz/test/e2e-p2.sh`、`packages/plugin-wiki/test/e2e-p3a.sh`、`packages/plugin-wiki/test/e2e-version-meta.sh` 里的 shell 变量名，脚本再把它赋给 `GEEWIKI_DB_PASSWORD`。
+
+### 不属于部署的环境变量
+
+以下变量**刻意不进上面的表**，部署时不要设：
+
+- **仅开发形态**：`GEEWIKI_DEV_API`、`GEEWIKI_DEV_PORT`（Vite dev server 的代理目标与端口，读取点在 `packages/web/vite.config.ts`）——生产由后端直接托管静态产物，不走 Vite 代理。清单见 [development.md §1](development.md)。
+- **仅验收 / e2e**：`GEEWIKI_E2E_PG`（只有 `e2e-p2.sh` / `e2e-p3a.sh` / `e2e-version-meta.sh` 三条脚本支持它）、`GW_PORT`（`scripts/acceptance/plugin-runtime-disable/run.ts` 的端口覆盖）、`GEEWIKI_KEEP_TMP`（`scripts/acceptance/search-mode/run.ts` 保留临时目录，唯一消费者）、`FIXTURE_OUT` / `FIXTURE_ENTRY` / `FIXTURE_OUT_DIR`（`packages/web/fixtures/vite.config.ts`）、`MOCK_IDP_*`（`packages/plugin-oidc/test/mock-idp.mjs`）。
+- **仅单元测试**：`GEEWIKI_E2E_SPLIT_KEY`、`GEEWIKI_LLM_TEST_KEY`、`GEEWIKI_LLM_TEST_EMPTY`、`GEEWIKI_LLM_KEY_2`、`GEEWIKI_LLM_CRED_TEST_KEY`、`GEEWIKI_TEST_ABSENT_KEY_XYZ`、`GEEWIKI_TEST_OPENAI_KEY_1`、`GEEWIKI_TEST_PLUGIN_KEY`、`GEEWIKI_TEST_SETTINGS_KEY`、`GEEWIKI_TEST_UNSET_KEY`。**看到 `GEEWIKI_TEST_*` / `GEEWIKI_LLM_*` 前缀就当作测试夹具命名空间**，它们不是运维接口。
 
 ---
 
@@ -272,18 +302,24 @@ docker compose --profile production up -d --build
 - `POST /api/plugins/%40geewiki%2Fdb-sqlite/disable` → **409 `base_layer`**：`@geewiki/db-sqlite 属于基础层（冷操作），请编辑基础层清单 plugins.base.json 后重启进程`（基础层插件不可热卸载）；
 - `POST /api/plugins/%40geewiki%2Fpostgres/enable` → **409 `hot_reload_not_supported`**：`@geewiki/postgres 未声明 runtime.supportsHotReload: true，仅支持持久化安装 + 进程重启（冷操作）`。
 
-**正确步骤**：① 在外部设好连接串环境变量；② **直接编辑 `config/plugins.base.json`**，把 `{"name": "@geewiki/db-sqlite"}` 换成 `@geewiki/postgres` 条目并带上 `config`；③ 重启进程。
+**正确步骤**：① 在外部设好**密码**环境变量；② **直接编辑 `config/plugins.base.json`**，把 `{"name": "@geewiki/db-sqlite"}` 换成 `@geewiki/postgres` 条目并带上 `config`（**连接参数写在 `config` 里**，只有密码走变量名）；③ 重启进程。
 
 ```bash
-export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewiki'
+# 变量名是你自己取的；把它填进下面 config 的 passwordEnv，两边必须一致
+export GEEWIKI_DB_PASSWORD='REPLACE_ME'
 ```
 
 ```jsonc
-// config/plugins.base.json —— 把 db-sqlite 换成 postgres（示例，凭据一律用变量名）
+// config/plugins.base.json —— 把 db-sqlite 换成 postgres（示例，凭据走变量名）
 {
   "enabled": [
     { "name": "@geewiki/postgres",
-      "config": { "connectionStringEnv": "GEEWIKI_DATABASE_URL", "ssl": false } },
+      "config": {
+        "host": "127.0.0.1", "port": 5432,
+        "database": "geewiki", "user": "geewiki",
+        "passwordEnv": "GEEWIKI_DB_PASSWORD",   // ← 存放密码的环境变量名
+        "ssl": false
+      } },
     { "name": "@geewiki/http" },
     { "name": "@geewiki/wiki" }
     // 不要同时保留 @geewiki/db-sqlite：两者同属 database-provider 冲突组，互斥
@@ -292,11 +328,11 @@ export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewik
 }
 ```
 
-`@geewiki/postgres` 的 `configSchema` 字段（真源 `packages/db-postgres/src/index.ts:41` 的 `PostgresConfigSchema`）：
+`@geewiki/postgres` 的 `configSchema` 字段（真源：`packages/db-postgres/src/index.ts` 的 `PostgresConfigSchema`）：
 
 | 字段 | 类型 / 默认 | 说明（schema 里的原文） |
 | --- | --- | --- |
-| `connectionStringEnv` | string，`''` | 存放连接串的**环境变量名**（推荐；留空则用下面的分项配置）。例如 `GEEWIKI_DATABASE_URL` |
+| `connectionStringEnv` | string，`''` | 存放连接串的**环境变量名**（schema 自述“推荐；留空则用下面的分项配置”）。⚠️ **该字段目前只校验名字形态、没有实现**：见 §4 的死路径警告，**不要靠它切库** |
 | `host` | string，`'127.0.0.1'` | 数据库主机 |
 | `port` | number，`5432`（1–65535） | 端口 |
 | `database` | string，`'geewiki'` | 库名 |
@@ -307,7 +343,7 @@ export GEEWIKI_DATABASE_URL='postgres://geewiki:REPLACE_ME@127.0.0.1:5432/geewik
 | `idleTimeoutMillis` | number，`30000` | 空闲连接回收（毫秒） |
 | `ssl` | boolean，`false` | 是否使用 SSL |
 
-**关于"清单能否承载连接配置"**：**能**。实测：`PUT /api/plugins/:name/config` 会把 `config` 写进该插件所在清单层的条目上，`POST /api/session/persist`（管理台的「应用并持久化」）再把它并入 `config/plugins.base.json`——条目形状就是 `{ "name": …, "config": { … } }`（`packages/manager/src/index.ts` 的 `persistConfig()`）。**但清单是会被复制出去的文件**（`plugins.base.example.json` 由它派生、备份会打包它、排障时它被粘贴出去），所以凭据一律走**环境变量名**：`@geewiki/postgres` 现在**只有** `connectionStringEnv` 与 `passwordEnv` 两个字段，**不提供任何明文密码字段**（`packages/db-postgres/src/index.ts` 的 `PostgresConfigSchema`；实施日志里"postgres 的 `password` 会明文落进清单"那条**已过时**）。
+**关于"清单能否承载连接配置"**：**能**。实测：`PUT /api/plugins/:name/config` 会把 `config` 写进该插件所在清单层的条目上，`POST /api/session/persist`（管理台的「应用并持久化」）再把它并入 `config/plugins.base.json`——条目形状就是 `{ "name": …, "config": { … } }`（`packages/manager/src/index.ts` 的 `persistConfig()`）。**但清单是会被复制出去的文件**（`plugins.base.example.json` 由它派生、备份会打包它、排障时它被粘贴出去），所以凭据一律走**环境变量名**：`@geewiki/postgres` 提供 `connectionStringEnv` 与 `passwordEnv` 两个字段、**不提供任何明文密码字段**（`packages/db-postgres/src/index.ts` 的 `PostgresConfigSchema`；实施日志里“postgres 的 `password` 会明文落进清单”那条**已过时**），但其中**只有 `passwordEnv` 真正被读**（`resolveConnection()`），`connectionStringEnv` 尚未实现 ⇒ **现阶段“凭据只走环境变量”等价于“只用 `passwordEnv`”，而 host/port/database/user 必须写在清单里**。
 
 **两条必须知道的边界**：① 切到 PostgreSQL 后 **`/api/search` 不可用**——`@geewiki/search` 依赖 SQLite 专有的 FTS5，启用时会显式抛错拒绝。（`/api/ai` 的问答**不受数据库方言影响**：系统已无任何问答插件，现行 AI 能力经 `@geewiki/ai-assistant` 的 `POST /api/ai/turn` 提供，"不可用"只取决于**有没有可用模型**，缺模型即 503。）② 真实 PG 端到端验证**已完成**，读数、三个被 PG 抓出的真缺陷与两条类级守卫见 **§11**。
 
