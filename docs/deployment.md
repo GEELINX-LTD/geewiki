@@ -205,6 +205,16 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 
 > **驱动层还有一条隐式通道**（node-postgres，非本仓代码）。`pg` 的 `ConnectionParameters` 用 `val()` 取参数：**只有应用没显式给值才回退读 libpq 风格环境变量 `PG<参数大写>`**。本仓 `requirePool()` 总会给 `host`/`port`/`database`/`user` 填上非空默认值 ⇒ `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER` **实际被覆盖**；但 `passwordEnv` 未配时传下去的是**空串（falsy）** ⇒ **`PGPASSWORD` 会被驱动捡走**；`ssl` 未配（`undefined`）时驱动读 `PGSSLMODE`；`PGAPPNAME`、`PGCONNECT_TIMEOUT` 等同理由驱动读取。反过来，`PG_PASSWORD`（带下划线）**既不是应用读的也不是驱动读的**——它只是 `packages/plugin-authz/test/e2e-p2.sh`、`packages/plugin-wiki/test/e2e-p3a.sh`、`packages/plugin-wiki/test/e2e-version-meta.sh` 里的 shell 变量名，脚本再把它赋给 `GEEWIKI_DB_PASSWORD`。
 
+### 模型端点与模型名怎么填（`@geewiki/llm`）
+
+出厂模板 `config/plugins.base.example.json` 里 `@geewiki/llm` 的 `baseUrl` 与 `model` 是**通用占位符**（`https://your-openai-compatible-endpoint/v1` / `your-model-name`）——它们**不是可用值**。新部署要改成自己的端点与模型名：改 `config/plugins.base.json`（live 清单、本机文件、不入库；本机没有时先从模板复制，见 §5），或在管理台的插件配置表单里填。三条边界：
+
+- **`baseUrl` 与 `model` 只能写在配置文件里，没有环境变量间接层** ⇒ 换端点/换模型就得改配置。全仓在 `packages/plugin-llm/src` 与 `packages/plugin-openai/src` 里只有两处 `process.env` 读取：`credentials.ts` 的 `resolveCredential()`（读的是 `apiKeyEnv` 那个**名字**所对应的变量）与 `provider.ts` 的 `configLogEnabled()`（`GEEWIKI_OPENAI_DEBUG`）。**不存在 `GEEWIKI_LLM_BASE_URL` / `GEEWIKI_LLM_MODEL` 这类部署变量**，设了也不会生效。
+- **占位符 ≠ 留空，两者行为不同**：`baseUrl` 非空就照着发请求（打到占位符域名 ⇒ 上游连接失败，**不会**回落默认端点）；`baseUrl` **留空**才由适配器兜底（`packages/plugin-openai/src/provider.ts` 的 `effectiveBaseUrl()`：非空用配置值、空串用 `options.defaults.baseUrl`；OpenAI 兼容适配器的默认值见 `packages/plugin-openai/src/index.ts` 的 `defaults`，是 `https://api.openai.com/v1` + `gpt-4o-mini`）。⇒ 用 OpenAI 官方端点的人可以把它清空，用自建/内网端点的人**必须填实值**。
+- **密钥走 `apiKeyEnv`，它的值是「环境变量名」而不是密钥值**（`packages/plugin-llm/src/credentials.ts` 的 `resolveCredential(apiKeyEnv?)`）。该字段**留空 = 这条通道未配置** ⇒ `MISSING_CREDENTIAL`（此时若管理台填过 `apiKey` 密钥仍然可用），没有可用模型时 AI 路由返回 503 而不是崩溃（见 §7 末尾「缺模型即 503」）。把密钥值误填进这个字段会被名字形态校验判为 `INVALID_CREDENTIAL` **显式拒绝**，不会静默拿去当变量名查。第二条出路是在管理台填 `apiKey`（`role: 'secret'`：写一次不可回读，落 gitignored 的 `config/secrets.json`、权限 `0600`，见 §5）；两处都有值时**界面填写的优先**。
+
+> `GEEWIKI_LLM_*` **不是**部署变量：它是单元测试夹具的命名空间，理由与全量清单见下节「不属于部署的环境变量」，此处不重复。
+
 ### 不属于部署的环境变量
 
 以下变量**刻意不进上面的表**，部署时不要设：

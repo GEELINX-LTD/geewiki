@@ -34,8 +34,8 @@
       "name": "@geewiki/llm",
       "config": {
         "provider": "openai",
-        "baseUrl": "https://zhigu.bsnc.cn/llm/v1",
-        "model": "DeepSeek V4 Flash",
+        "baseUrl": "https://your-openai-compatible-endpoint/v1",
+        "model": "your-model-name",
         "reasoningEffort": "",
         "contextWindow": 256000,
         "maxOutputTokens": 32000,

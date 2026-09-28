@@ -159,5 +159,5 @@ curl -s localhost:3000/api/my-note
 | 8 | ESM 模块实例**永不回收** | 热更新语义不完整（`docs/plugin-platform.md` §5.2） | 不要依赖模块级状态被重置（反模式 #10） |
 | 9 | 插件与宿主同进程同权限，**无沙箱、无资源配额** | "安全可控"的边界 | 在 README 里写清你的插件会做什么；`applyTimeout` 只能兜住启动阶段 |
 | 10 | 外部插件**无发布者签名**：`install-plugin` 只做完整性基线（sha256），`unsigned` 不等于 `ok` | 分发链路可信度不足 | 自己出签名/校验说明；不要把"没报错"当"没被改过" |
-| 11 | `config/plugins.base.example.json` 里 `@geewiki/llm` 的默认配置硬编码了一个**私有 LLM 端点与模型名** | 与"不绑厂商"冲突（且它是文档示例的来源） | 本系列示例一律用 `https://api.example.com/v1` 占位；不要沿用该端点 |
+| 11 | ~~出厂模板 `config/plugins.base.example.json` 硬编码了私有端点与模型名~~ **已修正为通用占位符**（台账见 `docs/agent/backlog.md`）；但 `@geewiki/llm` 的 `baseUrl`/`model` **没有环境变量间接层**，只能写在清单里 | 曾经的"不绑厂商"冲突（且它是文档示例的来源） | 本系列示例一律用 `https://api.example.com/v1` 占位；你自己的私有端点**不要**写进随版本发布的清单 |
 | 12 | 外部插件不是 workspace 包 ⇒ 不参与 `pnpm -r` 的 `test`/`typecheck`/`build` | 外部插件的质量门禁天然弱一档 | 自己在插件目录内备好 `test/` 与运行说明（[`review-checklist.md`](review-checklist.md) 硬性项） |

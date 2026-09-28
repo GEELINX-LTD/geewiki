@@ -263,7 +263,7 @@ docker compose logs geewiki | grep 外部插件目录
 }
 ```
 
-> **不绑厂商（硬要求）**：清单与默认配置里**不要**写死某家私有端点或模型名；本文与仓内文档示例统一用 `https://api.example.com/v1` 之类占位符。现状提醒：`config/plugins.base.example.json` 里 `@geewiki/llm` 的默认配置**目前确实硬编码了一个私有端点与模型名**，这是已登记的违背项（见 `docs/agent/backlog.md`），**不要沿用**。LLM 一律经 `llm-service` 抽象（参考 `packages/plugin-openai/src/index.ts`）。
+> **不绑厂商（硬要求）**：清单与默认配置里**不要**写死某家私有端点或模型名；本文与仓内文档示例统一用 `https://api.example.com/v1` 之类占位符。出厂模板 `config/plugins.base.example.json` 里 `@geewiki/llm` 的默认配置**已经是占位符**（此前硬编码私有端点与模型名，已登记并修正，见 `docs/agent/backlog.md`）。注意边界：`baseUrl` 与 `model` **只能写在清单里，没有环境变量间接层**（换端点就得改配置），只有密钥走 `apiKeyEnv`／`role: 'secret'`（见 `docs/deployment.md`）。LLM 一律经 `llm-service` 抽象（参考 `packages/plugin-openai/src/index.ts`）。
 
 ---
 
