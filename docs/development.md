@@ -24,6 +24,27 @@
 - **`plugin-search` 在 PG 上报** `迁移失败（已回滚）: 0001_search.sql error: syntax error at or near "VIRTUAL"` —— 这是**预期行为**（插件有显式方言守卫，见 `packages/plugin-search/src/index.ts`）。根因是它用**裸字符串**声明 `migrations: './migrations'` ⇒ 在 `resolveMigrationsDirs` 里归入 `'default'` 键、被所有方言命中；**最小修法一行**：`migrations: { sqlite: './migrations' }`。
 - **多实例部署必然失败**（OIDC 流程状态存进程内，方向是**失败关闭**）；附件的进程内并发计数同理 ⇒ 附件能力**不支持多实例共享目录**，要在部署文档里写明。
 
+### 1.1 开发期与验收期环境变量（**不是部署接口**）
+
+这些变量只在 `pnpm dev`、验收脚本与 e2e 里被读到，**不要写进 `.env` 或部署文档**；
+部署者需要碰的变量以 [deployment.md §4](deployment.md) 为唯一真源。
+
+| 变量 | 默认值 | 读取点（符号） | 语义与陷阱 |
+| --- | --- | --- | --- |
+| `GEEWIKI_DEV_API` | `http://127.0.0.1:3000` | `packages/web/vite.config.ts` 的 `apiTarget` | Vite dev server 把 `/api` 与 `/plugins-ui` 代理到的后端地址。**与 `GEEWIKI_PORT` 不自动同步**：改了后端端口却忘改本变量，开发形态下前后端直接断链。注意 `/plugins-ui` 也走代理（插件 UI 产物可能在 `publicDir` 之外，只有后端知道该按哪个根提供） |
+| `GEEWIKI_DEV_PORT` | `5173` | `packages/web/vite.config.ts` 的 `devPort` | dev server 监听端口，代码是 `Number(process.env['GEEWIKI_DEV_PORT'] ?? 5173)` ⇒ **值必须是纯数字**。验收纪律要求跑在隔离端口上，**不得占用开发用的 3000 / 5173**（见 `scripts/acceptance/plugin-ui-cdp.mjs`） |
+| `GEEWIKI_PLUGIN_UI_DIST` | （由脚本注入） | 根 `package.json` 的 `dev` 脚本设为 `packages/web/public` | dev 形态下让内置插件夹具**免构建**即可用；`GEEWIKI_WEB_DIST` 仍保持默认 `packages/web/dist`（那里才有 `index.html`，否则首页 404）。**这是开发与生产语义不同的变量**，生产镜像内刻意不设 |
+| `GEEWIKI_E2E_PG` | 未设（当 `0`） | `packages/plugin-authz/test/e2e-p2.sh`、`packages/plugin-wiki/test/e2e-p3a.sh`、`packages/plugin-wiki/test/e2e-version-meta.sh` | 把这三条 e2e 切到**真 PostgreSQL 轨**（判据是字符串 `== "1"`）；**只有这三条脚本支持它**。配套的是脚本自己的 shell 变量 `PG_DB` / `PG_PORT` / `PG_USER` / `PG_PASSWORD`（脚本内部变量，再赋给 `GEEWIKI_DB_PASSWORD` 传给应用） |
+| `GEEWIKI_KEEP_TMP` | 未设 | `scripts/acceptance/search-mode/run.ts` | 设 `1` 则**保留验收临时目录**并打印路径，便于排障；唯一消费者。该变量“有码无表”的台账项见 `docs/agent/backlog.md` **F30** |
+| `GW_PORT` | `3316` | `scripts/acceptance/plugin-runtime-disable/run.ts` | 该验收脚本的端口覆盖。⚠️ **前缀是 `GW_` 而不是 `GEEWIKI_`**，只 grep `GEEWIKI_` 会漏掉它 |
+| `FIXTURE_OUT` / `FIXTURE_ENTRY` / `FIXTURE_OUT_DIR` | `@geewiki/wiki` / `./src/index.tsx` / 无 | `packages/web/fixtures/vite.config.ts` | 构建插件 UI 夹具产物时的输出插件名 / 入口 / 输出目录覆盖 |
+| `MOCK_IDP_PORT` / `MOCK_IDP_ALG` / `MOCK_IDP_ISS` / `MOCK_IDP_SUB` / `MOCK_IDP_AUD` / `MOCK_IDP_EXP_OFFSET` / `MOCK_IDP_EMAIL` | 见脚本 | `packages/plugin-oidc/test/mock-idp.mjs` | 假 OIDC IdP 的端口、签名算法、issuer/subject/audience、过期偏移与邮箱 |
+
+两个容易写错的口径：
+
+- **`GEEWIKI_DB_PASSWORD` 不是内置变量**。本节 §1「PG 隔离配方」里它只是被填进 `@geewiki/postgres` 的 `passwordEnv` 的那个**名字**（应用读的是配置里填的名字，填什么读什么）。另外驱动层 node-postgres 会在应用未显式传值时按 libpq 惯例回退读 `PGPASSWORD`（无下划线）——完整的凭据解析链见 [deployment.md §4](deployment.md)。
+- **`GEEWIKI_TEST_*` / `GEEWIKI_LLM_TEST_*` / `GEEWIKI_LLM_KEY_2` / `GEEWIKI_LLM_CRED_TEST_KEY` / `GEEWIKI_E2E_SPLIT_KEY` 等是单元测试夹具的命名空间**，不是运维接口，**不要当部署变量写进任何表**。
+
 ---
 
 ## 2. 数据库与迁移约定
@@ -87,7 +108,12 @@
 
 ### 4.6 前端与浏览器行为
 
-- **前端行为不能用 curl 代替**：仓库明确记录 **"真实浏览器交互从未验证"** —— 所有端到端都是 curl，前端只有类型检查、守卫测试与 SSR 测试 ⇒ 任何前端交互结论都必须标注"**未在真实浏览器验证**"。
+- **前端行为不能用 curl 代替**：仓库明确记录 **"真实浏览器交互从未验证"** —— 常规端到端都是 curl，前端只有类型检查、守卫测试与 SSR 测试 ⇒ 任何前端交互结论都必须标注"**未在真实浏览器验证**"。
+  - **这些验收脚本在哪**：需要真实服务的 shell 端到端在 `packages/*/test/e2e-*.sh`（共 8 个）；
+    需要真实浏览器的 CDP 界面验收在 `scripts/acceptance/`（`*-cdp.mjs` 与按批次分目录的
+    `ai-split-e2e/`、`p0-tools/`…`p6-summary/`，共用夹具 `scripts/acceptance/lib/`）。
+    **两者都不在 CI 里**（见 `docs/ci-cd.md` §6），所以本节的口径是「**门禁没覆盖 ⇒ 结论默认未验证**」；
+    差距与收敛建议见 `docs/agent/backlog.md` F15。
 - **CDP 里发 ⌘Z 必须用 Ctrl（modifiers 2）**：CodeMirror 的 `Mod-` 在非 macOS 上就是 Ctrl，发 Meta 在 Linux 上**什么都不会发生**，而"撤销后正文没变"很容易被读成"符合预期"。
 - **用状态行判断"有没有未保存改动"会骗人**：草稿自动保存（900ms 防抖）之后，文案从「有未保存的改动」被换成「草稿已自动保存（…）」⇒ "脏"与"已保存"在文本上不可区分；判据改成**看正文**（探针字符串在不在、原文有没有回来）。
 
@@ -95,21 +121,42 @@
 
 ```bash
 pnpm install --frozen-lockfile        # 主工作树默认没有 node_modules
-pnpm typecheck                        # 预期 exit 0（17 个包）
-pnpm test                             # 各包单测（不含 e2e）
+pnpm typecheck                        # 预期 exit 0（包数以 ls -d packages/*/ 为准）
+pnpm test                             # 各包单测（不含 e2e）；用例数以其输出为准
 pnpm build                            # 预期 exit 0
 
 # e2e（真实起服务 + 真实 curl，pnpm test 不包含它们）
-PORT=46101 bash packages/plugin-auth/test/e2e-p1.sh      # 38/38
-bash packages/plugin-oidc/test/e2e-p15.sh                # 44/44（测试内 mock IdP）
-PORT=46301 bash packages/plugin-org/test/e2e-p2-org.sh   # 44/44
-PORT=46401 bash packages/plugin-authz/test/e2e-p2.sh     # 34/34（SQLite）
-bash packages/plugin-wiki/test/e2e-p3a.sh                # P3a：SQLite 85/0/0；PG 下 G/H/I/K 整体跳过，阶段 L 方言中立
-bash packages/plugin-authz/test/e2e-p4.sh                # 80/80（后期基线）
+# 端口以各脚本自身的 PORT:- 默认值为准；与别的实例并存时用 PORT=<端口> 覆盖（见 §1）
+bash packages/plugin-auth/test/e2e-p1.sh
+bash packages/plugin-authz/test/e2e-p2.sh
+bash packages/plugin-authz/test/e2e-p4.sh
+bash packages/plugin-oidc/test/e2e-p15.sh
+bash packages/plugin-org/test/e2e-p2-org.sh
+bash packages/plugin-wiki/test/e2e-p3a.sh            # PG 下 G/H/I/K 阶段整体跳过，阶段 L 方言中立
+bash packages/plugin-wiki/test/e2e-attachments.sh
+bash packages/plugin-wiki/test/e2e-version-meta.sh
 ```
 
-**最近一次记录的全量基线**（`main` = `ed2a3a9`，由编排者实际复跑；取数时刻见当轮记录）：`pnpm typecheck` exit 0（17 包全 Done）；`pnpm test` **886 / 886 通过 / 0 失败**；`pnpm build` exit 0；六条 e2e **共 325 项断言零失败**（38 / 44 / 44 / 34 / 85 / 80）。
+**本节刻意不写「多少包 / 多少用例 / 多少断言」这类读数。** 它此前记录的一组基线（17 个包、886 通过、
+六条 e2e 共 325 项断言）早已**全部过期**——包数不是 17、e2e 条数也不是当时的六条（以 §4.7 列表里
+当前列出的脚本为准，总数用下面的命令现算），正是 `docs/README.md` 纪律第 5 条说的「**过时的数字比没有数字更坏**」。
+同理，**用例数与测试文件数一律以 `pnpm test` 的输出为准**（`.github/workflows/ci.yml` 已改成这个口径），
+本文与 README 都不再维护任何“N 个测试文件 / N 个用例”的快照。
+
+**方法论保留不变**：跑基线时记下三样东西——取数时的 `HEAD`、命令输出里的 pass/fail 计数、
+以及**被跳过的阶段**（PG 下的跳过不算失败，也不算通过）。一次性核对命令：
+
+```bash
+git rev-parse --short HEAD
+git log -1 --format='%h %ad' --date=iso
+find packages -name '*.test.ts' -not -path '*/node_modules/*' | wc -l   # 测试文件数（用例数以 pnpm test 输出为准）
+ls packages/*/test/e2e-*.sh | wc -l                                     # e2e 脚本条数（会随批次增长，别抄旧数）
+grep -rhoE 'PORT="\$\{PORT:-[0-9]+\}"' packages/*/test/*.sh | sort -n   # 各 e2e 默认端口，避免撞车
+```
+
 > 起服务后**必须轮询 `/api/health` 到 `"present":true`** 再开始验收（见 §1）。
+> 上述 e2e 与 `scripts/acceptance/` 的 CDP 界面验收**都不进 CI**（`docs/ci-cd.md` §6 的诚实清单），
+> 把它拉进门禁的建议见 `docs/agent/backlog.md` F15。
 
 ### 4.8 已声明的验证盲区（诚实清单）
 
