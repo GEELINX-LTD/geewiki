@@ -153,23 +153,29 @@ curl -s -X POST "$BASE/api/llm/test" -H 'content-type: application/json' \
 
 ### 环境变量
 
+**本表只列部署者一定会碰的几个；全量与各变量的判定细节以 [docs/deployment.md](docs/deployment.md) 第 4 节「环境变量一览」为唯一真源**（break-glass 应急令牌 `GEEWIKI_ADMIN_TOKEN`、路由访问门禁 `GEEWIKI_STRICT_ROUTE_ACCESS`、备份目录 `GEEWIKI_BACKUP_DIR`、上游调试日志 `GEEWIKI_OPENAI_DEBUG`、OIDC 票据密钥、以及“配置项里填环境变量名”的那几个凭据通道，全部写在那里）—— 同一事实只在一处维护，本表不再养第二份全量表。
+
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `GEEWIKI_PORT` | `3000` | 后端监听端口 |
 | `GEEWIKI_HOST` | `0.0.0.0` | 后端监听地址；仅本机可访问可设 `127.0.0.1` |
-| `GEEWIKI_DEV_API` | `http://127.0.0.1:3000` | **仅开发形态**：Vite 把 `/api`、`/plugins-ui` 代理到的后端地址 |
-| `GEEWIKI_DEV_PORT` | `5173` | **仅开发形态**：Vite dev server 监听端口 |
 | `GEEWIKI_DATA_DIR` | `./data` | SQLite 数据库与运行时数据目录 |
 | `GEEWIKI_CONFIG_DIR` | `./config` | 插件清单与密钥文件 `secrets.json` 所在目录 |
 | `GEEWIKI_WEB_DIST` | `packages/web/dist` | 前端静态产物根（app shell、`/assets/*`、SPA fallback） |
 | `GEEWIKI_PLUGIN_UI_DIST` | 同 `GEEWIKI_WEB_DIST` | **内置插件 UI 资产根**，即含 `plugins-ui/<插件名>/` 的目录 |
 | `GEEWIKI_PLUGINS_DIR` | `./plugins` | **外部插件目录**，启动时扫描其中的子目录；设为 `null`（选项层）则完全不启用外部插件发现 |
-| `GEEWIKI_OIDC_TICKET_SECRET` | 未设置 | OIDC 票据签名密钥。**未配置则每进程随机** —— 多实例部署或重启后既有票据失效 |
+
+> 全量口径（不是本表）：`cd /root/dev/geewiki && grep -rhoE "(GEEWIKI|GW)_[A-Z0-9_]+" packages/*/src scripts | sort -u`。
+> 注意不少变量名**不写在 `process.env.` 里**，而是作为常量或配置项默认值出现（如 `ADMIN_TOKEN_ENV`、`STRICT_ROUTE_ACCESS_ENV`），
+> 只 grep `process.env\.` 会漏掉这一整类。`GEEWIKI_TEST_*` / `GEEWIKI_LLM_*` / `GEEWIKI_E2E_*` 是测试与联调专用的命名分层，不是运维接口。
 
 **所有相对路径一律以仓库根为基准**，与进程工作目录无关（`@geewiki/core` 的 `resolveProjectPath`
 向上查找 `pnpm-workspace.yaml` 定位仓库根），因此后端从任意目录启动都指向同一份数据与配置。
+**唯一例外是 `GEEWIKI_BACKUP_DIR`**：它的默认值按 `process.cwd()` 解析，因此会随启动目录而漂。
 
 `GEEWIKI_PORT` 与 `GEEWIKI_DEV_API` **不同步**：改了前者却不设后者，开发形态下前后端就断链。
+开发期变量（`GEEWIKI_DEV_API` / `GEEWIKI_DEV_PORT` 等）只影响 Vite dev server，清单见
+[docs/development.md](docs/development.md) §1；生产由后端直接托管静态产物，不走 Vite 代理。
 
 两个 `null` 语义不同：`webDist: null` = 不启用静态服务；`pluginUiDist: null` = 不用内置资产根
 （只看插件自带产物）。环境变量留空即等同"未设置 = 回落 `GEEWIKI_WEB_DIST`"。
@@ -200,7 +206,9 @@ curl -s -X POST "$BASE/api/llm/test" -H 'content-type: application/json' \
 > 生成），`config/plugins.base.example.json` 是**随版本发布**的默认值（入库）；live 文件不存在时按模板装配。
 > 「默认启用哪些插件」这类数量口径请看**模板**。
 
-**出厂清单**：内置插件共 **25 个**注册于代码内注册表 `defaultRegistry()`，其中 **21 个默认启用**：
+**出厂清单**：内置插件注册于代码内注册表 `defaultRegistry()`（`packages/server/src/index.ts`），
+其中大部分默认启用——**两个口径分开看，数量以代码为准**：「注册了多少个插件」看 `defaultRegistry()`
+返回的条目；「默认启用哪些」看 `config/plugins.base.example.json`（下表为当前读数：注册 25 条 / 默认启用 21 个）：
 
 ```
 db-sqlite  http  auth  org  authz  ops  wiki  builtin-docs  search
@@ -271,16 +279,18 @@ Plugin Manager（核心大脑）：热加载引擎 · 依赖图/冲突组 · 会
 
 ```
 geewiki/
-├── packages/                 # 28 个 workspace 包
+├── packages/                 # workspace 包（包数以 `ls -d packages/*/ | wc -l` 为准；当前 28）
 │   ├── core/                 # 内核类型与常量：Manifest 规范、DatabaseAdapter、SlotService、cordis 类型增强
 │   ├── manager/              # 插件管理器：依赖图 / 冲突组 / 会话层沙箱 / 迁移 / 看门狗 / 插槽注册表
 │   ├── server/               # 应用宿主：HTTP 服务、静态资源、内置插件注册表（@geewiki/http 也在此）
 │   ├── web/                  # React 19 管理台与 wiki 前端（Vite；fixtures/ 为插槽演示）
 │   ├── db-sqlite/            # @geewiki/db-sqlite —— 默认数据库
 │   ├── db-postgres/          # @geewiki/postgres —— PostgreSQL 适配器（默认不启用）
-│   └── plugin-*/             # 22 个插件包：auth org authz ops echo editor-plain llm openai oidc
+│   └── plugin-*/             # 插件包（以列表名字为准；包数现算 `ls -d packages/plugin-*/ | wc -l`）：
+│                             #   auth org authz ops echo editor-plain llm openai oidc
 │                             #   search wiki builtin-docs 与 10 个 ai-* 插件
-│                             #   （连同上面两个数据库插件，共 24 个包提供 25 个内置插件注册）
+│                             #   （连同上面两个数据库插件提供内置插件注册；注册条目数以 `defaultRegistry()` 为准，
+│                             #    见上方“出厂清单”——包数与注册条目数是两个不同口径）
 ├── config/                   # 插件清单：plugins.base.example.json（随版本发布的默认值，入库）
 │                             #   与 plugins.base.json / plugins.session.json / secrets.json（本机状态，.gitignore）
 ├── data/                     # SQLite 数据库与运行时数据（.gitignore）

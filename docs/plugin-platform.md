@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | ① | 插件配置系统：manifest `configSchema` → 前端表单 + 持久化 + 热更新 | **已落地**：`configSchema` 采用 schemastery 3.18.0（`packages/core/src/index.ts` 的类型 + 内置插件均为 `Schema.object({...})`）；服务端校验 + 白名单裁剪 + 原子落盘 + 已激活插件 `fork.update()` 热更新（失败双向回滚）；管理台按 schema 自动生成表单，无 schema 插件退回 JSON 原文通道（不校验、不裁剪） |
 | ② | 外部插件加载：`./plugins` 目录 + 清单发现 | **已落地**：`packages/manager/src/discovery.ts` 的 `loadExternalPlugins()` 发现并加载，`packages/server/src/index.ts` 的 `buildRegistry()` 把外部插件**并入同一注册表**；发现期问题经 `GET /api/plugins` 的 `issues` 字段可观测（见 §4.6）。**当前数量口径**：`packages/server/src/index.ts` 共 **25 条内置插件注册**（`source: 'builtin'`），`config/plugins.base.json` **默认启用 21 条**；**已注册未启用 4 条**：`@geewiki/echo`、`@geewiki/editor-plain`、`@geewiki/oidc`、`@geewiki/postgres` |
-| ③ | 前端 Slot 插槽：插件向 Web 管理台贡献 UI | **宿主侧与后端链路均已落地**（详见 §4.8）。真源是 `packages/core/src/slots.ts`（浏览器安全子集，前端经 `@geewiki/core/slots` 子路径导入；`SLOT_NAMES` `:94`、`SlotName` `:123`、`SLOT_CARDINALITY` `:138`）——**前端手抄镜像已删除**（守卫 `packages/manager/test/slots.test.ts` + `packages/web/test/slotPropsMirror.test.ts` 仍在）。**当前 7 个内置插槽**：`app-header`(multi) / `app-footer`(multi) / `editor`(single) / `editor-toolbar`(multi) / `app-dock`(single) / `article-summary`(single) / `account-identities`(multi) | **2026-09-21 起已泛化为「宿主节点 + 三种模式」**（`replace` / `wrap` / `extend`）：目录 `packages/core/src/extensions.ts` 现有 7 插槽 + 2 外壳（`shell-brand` / `shell-brand-text`）+ 5 页面元素（`wiki-meta` / `wiki-actions` / `wiki-toc` / `graph-toolbar` / `account-profile`）+ 15 个 `ui-*` 原语（11 个叶子元素三模式全开；4 个 **portal 类**只开 `extend` + `replace`，理由见 §4.9）；契约与验收读数见 §4.9 与 [design/ui-extension-platform.md](design/ui-extension-platform.md) |
+| ③ | 前端 Slot 插槽：插件向 Web 管理台贡献 UI | **宿主侧与后端链路均已落地**（详见 §4.8）。真源是 `packages/core/src/slots.ts`（浏览器安全子集，前端经 `@geewiki/core/slots` 子路径导入；`SLOT_NAMES` / `SlotName` / `SLOT_CARDINALITY` 三个导出）——**前端手抄镜像已删除**（守卫 `packages/manager/test/slots.test.ts` + `packages/web/test/slotPropsMirror.test.ts` 仍在）。**当前 7 个内置插槽**：`app-header`(multi) / `app-footer`(multi) / `editor`(single) / `editor-toolbar`(multi) / `app-dock`(single) / `article-summary`(single) / `account-identities`(multi) | **2026-09-21 起已泛化为「宿主节点 + 三种模式」**（`replace` / `wrap` / `extend`）：目录 `packages/core/src/extensions.ts` 现有 7 插槽 + 2 外壳（`shell-brand` / `shell-brand-text`）+ 5 页面元素（`wiki-meta` / `wiki-actions` / `wiki-toc` / `graph-toolbar` / `account-profile`）+ 15 个 `ui-*` 原语（11 个叶子元素三模式全开；4 个 **portal 类**只开 `extend` + `replace`，理由见 §4.9）；契约与验收读数见 §4.9 与 [design/ui-extension-platform.md](design/ui-extension-platform.md) |
 | ④ | 治理补齐：`drainTimeout` 消费、`conflictGroup` 替换交互、`enable` 回滚作用域 | 三项**均已落地**：排空见 §5.3 L-1（粒度是**全站**在途请求，非 owner 级）；冲突组替换 = `POST /api/plugins/:name/replace` + 管理台顶替确认框（前置校验与前端交互已收紧为三类零副作用阶段拒绝：被顶替者真实激活层非 session → 409 `base_layer`；卸载集合内任一成员真实激活层非 session → 409 `base_layer` + `details.plugins`；目标无法承接依赖边 → 409 `provider_mismatch`）；`enable` 回滚改为全递归共用集合 |
 | ⑤ | 容器化：`docker compose up` 可用 | **已落地并实测**（`Dockerfile` / `docker-compose.yml` / [deployment.md](./deployment.md)）。残留的运行期口径见 §5.3 L-12 |
 | ⑥ | PostgreSQL 适配 | **已落地**：真 PG 15 端到端验证通过（迁移失败 0、插件 20 active / 0 error）；`DatabaseAdapterAsync` 双轨 + 方言迁移目录双路径已就位。 |
@@ -103,17 +103,17 @@ schemastery 暴露的 `[Symbol.for('standard-schema')]` 接口返回 `{value}` �
 
 **S-7…S-17 序列化载荷规格（批次 C 配置表单的输入契约）。**
 
-> 编号来源：以下为对 `schemastery@3.18.0` **源码 + 独立探针**的实测（源码即 `data/spike/node_modules/schemastery/src/index.ts`，行号以该 3.18.0 版本为准；探针为 `probe4-payload-spec.mjs` / `probe5-identity.mjs` / `probe6-labels.mjs` / `probe7-graph.mjs`，产物 `data/spike/probe{4,5,6,7}.out`；均在 `data/spike/` 下、已被 gitignore）。
+> 编号来源：以下为对 `schemastery@3.18.0` **源码 + 独立探针**的实测（源码即 `data/spike/node_modules/schemastery/src/index.ts`，符号名以该 3.18.0 版本为准；探针为 `probe4-payload-spec.mjs` / `probe5-identity.mjs` / `probe6-labels.mjs` / `probe7-graph.mjs`，产物 `data/spike/probe{4,5,6,7}.out`；均在 `data/spike/` 下、已被 gitignore）。
 > **依赖前提**：schemastery 现已**正式声明为工作区依赖**——17 个包的 `package.json` 均为 `"schemastery": "3.18.0"`（含 `packages/core` / `packages/manager` / `packages/plugin-wiki` / `packages/plugin-echo`）；**cordis 4.0.0-rc.10 不依赖它**（其 `dependencies` 仅 `@standard-schema/spec` 与 `cosmokit`）。
 
 **S-7 载荷形状：`{ uid: number, refs: Record<uidString, Node> }`；`refs` 是对象不是数组。**
 
-`Schema.prototype.toJSON()`（`src/index.ts:235-246`）产出顶层 `{uid, refs}`。嵌套 Schema 在被 stringify 时**只返回自己的 uid 数字**，并注册进同一张 `refs` 表。**节点上没有 `uid` 字段**——uid 不可枚举，仅作为 `refs` 的键存在。
+`Schema.prototype.toJSON()`（schemastery 导出 `Schema` 的实例方法）产出顶层 `{uid, refs}`。嵌套 Schema 在被 stringify 时**只返回自己的 uid 数字**，并注册进同一张 `refs` 表。**节点上没有 `uid` 字段**——uid 不可枚举，仅作为 `refs` 的键存在。
 
 **S-8 反序列化没有 `Schema.fromJSON`；且反序列化会执行载荷里的 callback 字符串（安全红线）。**
 
-- 唯一入口是构造函数本身：`Schema(payload)` / `new Schema(payload)`，`refs` 分支在 `src/index.ts:178-208`。实测还原后可正常 `validate` / `simplify`（`probe4.out` §1：`revived type=object`，`validate({})` 返回 `$.name missing required value`）。
-- **安全红线（必须遵守）**：反序列化会对节点的 `callback` 字符串执行 `new Function('return ' + s)()`（`src/index.ts:197-202`）。因此**前端绝不可对插件下发的载荷调用 `Schema(payload)`**——等价于任意 JS 执行。
+- 唯一入口是构造函数本身：`Schema(payload)` / `new Schema(payload)`，`refs` 分支在 schemastery 的 `Schema` 工厂函数（`Schema` 本身就是 `function (options)`）内的 `if (options.refs)` 分支里。实测还原后可正常 `validate` / `simplify`（`probe4.out` §1：`revived type=object`，`validate({})` 返回 `$.name missing required value`）。
+- **安全红线（必须遵守）**：反序列化会对节点的 `callback` 字符串执行 `new Function('return ' + s)()`（同处 `Schema` 工厂函数内的 `typeof schema.callback === 'string'` 分支）。因此**前端绝不可对插件下发的载荷调用 `Schema(payload)`**——等价于任意 JS 执行。
 - **正确做法**：前端**只按 `refs` 图渲染**，不 hydrate；服务端下发前**剥离 `callback` / `preserve`**，并把 `transform` 类型**降级为透传其 `inner`**；**校验与默认值填充一律留在后端**。
 
 **S-9 节点字段全集（实测，`probe4.out` §6 的 `[node keys seen]`）。**
@@ -127,7 +127,7 @@ schemastery 暴露的 `[Symbol.for('standard-schema')]` 接口返回 `{value}` �
 
 **S-11 类型枚举与控件判定顺序。**
 
-类型注册处 `src/index.ts:803-839`，共 17 种：`is / any / never / const / string / number / boolean / bitset / function / array / dict / tuple / object / union / intersect / transform / lazy`。
+类型注册处是 schemastery 中 `defineMethod(name, …)` 的这组顶层调用（自 `defineMethod('is', …)` 起至 `defineMethod('transform', …)`；`lazy` 另由 `Schema.lazy` 与 `Schema.extend('lazy', …)` 注册），共 17 种：`is / any / never / const / string / number / boolean / bitset / function / array / dict / tuple / object / union / intersect / transform / lazy`。
 **控件判定顺序：`meta.role` 优先 → `type` → 结构字段（`dict` / `inner` / `list` / `sKey` / `bits`）**。
 
 **S-12 枚举（union of const）与判别联合。**
@@ -161,17 +161,17 @@ schemastery 暴露的 `[Symbol.for('standard-schema')]` 接口返回 `{value}` �
 
 **S-15 默认值是自动注入的，无法区分"用户显式设置"。**
 
-`meta.default` 对 `object` / `array` / `dict` / `tuple` / `bitset` 恒存在（`{}` / `[]` / `0`，由 `defineMethod` 自动注入，见 `src/index.ts:791-797`），**无法据此区分「用户显式设置的默认值」**。表单的"是否已自定义"状态需另找依据。
+`meta.default` 对 `object` / `array` / `dict` / `tuple` / `bitset` 恒存在（`{}` / `[]` / `0`，由 schemastery 内部 `defineMethod` 工厂自动注入：`object` / `dict` → `{}`、`array` / `tuple` → `[]`、`bitset` → `0`），**无法据此区分「用户显式设置的默认值」**。表单的"是否已自定义"状态需另找依据。
 
 **S-16 `required` 判定发生在默认值填充之前。**
 
-`src/index.ts:413-422`：对象缺失时先判 `schema.meta.required`（`:414` 抛 `missing required value`），再走默认值回填。因此 **`required` + `default` 同时存在时，对象缺失仍报 `missing required value`**（`probe7.out` REQUIRED：`refs["23"] = {type:'object', meta:{default:{}, required:true}}`，`validate({})` → `$.o missing required value`）。表单不能因为"有默认值"就推断该字段可省略。
+schemastery 静态方法 `Schema.resolve` 开头的 `isNullable(data)` 分支：对象缺失时先判 `schema.meta.required`（不满足即抛 `missing required value`），再走默认值回填。因此 **`required` + `default` 同时存在时，对象缺失仍报 `missing required value`**（`probe7.out` REQUIRED：`refs["23"] = {type:'object', meta:{default:{}, required:true}}`，`validate({})` → `$.o missing required value`）。表单不能因为"有默认值"就推断该字段可省略。
 
 **S-17 cordis 集成形状（与 F-7 呼应）。**
 
-插件写 `plugin.Config = Schema` 后，`app.plugin(plugin, rawConfig)` 会**自动校验并填默认值**；`~standard.validate()` 返回 `{value}` 或 `{issues:[{message, path}]}`（`src/index.ts:216-233`），正是 cordis `resolveConfig` 期望的形状。
+插件写 `plugin.Config = Schema` 后，`app.plugin(plugin, rawConfig)` 会**自动校验并填默认值**；`~standard.validate()` 返回 `{value}` 或 `{issues:[{message, path}]}`（schemastery 中由 `Object.defineProperty(Schema.prototype, '~standard', …)` 定义的 getter），正是 cordis `resolveConfig` 期望的形状。
 
-> 补充（与 S-6 同源、落在实现细节上）：校验不剔除未知字段的原因是 object resolver 用 `merge(result, data)`（`src/index.ts:700`，另见 `:732`）→ 白名单裁剪要自己做，参见 S-6。
+> 补充（与 S-6 同源、落在实现细节上）：校验不剔除未知字段的原因是 object resolver（`Schema.extend('object', …)`）在非 strict 分支用 `merge(result, data)` 把原始数据并回结果、intersect resolver（`Schema.extend('intersect', …)`）同形 → 白名单裁剪要自己做，参见 S-6。
 
 ### 2.3 外部插件加载（ESM）
 
@@ -292,7 +292,7 @@ for (const q of ['知识库','检索','gee']) console.log(tok, q, db.prepare('SE
 
 **该行为由行为侧测试兜底，不靠实现形态约定**：批次 C 的 **C-5 一类双向回滚断言**（409 后：进程内配置 = 旧值 **且** 磁盘清单 = 旧值）是该契约的验收口径。换言之，**契约钉在可观测行为上，而不是"有没有中间件"**——后续若有人改成中间件形态，只要 C-5 类断言仍绿即视为合规。
 
-**原子写是必须项，且已满足**：D-2 的"`.tmp` + `rename` 原子替换"**已内联实现在既有的 `writeList()` 里**（`packages/manager/src/index.ts` 的 `writeList()`：先 `writeFileSync(tmp, …, { flag: 'wx' })` 再 `renameSync(tmp, file)`，临时名带 pid + 随机后缀），并有断言钉住"不留 `.tmp`"（`packages/manager/test/config.test.ts:162`：`assert.equal(existsSync(\`${env.baseFile}.tmp\`), false, '原子写不应留下 .tmp')`）。**未独立成 `packages/manager/src/config-store.ts`（无需另建该文件）**。**结论：原子写保留为必须项，状态=已满足。**
+**原子写是必须项，且已满足**：D-2 的"`.tmp` + `rename` 原子替换"**已内联实现在既有的 `writeList()` 里**（`packages/manager/src/index.ts` 的 `writeList()`：先 `writeFileSync(tmp, …, { flag: 'wx' })` 再 `renameSync(tmp, file)`，临时名带 pid + 随机后缀），并有断言钉住"不留 `.tmp`"（`packages/manager/test/config.test.ts` 中用例「updateConfig：未激活插件只落盘（不改内存、不加载）」的末行断言：`assert.equal(existsSync(\`${env.baseFile}.tmp\`), false, '原子写不应留下 .tmp')`）。**未独立成 `packages/manager/src/config-store.ts`（无需另建该文件）**。**结论：原子写保留为必须项，状态=已满足。**
 
 **D-3 外部插件信任模型：进程内动态 `import`，信任边界＝管理员显式安装的本地目录。**
 靠**路径守卫**防路径穿越：入口与 migrations 目录必须**经 `realpathSync` 求真实路径后**仍位于插件目录内；不引入子进程沙箱。理由：安全收益不抵 IPC 与状态同步成本——插件需要直接访问 `ctx`（DI 容器、事件总线、DB 服务），跨进程会把"插件即代码"退化成 RPC，且无法复用 cordis 的生命周期与依赖注入。
@@ -313,7 +313,7 @@ for (const q of ['知识库','检索','gee']) console.log(tok, q, db.prepare('SE
 插件名出现在 session 清单则配置写 session 文件，否则写 base 文件。理由：保持"配置属于哪一层"与"插件属于哪一层"同一个心智模型，避免出现"session 插件的配置写进 base、disable 后残留脏数据"的状态。
 
 **D-6 PostgreSQL 适配方向：新增异步抽象 `DatabaseAdapterAsync`，不把现有同步 `DatabaseAdapter` 整体改异步。**
-理由：现有同步接口的消费点只有 3 处（`packages/plugin-wiki/src/index.ts` 的 `ctx.get('db')`、`packages/server/src/index.ts:355` 健康检查、`packages/manager/src/index.ts:480` 迁移探测），better-sqlite3 的同步优势对现有代码零损耗；整体异步化会把改造成本摊到全部业务代码。驱动选 `pg`；**统一查询层可选 Kysely（尚未落地，标注为"待评估"）**。
+理由：现有同步接口的消费点只有 3 处（`packages/plugin-wiki/src/index.ts` 的 `ctx.get('db')`、`packages/server/src/index.ts` 中 `HttpPlugin.apply()` 里 `new HttpRouter(...)` 工厂回调取到的 `rawDb`（健康检查用，同处注释写明“不必在健康检查里写 `instanceof` 分支”）、`packages/manager/src/index.ts` 的 `activateCore()`（激活前迁移控制器取的 `dbForMigration`），better-sqlite3 的同步优势对现有代码零损耗；整体异步化会把改造成本摊到全部业务代码。驱动选 `pg`；**统一查询层可选 Kysely（尚未落地，标注为"待评估"）**。
 
 **D-7 批次顺序：B 最优先。**
 `configSchema` 与 `client` 两个契约不先冻结，批次 C / D 必然返工。
@@ -339,9 +339,9 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 **插件 UI 资源 URL 的统一约定**（两种模式 URL 完全一致）：
 
 - 后端新增 `/plugins-ui/<name>/client.js` 与 `/plugins-ui/<name>/client.css` 静态路由。注意现有静态托管把 root 锁死在 `webDist`（`packages/server/src/index.ts` 顶层的 `serveStatic(root, req, res)`，其 `root` 由 `HttpPlugin` 插件的 `webDist` 配置项传入），因此插件 UI 资源不能靠现有托管顺带覆盖，必须显式加挂载点；
-- dev 模式在 `packages/web/vite.config.ts` 的 proxy（当前仅 `{'/api': 'http://127.0.0.1:3000'}`，见该文件 `:12`）里追加 `'/plugins-ui'` 转发到 `3000`。
+- dev 模式在 `packages/web/vite.config.ts` 的 proxy（当前仅 `{'/api': 'http://127.0.0.1:3000'}`，见该文件的 `server.proxy` 配置）里追加 `'/plugins-ui'` 转发到 `3000`。
 
-> **这两条都是硬要求**：引入双资产根（`<插件目录>/dist` 优先）后，资产可能位于 `publicDir` 之外，故**挂载点与 proxy 都需要**，实现形态是"按名查根表 + 绝不 SPA fallback"。核对：`packages/web/vite.config.ts:24` 含 `'/plugins-ui'`；`packages/server/src/index.ts` 含 `servePluginUiAsset()`（`:386-434`）与 `/plugins-ui` 分支（`:448-451`）。详见 §4.3。
+> **这两条都是硬要求**：引入双资产根（`<插件目录>/dist` 优先）后，资产可能位于 `publicDir` 之外，故**挂载点与 proxy 都需要**，实现形态是"按名查根表 + 绝不 SPA fallback"。核对：`packages/web/vite.config.ts` 的 `server.proxy` 表含 `'/plugins-ui'` 键；`packages/server/src/index.ts` 含 `servePluginUiAsset()`（`async function servePluginUiAsset(...)`）与 `serveStatic()` 开头 `pathname` 命中 `PLUGIN_UI_PREFIX` 时转交 `servePluginUiAsset` 的分支。详见 §4.3。
 
 **插件客户端 bundle 的构建方式**：`plugins/<name>/client/vite.config.ts` 用 `build.lib`（`entry`、`formats: ['es']`、`fileName: 'client'`），并**显式设置 `cssFileName: 'client'`**（Vite 6 单入口时 CSS 默认文件名不稳定），产物落在 `plugins/<name>/dist/client.js` + `client.css`。
 
@@ -389,7 +389,7 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 - **只列三条件同时满足者**：名字合法 ∩ 当前已激活 ∩ 声明了 `client` 且入口文件在某个候选根里**确实存在**。
 - **`skipped` 的四个 `reason`**（互斥、每插件至多一条、按 name 排序）：`'inactive' | 'no_client' | 'entry_missing' | 'invalid_name'`；**判定顺序**：`invalid_name` > `inactive` > `no_client` > `entry_missing`。
 - **空表仍 200，永不 404**。
-- 响应头 `cache-control: no-store` + `ETag: "<revision>"`；`If-None-Match` 命中 → **304 无 body**。`stripEtagWeakness()`（`packages/manager/src/index.ts:2656`）只剥离可选 `W/` 与前后引号后**全等比较**，**不做 RFC 7232 列表 / 通配符解析**（刻意的简化，源码注释已写明）。
+- 响应头 `cache-control: no-store` + `ETag: "<revision>"`；`If-None-Match` 命中 → **304 无 body**。`stripEtagWeakness()`（`packages/manager/src/index.ts` 的 `function stripEtagWeakness(value: string): string`）只剥离可选 `W/` 与前后引号后**全等比较**，**不做 RFC 7232 列表 / 通配符解析**（刻意的简化，源码注释已写明）。
 - **`client` 契约**：`geewiki.client?: { entry?: string; css?: string }`；`entry` / `css` 均为**单段文件名**（`PLUGIN_UI_FILE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/`），`entry` 缺省 `client.js`，`css` 缺省不注入样式；声明非法（含 `/`、以 `.` 开头、空白等）→ `pluginUiEntryOf()` **整体视为未声明**且不抛错；**未声明 `client` 的插件永不进入口表**。`geewiki.entry` 是**后端**入口，与 `client` 不可混用。
 
 ### 4.2 `revision` / `rev` 的计算与 304 短路边界
@@ -397,38 +397,38 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 - `revision` = `sha1(JSON.stringify({ version: 1, plugins })).slice(0, 12)`；**`skipped` 不参与**、`plugins` 按键排序 ⇒ `revision` 与注册表顺序无关。
 - `rev` = `sha1(`` `${mtimeMs}-${size}` ``)`.slice(0, 8)（与样式拼接），**只 stat 不读内容**。
 - **边界一（`revision` 不含 `skipped`）**：当"未启用 / 无界面插件集合"变化时 `revision` 纹丝不动、304 命中 ⇒ 管理台**永远看不到** `skipped` 的变化。**现行处理**：`syncPluginUi` 有 `force` 参数（`const useEtag = !force && lastRevision !== undefined && isSettled()`）；管理台 `AdminPage.load()` 走 `syncPluginUi({ force: true })`（不带 `If-None-Match`），而 15s 可见期轮询仍走 304 短路。
-- **边界二（`revision` 只是表内容哈希）**："启用 → 停用 → 再启用"会回到**同一个**值 ⇒ 若此前某次加载失败，304 会让宿主**永久**漏加载那个插件。**现行处理**：`isUiSettled(entries, loaded, failed)`（`packages/web/src/lib/pluginUiPlan.ts:599`；304 短路开关在 `packages/web/src/lib/pluginUi.ts:614-615`：`const useEtag = !force && lastRevision !== undefined && isSettled()`）——**未收敛时不带 `If-None-Match`**（强制取一次完整表重新对齐），并以 `rev` 为键**记忆加载失败**，把"已按同一 rev 失败过"视为已收敛，避免 15s 轮询对同一个坏产物反复 import 与重复告警（`rev` 变化后自然重新尝试）。
+- **边界二（`revision` 只是表内容哈希）**："启用 → 停用 → 再启用"会回到**同一个**值 ⇒ 若此前某次加载失败，304 会让宿主**永久**漏加载那个插件。**现行处理**：`isUiSettled(entries, loaded, failed)`（`packages/web/src/lib/pluginUiPlan.ts` 的 `export function isUiSettled(...)`；304 短路开关在 `packages/web/src/lib/pluginUi.ts` 的 `async function doSync(force)` 内：`const useEtag = !force && lastRevision !== undefined && isSettled()`）——**未收敛时不带 `If-None-Match`**（强制取一次完整表重新对齐），并以 `rev` 为键**记忆加载失败**，把"已按同一 rev 失败过"视为已收敛，避免 15s 轮询对同一个坏产物反复 import 与重复告警（`rev` 变化后自然重新尝试）。
 - 另：请求失败 / 非 2xx / JSON 解析失败 / 格式不可信时**既不加载也不卸载**（只 `console.debug`），避免网络抖动清空已加载 UI。
 
 ### 4.3 双资产根与静态层
 
 - **URL 形态**：`/plugins-ui/<插件名>/<相对路径>`；入口与样式是单段文件名，**其它资源可嵌套子目录**（段数 ≤ `PLUGIN_UI_ASSET_MAX_DEPTH = 16`）。**插件名不编码**（scope 名 `@geewiki/wiki` 就是两段），**编码名一律 404**。
-- **双资产根，顺序即优先级**：① `<插件目录>/dist`（外部插件自带产物）；② `<webDist>/plugins-ui/<名>`（内置与夹具）。**"用哪个根 / 入口在不在"只有一份实现**——`packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`，被入口表 `buildPluginUiTable` 与静态层根表 `pluginUiRootsFor` **共同调用**（关键不变式：两处各算一遍就会出现"表里说就绪、资产却 404"或"`rev` 变了内容还是旧的"）。**遗留（改名未做，如实记录）**：`resolvePluginUiRoots` / `resolvePluginUiHit` / `BuildPluginUiTableOptions.webDist` / `pluginUiRootsFor` 的形参**仍叫 `webDist`**（`packages/manager/src/plugin-ui.ts:199` / `:217` / `:243` / `:337`），语义已是"第二候选根的内置根"。
-- **静态层 `servePluginUiAsset`**（`packages/server/src/index.ts` 的 `servePluginUiAsset()`，当前在 `:1062`）：按段还原插件名 → **精确查根表** → 入口单段 / 资源嵌套相对路径校验 → **段比较**包含判定 → **绝不 SPA fallback**，缺失即 404 `application/json`（`sendNotFound()`，当前在 `:1027`）；`serveStatic()`（当前在 `:1160`）的 `/plugins-ui` 分支命中后直接 `return`。静态层按名查根**不按激活过滤**（刻意的：刚被停用的插件可能还有在途 import 要结算，给 404 只会制造无谓 console error）。
+- **双资产根，顺序即优先级**：① `<插件目录>/dist`（外部插件自带产物）；② `<webDist>/plugins-ui/<名>`（内置与夹具）。**"用哪个根 / 入口在不在"只有一份实现**——`packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiHit`，被入口表 `buildPluginUiTable` 与静态层根表 `pluginUiRootsFor` **共同调用**（关键不变式：两处各算一遍就会出现"表里说就绪、资产却 404"或"`rev` 变了内容还是旧的"）。**遗留（改名未做，如实记录）**：`resolvePluginUiRoots` / `resolvePluginUiHit` / `BuildPluginUiTableOptions.webDist` / `pluginUiRootsFor` 的形参**仍叫 `webDist`**（形参 / 字段声明分别见 `packages/manager/src/plugin-ui.ts` 的 `resolvePluginUiRoots(...)`、`resolvePluginUiHit(...)`、`BuildPluginUiTableOptions`、`pluginUiRootsFor(...)` 四处声明本身），语义已是"第二候选根的内置根"。
+- **静态层 `servePluginUiAsset`**（`packages/server/src/index.ts` 的 `async function servePluginUiAsset(...)`）：按段还原插件名 → **精确查根表** → 入口单段 / 资源嵌套相对路径校验 → **段比较**包含判定 → **绝不 SPA fallback**，缺失即 404 `application/json`（`sendNotFound()`，同文件 `function sendNotFound(res: ServerResponse): void`）；`serveStatic()`（同文件 `async function serveStatic(roots: StaticRoots, req, res): Promise<void>`）的 `/plugins-ui` 分支命中后直接 `return`。静态层按名查根**不按激活过滤**（刻意的：刚被停用的插件可能还有在途 import 要结算，给 404 只会制造无谓 console error）。
 - **`isContained()` 用段比较，刻意不用 `startsWith`**：前缀比较会让 `/a/b-evil` 通过 `/a/b` 的检查。
 - **`GEEWIKI_PLUGIN_UI_DIST` + `ServerOptions.pluginUiDist`，缺省回落 `webDist`**（prod 与既有行为不变）。**两个 `null` 语义不同**：`pluginUiDist: null` = "不使用内置根（只看插件自带产物）"；`webDist: null` = "不启用静态服务"。根 `dev` 脚本用 `GEEWIKI_PLUGIN_UI_DIST=packages/web/public`，`dev:server` / `start` 保持默认 `packages/web/dist`；启动日志**同时打印两个根**，二者相同时附注"（同静态产物根）"。
-- dev 下 `packages/web/vite.config.ts:24` 的 `server.proxy` 有 `'/plugins-ui'`（资产可能来自 `plugins/<name>/dist`，位于 `publicDir` 之外，dev 下 Vite 不会提供它）；且 Vite 的 proxy 中间件排在 `publicDir` 之前，故这条会覆盖 `publicDir` 的默认静态服务。
+- dev 下 `packages/web/vite.config.ts` 的 `server.proxy` 有 `'/plugins-ui'`（资产可能来自 `plugins/<name>/dist`，位于 `publicDir` 之外，dev 下 Vite 不会提供它）；且 Vite 的 proxy 中间件排在 `publicDir` 之前，故这条会覆盖 `publicDir` 的默认静态服务。
 
 ### 4.4 静态层根表禁止缓存（决策）
 
-`packages/server/src/index.ts` 的 `pluginUiRoots` **必须每请求现算**（现为 `servePluginUiAsset()` 内的 `roots.pluginUiRoots?.() ?? {}`（`packages/server/src/index.ts:1087`）与静态层根表闭包（`:1256`））。**理由（寿命必须一致）**：入口表每请求现算，根表若缓存则两者寿命不同 → "入口表说该插件就绪（并给出 `rev`），静态层却从**已消失的根**取文件 → 404"，而前端还会照表去 import 那个 404 资产。**触发条件**：同名入口文件在**两个候选根都存在**，随后高优先级那个根消失——`resolvePluginUiHit` 会回退到次优先根并在表里继续列出该插件，而缓存仍指着已消失的根（回归用例：删掉高优先级根的同名入口 → 同一资产必须 200 且回退为次优先根内容，并断言入口表 `rev` 等于此刻真正被服务的那个文件）。**注意**：保留"函数"形态是另一件事——它解开的是"http 条目早于外部插件发现"的注册顺序陷阱，与缓存无关。代价可控：`pluginUiRootsFor()` 只对声明了 `client` 的插件做几次 stat。
+`packages/server/src/index.ts` 的 `pluginUiRoots` **必须每请求现算**（现为 `servePluginUiAsset()` 内的 `roots.pluginUiRoots?.() ?? {}`（`packages/server/src/index.ts`）与 `HttpPlugin.apply()` 内的静态层根表闭包 `const pluginUiRoots = (): Record<string, string> => config.pluginUiRoots?.() ?? {}`）。**理由（寿命必须一致）**：入口表每请求现算，根表若缓存则两者寿命不同 → "入口表说该插件就绪（并给出 `rev`），静态层却从**已消失的根**取文件 → 404"，而前端还会照表去 import 那个 404 资产。**触发条件**：同名入口文件在**两个候选根都存在**，随后高优先级那个根消失——`resolvePluginUiHit` 会回退到次优先根并在表里继续列出该插件，而缓存仍指着已消失的根（回归用例：删掉高优先级根的同名入口 → 同一资产必须 200 且回退为次优先根内容，并断言入口表 `rev` 等于此刻真正被服务的那个文件）。**注意**：保留"函数"形态是另一件事——它解开的是"http 条目早于外部插件发现"的注册顺序陷阱，与缓存无关。代价可控：`pluginUiRootsFor()` 只对声明了 `client` 的插件做几次 stat。
 
 ### 4.5 动态 import URL 与 `/* @vite-ignore */`
 
-- **`/* @vite-ignore */` 并不能阻止 Vite 改写动态 import**。dev 之所以没踩坑，是因为 `pluginUiBase()` 返回的是**同源绝对 URL**（首字符 `h`），而 Vite 的 `injectQuery` 只对以 `.` / `/` 开头的 URL 追加参数。**因此"同源绝对 URL"是硬要求，不要改成相对路径**（源码侧依据 `packages/web/src/lib/pluginUiPlan.ts:24-26`）。
+- **`/* @vite-ignore */` 并不能阻止 Vite 改写动态 import**。dev 之所以没踩坑，是因为 `pluginUiBase()` 返回的是**同源绝对 URL**（首字符 `h`），而 Vite 的 `injectQuery` 只对以 `.` / `/` 开头的 URL 追加参数。**因此"同源绝对 URL"是硬要求，不要改成相对路径**（源码侧依据：`packages/web/src/lib/pluginUiPlan.ts` 文件头对 `{@link pluginUiBase}` 返回同源绝对 URL、以及 Vite `injectQuery` 只对 `.` / `/` 开头 URL 追加参数的注释）。
 - **不采用 `?v=` 参数**：给**根相对** URL 加 `?v=` 在 dev 下会触发 Vite `injectQuery` 改写成 `?import&v=…` → **必然 500**；即便改用**同源绝对 URL** 绕开改写，`rev` 变化也会产生**新模块实例**，而 `registerSlot` 是 append、已加载集合只按插件名去重 → **插槽条目翻倍**（实测 2→4），且 ESM 无法从模块图卸载。
-- **现行形态**：import URL **不带任何 query**，`rev` **只用于变更检测**；真正换代码的路径是 unload → load（**同一 URL 命中模块缓存** ⇒ **插件产物更新后需整页刷新才会生效**）。ESM 无法从模块图卸载这一条**仍是已知边界、不是待办**（`packages/web/src/lib/pluginUi.ts:47-50` 的「已知边界（决策，不是待办）」）。
+- **现行形态**：import URL **不带任何 query**，`rev` **只用于变更检测**；真正换代码的路径是 unload → load（**同一 URL 命中模块缓存** ⇒ **插件产物更新后需整页刷新才会生效**）。ESM 无法从模块图卸载这一条**仍是已知边界、不是待办**（`packages/web/src/lib/pluginUi.ts` 文件头的「已知边界（决策，不是待办）」注释块）。
 
 ### 4.6 `skipped` 的前端分级展示，及其与发现期 `issues` 的语义区别
 
-- **分级**：`classifyUiSkips(skipped)`（`packages/web/src/lib/pluginUiPlan.ts:508`）按 `reason` 分级——`entry_missing` / `invalid_name` → `attention`，`inactive` / `no_client` → `normal`；配 `UI_SKIP_LABEL` / `UI_SKIP_HELP`（`:522` / `:530`，四值中文标签与解释，如 `entry_missing` → 「界面产物缺失」+「通常是发布时漏带 dist/ 目录」）。管理台（`packages/web/src/pages/GraphPage.tsx`，宿主路由 `plugins`「插件管理」）把 `attention` 渲染成 warning Card（标题「有 N 个插件的界面没能加载」，`:808-834`）、`normal` 渲染成默认收起的可折叠 `<details>`（`:837-853`）。**分级的理由**：`entry_missing` 是"作者声明了界面、产物却没跟上"的**真实故障**，必须显著；`inactive` / `no_client` 是**预期状态**，与故障同级用告警样式呈现只会让真正的故障淹没在噪声里。注：`packages/plugin-ops/ui/index.tsx` 是**「审计与运维」台面**（宿主路由 `audit`），**不是**插件管理界面。
-- **读取路径**：`parseUiTable` 直接丢弃 `skipped`，故补了最小订阅式读取 `pluginUiState()`（`packages/web/src/lib/pluginUi.ts:319`）与 `subscribePluginUiState()`（`:308`；快照引用稳定、变更后才通知），管理台在 `packages/web/src/pages/GraphPage.tsx:328` 经 `useSyncExternalStore` 消费；**没有新写第二份 fetch**；解析侧 `readSkipped`（`packages/web/src/lib/pluginUiPlan.ts:437`）**刻意从宽**（`skipped` 坏掉绝不能让"加载 / 卸载"也判为不可信）。
+- **分级**：`classifyUiSkips(skipped)`（`packages/web/src/lib/pluginUiPlan.ts` 的 `export function classifyUiSkips(skipped: readonly UiSkipped[]): UiSkipGroups`）按 `reason` 分级——`entry_missing` / `invalid_name` → `attention`，`inactive` / `no_client` → `normal`；配 `UI_SKIP_LABEL` / `UI_SKIP_HELP`（同文件的两个 `export const UI_SKIP_LABEL: Record<UiSkipReason, string>` / `export const UI_SKIP_HELP: Record<UiSkipReason, string>`，四值中文标签与解释，如 `entry_missing` → 「界面产物缺失」+「通常是发布时漏带 dist/ 目录」）。管理台（`packages/web/src/pages/GraphPage.tsx`，宿主路由 `plugins`「插件管理」）把 `attention` 渲染成 warning Card（标题「有 N 个插件的界面没能加载」；即 `GraphPage()` 内 `uiSkips.attention.length > 0 && (…)` 的 Card 渲染块）、`normal` 渲染成默认收起的可折叠 `<details>`（紧邻其后的 `uiSkips.normal.length > 0 && (…)` 块，包 `<details className="text-xs">`）。**分级的理由**：`entry_missing` 是"作者声明了界面、产物却没跟上"的**真实故障**，必须显著；`inactive` / `no_client` 是**预期状态**，与故障同级用告警样式呈现只会让真正的故障淹没在噪声里。注：`packages/plugin-ops/ui/index.tsx` 是**「审计与运维」台面**（宿主路由 `audit`），**不是**插件管理界面。
+- **读取路径**：`parseUiTable` 直接丢弃 `skipped`，故补了最小订阅式读取 `pluginUiState()`（`packages/web/src/lib/pluginUi.ts` 的 `export function pluginUiState(): PluginUiState`）与 `subscribePluginUiState()`（同文件 `export function subscribePluginUiState(listener: () => void): () => void`；快照引用稳定、变更后才通知），管理台在 `packages/web/src/pages/GraphPage.tsx` 的 `GraphPage()` 内经 `const uiState = useSyncExternalStore(subscribePluginUiState, pluginUiState, pluginUiState)` 消费；**没有新写第二份 fetch**；解析侧 `readSkipped`（`packages/web/src/lib/pluginUiPlan.ts` 的 `function readSkipped(raw: unknown): UiSkipped[]`）**刻意从宽**（`skipped` 坏掉绝不能让"加载 / 卸载"也判为不可信）。
 - **两通路职责不同，不得混用**：`GET /api/plugins/ui` 的 `skipped` = "**插件在（已注册 / 已发现），但它的前端界面没加载**"（UI 产物就绪性的唯一机器可读出口；典型情形：清单声明了 `client` 却忘了跑 `build:fixtures` → `entry_missing`）；`GET /api/plugins` 的 `issues` = "**整个插件都没加载进来**"（发现 / 加载期失败：目录、清单、入口模块）。管理台告警块已把区别写死：「这些插件**已在注册表中**，但它们的**前端界面**没有出现在管理器里——与上面的'发现期问题'不同：那一类是整个插件都没加载进来，这一类是插件在、界面缺。」
 - **`issues` 形状（`GET /api/plugins`）**：`ok(h, { plugins: manager.snapshot(), issues: manager.discoveryIssues() })`；`issues` 元素为 `DiscoveryIssue` = `{ code, dir, message }` 三字段，**没有 name 字段**（失败目录未必解析得出插件名）。`code` 八值枚举：`'missing_manifest'` / `'invalid_manifest'` / `'entry_not_found'` / `'invalid_plugin_path'` / `'invalid_plugin_dir'` / `'duplicate_plugin'` / `'invalid_module'` / `'load_failed'`。插件根目录不可读时记 `code: 'invalid_plugin_dir'`、`message: 插件根目录不可读，已跳过全部外部插件: …`。新增字段属**向后兼容**。
 
 ### 4.7 依赖阻止停用的专门说明块
 
-后端 `409 has_dependents`（`details.dependents` 为依赖方名单）现被管理台捕获并弹出**专门说明块**（`packages/web/src/pages/GraphPage.tsx:911-949`，标题在 `:918`）——标题「无法停用「X」：还有插件在依赖它」+ 列出依赖方 + **两段可操作指引**（① 先在上表逐个停用依赖方再回来停用目标；② 若它是被同冲突组其它插件顶替，可在目标插件那行点「启用」走**冲突组替换**，会连同依赖方一起安全接管）。`dependentNamesOf()`（`packages/web/src/pages/GraphPage.tsx:142`，在 `:431` 捕获 `has_dependents` 时调用）**防御性**读取 `details`：形状不符退回空数组 → 走兜底文案，**不显示 `undefined`**。**刻意未实现自动级联停用**（破坏性操作）。
+后端 `409 has_dependents`（`details.dependents` 为依赖方名单）现被管理台捕获并弹出**专门说明块**（`packages/web/src/pages/GraphPage.tsx` 中 `GraphPage()` 内由 `blockedDisable` 状态驱动的 `{blockedDisable && ( … )}` 渲染块，标题行文本「无法停用「{labelOf(blockedDisable.name)}」：还有插件在依赖它」）——标题「无法停用「X」：还有插件在依赖它」+ 列出依赖方 + **两段可操作指引**（① 先在上表逐个停用依赖方再回来停用目标；② 若它是被同冲突组其它插件顶替，可在目标插件那行点「启用」走**冲突组替换**，会连同依赖方一起安全接管）。`dependentNamesOf()`（`packages/web/src/pages/GraphPage.tsx` 的 `function dependentNamesOf(details: unknown): string[]`；在停用动作内 `err instanceof ApiError && err.code === 'has_dependents'` 分支经 `setBlockedDisable({ name: p.name, dependents: dependentNamesOf(err.details) })` 调用）**防御性**读取 `details`：形状不符退回空数组 → 走兜底文案，**不显示 `undefined`**。**刻意未实现自动级联停用**（破坏性操作）。
 
 ### 4.9 界面扩展平台（P4–P10）：插槽泛化为**宿主节点 + 三种模式**
 
@@ -499,16 +499,16 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 ### 5.1 安全
 
-整体安全姿态**高于平均水平**：CSRF 三层闸门（`packages/plugin-auth/src/http.ts:93-134`，`Sec-Fetch-Site` + `Origin` + 自定义头 `x-gw-csrf`）、`SameSite=Lax`（`:64`）、登录失败限流（`packages/plugin-auth/src/index.ts:132`，429 + `login.rate_limited` 审计）、Markdown 消毒单点（`packages/web/src/lib/sanitize.ts`）、schemastery 刻意避开 `new Function`（`packages/manager/src/config-schema.ts:11`）、插件 UI 静态层四层防护 + 段比较 `isContained()` + `realpath`、外部插件 `realpathSync` 防穿越、看门狗熔断。以下是**仍存在的**问题：
+整体安全姿态**高于平均水平**：CSRF 三层闸门（`packages/plugin-auth/src/http.ts` 的 `export function checkCsrf(req: IncomingMessage, hasSessionCookie: boolean): CsrfViolation | null` 及其上方注释，`Sec-Fetch-Site` + `Origin` + 自定义头 `x-gw-csrf`（常量 `CSRF_HEADER`））、`SameSite=Lax`（同文件 Set-Cookie 拼接处硬编码的 `'SameSite=Lax'`）、登录失败限流（`packages/plugin-auth/src/index.ts` 登录路由内的 `h.json(429, …)` + `action: 'login.rate_limited'` 审计）、Markdown 消毒单点（`packages/web/src/lib/sanitize.ts`）、schemastery 刻意避开 `new Function`（`packages/manager/src/config-schema.ts` 文件头「安全红线」注释：下发前剥离 `callback` / `preserve` / `constructor`）、插件 UI 静态层四层防护 + 段比较 `isContained()` + `realpath`、外部插件 `realpathSync` 防穿越、看门狗熔断。以下是**仍存在的**问题：
 
 | 级别 | 问题 | 证据 | 现状 / 建议 |
 | --- | --- | --- | --- |
-| **中** | **路由访问等级默认 `public`**：`register()` 第 4 参可省，省略即匿名可调；全仓 50+ 个 `.register(...)` 调用点全靠作者自觉 | `packages/core/src/index.ts:567-570`（`access?`，注释「省略等价于 `{access:'public'}`」） | **F11 审计钩子已落地并在工作**：启动时把未显式声明 `access` 的路由聚合成一条告警——当前实跑仍可见 `[geewiki] 1/18 条路由未显式声明访问等级，正按默认 'public'（匿名可调）运行：`；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时**拒绝启动**（`packages/server/src/index.ts:273-310`）。**仍建议**① 长期把默认改为 `user`，`public` 必须显式写 |
-| **中** | **插件进程内无隔离、无资源配额**：插件与宿主同进程、同权限，可任意读写文件系统 / 发网络请求 / 死循环 / OOM。一个坏插件能拖垮整站 | 设计自认「插件平台内的插件本就能执行任意代码」（`packages/core/src/index.ts:1159`） | F14 已做 `runtime.applyTimeout`（缺省 30s + 晚到 fiber 回收）；F10 已做 `permissions` 清单 + 激活提示 + 快照下发 + 「用法 ⇒ 必须声明」守卫；**剩余风险收缩为「同进程同权限」这一条架构前提**——一个拿到 `fs:write` 的插件仍能改写宿主文件，那不是配置能解决的，只能靠进程边界。worker / 子进程隔离模式**有意后置**（§5.4） |
+| **中** | **路由访问等级默认 `public`**：`register()` 第 4 参可省，省略即匿名可调；全仓 50+ 个 `.register(...)` 调用点全靠作者自觉 | `packages/core/src/index.ts` 的 `export interface RouteAccessOptions`（字段 `access?: RouteAccess`，注释「省略等价于 `{ access: 'public' }`」） | **F11 审计钩子已落地并在工作**：启动时把未显式声明 `access` 的路由聚合成一条告警——当前实跑仍可见 `[geewiki] 1/18 条路由未显式声明访问等级，正按默认 'public'（匿名可调）运行：`；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时**拒绝启动**（`packages/server/src/index.ts` 的 `export function auditRouteAccess(router: HttpRouterServiceType, env: NodeJS.ProcessEnv = process.env): void` 与开关常量 `export const STRICT_ROUTE_ACCESS_ENV = 'GEEWIKI_STRICT_ROUTE_ACCESS'`）。**仍建议**① 长期把默认改为 `user`，`public` 必须显式写 |
+| **中** | **插件进程内无隔离、无资源配额**：插件与宿主同进程、同权限，可任意读写文件系统 / 发网络请求 / 死循环 / OOM。一个坏插件能拖垮整站 | 设计自认「插件平台内的插件本就能执行任意代码」（`packages/core/src/index.ts` 插槽服务文档注释中谈 `HttpRouterService.trackStream(res, owner)` 的 owner 契约的一段：“插件平台内的插件本就能执行任意代码，故 owner 不是安全边界”） | F14 已做 `runtime.applyTimeout`（缺省 30s + 晚到 fiber 回收）；F10 已做 `permissions` 清单 + 激活提示 + 快照下发 + 「用法 ⇒ 必须声明」守卫；**剩余风险收缩为「同进程同权限」这一条架构前提**——一个拿到 `fs:write` 的插件仍能改写宿主文件，那不是配置能解决的，只能靠进程边界。worker / 子进程隔离模式**有意后置**（§5.4） |
 | **中** | **外部插件无发布者签名**：装进来的代码即得以全权限运行 | F17 已落地「安装 + 完整性校验」：`pnpm run install-plugin <目录\|.tgz\|https URL>` + `--verify`、`GET /api/plugins/integrity`（admin） | **仍缺远端注册表与发布者签名**。注意 `--verify` 的结果有三种，其中 `unsigned`（没有基线 ⇒ 无法判断）**刻意与 `ok` 分开**——把"无法判断"报成"通过"正是这类设施最容易退化成"看起来在防护、实际什么都没防"的方式 |
 | **低** | 普通配置字段在 `GET /api/plugins/:name/config` **明文返回**（密钥字段已妥善处理：`role:'secret'` + 0600 + 不回显） | `packages/manager/src/secrets.ts`（头部注释明确边界）；§5.3 L-20 | 已充分记档，属可接受的产品取舍；若未来接多租户再收紧 |
-| **低** | `config/secrets.json` 明文（0600）。威胁模型 = 能读宿主文件系统者即可读密钥 | `packages/manager/src/secrets.ts:15-19` 自述 | 已有 `apiKeyEnv` 作为更强路径，保持即可 |
-| **低** | React Flow `proOptions={{ hideAttribution: true }}` 会在 console 打许可证提示 | `packages/web/src/components/PluginGraph.tsx:416` | 合规动作，非漏洞；可评估替换图表库 |
+| **低** | `config/secrets.json` 明文（0600）。威胁模型 = 能读宿主文件系统者即可读密钥 | `packages/manager/src/secrets.ts` 文件头「明确的边界（如实记录，不做过度承诺）」一段自述 | 已有 `apiKeyEnv` 作为更强路径，保持即可 |
+| **低** | React Flow `proOptions={{ hideAttribution: true }}` 会在 console 打许可证提示 | `packages/web/src/components/PluginGraph.tsx` 中 React Flow 的 `proOptions={{ hideAttribution: true }}` 属性 | 合规动作，非漏洞；可评估替换图表库 |
 
 **未发现**：SQL 注入（全仓走参数化 `run(sql, params)`）、路径穿越（静态层有 `realpath` + 段比较守卫）、XSS 注入点（`dangerouslySetInnerHTML` 全部由 `sanitize.ts` 单点供给）、原型污染（`sanitizeSchemaPayload()` 剥离 `callback` / `preserve` / `constructor`）、依赖漏洞（`pnpm audit` 干净）。
 
@@ -516,9 +516,9 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 | 级别 | 问题 | 证据 | 影响 |
 | --- | --- | --- | --- |
-| **中** | **ESM 模块实例永不回收** ⇒ 后端插件改码**必须重启进程**；前端插件产物更新**必须整页刷新** | `packages/web/src/lib/pluginUi.ts:47-50` 记为「已知边界（决策，不是待办）」；§5.3 L-6 | 开发迭代摩擦大；「热插拔」名不副实——只有**启停**是热的，**改码**不是 |
-| **中** | **`provide` 时序陷阱**：插件 `apply` 未结算时 `provide` 的服务对其间创建的子插件**不可见**，`ctx.get` 返回 `undefined` 并**静默跳过** | `packages/core/src/index.ts:1147-1156`、`packages/manager/src/slot-plugin.ts` 文件头（含实测证据） | 极难排查的静默失效；也是当前 `slot` 必须做独立兄弟插件、顺序排 manager 之前的**根因** |
-| **中** | **`slot` 的供应方归属曾被注释写成「由管理器提供」，与实现相反** | 已改正：提供者是独立插件 `@geewiki/slot` 且排在管理器之前，`packages/core/src/index.ts` 的 `SlotService` 文档已写明该时序与理由（`:1530-1538` 附近） | 属**已修复的注释缺陷**，保留登记以防回退——core 注释里写着「归属曾经写错过，别再改回去」（**已经踩过一次**） |
+| **中** | **ESM 模块实例永不回收** ⇒ 后端插件改码**必须重启进程**；前端插件产物更新**必须整页刷新** | `packages/web/src/lib/pluginUi.ts` 文件头的「已知边界（决策，不是待办）」注释块记为「已知边界（决策，不是待办）」；§5.3 L-6 | 开发迭代摩擦大；「热插拔」名不副实——只有**启停**是热的，**改码**不是 |
+| **中** | **`provide` 时序陷阱**：插件 `apply` 未结算时 `provide` 的服务对其间创建的子插件**不可见**，`ctx.get` 返回 `undefined` 并**静默跳过** | `packages/core/src/index.ts` 插槽服务（`ctx.get('slot')`）文档注释中「归属曾经写错过，别再改回去」一段（该段正文即是本行描述的时序：`apply` 未结算时 `provide` 的服务对它期间创建的子插件不可见）、`packages/manager/src/slot-plugin.ts` 文件头（含实测证据） | 极难排查的静默失效；也是当前 `slot` 必须做独立兄弟插件、顺序排 manager 之前的**根因** |
+| **中** | **`slot` 的供应方归属曾被注释写成「由管理器提供」，与实现相反** | 已改正：提供者是独立插件 `@geewiki/slot` 且排在管理器之前，`packages/core/src/index.ts` 的 `SlotService` 文档已写明该时序与理由（`export interface SlotService` 上方的插槽服务注释块，含「归属曾经写错过，别再改回去」一段） | 属**已修复的注释缺陷**，保留登记以防回退——core 注释里写着「归属曾经写错过，别再改回去」（**已经踩过一次**） |
 | **低** | 看门狗熔断粒度为**整站**：连续失败 ≥3 且会话非空 → 清 session + `exit(1)` | `packages/manager/src/watchdog.ts`（59 行） | 单个会话插件的故障会触发全站重启。作为安全网可接受，但缺「只回滚该插件」的中间档 |
 | **低** | 排空粒度是**全站在途请求**（非 owner 级） | §5.3 L-1 | 卸载一个小插件要等全站请求结算，可能空转满 `drainTimeout` |
 
@@ -541,7 +541,7 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 `?v=<mtime>` 每次都产生新模块实例（§2.3 实证），反复热重载会累积旧实例。当前不做回收；若未来出现高频重载场景需评估。插件 UI 侧的最终形态见 §4.5——import URL 不带任何 query，`rev` 只用于变更检测，**产物更新后需整页刷新才会生效**。
 
 **L-7 React Flow 授权提示会打进 console。**
-`packages/web/src/components/PluginGraph.tsx:416` 的 `proOptions={{ hideAttribution: true }}` 会让 React Flow 在 console 打印授权提示。这是**上游许可证提示，不是缺陷**；是否保留需按许可证条款决定（改回显示署名即可消除）。基线验收时已确认：除该提示外 console 无错误。**该条与其余 L-n 的语义不同**：其余是功能 / 架构限制，本条是法律与观感层面的取舍。
+`packages/web/src/components/PluginGraph.tsx` 里 React Flow 的 `proOptions={{ hideAttribution: true }}` 会让 React Flow 在 console 打印授权提示。这是**上游许可证提示，不是缺陷**；是否保留需按许可证条款决定（改回显示署名即可消除）。基线验收时已确认：除该提示外 console 无错误。**该条与其余 L-n 的语义不同**：其余是功能 / 架构限制，本条是法律与观感层面的取舍。
 
 **L-11 外部插件的加载期故障不会阻断宿主启动。**
 `loadExternalPlugins` 的设计原则是"加载失败 / 清单缺失 / 重名 / 路径越界只记为 issue 并跳过，绝不阻断宿主启动"。**列目录这唯一一处例外已收敛**（现记 `invalid_plugin_dir` 并跳过，见 §4.6）。此条保留用于强调"例外只应有一处"的边界：后续修复应保持该边界而不是顺带扩大。
@@ -550,21 +550,21 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 镜像只打进**随版本发布的默认值模板** `config/plugins.base.example.json`（`COPY --from=builder /src/config/plugins.base.example.json …`）——**不再整个 COPY `config/`**：那是开发者本机目录，里面有 `secrets.json`（模型 API key）与本机的模型/端点/开关，整目录 COPY 等于把密钥打进镜像层随镜像分发（已用探测构建实测到 `/cfg/secrets.json`）。未挂载 `./config` 时，运行期对基础层的修改写在容器可写层里；挂了卷则卷内容优先。**排障时必须先分辨"当前看的是镜像模板、容器可写层，还是卷内容"。**
 
 **L-13 schemastery `bitset` 暂保留降级为 JSON 编辑（裁决）。**
-`packages/web/src/lib/configSchema.ts:218` 的 `case 'bitset':` 与其它无控件类型一起回落 `kind: 'json'`（配置表单对该类型回落到 JSON 文本编辑，附注「bitset 类型改以 JSON 编辑」）。理由：`bitset` 在当前两个内置插件（`packages/plugin-wiki` / `packages/plugin-echo`）的 `configSchema` 中**均未使用**；载荷侧信息（`bits` 名字→数字字面量映射）已在 §2.2 记录，未来实现时无需重新勘察。**影响面**：仅表现为该类型的配置项需要手工写数字，不产生错误数据（服务端仍按 schemastery 校验）。
+`packages/web/src/lib/configSchema.ts` 控件映射中的 `case 'bitset':` 分支与其它无控件类型一起回落 `kind: 'json'`（配置表单对该类型回落到 JSON 文本编辑，附注「bitset 类型改以 JSON 编辑」）。理由：`bitset` 在当前两个内置插件（`packages/plugin-wiki` / `packages/plugin-echo`）的 `configSchema` 中**均未使用**；载荷侧信息（`bits` 名字→数字字面量映射）已在 §2.2 记录，未来实现时无需重新勘察。**影响面**：仅表现为该类型的配置项需要手工写数字，不产生错误数据（服务端仍按 schemastery 校验）。
 
 **L-14 发现期 issue 的可观测性（已闭合，保留作契约锚点）。**
-`GET /api/plugins` 返回机器可读的 `issues`（形状见 §4.6），管理台插件管理页渲染"外部插件发现期有 N 条问题（这些插件未加载）"的提示块。**与 `GET /api/plugins/ui` 的 `skipped` 职责不同**（见 §4.6 的对比）。当前后端在 `packages/manager/src/index.ts` 的 `discoveryIssues()`（`:834`）与路由 `:2360`；管理台 UI 在 `packages/web/src/pages/GraphPage.tsx:796`（`issues.map`；类型与状态在 `:303`）。
+`GET /api/plugins` 返回机器可读的 `issues`（形状见 §4.6），管理台插件管理页渲染"外部插件发现期有 N 条问题（这些插件未加载）"的提示块。**与 `GET /api/plugins/ui` 的 `skipped` 职责不同**（见 §4.6 的对比）。当前后端在 `packages/manager/src/index.ts` 的管理器方法 `discoveryIssues(): DiscoveryIssue[]`（直接返回 `[...this.config.discoveryIssues]`）与 `router.register('GET', '/api/plugins', …)` 路由里的 `issues: manager.discoveryIssues()`；管理台 UI 在 `packages/web/src/pages/GraphPage.tsx` 的 `{issues.map((issue, i) => ( … ))}` 渲染块（类型 `ConfigIssue` / `DiscoveryIssueInfo` 见文件头 import）。
 
 **L-17 向量 / 语义检索未做（有意后置），检索是纯字面匹配。**
 当前检索链路为 **FTS5 trigram 子串匹配 + <3 字符的 LIKE 兜底**（见 §2.4），**没有任何 embedding、向量库或语义召回**。`packages/core/src/services.ts` 只有 `EmbeddingProvider` 接口、`EmbeddingServiceError`、`assertEmbeddingResult()` 校验器与 `probeEmbeddingProvider()` 探针，**没有查询接线**。**不做的理由是环境约束**：项目的立身之本是"离线 + 零重依赖 + 开箱即用"（默认只依赖一个 SQLite 文件）；本地跑 embedding 需要预烤模型权重 + ONNX Runtime WASM，两者都会把"`pnpm install` 即可运行"变成"先下载几百 MB 模型"；调用远端 embedding API 则与"没有 API key 也完整可用"的承诺冲突。**后果（如实登记）**：**同义改写、跨语言、模糊表述一律搜不到**（搜「怎么备份数据」不会命中「数据备份指南」）。当前只留接口位（`search-service` 是唯一检索入口，将来换实现不影响消费方）。
 
 **L-18 `snippet` 是已转义的 HTML、`score` 只在同次查询内可比——跨包契约，消费方必须遵守。**
-- `snippet` 由 `@geewiki/search` 的 `buildSnippet()`（`packages/plugin-search/src/index.ts:305`）**服务端转义**（正文先按原始下标切片、三段分别 HTML 转义、再拼进 `<mark>`），**只含 `<mark>` 一种标签**。⇒ 前端**不得二次转义**（会显示成字面 `&lt;mark&gt;`），也**不得**当纯文本插入页面（那样高亮会消失）。该设计的价值是：正文里的 `<script>` **不可能逃逸成真标签**。
+- `snippet` 由 `@geewiki/search` 的 `buildSnippet()`（`packages/plugin-search/src/index.ts` 的 `export function buildSnippet(text: string, query: string, radius: number): string | null`）**服务端转义**（正文先按原始下标切片、三段分别 HTML 转义、再拼进 `<mark>`），**只含 `<mark>` 一种标签**。⇒ 前端**不得二次转义**（会显示成字面 `&lt;mark&gt;`），也**不得**当纯文本插入页面（那样高亮会消失）。该设计的价值是：正文里的 `<script>` **不可能逃逸成真标签**。
 - `score` 是 FTS 路**取负后的 BM25**（越大越相关）。**这不是归一化**——值域无界、量级随语料规模与查询词变化，故**只在同一次查询的结果内部可比**；LIKE 路恒为 `0`，**两种 `mode` 的 `score` 也不可比**。消费方不得跨查询、跨 `mode` 比大小，也不得把它当"百分比相关度"展示。
-- 附：**自实现高亮而非用 FTS5 的 `snippet()`**——trigram 下后者的上限约 64 token（≈ 中文 64 字），太短且会把片段切得很碎（`packages/plugin-search/src/index.ts:170-178`）。
+- 附：**自实现高亮而非用 FTS5 的 `snippet()`**——trigram 下后者的上限约 64 token（≈ 中文 64 字），太短且会把片段切得很碎（`packages/plugin-search/src/index.ts` 中 `buildSnippet()` 上方的注释：“自实现高亮片段（不用 FTS5 的 `snippet()`：trigram 下它上限约 64 token ≈ 中文 64 字”）。
 
 **L-19 `search` / `ask` 是 wiki 下的保留首段 slug。**
-`#/wiki/search/<q>` 与 `#/wiki/ask/<q>` 占用 `search` / `ask` 两个**首段 slug**。**保留段共 4 项**，前端与后端各持一份**同为 `['search', 'ask', 'new', 'list']`**：`packages/web/src/lib/wikiRoute.ts:33` 的 `WIKI_RESERVED_FIRST_SEGMENTS` 与 `packages/plugin-wiki/src/index.ts:418` 的 `RESERVED_FIRST_SEGMENTS`（前端注释自认"待其批次对齐"）。⇒ 用户**不能再创建名为这四者之一的页面**（也不能建 `search/edit` 这类路径）；服务端 slug 校验**不会**拦截它们，冲突只在前端路由层显现。这是**主动付出的代价**：换取的是"可分享、刷新不丢"的 hash 子路由，而无需引入前端路由库或改动 Slot 机制。
+`#/wiki/search/<q>` 与 `#/wiki/ask/<q>` 占用 `search` / `ask` 两个**首段 slug**。**保留段共 4 项**，前端与后端各持一份**同为 `['search', 'ask', 'new', 'list']`**：`packages/web/src/lib/wikiRoute.ts` 的 `export const WIKI_RESERVED_FIRST_SEGMENTS: readonly string[]` 与 `packages/plugin-wiki/src/index.ts` 的 `export const RESERVED_FIRST_SEGMENTS: ReadonlySet<string>`（前端注释自认"待其批次对齐"）。⇒ 用户**不能再创建名为这四者之一的页面**（也不能建 `search/edit` 这类路径）；服务端 slug 校验**不会**拦截它们，冲突只在前端路由层显现。这是**主动付出的代价**：换取的是"可分享、刷新不丢"的 hash 子路由，而无需引入前端路由库或改动 Slot 机制。
 
 **L-20 密钥的剩余边界：环境变量由运维设置；`redact` 是启发式且刻意不脱敏模型输出。**
 - 配置里只存**环境变量名**（`apiKeyEnv`），**环境变量本身由运维在外部设置**——本系统不负责密钥的注入、轮转与保管。
