@@ -223,14 +223,14 @@
   `config/secrets.json` 也被 `.gitignore` 忽略。
 - **影响**：新克隆按示例填写会先打到一个**不属于自己**的端点；
   若仓库公开，则等于对外披露自建代理端点与内部模型命名。
-- **建议改法（最小改动）**：示例改为厂商中性占位（`https://api.openai.com/v1` + `gpt-4o-mini` 之类
-  或直接用 `<你的 OpenAI 兼容端点>` 占位）＋ 一行注释指向 `apiKeyEnv` 兜底路径；
-  同时在 `docs/deployment.md`「接入模型」保留一句「示例端点仅为占位」。
-- **验证方式**：`grep -n 'zhigu' config/*.json README.md docs/*.md` 应无命中；
-  `pnpm typecheck` / `pnpm test` 不受影响（纯 JSON 值）。
+- **建议改法（本轮已落地，`3ac5c79`）**：示例改为通用占位符（`https://your-openai-compatible-endpoint/v1` /
+  `your-model-name`）；边界说明（`baseUrl`/`model` 无环境变量间接层、密钥走 `apiKeyEnv`）写进
+  `docs/deployment.md`；`enabled` 列表未动。
+- **验证方式**：`grep -n 'zhigu' config/plugins.base.example.json README.md` 应无命中
+  （`docs/agent/` 下两处字面量为刻意保留的证据）；`pnpm typecheck` / `pnpm test` 不受影响（纯 JSON 值）。
 - **风险与兼容性**：`plugins.base.example.json` 是**数量口径真源** ⇒ 只改端点/模型字符串、
-  不动 `enabled` 列表，就不影响任何计数类断言。**本轮不改**（任务书禁止改 config 模板）。
-- **状态**：`未处理`。
+  不动 `enabled` 列表，就不影响任何计数类断言（本次即按此执行）。
+- **状态**：`本轮处理`（端点字面量保留作证据）。
 
 ### F9 · 版本与阶段元数据严重滞后（`description` 仍写「Phase 0 骨架」）
 
@@ -772,7 +772,7 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F5 | `geewiki.slots` 与 bundle `registerSlot` 不一致 ⇒ 静默空白 | P1 | 高可扩展 | 未处理 |
 | F6 | 4 个安全/运维环境变量此前查无文档 | P1 | 安全可控 | 本轮已修（文档） |
 | F7 | `GEEWIKI_OPENAI_DEBUG` 默认开启诊断日志 | P1 | 安全可控 | 未处理 |
-| F8 | 出厂模板写死私有端点与私有模型名 | P1 | 不绑厂商 | 未处理 |
+| F8 | 出厂模板写死私有端点与私有模型名 | P1 | 不绑厂商 | 本轮处理 |
 | F9 | `description` 仍写「Phase 0 骨架」、`0.1.0`、无根 CHANGELOG | P1 | 对外一致性 | 未处理 |
 | F10 | `docs/README.md` 文档地图漏登 4 篇 | P1 | 事实真源纪律 | 本轮已修（文档） |
 | F11 | 写死读数腐化（CI 注释 177、§4.7 基线） | P1 | 事实真源纪律 | 本轮已修（文档） |

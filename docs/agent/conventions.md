@@ -123,8 +123,8 @@
   理由：威胁模型已在 `docs/deployment.md` 写明（能读宿主文件系统者即可读密钥）；这四条保证的是
   「密钥不会通过配置/HTTP/清单这三条更宽的路泄漏」。
 - **配置模板与文档里不得出现真实端点或真实密钥**：`config/plugins.base.example.json` 是随版本发布的示例。
-  当前它写着私有端点 `https://example.com/llm/v1` 与 `model: "DeepSeek V4 Flash"` —— **这是已登记的违背
-  「不绑厂商」理念的现状，见 `backlog.md` F8；新增/改动模板时不得照抄它。**
+  它曾写着私有端点 `https://example.com/llm/v1` 与 `model: "DeepSeek V4 Flash"` —— **这是已登记的
+  违背「不绑厂商」理念的实例，现已改为占位符（见 `backlog.md` F8）；新增/改动模板时不得写入真实端点。**
 
 ---
 

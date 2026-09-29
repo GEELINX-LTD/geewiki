@@ -8,19 +8,20 @@
 
 ## 1. 流水线概览
 
-单个 workflow（名为 `CI/CD`）包含六个作业：
+单个 workflow（名为 `CI/CD`）包含七个作业：
 
 | 作业 | 内容 | 触发时机 |
 |---|---|---|
 | `lint` | `pnpm lint` —— ESLint 硬门禁，**警告即失败**（`--max-warnings 0`） | push main / push tag / PR |
 | `typecheck` | `pnpm typecheck` —— 28 个包 + `tsconfig.scripts.json` | 同上 |
-| `test` | `pnpm test` —— Node 内置测试运行器，177 个测试文件 | 同上 |
+| `test` | `pnpm test` —— Node 内置测试运行器（文件数与用例数以 `pnpm test` 输出为准） | 同上 |
 | `build` | `pnpm build` —— 各包 `vite build` 等产物 | 同上 |
+| `docs` | `pnpm run docs:links`（**阻断**：死链直接红）+ `pnpm run docs:conventions`（只报告）—— 文档门禁 | 同上 |
 | `docker-build` | 构建镜像但**不推送**，验证 Dockerfile 未被破坏 | 仅 PR |
 | `publish` | 构建多阶段镜像并推送到 GHCR；tag 推送时另建 GitHub Release | push main / push tag `v*` |
 
 **`publish` 受门禁约束**：它声明了 `needs: [lint, typecheck, test, build]`，因此四个门禁
-全部通过才会产出镜像。未通过测试的提交不会被发布。
+全部通过才会产出镜像。未通过测试的提交不会被发布。`docs` 作业刻意不进这条 `needs` 链（理由见 `ci.yml` 中该作业的注释），它照常运行，只是不拦发布。
 
 **权限最小化**：workflow 默认 `contents: read`，只有 `publish` 作业单独提权到
 `packages: write`（推送镜像所需）。因此 PR 触发的运行无法写入仓库或镜像仓库。
@@ -40,6 +41,8 @@ pnpm lint        # ESLint，警告即失败（--max-warnings 0）；pnpm lint:fi
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm run docs:links        # 文档链接与锚点存活（阻断：死链直接红）
+pnpm run docs:conventions  # 文档规范 R1/R2/R3（只报告，不阻断）
 ```
 
 只跑单个包：
