@@ -78,7 +78,7 @@ jobs:
       - uses: ./.github/actions/setup
       - name: 文档链接与锚点存活（阻断：死链直接红）
         run: pnpm run docs:links
-      # docs:conventions 只报告不阻断：存量 R1/R2 违规远大于 0（见仓库内实测），
+      # docs:conventions 只报告不阻断：存量违规远大于 0（见仓库内实测；R2 为主，R3 的 2 处为台账证据），
       # 一旦逐条清完再把下一行改成 `run: pnpm run docs:conventions -- --fail-on R1,R2,R3`。
       - name: 文档规范（R1 索引 / R2 行号引用 / R3 私有端点）—— 只报告
         run: pnpm run docs:conventions
