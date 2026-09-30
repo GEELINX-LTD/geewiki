@@ -4,8 +4,8 @@
  * 为什么不阻断：三条规则里 R1/R2 判的是「应该改成什么」而不是「坏了」，且存量违规
  * 很多（集中在 docs/design/ 与 docs/changelog/ 的历史文档里，成片的 `路径.ts:123`）。把它们做成
  * 阻断门禁 = 这个门禁永远绿不了 = 永远没人看。所以默认 exit 0，违规清单进 CI 日志；
- * 想按规则收紧时用 `--fail-on R3` 这种**逐条**开关（R1 已为 0、可直接收紧；R3 的 2 处命中
- * 是台账刻意保留的证据，先定去留再收紧）。
+ * 想按规则收紧时用 `--fail-on R3` 这种**逐条**开关（R1 已为 0、可直接收紧；R3 只有在运行环境注入了
+ * `GEEWIKI_FORBIDDEN_ENDPOINTS` 时才可能产出命中，默认空数组 → 恒 0，CI 要不要收紧取决于是否注入该变量）。
  *
  * 规则（与 docs/README.md「文档纪律」、docs/development.md §5 同源，这里只是把它编译成检查）：
  *
@@ -19,7 +19,10 @@
  *      而 CONTRIBUTING/README 的纪律都写着「引用代码用**路径 + 符号名**」。
  *      代码块内不检查：那是报错栈、日志、diff 的引用现场，不是给读者跳代码的链接。
  *
- *  R3  不允许出现私有端点字面量（当前：`example.com`）。
+ *  R3  不允许出现私有端点字面量。待禁字面量**不写在本文件里**，由环境变量
+ *      `GEEWIKI_FORBIDDEN_ENDPOINTS` 提供（逗号分隔；未设置则为空数组，本规则自动空跑）。
+ *      为什么搬到环境变量：这条门禁防的正是「私有端点字面量进 git」，而把待禁字面量硬编码在
+ *      源码里，等于让门禁自身成为泄漏点——历史上就漏过一次，代价是整条历史被迫改写。
  *      出厂示例必须是占位符（`https://api.example.com/v1`）。历史上私有端点泄进过
  *      `config/plugins.base.example.json`（那条在整改台账里单独跟），文档示例同理。
  *      这里刻意用**字面量数组**而不是正则：正则写错会静默失效，字面量漏了看得见。
@@ -46,8 +49,12 @@ const EXCLUDE_DIR_NAMES = new Set([
   '.pi',
 ])
 
-/** 私有端点字面量（R3）。新增就往这里加一行，别改成正则。 */
-const FORBIDDEN_LITERALS = ['example.com']
+/** 私有端点字面量（R3）。从环境变量 GEEWIKI_FORBIDDEN_ENDPOINTS 读取（逗号分隔）；
+ *  该变量不入库，真实端点字面量因此永远不会进 git。未设置时为空数组。 */
+const FORBIDDEN_LITERALS = (process.env.GEEWIKI_FORBIDDEN_ENDPOINTS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
 
 /** R2 允许的文件扩展名集合：只有这些扩展名后面的 `:数字` 才算行号引用。 */
 const CODE_EXT = 'ts|tsx|js|mjs|cjs|jsx|json|sql|sh|bash|py|css|scss|less|html|vue|yml|yaml|toml|md|go|rs|java|kt'
