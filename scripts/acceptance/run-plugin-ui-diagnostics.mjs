@@ -10,6 +10,37 @@ await runBrowserFlow({
   async prepare(temporary) {
     const root = join(temporary, 'plugins')
     const sources = {
+      '00-timeout': `export async function register(host) {
+        const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
+        const runs = (s.timeoutRuns ??= []);
+        const run = { index: runs.length + 1, started: performance.now() };
+        runs.push(run);
+        const registerAll = () => [
+          host.registerSlot('app-header', () => host.React.createElement('span', { 'data-ui-fixture': 'timeout' }, 'timeout-' + run.index)),
+          host.registerExtension('ui-card', () => null),
+          host.registerRoute('fixture-timeout', () => null),
+          host.registerTool('fixture.timeout', () => run.index),
+          host.registerMarkdownExtension({ name: 'fixture-timeout', marked: {} }),
+          host.registerTheme({ name: 'fixture-timeout-' + run.index, light: { '--gw-accent': '#123456' } }),
+        ];
+        const original = registerAll();
+        const cleanup = () => {
+          run.cleaned = (run.cleaned ?? 0) + 1;
+          host.unregisterSlot('app-header');
+          host.unregisterRoutes(host.pluginName);
+          host.unregisterTools(host.pluginName);
+          host.unregisterMarkdownExtensions(host.pluginName);
+          host.unregisterThemes(host.pluginName);
+        };
+        if (s.recoverTimeout) return cleanup;
+        await new Promise(resolve => { run.release = resolve; });
+        if (run.reject) { run.rejected = true; throw new Error('fixture timed-out late rejection'); }
+        registerAll();
+        cleanup();
+        for (const off of original) off();
+        run.mutationsComplete = true;
+        return () => { run.lateCleanup = (run.lateCleanup ?? 0) + 1; cleanup(); };
+      }`,
       sync: `export function register(host) {
         const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
         s.counts.sync = (s.counts.sync ?? 0) + 1;
@@ -29,6 +60,7 @@ await runBrowserFlow({
       healthy: `export function register(host) {
         const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
         s.counts.healthy = (s.counts.healthy ?? 0) + 1;
+        s.healthyAt = performance.now();
         host.registerSlot('app-header', () => host.React.createElement('span', { 'data-ui-fixture': 'healthy' }, 'healthy'));
       }`,
       missing: `export function register(host) {
@@ -65,11 +97,14 @@ await runBrowserFlow({
         const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
         host.registerSlot('app-header', () => host.React.createElement('span', { 'data-ui-fixture': 'late' }, 'late'));
         await new Promise(resolve => { s.release = resolve; s.waiting = true; });
-        if (s.rejectLate) throw new Error('fixture stale asynchronous failure');
-        return () => { s.cleaned = (s.cleaned ?? 0) + 1; };
+        try {
+          if (s.rejectLate) throw new Error('fixture stale asynchronous failure');
+          return () => { s.cleaned = (s.cleaned ?? 0) + 1; };
+        } finally { s.lateSettled = (s.lateSettled ?? 0) + 1; }
       }`,
     }
     const declarations = {
+      '00-timeout': { slots: ['app-header'], extensions: [{ node: 'ui-card', mode: 'extend' }], routes: [{ id: 'fixture-timeout' }] },
       missing: { slots: ['app-header', 'app-footer'], extensions: [{ node: 'ui-card', mode: 'extend' }], routes: [{ id: 'fixture-missing' }] },
       dynamic: { slots: ['app-header'], extensions: [{ node: 'ui-card', mode: 'extend' }], routes: [{ id: 'fixture-dynamic' }] },
       lazy: { slots: ['account-identities'] },

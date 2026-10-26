@@ -18,7 +18,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createPluginUiHost, installPluginScope, type PluginUiHostContext } from '../src/lib/pluginUi'
 import { registerSlotByName, slotContributors, slotSummary, unregisterSlot } from '../src/lib/slots'
-import { clientToolSummary } from '../src/lib/clientTools'
+import { clientToolSummary, invokeClientTool } from '../src/lib/clientTools'
+import { registeredRoute } from '../src/lib/routes'
 import { markdownExtensions } from '../src/lib/markdownExt'
 import { themeContributors } from '../src/lib/pluginTheme'
 import type { GeeWikiHostSdk } from '../src/lib/hostSdk'
@@ -344,5 +345,52 @@ test('★ P13：installPluginScope 装上/还原全局对象；非 LIFO 撤销�
   } finally {
     if (saved === undefined) delete glob.__GEEWIKI_HOST__
     else glob.__GEEWIKI_HOST__ = saved
+  }
+})
+
+test('撤销后的旧宿主不能新增或批量删除贡献，保留的 token 不影响同 owner 新代次', async () => {
+  const owner = '@demo/expired'
+  let active = true
+  const meta: PluginUiHostContext['meta'] = { entry: 'client.js', rev: 'r', slots: ['app-header'], extNodes: ['ui-card'], routes: [{ id: 'expired-route' }] }
+  const old = makeHost({ name: owner, meta, isActive: () => active })
+  const replacement = makeHost({ name: owner, meta })
+  const Old = (): null => null
+  const New = (): null => null
+  const registerAll = (host: typeof old.host, component: typeof C, label: string): Array<() => void> => [
+    host.registerSlot('app-header', component),
+    host.registerExtension('ui-card', component),
+    host.registerRoute('expired-route', component),
+    host.registerTool('fixture.expired', () => label),
+    host.registerMarkdownExtension({ name: 'fixture-expired', marked: {} }),
+    host.registerTheme({ name: label, light: { '--gw-accent': '#123456' } }),
+  ]
+  const clear = (disposers: Array<() => void>): void => { for (const off of disposers.splice(0)) off() }
+  try {
+    const retained = registerAll(old.host, Old, 'old')
+    active = false
+    clear(old.disposers)
+    registerAll(replacement.host, New, 'replacement')
+    // 旧入口继续运行，既尝试追加注册，也尝试注销同名插件的全部贡献。
+    for (const off of registerAll(old.host, Old, 'late')) off()
+    let invoked = false
+    old.host.unregisterSlot('app-header', () => { invoked = true })
+    old.host.unregisterSlot('app-header')
+    old.host.unregisterRoutes(owner)
+    old.host.unregisterTools(owner)
+    old.host.unregisterMarkdownExtensions(owner)
+    old.host.unregisterThemes(owner)
+    for (const off of retained) { off(); off() }
+    assert.equal(invoked, false, '旧宿主的 token 入口也应失效')
+    assert.equal(old.disposers.length, 0, '撤销后不能再积累注册')
+    assert.deepEqual(slotContributors('app-header'), [owner])
+    assert.deepEqual(slotContributors('ui-card'), [owner])
+    assert.equal(registeredRoute('expired-route')?.component, New)
+    assert.equal(await invokeClientTool('fixture.expired', {}), 'replacement')
+    assert.deepEqual(markdownExtensions().filter(item => item.owner === owner), [{ owner, name: 'fixture-expired' }])
+    assert.equal(themeContributors().find(item => item.owner === owner)?.name, 'replacement')
+  } finally {
+    active = false
+    clear(old.disposers)
+    clear(replacement.disposers)
   }
 })

@@ -93,6 +93,7 @@ docs/
 | [adr/0013-openai-diagnostics-opt-in.md](adr/0013-openai-diagnostics-opt-in.md) | 上游错误诊断改为显式开启的决策（状态 `accepted`） | 只记录默认值取舍与脱敏边界；变量用法以 deployment 为准 |
 | [adr/0014-plugin-ui-entry-settlement.md](adr/0014-plugin-ui-entry-settlement.md) | 插件界面入口结算、失败重试与迟到回收的决策（状态 `accepted`） | 只记录生命周期取舍；作者接口见 plugin/api-reference，运行诊断见 plugin-platform |
 | [adr/0015-plugin-ui-registration-diagnostics.md](adr/0015-plugin-ui-registration-diagnostics.md) | 插件界面生效声明与实际注册的一致性诊断（状态 `accepted`） | 只记录诊断时机、事实来源与代价；作者接口见 plugin/api-reference，运行诊断见 plugin-platform |
+| [adr/0016-plugin-ui-entry-timeout.md](adr/0016-plugin-ui-entry-timeout.md) | 插件界面显式入口等待上限与作用域撤销（状态 `accepted`） | 只记录生命周期取舍和不隔离的边界；作者接口见 plugin/api-reference，运行诊断见 plugin-platform |
 | [design/ui-extension-platform.md](design/ui-extension-platform.md) | **界面扩展平台契约定稿**：可被替换 / 包裹 / 扩展的节点目录、三种模式语义、多插件共存裁决、主题令牌 | 界面扩展的**设计**真源。实际取值与允许模式以源码为凭：`packages/core/src/extensions.ts` 与 `packages/core/src/slots.ts`（见真源表） |
 | [design/block-attribution.md](design/block-attribution.md) | **块级归属**：谁最后改了哪一块——归属模型、写入时机、呈现方式 | 只管「归属」。权限判定在 [design/access-control.md](design/access-control.md)，别在这里找可见性规则 |
 | [design/dock-images.md](design/dock-images.md) | 输入条（dock）的**图片输入**：设计、现状、未做项 | 只管图片输入。dock 作为 AI 唯一对话入口的契约在 [plugin-platform.md](plugin-platform.md) 与 `packages/plugin-ai-assistant` |

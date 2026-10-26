@@ -853,9 +853,9 @@ export function GraphPage(): ReactNode {
           <CardBody>
             <ul className="m-0 flex list-none flex-col gap-2 p-0">
               {uiState.failed.map((item) => (
-                <li key={item.name} data-plugin-ui-entry-failed={item.name} data-error={item.message}>
+                <li key={item.name} data-plugin-ui-entry-failed={item.name} data-error={item.message} data-error-kind={item.kind}>
                   <span className="text-xs font-medium text-ink">{labelOf(item.name)}</span>
-                  <Badge tone="warn" className="ml-2">界面不可用</Badge>
+                  <Badge tone="warn" className="ml-2">{item.kind === 'timeout' ? '初始化超时' : '界面不可用'}</Badge>
                 </li>
               ))}
             </ul>

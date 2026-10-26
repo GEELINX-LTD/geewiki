@@ -434,15 +434,19 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 模块导入、顶层求值、显式 `register(host)` / 默认入口执行失败，均由
 `packages/web/src/lib/pluginUi.ts` 的 `loadPluginUi` 回收本次注册并记录到
-`pluginUiState().failed`。显式入口返回 Promise 时等待其结算；在此之前不标记成功或注入 CSS。
-页面显示固定中文提示，「插件管理」单列加载或初始化失败项；原始错误摘要仅保留在控制台和
-诊断数据属性，不作为正文展示。这与服务端入口表的 `skipped`、发现期的 `issues` 分属不同阶段。
+`pluginUiState().failed`。显式入口返回 Promise 时最多等待 15 秒；在完成前不标记成功或注入 CSS。
+超时以 `kind: 'timeout'` 记录并继续后续加载，其余异常为 `kind: 'error'`；页面与管理台显示不同的固定中文提示。
+原始错误摘要仅保留在控制台和诊断数据属性，不作为正文展示。
+这与服务端入口表的 `skipped`、发现期的 `issues` 分属不同阶段。
 
 同一失败版本不随轮询重复执行；版本变化或停用后重新启用会重试，成功后提示消失。
 失败项不在已加载集合中，因此同步入口表时也会专门清理停用、换版本的失败代次。
-等待期间已经卸载或过期的结果仅做回收，不再写入成功或失败状态。
-入口作者接口见 [plugin/api-reference.md](plugin/api-reference.md) §8，取舍见
-[ADR-0014](adr/0014-plugin-ui-entry-settlement.md)。
+停用立即中止宿主对显式入口的等待，超时、失败或停用均撤销旧作用域并回收其贡献。
+旧宿主随后不能新增或批量注销注册，迟到结果不再写入成功或失败状态；晚到清理函数仍执行一次。
+模块求值和显式入口同步调用期间安装全局作用域，等待返回值期间恢复基础 SDK，异步代码必须保留 `host` 引用。
+上限不能取消原 Promise、抢占同步死循环或终止模块导入，重新取得全局 SDK 也不受旧引用撤销约束，
+因此不是插件沙箱。作者接口见 [plugin/api-reference.md](plugin/api-reference.md) §8，取舍见
+[ADR-0014](adr/0014-plugin-ui-entry-settlement.md) 与 [ADR-0016](adr/0016-plugin-ui-entry-timeout.md)。
 
 入口执行成功后，`diagnosePluginUiRegistration` 以真实插槽/扩展点和路由注册表的 owner
 核对入口表中已经生效的 `slots`、`extNodes`、`routes`。缺项进入

@@ -21,7 +21,7 @@ async function evaluate(expression) {
 }
 
 async function wait(expression, label) {
-  const deadline = Date.now() + 20_000
+  const deadline = Date.now() + 45_000
   while (Date.now() < deadline) {
     if (await evaluate(expression)) return
     await delay(60)
@@ -40,6 +40,18 @@ const failures = () => evaluate('[...document.querySelectorAll("[data-plugin-ui-
 const count = id => evaluate(`window.__uiFixture.counts[${JSON.stringify(id)}]`)
 const diagnostics = () => evaluate('window.__GEEWIKI_PLUGIN_UI__.diagnostics()')
 const diagnostic = async id => (await diagnostics()).find(item => item.name === name(id))
+const timeoutState = () => evaluate(`(() => {
+  const host = window.__GEEWIKI_HOST__, owner = '${name('00-timeout')}';
+  return {
+    slot: host.slotContributors('app-header').filter(item => item === owner),
+    ext: host.slotContributors('ui-card').filter(item => item === owner),
+    themes: host.themeContributors.filter(item => item.owner === owner),
+    markdown: host.markdownExtensions.filter(item => item.owner === owner),
+    tools: host.clientTools.filter(item => item === 'fixture.timeout'),
+    loaded: window.__GEEWIKI_PLUGIN_UI__.loaded().includes(owner),
+    css: document.querySelectorAll('link[data-plugin-ui="' + owner + '"]').length,
+  };
+})()`)
 
 try {
   const auth = await ensureAdminSession(baseUrl, { adminToken: '' })
@@ -66,7 +78,7 @@ try {
   }
   send = (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++sequence
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`CDP 超时：${method}`)) }, 15_000)
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`CDP 超时：${method}`)) }, 45_000)
     pending.set(id, { resolve, reject, timer })
     ws.send(JSON.stringify({ id, method, params }))
   })
@@ -77,6 +89,12 @@ try {
   await send('Page.navigate', { url: baseUrl })
   await wait('window.__GEEWIKI_PLUGIN_UI__?.loaded().includes("@gw-test/ui-healthy")', '正常插件已加载')
   await sync()
+  assert.ok((await failures()).includes(name('00-timeout')), '挂起入口应有可见超时提示')
+  assert.deepEqual(await timeoutState(), { slot: [], ext: [], themes: [], markdown: [], tools: [], loaded: false, css: 0 })
+  assert.equal(await evaluate(`document.querySelector('[data-plugin-ui-failed="${name('00-timeout')}"]').dataset.errorKind`), 'timeout')
+  assert.match(await evaluate(`document.querySelector('[data-plugin-ui-failed="${name('00-timeout')}"]').textContent`), /初始化超时/)
+  assert.ok(await evaluate('window.__uiFixture.healthyAt - window.__uiFixture.timeoutRuns[0].started >= 14_000'))
+  passed('真实挂起入口在上限后可见超时，六类注册回收，后续正常插件及同步恢复')
   for (const id of ['sync', 'async', 'top']) {
     assert.ok((await failures()).includes(name(id)), `${id} 必须有可见失败提示`)
     assert.ok(!(await contributors()).includes(name(id)), `${id} 的部分注册必须回滚`)
@@ -100,11 +118,13 @@ try {
   assert.equal(await count('async'), 1)
   assert.equal(await count('healthy'), 1)
   assert.equal(await count('missing'), 1, '声明缺项不能导致自动重执行入口')
+  assert.equal(await evaluate('window.__uiFixture.timeoutRuns.length'), 1, '超时版本也不应自动重试')
   passed('同一失败版本不会因重复同步而重跑入口，正常插件也不重复注册')
 
   await evaluate('location.hash = "#/plugins"')
-  await wait('document.querySelectorAll("[data-plugin-ui-entry-failed]").length === 3', '管理台显示入口失败')
-  passed('管理台区分已运行的插件与失败的客户端界面')
+  await wait('document.querySelectorAll("[data-plugin-ui-entry-failed]").length === 4', '管理台显示入口失败和超时')
+  assert.match(await evaluate(`document.querySelector('[data-plugin-ui-entry-failed="${name('00-timeout')}"]').textContent`), /初始化超时/)
+  passed('管理台区分已运行的插件、失败和超时的客户端界面')
   await wait('document.querySelectorAll("[data-plugin-ui-mismatch]").length === 2', '管理台列出声明缺项')
   await evaluate('window.__uiFixture.registerDynamic()')
   await wait('!document.querySelector(\'[data-plugin-ui-mismatch="@gw-test/ui-dynamic"]\')', '延迟注册后提示自动消失')
@@ -155,6 +175,43 @@ try {
   assert.equal(await evaluate(`document.querySelectorAll('link[data-plugin-ui="${name('sync')}"]').length`), 1)
   passed('版本变化后重试成功，失败提示自愈且样式仅注入一次')
 
+  await toggle('00-timeout', false)
+  await sync()
+  assert.ok(!(await failures()).includes(name('00-timeout')))
+  await evaluate('window.__uiFixture.recoverTimeout = true')
+  await toggle('00-timeout', true)
+  await sync()
+  const replacement = await timeoutState()
+  assert.equal(replacement.loaded, true)
+  assert.deepEqual(replacement.slot, [name('00-timeout')])
+  assert.deepEqual(replacement.ext, [name('00-timeout')])
+  assert.equal(replacement.themes.length, 1)
+  assert.equal(replacement.markdown.length, 1)
+  assert.equal(replacement.tools.length, 1)
+  assert.equal(replacement.css, 1)
+  assert.equal(await diagnostic('00-timeout'), undefined)
+  assert.equal(await evaluate('window.__GEEWIKI_HOST__.invokeTool("fixture.timeout", {})'), 2)
+  await evaluate('window.__uiFixture.timeoutRuns[0].release(); void 0')
+  await wait('window.__uiFixture.timeoutRuns[0].lateCleanup === 1', '超时入口的迟到清理函数执行一次')
+  assert.equal(await evaluate('window.__uiFixture.timeoutRuns[0].mutationsComplete'), true)
+  assert.deepEqual(await timeoutState(), replacement, '旧宿主的注册、批量注销和旧 token 均不能影响新代次')
+  assert.equal(await diagnostic('00-timeout'), undefined, '新代次页面注册也仍然存在')
+  assert.equal(await evaluate('window.__GEEWIKI_HOST__.invokeTool("fixture.timeout", {})'), 2)
+  passed('超时后重新启用可恢复，旧入口迟到注册和注销不影响六类新贡献，迟到清理仅执行一次')
+
+  await toggle('00-timeout', false)
+  await sync()
+  await evaluate('window.__uiFixture.recoverTimeout = false')
+  await toggle('00-timeout', true)
+  await sync()
+  assert.ok((await failures()).includes(name('00-timeout')))
+  await evaluate('window.__uiFixture.timeoutRuns[2].reject = true; window.__uiFixture.timeoutRuns[2].release(); void 0')
+  await wait('window.__uiFixture.timeoutRuns[2].rejected === true', '超时后的拒绝已发生')
+  await sync()
+  assert.deepEqual(await timeoutState(), { slot: [], ext: [], themes: [], markdown: [], tools: [], loaded: false, css: 0 })
+  assert.ok((await failures()).includes(name('00-timeout')))
+  passed('超时后的迟到拒绝被消费，提示保持正确，重复同步继续工作')
+
   for (const rejectLate of [false, true]) {
     await evaluate(`Object.assign(window.__uiFixture, { waiting: false, rejectLate: ${rejectLate} })`)
     await toggle('late', true)
@@ -162,16 +219,21 @@ try {
     await wait('window.__uiFixture.waiting === true', '异步入口进入等待')
     assert.equal(await evaluate(`window.__GEEWIKI_PLUGIN_UI__.loaded().includes('${name('late')}')`), false)
     assert.equal(await diagnostic('late'), undefined, '入口等待期间不做声明缺项诊断')
+    assert.equal(await evaluate('window.__GEEWIKI_HOST__.pluginName'), undefined, '异步等待期间全局 SDK 已还原')
+    const settledBefore = await evaluate('window.__uiFixture.lateSettled ?? 0')
     await toggle('late', false)
-    await evaluate(`window.__GEEWIKI_PLUGIN_UI__.unload('${name('late')}'); window.__uiFixture.release(); void 0`)
+    await evaluate(`window.__GEEWIKI_PLUGIN_UI__.unload('${name('late')}'); void 0`)
     await evaluate('window.__uiPending')
     await sync()
+    // 不释放原 Promise 也应先恢复同步；再让旧入口结算，检验迟到成功和拒绝。
+    await evaluate('window.__uiFixture.release(); void 0')
+    await wait(`window.__uiFixture.lateSettled === ${settledBefore + 1}`, '已撤销入口迟到结算')
     assert.ok(!(await contributors()).includes(name('late')))
     assert.ok(!(await failures()).includes(name('late')))
     assert.equal(await evaluate(`!!document.querySelector('link[data-plugin-ui="${name('late')}"]')`), false)
   }
   assert.equal(await evaluate('window.__uiFixture.cleaned'), 1)
-  passed('在途入口卸载后，迟到成功和失败均不复活贡献或提示，异步返回的清理函数执行一次')
+  passed('在途入口卸载立即结束等待，迟到成功和失败均不复活贡献或提示，清理执行一次')
   assert.deepEqual(errors, [])
   passed('没有未处理的 JavaScript 异常或 Promise 拒绝')
 } catch (error) {

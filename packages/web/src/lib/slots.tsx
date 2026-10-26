@@ -681,8 +681,8 @@ export function SlotOutlet({ name }: { name: BuiltinSlotName }): ReactNode {
           原始串可能是英文/含路径，`lib/errorText.ts` 的 `cleanHint` 之所以拦掉它们，
           就是为了不让界面出现这种文本。用户看到的是下一行的固定中文句子。
         */
-        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
-          {pluginUiFailureNotice(f.name)}
+        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message} data-error-kind={f.kind}>
+          {pluginUiFailureNotice(f.name, f.kind)}
         </p>
       ))}
       {entries.map((entry, index) => {
@@ -1132,8 +1132,10 @@ export function useSlotEntries(name: SlotName): readonly SlotEntry[] {
  * 文案刻意给出**可执行的下一步**（去插件管理检查），而不是只说"加载失败"。
  * 排障摘要只进 `data-error`，不进可见正文（原始串可能是英文/含路径，见 `lib/errorText.ts`）。
  */
-export const pluginUiFailureNotice = (name: string): string =>
-  `插件界面「${name}」加载失败，相关功能在本页不可用。请在「插件管理」页检查或联系插件作者。`
+export const pluginUiFailureNotice = (name: string, kind: PluginUiFailure['kind'] = 'error'): string =>
+  kind === 'timeout'
+    ? `插件界面「${name}」初始化超时，已回收其贡献。请在「插件管理」页检查或重新启用。`
+    : `插件界面「${name}」加载失败，相关功能在本页不可用。请在「插件管理」页检查或联系插件作者。`
 
 /**
  * **本插槽**的加载期失败清单。
@@ -1162,8 +1164,8 @@ export function EditorToolbarSlotOutlet(props: EditorToolbarSlotProps): ReactNod
   return (
     <div className="slot-outlet slot-outlet-toolbar" data-slot="editor-toolbar" data-count={entries.length}>
       {failures.map((f) => (
-        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
-          {pluginUiFailureNotice(f.name)}
+        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message} data-error-kind={f.kind}>
+          {pluginUiFailureNotice(f.name, f.kind)}
         </p>
       ))}
       {entries.map((entry, index) => {
@@ -1246,8 +1248,8 @@ export function AppDockSlotOutlet(props: AppDockSlotProps): ReactNode {
       {...(entry ? { 'data-dock-source': entry.source } : {})}
     >
       {failures.map((f) => (
-        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
-          {pluginUiFailureNotice(f.name)}
+        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message} data-error-kind={f.kind}>
+          {pluginUiFailureNotice(f.name, f.kind)}
         </p>
       ))}
       {entry &&
@@ -1313,8 +1315,8 @@ export function ArticleSummarySlotOutlet(props: ArticleSummarySlotProps): ReactN
       {...(entry ? { 'data-summary-source': entry.source } : {})}
     >
       {failures.map((f) => (
-        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
-          {pluginUiFailureNotice(f.name)}
+        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message} data-error-kind={f.kind}>
+          {pluginUiFailureNotice(f.name, f.kind)}
         </p>
       ))}
       {entry &&
@@ -1491,8 +1493,8 @@ export function AccountIdentitiesSlotOutlet(props: AccountIdentitiesSlotProps): 
   return (
     <div className="slot-outlet" data-slot="account-identities" data-count={entries.length}>
       {failures.map((f) => (
-        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
-          {pluginUiFailureNotice(f.name)}
+        <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message} data-error-kind={f.kind}>
+          {pluginUiFailureNotice(f.name, f.kind)}
         </p>
       ))}
       {entries.map((entry, index) => {
