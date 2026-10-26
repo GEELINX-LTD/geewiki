@@ -77,6 +77,7 @@
 | 0011 | [PostgreSQL 并发写入进入测试门禁](./0011-postgres-write-integration-gate.md) | accepted | 在现有 test 作业运行真实 PostgreSQL 竞争与回滚验收，普通单测保持无需外部数据库 |
 | 0012 | [路由声明在注册期校验](./0012-route-access-registration-validation.md) | accepted | core 要求显式 access，严格模式覆盖热启用，旧 JS 非严格调用保留迁移窗口 |
 | 0013 | [上游错误诊断日志仅显式开启](./0013-openai-diagnostics-opt-in.md) | accepted | 默认关闭上游错误体摘要，仅精确的 1 开启，保留错误码与启发式脱敏边界 |
+| 0014 | [插件界面入口结算与失败诊断](./0014-plugin-ui-entry-settlement.md) | accepted | 等待异步入口，统一失败回滚和版本去重，迟到结果不得复活已卸载界面 |
 
 编号是**追加式**的，不复用、不插号。空号一旦出现就说明有文件被删了——本目录里已经发生过一次
 （编号缺位会留下死链，`scripts/docs-links.ts` 在 CI 里拒绝指向不存在文件的链接）。

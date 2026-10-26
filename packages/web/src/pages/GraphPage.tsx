@@ -21,7 +21,7 @@ import { describeRoot, hasDynamicOptions, type FieldDescriptor } from '../lib/co
 import { describeError, errorLine } from '../lib/errorText'
 import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
-import { syncPluginUi, subscribePluginUiState, pluginUiState } from '../lib/pluginUi'
+import { syncPluginUi, subscribePluginUiState, pluginUiState, unloadPluginUi } from '../lib/pluginUi'
 import { Ext } from '../lib/slots'
 import { themeContrastIssues } from '../lib/pluginTheme'
 import { AA_TEXT_MIN } from '../lib/contrastPlan'
@@ -416,6 +416,8 @@ export function GraphPage(): ReactNode {
       setBlockedDisable(null)
       try {
         await api.disable(p.name)
+        // 入口可能仍在 await；先推进其代次，不能等排队的整表同步才回收。
+        unloadPluginUi(p.name)
         /*
          * 两种层的后果不同，提示必须分开说：会话层插件停用是**真的写了会话清单**（"已保存"成立）；
          * 基础层插件停用**什么都没写**（进程内登记，重启即恢复），继续沿用旧文案会让人以为已经持久化。
@@ -834,6 +836,26 @@ export function GraphPage(): ReactNode {
                     {UI_SKIP_LABEL[item.reason]}
                   </Badge>
                   <div className="text-xs text-muted">{UI_SKIP_HELP[item.reason]}</div>
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      )}
+
+      {uiState.failed.length > 0 && (
+        <Card className="border-warn-line bg-warn-bg">
+          <CardHeader
+            as="h2"
+            title={`有 ${uiState.failed.length} 个插件的界面加载或初始化失败`}
+            description="相关界面暂时不可用。可停用后重新启用，或联系插件作者检查；插件的其他服务不受这条提示影响。"
+          />
+          <CardBody>
+            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              {uiState.failed.map((item) => (
+                <li key={item.name} data-plugin-ui-entry-failed={item.name} data-error={item.message}>
+                  <span className="text-xs font-medium text-ink">{labelOf(item.name)}</span>
+                  <Badge tone="warn" className="ml-2">界面不可用</Badge>
                 </li>
               ))}
             </ul>

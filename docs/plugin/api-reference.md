@@ -260,6 +260,11 @@ export function register(host): () => void          // 推荐：宿主注入作�
 ```
 
 作用域宿主类型 `PluginUiHost`（`packages/web/src/lib/pluginUi.ts`）= 完整 SDK + **`readonly pluginName: string`**（全局 SDK 上没有这个字段，可用于自检归属，见 `packages/web/fixtures/src/index.tsx`）+ 过闸门的 `registerSlot`/`registerExtension`。
+显式 `register(host)` 或默认导出入口可返回 Promise；宿主会等待结算，再标记界面已加载并注入 CSS。
+返回（或 Promise 结算为）卸载函数时，宿主会在停用或替换时调用它。
+同步异常和异步拒绝都会回收已登记贡献，并在页面及「插件管理」提示界面不可用；
+同一失败版本不会随轮询重复执行，版本变化或停用后重新启用会重试。
+未经过宿主登记的计时器、网络请求等副作用仍由插件负责清理。
 现算 SDK 版本：`grep -n HOST_SDK_VERSION packages/web/src/lib/hostSdk.ts`（本文件不写死读数）。
 
 | SDK 成员 | 首个可用版本 | 签名与要点 |

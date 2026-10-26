@@ -679,7 +679,7 @@ export function SlotOutlet({ name }: { name: BuiltinSlotName }): ReactNode {
           就是为了不让界面出现这种文本。用户看到的是下一行的固定中文句子。
         */
         <p key={f.name} className="slot-error" role="status" data-plugin-ui-failed={f.name} data-error={f.message}>
-          {`插件界面「${f.name}」加载失败，相关功能在本页不可用。作者可能漏发产物，请在「插件管理」页检查。`}
+          {pluginUiFailureNotice(f.name)}
         </p>
       ))}
       {entries.map((entry, index) => {
@@ -1130,7 +1130,7 @@ export function useSlotEntries(name: SlotName): readonly SlotEntry[] {
  * 排障摘要只进 `data-error`，不进可见正文（原始串可能是英文/含路径，见 `lib/errorText.ts`）。
  */
 export const pluginUiFailureNotice = (name: string): string =>
-  `插件界面「${name}」加载失败，相关功能在本页不可用。作者可能漏发产物，请在「插件管理」页检查。`
+  `插件界面「${name}」加载失败，相关功能在本页不可用。请在「插件管理」页检查或联系插件作者。`
 
 /**
  * **本插槽**的加载期失败清单。

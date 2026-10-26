@@ -689,6 +689,16 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
   const disposers: Array<() => void> = []
   const host = createPluginUiHost({ name, sdk, meta, suppressed: suppressedOwners, disposers })
   const restoreScope = installPluginScope(host, sdk)
+  const isCurrent = (): boolean =>
+    (epochs.get(name) ?? 0) === epoch && desired[name]?.rev === meta.rev && !loaded.has(name)
+  const fail = (err: unknown): void => {
+    // 导入求值与显式入口都可能先注册后抛错；迟到失败也必须回收，但不能污染新代次。
+    rollbackDisposers(disposers)
+    if (!isCurrent()) return
+    failed.set(name, meta.rev)
+    failedLoads.set(name, errorDetail(err))
+    emitState()
+  }
   try {
     let mod: PluginUiModule
     try {
@@ -697,25 +707,11 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
     } catch (err) {
       // 入口已声明却加载失败属于真实故障（作者漏发产物的典型症状），但不该打断宿主启动
       console.warn(`[geewiki-plugin-ui] 插件界面加载失败：${name}`, err instanceof Error ? err.message : err)
-      failed.set(name, meta.rev)
-      /*
-        记进**要给人看的那一份**并广播：否则界面上的表现只是"这块功能不见了"，
-        用户既不知道原因，也不知道该去插件管理里检查产物。emitState 必须显式调用 ——
-        失败路径上没有任何插槽注册发生，不广播就永远不会有订阅者重渲染。
-        存的是**排障摘要**（`errorDetail`），它只会落在 console 与 `data-*` 上：
-        给用户看的正文是 `slots.tsx` 里那句固定中文（原始串可能含英文/路径，不能直接展示）。
-      */
-      failedLoads.set(name, errorDetail(err))
-      emitState()
-      /*
-        模块求值期可能已经注册了一部分（顶层形态）：必须回滚，否则"加载失败"的插件会留下半截 UI。
-        装上作用域之前这不可能发生 —— 那批注册会落到全局 SDK 名下，只是更难发现而已。
-      */
-      rollbackDisposers(disposers)
+      fail(err)
       return
     }
     // 迟到检查：await 期间该插件可能已被卸载，或已不再被入口表需要（例如用户刚点了停用）
-    if ((epochs.get(name) ?? 0) !== epoch || !(name in desired) || loaded.has(name)) {
+    if (!isCurrent()) {
       console.debug(`[geewiki-plugin-ui] 丢弃迟到的插件界面加载：${name}`)
       // 同上：模块求值期的注册必须跟着这次作废的加载一起回滚
       rollbackDisposers(disposers)
@@ -736,18 +732,23 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
       console.debug(`[geewiki-plugin-ui] 插件 bundle 未导出 register(host)，按其模块顶层注册登记：${name}`)
     } else {
       try {
-        const cleanup = register(host)
+        const cleanup: unknown = await register(host)
         if (typeof cleanup === 'function') disposers.push(cleanup as () => void)
       } catch (err) {
-        // 插件入口自身执行失败：回滚它已经注册的部分，避免留下半截 UI
         console.warn(`[geewiki-plugin-ui] 插件 ${name} 的客户端入口执行失败，已回滚：`, err)
-        rollbackDisposers(disposers)
+        fail(err)
         return
       }
+    }
+    // 显式入口同样可以等待异步工作；结算时必须再次复核，避免已停用插件迟到复活。
+    if (!isCurrent()) {
+      rollbackDisposers(disposers)
+      return
     }
     const link = meta.css ? injectCss(name, `${base}/${meta.css}`) : undefined
     loaded.set(name, { plugin: name, rev: meta.rev, disposers, link })
     // 成功即自愈：清掉这个插件此前可能留下的失败记录，否则提示条会在问题已解决后继续挂着
+    failed.delete(name)
     failedLoads.delete(name)
     emitState()
     console.debug(`[geewiki-plugin-ui] 已加载插件界面：${name}`)
@@ -766,6 +767,7 @@ export function unloadPluginUi(name: string): boolean {
     "它的界面加载失败"这条提示就过期了 —— 留着会让用户对着一条无法处理的红字。
     若是 rev 变化导致的重试，紧接着的加载失败会重新写入，语义仍然正确。
   */
+  failed.delete(name)
   const hadFailure = failedLoads.delete(name)
   const entry = loaded.get(name)
   if (!entry) {
@@ -861,6 +863,10 @@ async function doSync(force: boolean): Promise<void> {
   }
   lastRevision = table.revision
   desired = table.entries
+  // 失败者从未进入 loaded，不能只靠 plan.unload 清理；停用或换版本也要结束其失败代次。
+  for (const [name, rev] of failed) {
+    if (desired[name]?.rev !== rev) unloadPluginUi(name)
+  }
   lastSkipped = Object.freeze(table.skipped)
   // 路由快照紧随入口表重建（F2）：导航项来自声明，必须在 bundle 加载**之前**就可见
   rebuildRoutes()

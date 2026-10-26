@@ -430,6 +430,20 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 后端 `409 has_dependents`（`details.dependents` 为依赖方名单）现被管理台捕获并弹出**专门说明块**（`packages/web/src/pages/GraphPage.tsx` 中 `GraphPage()` 内由 `blockedDisable` 状态驱动的 `{blockedDisable && ( … )}` 渲染块，标题行文本「无法停用「{labelOf(blockedDisable.name)}」：还有插件在依赖它」）——标题「无法停用「X」：还有插件在依赖它」+ 列出依赖方 + **两段可操作指引**（① 先在上表逐个停用依赖方再回来停用目标；② 若它是被同冲突组其它插件顶替，可在目标插件那行点「启用」走**冲突组替换**，会连同依赖方一起安全接管）。`dependentNamesOf()`（`packages/web/src/pages/GraphPage.tsx` 的 `function dependentNamesOf(details: unknown): string[]`；在停用动作内 `err instanceof ApiError && err.code === 'has_dependents'` 分支经 `setBlockedDisable({ name: p.name, dependents: dependentNamesOf(err.details) })` 调用）**防御性**读取 `details`：形状不符退回空数组 → 走兜底文案，**不显示 `undefined`**。**刻意未实现自动级联停用**（破坏性操作）。
 
+### 4.8 浏览器入口执行失败
+
+模块导入、顶层求值、显式 `register(host)` / 默认入口执行失败，均由
+`packages/web/src/lib/pluginUi.ts` 的 `loadPluginUi` 回收本次注册并记录到
+`pluginUiState().failed`。显式入口返回 Promise 时等待其结算；在此之前不标记成功或注入 CSS。
+页面显示固定中文提示，「插件管理」单列加载或初始化失败项；原始错误摘要仅保留在控制台和
+诊断数据属性，不作为正文展示。这与服务端入口表的 `skipped`、发现期的 `issues` 分属不同阶段。
+
+同一失败版本不随轮询重复执行；版本变化或停用后重新启用会重试，成功后提示消失。
+失败项不在已加载集合中，因此同步入口表时也会专门清理停用、换版本的失败代次。
+等待期间已经卸载或过期的结果仅做回收，不再写入成功或失败状态。
+入口作者接口见 [plugin/api-reference.md](plugin/api-reference.md) §8，取舍见
+[ADR-0014](adr/0014-plugin-ui-entry-settlement.md)。
+
 ### 4.9 界面扩展平台（P4–P10）：插槽泛化为**宿主节点 + 三种模式**
 
 设计真源是 [design/ui-extension-platform.md](design/ui-extension-platform.md)，此处只记**契约要点与实现位置**。
