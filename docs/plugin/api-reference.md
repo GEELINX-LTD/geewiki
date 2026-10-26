@@ -334,13 +334,13 @@ UI 产物构建：外部插件的 UI 根被硬编码为 `<插件目录>/dist`（
 
 | 参考 | 值得抄什么 | 值得**避开**什么 |
 | --- | --- | --- |
-| `plugins/ui-demo/`（`package.json` + `src/index.ts` + `dist/` 产物） | 外部插件完整形态：`requires: ['http-service']`、`client: {entry:'client.js',css:'client.css'}`、`slots: ['app-header','app-footer']`、`extensions: [{node:'shell-brand-text',mode:'wrap'}]`、`apply(ctx)` 里 `ctx.get('http')` 缺失即 `throw`、**返回注销函数** | ① `provides: 'ui-demo-service'` 但代码里没有 `ctx.provide` ⇒ **AP-08**；② `RouterLike.register` 只声明 3 参 ⇒ 生成的路由匿名可调 ⇒ **AP-01**；③ `dist/` 不入库 ⇒ 干净检出需先 `build:fixtures` ⇒ **AP-15** |
-| `plugins/hello-geewiki/`（`index.ts` + `README.md`） | 零依赖最小后端：`entry: 'index.ts'`、config `greeting`/`uppercase`、未声明 `configSchema` ⇒ 管理台只给 JSON 原文编辑框；README 给了带编码插件名的 curl 与"需要第三方库须自带 `node_modules`"的口径 | 同样是 3 参注册（AP-01） |
+| `plugins/ui-demo/`（`package.json` + `src/index.ts` + `dist/` 产物） | 外部插件完整形态：`requires: ['http-service']`、`client: {entry:'client.js',css:'client.css'}`、`slots: ['app-header','app-footer']`、`extensions: [{node:'shell-brand-text',mode:'wrap'}]`、`ctx.get('http')` 缺失即 `throw`、返回注销函数；只注册路由，省略 `provides`，显式声明 `access: 'public'` 与 `owner` | `dist/` 不入库 ⇒ 干净检出需先 `build:fixtures`（AP-15） |
+| `plugins/hello-geewiki/`（`index.ts` + `README.md`） | 零依赖最小后端：`entry: 'index.ts'`、config `greeting`/`uppercase`、未声明 `configSchema` ⇒ 管理台只给 JSON 原文编辑框；README 给了带编码插件名的 curl 与依赖说明；省略 `provides`，显式声明 `access` 与 `owner` | — |
 | `packages/web/fixtures/src/index.tsx` | 前端产物的**真实源码**：`export function register(host): () => void`、特性探测 `host.registerExtension?.(...)`、顶层形态用 `hostAtEval?.pluginName` 判身份、自带最小 `PluginUiHost` 声明（不依赖宿主源码路径）、`CounterWidget` 证同一 React 实例、`ThrowerWidget` 验错误边界 | — |
 | `packages/plugin-echo/src/index.ts` | **`provides` 的正确处理**：刻意撤销 `provides`，注释写清"谎报的 token"后果；`runtime: {supportsHotReload: true, requiresCachePurge: false, drainTimeout: 5}`；`requires: ['@geewiki/http']` | — |
 | `packages/plugin-search/src/index.ts` | `ctx.provide('search-service', svc)` + 注销 + 导出契约类型；`requires: ['wiki-service','llm-service']`；`conflictGroup: "search-provider"`；`migrations: { default: 'migrations', postgres: 'migrations/postgres' }`（**FTS5 依赖 SQLite ⇒ postgres 方言下无迁移，由插件在 apply 里显式拒绝**） | — |
 | `packages/plugin-openai/src/index.ts` | provider 的正确形态：**注册进 `llm-service` 的"路由"**而不是自建 provider；端点/模型名全部来自配置（默认值一律用 `https://api.example.com/v1` 这类占位，**不要沿用仓库里那个私有端点**） | — |
-| `packages/manager/src/scaffold.ts` | 脚手架生成物即"最小契约"：`package.json` + `index.ts` + `dist/client.js` + `dist/client.css`(仅 `--ui`) + `README.md`；`gitignoreLinesFor(name)` 给出该加的两行例外 | 生成的清单与代码**同时**继承 AP-01 与 AP-08 |
+| `packages/manager/src/scaffold.ts` | 脚手架生成物即最小契约：`package.json` + `index.ts` + `dist/client.js` + `dist/client.css`（仅 `--ui`）+ `README.md`；省略未实现的 `provides`，路由显式声明 `access` / `owner`；`gitignoreLinesFor(name)` 给出该加的两行例外 | — |
 
 内置清单的两个真源：可启用集合看 `defaultRegistry()`（`packages/server/src/index.ts`），默认启用集合看 `config/plugins.base.example.json` 的 `enabled`（同目录 `plugins.base.json` 是本机现状，**不可当口径**）。二者数量**不相等**：已注册未写入默认基础层的至少有 `@geewiki/postgres`、`@geewiki/editor-plain`、`@geewiki/oidc`、`@geewiki/echo`。数量与全集一律现算，勿写死。
 

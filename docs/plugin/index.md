@@ -110,7 +110,7 @@ curl -s localhost:3000/api/my-note
 
 四条最容易踩的红线（详解在 `anti-patterns.md`）：
 
-1. `router.register()` **必须显式写第 4 参** `{ access }`——脚手架生成的示例本身就漏了，它跑出来的端点是匿名可调的。
+1. `router.register()` **必须显式写第 4 参** `{ access }`。脚手架和两个官方示例已显式声明 `public` 及 `owner`；管理接口应按用途收紧访问等级。
 2. 外部插件目录 `GEEWIKI_PLUGINS_DIR` 在部署环境里**必须是绝对路径**（Docker 场景已写死 `/app/plugins`，见 `Dockerfile`）。
 3. 改后端代码要**重启进程**，改前端产物要**整页刷新**——ESM 模块实例永不回收。
 4. `geewiki.slots` 声明与 bundle 里 `registerSlot()` 的名字必须完全一致，不一致是**静默空白**，不是报错。

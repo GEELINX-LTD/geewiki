@@ -451,54 +451,6 @@
   本轮**不擅自**调用 `gh api -X PATCH`。
 - **状态**：`未处理`（**需 GitHub 端操作，本仓库改不到**；本轮只把事实、复核命令与两种最小改法写清）。
 
-### F28 · 脚手架与两个官方示例自己谎报 `provides`（F3 的作者侧传播渠道）
-
-- **严重度**：**P1**（它本身不是安全失守，但它是 F3（P0）的**教学级传播渠道**：
-  新插件几乎全部从脚手架或示例起步，照抄即静默失效）
-- **违背**：「万物皆插件」的可信度——示例与脚手架是平台的事实文档，它们示范了「清单可以说谎」。
-- **现状事实**（`provide` 的每一处命中逐个核对，命令见「验证方式」）：
-  - 脚手架：`packages/manager/src/scaffold.ts` 的 `manifestJson()` 固定生成
-    ``provides: `${spec.name}-service` ``（它上一行注释还专门解释「依赖图的 token 不是 cordis 服务名：
-    `http-service` 是 `@geewiki/http` 的 provides 值」），而模板生成的 `apply(ctx, config)` 只做
-    `ctx.get('http')` + `router.register('GET', '/api/<name>', …)` + 返回 `unregister`——
-    **没有 `ctx.provide`**；该文件里 `provide` 的唯一命中是给 `RouterLike` 的那句注释
-    （「`@geewiki/http` 经 `ctx.provide('http', …)` 提供」）。
-  - `plugins/hello-geewiki/package.json`：`"provides": "hello-service"` + `"requires": ["http-service"]`；
-    该插件**没有 `src/` 目录**，入口是 `plugins/hello-geewiki/index.ts`，其中 `provide` 的唯一命中也是注释。
-  - `plugins/ui-demo/package.json`：`"provides": "ui-demo-service"`；`plugins/ui-demo/src/index.ts`
-    同样只有注释命中（`registerSlot("app-header"/"app-footer")` 只出现在前端产物
-    `plugins/ui-demo/dist/client.js` 里，与 `provides` 无关）。
-  - 为什么是「谎报」而非「多余声明」：依赖解析按 `packages/manager/src/deps.ts` 的
-    `const providers = registry.filter((p) => p.manifest.geewiki.provides === dep)` 判等——
-    **`provides` 只参与依赖图匹配，不创建任何 cordis 服务** ⇒ 声明了 `x-service` 而
-    `ctx.get('x-service')` 仍是 `undefined`。
-  - **正对照**（同一仓库里已有正确做法）：`packages/plugin-echo/src/index.ts` 注释写明
-    「这里**刻意不声明 `provides`**（曾写 `provides: 'echo-service'`，已撤销）」、
-    「本插件从未 `ctx.provide('echo-service', …)`，所以那是一个**谎报的 token**」、
-    「将来若确需对外提供能力：按 @geewiki/search 的范式补 `ctx.provide(...)` + dispose 注销 +
-    导出服务契约类型，再恢复 provides」——**同一个坑内置示例插件已经踩过并写死了教训，
-    但脚手架和 `plugins/` 下两个示例仍留在坑里。**
-- **影响**：任何照 `pnpm run new:plugin` 产物或照 `plugins/ui-demo` 抄的作者都会得到
-  「清单声称提供 `x-service`、实际没人提供」的插件；第三方若 `requires: ["x-service"]`，
-  依赖图判定其已满足、`ctx.get` 拿到 `undefined` ⇒ 静默 no-op（F3 正是这条链路的 P0 版本）。
-  同时它把「清单是契约」悄悄削弱成「清单是愿望」。
-- **建议改法（最小改动优先）**：三处各删一行 `provides`（`scaffold.ts` 的 `manifestJson()`、
-  `plugins/hello-geewiki/package.json`、`plugins/ui-demo/package.json`）——两个示例都只消费 `http`，
-  没有对外提供服务的需求，**删比补更诚实**（补 `ctx.provide` 必须按 `@geewiki/echo` 注释里那三件事
-  做齐：`ctx.provide` + dispose 注销 + 导出契约类型，才有资格声明 `provides`）。
-  若确要保留，脚手架模板就必须真的示范 `ctx.provide(…)` + 卸载注销，否则注释教的是
-  「不 provide 也能声明」。
-- **验证方式**：改前 `grep -n 'ctx\.provide' packages/manager/src/scaffold.ts plugins/hello-geewiki/index.ts plugins/ui-demo/src/index.ts`
-  应只剩注释命中；改后 `grep -rn '"provides"' plugins/*/package.json packages/manager/src/scaffold.ts`
-  的每个命中都必须能在同插件源码里找到对应的真实 `ctx.provide(`。回归：`pnpm --filter @geewiki/manager test`。
-- **风险与兼容性**：删 `provides` 会让任何以 `requires: ["hello-service"]` / `["ui-demo-service"]`
-  声明依赖的外部插件在装载时报「依赖找不到」——这是**把静默失效变成显式失败**，方向正确但属行为变更；
-  `plugins/*` 是对外示例，改清单要同步 `docs/plugin/api-reference.md` 的对照表
-  （该行现已把「`provides: 'ui-demo-service'` 但代码里没有 `ctx.provide`」标注为反模式 AP-08，
-  `docs/plugin/anti-patterns.md` 亦已点名）。
-- **状态**：`未处理`（**待授权**：涉及 `packages/manager/src/scaffold.ts` 与两个 `package.json`）。
-  **交叉引用 F3**（同一机制的权威描述与 P0 定级理由；本条只记「示例与脚手架在传播它」）。
-
 ---
 
 ## P2
@@ -769,7 +721,6 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F25 | plugin-platform 风险表与本台账职责重叠 | P2 | 事实真源纪律 | 本轮已加指向行 |
 | F26 | `GEEWIKI_TRUST_PROXY` 残留 ⇒ **未能复现** | — | — | 未能复现 |
 | F27 | ruleset `main-protection` 给 admin 开 `bypass_mode: always` 后门 | P1 | 安全可控 | 未处理（**需 GitHub 端操作**） |
-| F28 | 脚手架 + 两个官方示例自己谎报 `provides`（传播 F3） | P1 | 安全可控 / 可预期 | 未处理（**待授权**） |
 | F29 | 「插件编辑器不能上传附件」的四处过期表述（F5 落地后未回收） | P2 | 事实真源纪律 | 部分已缓解（文档 1 处已改） |
 | F30 | `GEEWIKI_KEEP_TMP` 有码无表（验收脚本开关） | P2 | 事实真源纪律 | 未处理 |
 

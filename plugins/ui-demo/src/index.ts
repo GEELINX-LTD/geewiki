@@ -18,7 +18,10 @@
 
 /** 宿主注入的 HTTP 路由服务（@geewiki/http 经 ctx.provide('http', …) 提供） */
 interface RouterLike {
-  register(method: string, path: string, handler: (h: RouteContextLike) => void): () => void
+  register(
+    method: string, path: string, handler: (h: RouteContextLike) => void,
+    options: { access: 'public' | 'user' | 'admin'; owner: string },
+  ): () => void
 }
 
 interface RouteContextLike {
@@ -44,7 +47,7 @@ const plugin = {
         hint: '这是一个示例插件：它的界面出现在页头/页脚插槽里，用来演示插件自带 UI 产物',
         timestamp: new Date().toISOString(),
       })
-    })
+    }, { access: 'public', owner: '@geewiki-plugin/ui-demo' })
 
     console.log('[@geewiki-plugin/ui-demo] 已激活: GET /api/ui-demo')
     return () => {

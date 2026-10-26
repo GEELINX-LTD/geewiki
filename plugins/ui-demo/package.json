@@ -7,7 +7,6 @@
   "geewiki": {
     "displayName": "插件界面示例",
     "description": "演示插件如何向管理界面贡献自己的 UI（计数器与错误隔离演示件）",
-    "provides": "ui-demo-service",
     "requires": ["http-service"],
     "runtime": {
       "supportsHotReload": true,

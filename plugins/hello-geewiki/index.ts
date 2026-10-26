@@ -13,7 +13,10 @@
 
 /** 宿主注入的 HTTP 路由服务（@geewiki/http 经 ctx.provide('http', …) 提供） */
 interface RouterLike {
-  register(method: string, path: string, handler: (h: RouteContextLike) => void): () => void
+  register(
+    method: string, path: string, handler: (h: RouteContextLike) => void,
+    options: { access: 'public' | 'user' | 'admin'; owner: string },
+  ): () => void
 }
 
 interface RouteContextLike {
@@ -45,7 +48,7 @@ const plugin = {
         config,
         timestamp: new Date().toISOString(),
       })
-    })
+    }, { access: 'public', owner: '@geewiki-plugin/hello' })
 
     console.log('[@geewiki-plugin/hello] 已激活: GET /api/hello')
     return () => {
