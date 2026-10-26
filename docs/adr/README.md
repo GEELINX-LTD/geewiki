@@ -73,6 +73,7 @@
 | 0007 | [清单两层 + 看门狗回滚](./0007-two-layer-manifest-and-watchdog.md) | accepted | JSON 说「这是什么」、TS 说「怎么跑」；代价是 JSON 那半层带不动 schemastery |
 | 0008 | [不引入代码格式化器](./0008-no-code-formatter.md) | proposed | 格式交给 `.editorconfig` 与 review；28 包一次性重排的代价是永久污染 blame |
 | 0009 | [单进程与 SQLite 最小部署](./0009-single-process-sqlite-minimal-deployment.md) | accepted | 默认形态是一个进程一个实例的 SQLite，用 crash marker 兜住「插件把宿主拖挂」；水平扩展明确划到范围外 |
+| 0010 | [写入前置条件、主体授权与部署启动检查](./0010-write-preconditions-and-startup-readiness.md) | accepted | 写事务验证页面状态，用户入口重查权限，标准部署检查必要服务，核心验收接入 build 作业 |
 
 编号是**追加式**的，不复用、不插号。空号一旦出现就说明有文件被删了——本目录里已经发生过一次
 （编号缺位会留下死链，`scripts/docs-links.ts` 在 CI 里拒绝指向不存在文件的链接）。

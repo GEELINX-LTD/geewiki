@@ -87,6 +87,7 @@ docs/
 | [adr/README.md](adr/README.md) | ADR 目录索引与格式约定（MADR 精简式；两条硬规矩：不锚定 commit hash / 行号，负面后果不许省略）。想知道某个不可逆决定的背景与代价时读 | 只记「为什么这么定」，**不描述当前实现**。当前实现看 [architecture.md](architecture.md) 与代码；ADR 与代码不符时以代码为准并**补一条新 ADR**，不回头改旧文件 |
 | [adr/0003-sqlite-fts5-primary-postgres-dual-track.md](adr/0003-sqlite-fts5-primary-postgres-dual-track.md) | 以 SQLite + FTS5 为主库、Postgres 走双轨兼容层的决策（回填，状态 `proposed`）。改检索或加 SQL 前必读 | 决策与其代价。检索的实际 SQL 在 `packages/plugin-search/src/index.ts`，没有 SQL 抽象层 |
 | [adr/0009-single-process-sqlite-minimal-deployment.md](adr/0009-single-process-sqlite-minimal-deployment.md) | 极简部署形态：单进程 + SQLite 默认 + `pnpm deploy` 部署树（状态 `accepted`）。动部署形态、进程边界、打包前读 | 部署形态的决策依据；操作手册在 [deployment.md](deployment.md)，流水线在 [ci-cd.md](ci-cd.md) |
+| [adr/0010-write-preconditions-and-startup-readiness.md](adr/0010-write-preconditions-and-startup-readiness.md) | 页面保存前置条件、主体写入入口、标准部署必要服务与核心流程门禁的决策（状态 `accepted`） | 只记录取舍；保存契约以 core 为准，部署操作见 deployment，验收接线见 ci-cd |
 | [design/ui-extension-platform.md](design/ui-extension-platform.md) | **界面扩展平台契约定稿**：可被替换 / 包裹 / 扩展的节点目录、三种模式语义、多插件共存裁决、主题令牌 | 界面扩展的**设计**真源。实际取值与允许模式以源码为凭：`packages/core/src/extensions.ts` 与 `packages/core/src/slots.ts`（见真源表） |
 | [design/block-attribution.md](design/block-attribution.md) | **块级归属**：谁最后改了哪一块——归属模型、写入时机、呈现方式 | 只管「归属」。权限判定在 [design/access-control.md](design/access-control.md)，别在这里找可见性规则 |
 | [design/dock-images.md](design/dock-images.md) | 输入条（dock）的**图片输入**：设计、现状、未做项 | 只管图片输入。dock 作为 AI 唯一对话入口的契约在 [plugin-platform.md](plugin-platform.md) 与 `packages/plugin-ai-assistant` |
