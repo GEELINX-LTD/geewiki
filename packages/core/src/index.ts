@@ -798,15 +798,15 @@ export function resolveProjectPath(path: string, fromUrl: string): string {
  * 粗粒度闸门挡的是"整类端点被匿名调用"（插件启停、条目写入），
  * 它**不能替代**逐对象判定：两者是纵深防御的两层，不是二选一。
  *
- * - `public`：任何主体（含匿名）都可调用。**默认值**，保证既有调用点零改动。
+ * - `public`：任何主体（含匿名）都可调用，必须显式选择。
  * - `user`：需要已登录用户（`principal.kind === 'user'`）或应急通道（`'break-glass'`）。
  * - `admin`：需要管理员（`orgRole` 为 `owner`/`admin`）或应急通道。
  */
 export type RouteAccess = 'public' | 'user' | 'admin'
 
-/** `register()` 的可选第 4 参；省略等价于 `{ access: 'public' }` */
+/** `register()` 的第 4 参；调用方必须显式选择访问等级。 */
 export interface RouteAccessOptions {
-  access?: RouteAccess
+  access: RouteAccess
   /**
    * ★ F9：这条路由还要求某个**能力**（内置的或插件声明的）。
    *
@@ -1094,15 +1094,15 @@ export interface HttpRouterService {
   /**
    * 注册路由（method 大写，path 精确或带 :param 匹配）；返回注销函数。
    *
-   * `opts.access` 是**粗粒度**访问等级（默认 `'public'`，故只传 3 个实参的既有调用点
-   * 行为完全不变）：它只挡"整类端点被匿名调用"，**逐对象判定必须由处理器另行完成**
-   * （见 {@link RouteAccess}）。
+   * `opts.access` 是必填的**粗粒度**访问等级：它只挡"整类端点被匿名调用"，
+   * **逐对象判定必须由处理器另行完成**（见 {@link RouteAccess}）。
+   * 旧 JavaScript 调用仅在非严格模式保留默认 `'public'`；严格模式在注册前拒绝遗漏。
    */
   register(
     method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
     path: string,
     handler: RouteHandler,
-    opts?: RouteAccessOptions,
+    opts: RouteAccessOptions,
   ): () => void
 
   /**
@@ -1121,12 +1121,11 @@ export interface HttpRouterService {
   /**
    * ★ F11：**枚举当前已注册的全部路由及其访问等级**（只读快照，诊断用）。
    *
-   * 存在的理由是一个**默认值太宽松**的问题：`register()` 的第 4 参可省，省略即
-   * `access: 'public'`（匿名可调）。全仓几十个调用点于是全靠作者自觉 —— 而"忘了写"
-   * 与"故意公开"在源码里长得一模一样，**评审时看不出来**，运行期也毫无痕迹。
+   * 旧 JavaScript 在非严格模式省略声明仍按 `access: 'public'` 运行，需要审计清单。
+   * TypeScript 契约已要求显式声明，严格模式还会在注册前校验（含插件热启用）。
    *
-   * 有了这个枚举，就有两件事可做（都已在实现里落地）：
-   * 1. 启动时把**未显式声明**的路由聚合成一条告警（`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时直接拒启）；
+   * 这个枚举支持：
+   * 1. 启动时把兼容调用的**未显式声明**路由聚合告警；严格模式也拒绝第三方路由器的遗漏；
    * 2. 测试里对**全量默认路由**做审计，把"哪些路由是公开的"变成一份**显式、可评审的清单**
    *    —— 新增一条公开路由必须同时改那份清单，于是它一定会出现在 diff 里。
    *

@@ -152,14 +152,14 @@ type GeeWikiPlugin = {
 
 ```ts
 register(method: 'GET'|'POST'|'PUT'|'DELETE'|'PATCH', path: string,
-         handler: RouteHandler, opts?: RouteAccessOptions): () => void   // ★ 第 4 参可省 ⇒ access:'public'
+         handler: RouteHandler, opts: RouteAccessOptions): () => void   // 第 4 参及 access 必填
 ```
 
 | 成员（`?` = 可选，向后兼容） | 签名 | 语义 / 陷阱 |
 | --- | --- | --- |
 | `register` | 见上 | `path` 支持 `:param`；返回注销函数；`opts.owner` 是**可观测性字段，非安全边界**（AP-06） |
 | `use?(hook)` | `(hook: RequestHook) => () => void` | 串行、任一 `ok:false` 短路；**不得自己写响应**；抛错视同 500；返回形态非法按**拒绝**处理；★**只对匹配到的路由执行** ⇒ 不构成全局鉴权（AP-06） |
-| `routes?()` | `() => readonly HttpRouteInfo[]` | `HttpRouteInfo { method; path; access; capability?; explicit: boolean; owner? }`；`explicit` 区分"作者写了 public"与"作者什么都没写"；`unauditedRoutes()` 挑 `!explicit`；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时启动**拒启** |
+| `routes?()` | `() => readonly HttpRouteInfo[]` | `HttpRouteInfo { method; path; access; capability?; explicit: boolean; owner? }`；`explicit` 区分显式公开与旧 JS 非严格兼容的默认值；`unauditedRoutes()` 挑 `!explicit`；严格模式在注册前拒绝遗漏，启动审计保留 |
 | `ownerStats?()` | `() => readonly RouteOwnerStats[]` | 只统计登记了 `owner` 的路由；未归因的不出现（**错误归因比没有归因更危险**） |
 | `stats()` / `inflight()` / `pending()` | — | 看门狗探针数据源；长连接**不计入** |
 | `drain(timeoutMs)` | `(ms: number) => Promise<boolean>` | 全站语义；`false` = 仍有请求在执行；插件粒度排空未实现 |
@@ -167,7 +167,10 @@ register(method: 'GET'|'POST'|'PUT'|'DELETE'|'PATCH', path: string,
 | `closeStreams?(owner?)` | `(owner?: string) => void` | 不传关全部；管理器卸载单插件时按 owner 收 |
 | `noteStreamRejected?()` | `() => void` | 并发上限是**持有者的策略**，被拒时自行上报 |
 
-`RouteAccess = 'public' | 'user' | 'admin'`（**默认 `public`**，AP-01）；`RouteAccessOptions { access?; capability?; owner? }`——`access` 与 `capability` 是**两层**（身份 vs 能力），都通过才放行。
+`RouteAccess = 'public' | 'user' | 'admin'`；`RouteAccessOptions { access; capability?; owner? }`。
+`access` 与 `capability` 是**两层**（身份 vs 能力），都通过才放行。内置路由器创建时读取严格开关，
+仅 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏（含热启用）；所有模式拒绝非法值。
+旧 JavaScript 仅在非严格模式保留默认 `public` 与启动聚合告警，迁移见 ADR-0012（AP-01）。
 `RouteHandlerContext { req; res; url: URL; params: Record<string,string>; json(status, body); noteStatus?(status); principal? }`——读 `principal` **必须失败关闭**（拿不到按匿名处理）；`noteStatus` 只记指标、不结束响应。
 `Principal { kind: 'anonymous'|'user'|'break-glass'; userId; orgId; orgRole: 'owner'|'admin'|'member'|'viewer'|null; groupIds; sessionId }`；`breakGlassPrincipal()` 受 `GEEWIKI_ADMIN_TOKEN` 控制（**未设置则完全禁用**，无默认令牌；`orgRole` 刻意 `null` ⇒ 按 `orgRole` 授权的下游默认拒绝）。
 

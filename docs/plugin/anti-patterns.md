@@ -71,7 +71,7 @@ const unregister = router.register(
 )
 ```
 
-**为什么**：`RouteAccess` 的取值是 `'public' | 'user' | 'admin'`，而 **`'public'` 是默认值**——`RouteAccessOptions` 的注释原文是"省略等价于 `{ access: 'public' }`"。这是 fail-open：忘记思考 = 公开。宿主只做**事后审计**（`unauditedRoutes()` 挑出 `explicit === false` 的路由，启动时聚合成**一条**告警；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时直接拒启），不会替你堵口。审计判据是 `HttpRouteInfo.explicit`——它区分的正是"作者写了 `access:'public'`"与"作者什么都没写"。
+**为什么**：core 要求第 4 参和 `access` 必填，内置路由器在严格模式下还会在注册前拒绝遗漏（含热启用），所有模式拒绝非法值。旧 JavaScript 在非严格模式省略声明仍默认 `'public'`：忘记思考就可能公开。启动审计用 `HttpRouteInfo.explicit` / `unauditedRoutes()` 区分显式公开和兼容默认值，聚合告警；迁移方式是补齐声明并开启 `GEEWIKI_STRICT_ROUTE_ACCESS=1`，见 ADR-0012。
 
 同时声明 `owner`：`HttpRouterService.ownerStats?()` 只统计登记了 `owner` 的路由，出问题时运维才能定位到你，而不是"未归因"。
 

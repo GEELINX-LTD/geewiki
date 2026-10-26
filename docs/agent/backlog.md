@@ -24,51 +24,25 @@
 
 ## P0
 
-### F1 · 路由访问等级默认 `public`（fail-open 默认值）
+### F1 · 旧 JavaScript 非严格路由仍默认 `public`
 
-- **严重度**：**P0**
-- **违背**：「安全可控」——默认值把「忘记写权限」变成「匿名可调用」，而不是失败。
-- **现状事实**：
-  - 类型声明：`packages/core/src/index.ts` 的 `RouteAccess = 'public' | 'user' | 'admin'`，
-    以及 `RouteAccessOptions.access?`（可选）——注释自己写明「**省略等价于 `{ access: 'public' }`**」
-    （截至 `64ff6fa` 约在第 805 / 809 行，会漂移）。
-  - 落地实现：`packages/server/src/index.ts` 注册路由处 `access: opts?.access ?? 'public'`，
-    并带一条注释说明「默认 public：只传 3 个实参的既有调用点（以及全部现存插件）行为完全不变」——
-    即这是**为兼容性刻意保留的 fail-open**。
-  - **已有强制机制（本轮复核结论：不是「零强制」，而是「半强制」）**：
-    - `packages/core/src/index.ts` 的 `HttpRouteInfo` 带 `access` / `explicit` / `owner` 三字段，
-      其中 `explicit` 的注释本身就是判据原文：「`access: 'public'` + `explicit: false` =
-      "作者没想过这件事"，需要被点名；`explicit: true` = "作者明确选择了公开"」。
-    - 同文件 `export function unauditedRoutes(routes: readonly HttpRouteInfo[]): readonly HttpRouteInfo[]`
-      —— 把「未点名」抽成可复用判据，而不是散落在告警文案里。
-    - `packages/server/src/index.ts` 的 `auditRouteAccess(router, env)` 在启动时把这些路由聚合成
-      **一条告警**（文案 `[geewiki] N/M 条路由未显式声明访问等级，正按默认 'public'（匿名可调）运行：`），
-      并在 `env[STRICT_ROUTE_ACCESS_ENV] === '1'`（即 `GEEWIKI_STRICT_ROUTE_ACCESS`）**抛错拒绝启动**；
-      组合根无条件调用 `auditRouteAccess(routerForAudit)`。
-    - 守卫：`packages/server/test/route-access-audit.test.ts` 存在（直接用 `unauditedRoutes()` 断言越界清单）。
-  - **但默认值一行未改**：`access: opts?.access ?? 'public'` 仍是 fail-open ⇒ 上面四件全部是
-    **事后审计 + 运维可选开关**，没有一件能在「作者漏写第 4 参」的当下阻止危险路由上线。
-- **严重度依据（本轮改写，原写法「完全没有强制」不准确）**：保留 **P0**，但依据改为
-  「**默认值 fail-open 未变，强制只存在于事后可审计与运维可选开关**」——默认部署不会设
-  `GEEWIKI_STRICT_ROUTE_ACCESS=1`，此时漏写权限的路径确实匿名可调，仍符合 P0 定义
-  「生产环境会静默失去访问控制保护」；缓解机制降低的是「无人发现」的概率，不是失守本身。
-- **影响**：新增路由的作者只要漏写第 4 参，该路由就**匿名可调**；单靠一条启动告警极易被忽略。
-  写操作类路由（`POST` / `PUT` / `DELETE`）一旦 fail-open，等于直接对外暴露写接口。
-- **建议改法（最小改动优先）**：
-  1. **先做只读审计**：在 `auditRouteAccess()` 里把「未显式声明」按 **HTTP 方法**与 **owner 包**分组，
-     输出「写操作里有几条匿名可调」——先量化影响面，再谈默认值。
-  2. **默认值改 fail-closed**（`?? 'user'`），并保留 `GEEWIKI_STRICT_ROUTE_ACCESS` 之外的过渡开关；
-     影响面评估口径：内置注册条目 **25 条**（`grep -c "source: 'builtin'" packages/server/src/index.ts`）、
-     默认启用 **21 条**（`config/plugins.base.example.json` 的 `enabled`），全仓 `.register(` 调用点上百处
-     （`grep -rn "router\.register(" packages/*/src`）——**逐条标注 `public` 是必要成本**。
-  3. 更便宜的中间态：只把**写方法**（非 `GET`/`HEAD`）的默认值改成 `user`，读路由维持现状。
-- **验证方式**：临时设 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 启动一次，`[geewiki] N/M 条路由未显式声明…`
-  里的 **N 必须为 0**；再跑 `packages/plugin-auth/test/e2e-p1.sh`（匿名访问受保护路由须 401/403）。
-  改默认值后需补守卫单测：断言 `register()` 省略 `access` 时解析结果不是 `public`。
-- **风险与兼容性**：**破坏性**。所有未显式声明的既有路由（含全部现存插件与只传 3 个实参的调用点）
-  行为改变 ⇒ 匿名读接口可能对未登录用户返回 401。必须配套一次性全仓标注 + 迁移说明（`docs/deployment.md` 排障节）。
-- **状态**：`部分已缓解`（F11 审计 + STRICT 开关 = **半强制**已落地；默认值未改 ⇒ 问题主体仍在）。
-  另见 `docs/plugin-platform.md`「当前限制与风险」表中同一问题（记为「中」）。
+- **严重度**：**P0**，触发条件缩小为未开启严格模式的旧 JavaScript 调用。
+- **复核日期**：2026-10-26；迁移决策见 [ADR-0012](../adr/0012-route-access-registration-validation.md)。
+- **违背**：「安全可控」——兼容窗口仍把漏写访问等级变成匿名可调用。
+- **当前事实**：
+  - `packages/core/src/index.ts` 的 `HttpRouterService.register` 第 4 参及
+    `RouteAccessOptions.access` 已必填，TypeScript 作者遗漏会在类型检查失败。
+  - `packages/server/src/index.ts` 的内置 `HttpRouter` 创建时读取严格开关，
+    `GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏，覆盖启动与插件热启用。
+  - 所有模式拒绝非法访问等级；启动审计重新抛出已被插件管理器接住的注册校验失败，避免空表通过。
+  - 旧 JavaScript 在非严格模式仍保留 `access: access ?? 'public'`；启动聚合告警继续存在。
+    这条兼容分支仍可能使漏写声明的读写端点匿名可调。
+- **剩余工作**：完成外部插件迁移评估，再决定是否默认严格或移除旧 JavaScript 的隐式公开分支。
+  不应仅把默认值改成 `user` 而不说明匿名读接口的兼容影响。
+- **现有验证**：`packages/server/test/route-access-audit.test.ts` 审计内置路由；
+  `packages/server/test/route-access-registration.test.ts` 验证严格启动、热启用拒绝、合法启停、
+  非法值拒绝、失败后端口释放及非严格兼容分支。
+- **状态**：`部分已缓解`；剩余边界与部署开关见 `docs/deployment.md` 环境变量表。
 
 ### F2 · 插件权限是纯声明，宿主完全不强制
 
@@ -695,7 +669,7 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 
 | 编号 | 一句话 | 严重度 | 违背理念 | 状态 |
 | --- | --- | --- | --- | --- |
-| F1 | 路由 `access` 省略即 `public`（fail-open 默认） | **P0** | 安全可控 | 部分已缓解 |
+| F1 | 旧 JavaScript 非严格路由省略 `access` 仍默认 `public` | **P0** | 安全可控 | 部分已缓解 |
 | F2 | 插件权限纯声明、宿主不强制（无沙箱/无配额） | **P0** | 安全可控 | 未处理 |
 | F3 | `provides` 只是依赖图 token，谎报后功能静默失效 | **P0** | 安全可控 / 可预期 | 未处理 |
 | F5 | `geewiki.slots` 与 bundle `registerSlot` 不一致 ⇒ 静默空白 | P1 | 高可扩展 | 未处理 |

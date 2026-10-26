@@ -43,8 +43,8 @@ pnpm docs:conventions # 文档规范检查，默认只报告（R1 未登记 / R2
 ## 机器不拦、但必须守住的（`ARCHITECTURE.md` §6 有完整理由）
 
 - **`eslint` 刻意不是 type-aware**，且没有 prettier / biome（ADR-0004、ADR-0008）。别为了"更严格"引入类型感知规则或格式化器。
-- **注册 HTTP 路由必须显式写 `access`**。省略第 4 参会静默变成 `public`；
-  `GEEWIKI_STRICT_ROUTE_ACCESS=1` 只在启动期审计，不是编译期保证。
+- **注册 HTTP 路由必须显式写 `access`**。core 类型要求第 4 参及 `access` 必填；
+  `GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏（含热启用），旧 JS 仅在非严格模式保留默认 `public`。
 - **插件清单的 `permissions` 是声明，不是沙箱**——进程内、无配额、无隔离（ADR-0006）。
   别写出"看起来被权限挡住了"的代码或文档。
 - **改了插槽 / Manifest / 宿主 API 就要同步 4 处**：`core` 契约、`manager` 校验、`web` 宿主镜像、文档地图。

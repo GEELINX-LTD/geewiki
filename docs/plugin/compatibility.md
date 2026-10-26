@@ -184,7 +184,7 @@ export default function SummaryCard(props) {
   ```
 
   运行期则看 `GET /api/plugins/slots` 的 `routes` / `routeConflicts` 字段。
-- `router.register()` 省略第 4 个参数 ⇒ `access: 'public'` 匿名可调；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 才拒启（`STRICT_ROUTE_ACCESS_ENV`，`packages/server/src/index.ts`）。这条与兼容无关但与"能不能挂这个路径"同源，见 [`review-checklist.md`](review-checklist.md) 硬性 gate 第一条。
+- `router.register()` 的第 4 参及 `access` 在 core 类型中必填；旧 JavaScript 非严格调用省略声明仍默认公开。`GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏（含热启用），所有模式拒绝非法访问等级。迁移时先补齐声明，再开启严格模式，见 ADR-0012 与 [`review-checklist.md`](review-checklist.md) 第一条 gate。
 
 ### 6.3 `GeeWikiClient` 只有 `{ entry?, css? }`
 

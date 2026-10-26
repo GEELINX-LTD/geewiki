@@ -160,8 +160,9 @@ const unregister = router.register('GET', '/api/my-note', handler, {
 })
 ```
 
-平台的默认值仍是 `'public'`，第三方调用漏参时，只有设置
-`GEEWIKI_STRICT_ROUTE_ACCESS=1` 才会在启动期拒绝。模板与示例已通过严格模式下的真实启动与 HTTP 回归。
+core 类型同样要求第 4 参及 `access` 必填。旧 JavaScript 仅在非严格模式保留默认 `'public'`；
+`GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏，覆盖启动与热启用。
+模板与示例已通过严格模式下的真实启动与 HTTP 回归。
 
 模板还示范了：`apply()` 里逐次 `ctx.get`、缺服务立刻抛错、返回卸载函数并撤销路由。
 

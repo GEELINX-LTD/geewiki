@@ -270,29 +270,30 @@ export interface RouterIdentityDeps {
   capabilityProbe?: (name: CapabilityName, principal: Principal) => boolean
 }
 
-/** ★ F11：严格模式的开关环境变量。设为 `1` 时，存在未显式声明访问等级的路由即**拒绝启动**。 */
+/** 严格模式开关：内置路由器在注册前拒绝遗漏访问等级，启动审计也拒绝遗漏。 */
 export const STRICT_ROUTE_ACCESS_ENV = 'GEEWIKI_STRICT_ROUTE_ACCESS'
 
 /**
  * ★ F11：启动期**全路由访问等级审计**。
  *
  * ## 审计的是"有没有人做过这个决定"，不是"公开对不对"
- * `register()` 的第 4 参可省，省略即 `access: 'public'`（匿名可调）。于是全仓几十个调用点
- * 全靠作者自觉 —— 而"**忘了写**"与"**故意公开**"在源码里长得一模一样：两种情况的 `access`
- * 都是 `'public'`，运行期也毫无痕迹。评审看不见风险，出事也追不到"这是谁定的"。
+ * TypeScript 契约要求显式声明；旧 JavaScript 在非严格模式省略声明仍为 `public`。
+ * 这里继续审计兼容调用及第三方路由器，用 `explicit` 区分隐式公开与作者明确选择。
  *
  * 所以这里点名的是 `explicit === false` 的那些，也就是"**没人明确负责**的公开"。
  * 公开本身不是问题（登录、健康检查、匿名可读的接口都该公开），**没被声明过**才是。
  *
  * ## 两种模式
  * - 默认：把清单聚合成**一条**告警（不是每条一行 —— 噪声会把告警训练成背景音）。
- * - `GEEWIKI_STRICT_ROUTE_ACCESS=1`：**拒绝启动**。给"不受信插件/合规环境"用：
- *   一个带着默认 public 上线的新端点会让进程直接起不来，而不是悄悄暴露。
+ * - `GEEWIKI_STRICT_ROUTE_ACCESS=1`：内置路由器在注册前拒绝遗漏声明；本审计
+ *   重抛启动期间的注册失败，并检查第三方路由器已登记的遗漏。
  *
  * `router.routes` 是可选方法（第三方实现可以不提供），拿不到就静默跳过 ——
  * 审计是增强，不该让不提供它的实现无法工作。
  */
 export function auditRouteAccess(router: HttpRouterServiceType, env: NodeJS.ProcessEnv = process.env): void {
+  // 插件管理器会记录 apply 失败后继续 boot；不能因失败路由未入表就空集通过。
+  if (router instanceof HttpRouter) router.assertRouteAccessRegistrations()
   const routes = router.routes?.()
   if (routes === undefined) return
   const unaudited = unauditedRoutes(routes)
@@ -372,6 +373,10 @@ function verdictDenial(raw: unknown): AccessDenial | null {
 class HttpRouter implements HttpRouterService {
   /** 已注册路由表。字段名刻意与 `routes()` 方法区分：后者是给审计用的**快照**。 */
   private readonly routeTable: RouteEntry[] = []
+  /** 固定本路由器的运行模式，热启用与启动遵守同一约束。 */
+  private readonly strictRouteAccess = process.env[STRICT_ROUTE_ACCESS_ENV] === '1'
+  /** 保留首个失败，让启动审计识别已被插件管理器接住的加载错误。 */
+  private routeAccessRegistrationError: Error | undefined
   /** ★ F12：owner → 命中其路由的请求数（进程内累计，不落盘、重启即清零） */
   private readonly ownerRequests = new Map<string, number>()
   /**
@@ -425,13 +430,23 @@ class HttpRouter implements HttpRouterService {
     handler: RouteHandler,
     opts?: RouteAccessOptions,
   ): () => void {
+    const access = opts?.access
+    const missing = access === undefined
+    const invalid = !missing && access !== 'public' && access !== 'user' && access !== 'admin'
+    if ((missing && this.strictRouteAccess) || invalid) {
+      const reason = missing ? '未显式声明 access' : 'access 必须为 public、user 或 admin'
+      const mode = this.strictRouteAccess ? `[${STRICT_ROUTE_ACCESS_ENV}=1] ` : ''
+      const error = new Error(`${mode}${method} ${path} ${reason}，拒绝注册`)
+      this.routeAccessRegistrationError ??= error
+      throw error
+    }
     const entry: RouteEntry = {
       method,
       path,
       segments: path.split('/').filter(Boolean),
       handler,
-      // 默认 public：只传 3 个实参的既有调用点（以及全部现存插件）行为完全不变
-      access: opts?.access ?? 'public',
+      // 非严格模式为旧 JavaScript 调用保留迁移窗口；core 类型已要求显式声明。
+      access: access ?? 'public',
       // ★ F11：记下"这是显式声明的还是吃了默认值"
       explicit: opts?.access !== undefined,
       // ★ F9：缺省即"不额外要求能力"——既有调用点行为完全不变
@@ -447,6 +462,11 @@ class HttpRouter implements HttpRouterService {
       const idx = this.routeTable.indexOf(entry)
       if (idx >= 0) this.routeTable.splice(idx, 1)
     }
+  }
+
+  /** 组合根启动审计使用；不属于插件可依赖的 HttpRouterService 契约。 */
+  assertRouteAccessRegistrations(): void {
+    if (this.routeAccessRegistrationError) throw this.routeAccessRegistrationError
   }
 
   /** 注册请求前置钩子；返回注销函数（幂等）。契约见 @geewiki/core 的 RequestHook。 */

@@ -27,12 +27,12 @@
 
 厂商中立是硬要求：**不要**在插件清单或默认配置里写死某家私有端点或模型名。LLM 一律经 `llm-service` 抽象（参考实现 `packages/plugin-openai/src/index.ts`：它是 `llm-service` 的"路由"而非 provider，端点/模型名全部来自配置）。本文档系列的示例统一用 `https://api.example.com/v1` 占位。
 
-### 原则三：安全可控 —— 但当前靠"可审计"，不靠"强制"
+### 原则三：安全可控 —— 访问等级有约束，权限清单仍需审计
 
 平台的安全模型是**声明 + 可见 + 可回归**，而不是沙箱：
 
 - `geewiki.permissions`（`packages/core/src/domain.ts` 的 `PLUGIN_PERMISSIONS`）是**诚实清单**，宿主**不做拦截**；
-- `router.register()` 的访问等级**默认 `'public'`**（`RouteAccess`，`packages/core/src/index.ts`），漏写第 4 参的端点匿名可调；
+- `router.register()` 在 core 类型中要求显式 `access`；严格模式在注册前拒绝遗漏，覆盖热启用。旧 JavaScript 非严格调用仍保留默认 `'public'`；
 - 插件与宿主**同进程、同权限**，无沙箱、无资源配额（`docs/plugin-platform.md` §5.1）。
 
 **代价（对你）**：审计责任在作者侧。显式写 `access`、显式写 `permissions`、显式写 `slots`——这三处"显式"是 [`review-checklist.md`](review-checklist.md) 的硬性 gate。**代价（对用户）**：清单只能保证"知道"，不能保证"没做"。这不是文档措辞问题，是架构现状，已登记在 `docs/plugin-platform.md` §5.1。
@@ -149,7 +149,7 @@ curl -s localhost:3000/api/my-note
 
 | # | 现状 | 与理念的冲突 | 作者当下该怎么做 |
 | --- | --- | --- | --- |
-| 1 | `router.register()` 省略第 4 参 ⇒ `access: 'public'`，匿名可调；启动只聚合成一条告警（`GEEWIKI_STRICT_ROUTE_ACCESS=1` 才拒启） | 与安全可控正面冲突（fail-open 默认值） | 每条路由显式声明 `access`；把审计清单变更当成 PR 的一部分（反模式 #1） |
+| 1 | 旧 JavaScript 非严格调用省略访问等级仍默认公开；core 类型已必填，严格模式注册期拒绝遗漏（含热启用） | 兼容窗口仍保留 fail-open 默认值（ADR-0012） | 补齐显式 `access` 后开启严格模式；审计清单变更进入评审（反模式 #1） |
 | 2 | `geewiki.permissions` **不被宿主强制**，未知取值只告警不阻断 | "可控"退化为"可评审" | 诚实声明；不要把它当能力开关（反模式 #2） |
 | 3 | `geewiki.provides` 只是依赖图 token，**不创建 cordis 服务**；谎报 ⇒ 依赖方 `ctx.get()` 拿到 `undefined` 后静默失效 | 插件间契约不可验证 | `provide()` 与 `provides` 必须同名同存（反模式 #3；口径见 `packages/plugin-echo/src/index.ts`） |
 | 4 | `geewiki.slots` 与 bundle 实际注册不一致 ⇒ **静默空白，无报错**；只声明 `routes` 不 `registerRoute` 同理（有占位但仍是你的问题） | 万物皆插件的可组合性缺自证手段 | 提交前用 `GET /api/plugins/slots` 与 `GET /api/plugins/ui` 自查（反模式 #4） |
