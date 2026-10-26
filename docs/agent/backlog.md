@@ -120,47 +120,6 @@
 - **风险与兼容性**：只新增 skipped 原因项 ⇒ 低风险；注意别把「bundle 尚未加载完成」误报成不一致。
 - **状态**：`未处理`。
 
-### F6 · 4 个安全/运维相关环境变量此前查无文档
-
-- **严重度**：**P1**（本轮已补文档，行为未变）
-- **违背**：「安全可控」依赖「可配置且可发现」；文档纪律要求配置项有唯一权威出处。
-- **现状事实**（语义均已回源码核实；**核实前 README.md 与 docs/deployment.md 的环境变量表里都没有这四个**）：
-  | 变量 | 消费者（符号） | 语义 | 默认 |
-  | --- | --- | --- | --- |
-  | `GEEWIKI_ADMIN_TOKEN` | `packages/server/src/index.ts` 的 `ADMIN_TOKEN_ENV` / `envAdminToken()` | break-glass 令牌；头 `x-gw-admin-token` 或 `Authorization: Bearer <token>`；**未设置 = 整条通道禁用**（无回退值，空串也算未启用）；每次使用打 stdout 结构化行 + `writeAuditLog({ action: 'access.break_glass' })`；未配令牌时受保护端点返回 **503 `bootstrap_required`**（不是 401） | 未设置（禁用） |
-  | `GEEWIKI_STRICT_ROUTE_ACCESS` | 同文件 `STRICT_ROUTE_ACCESS_ENV` + `auditRouteAccess()` | `1` ⇒ 存在未显式声明 `access` 的路由时**拒绝启动** | 未设置（只告警） |
-  | `GEEWIKI_BACKUP_DIR` | `packages/manager/src/index.ts` 的 `createBackup()`（restore 路径同样读一次） | 备份/恢复的默认输出目录 | `<仓库根>/backups` |
-  | `GEEWIKI_OPENAI_DEBUG` | `packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()` | **默认开启**；设为 `0` 才关闭上游错误诊断日志 | 开启 |
-- **影响**：运维不知道有 break-glass 通道（既可能漏配，也可能配了不知道有审计）；
-  不知道 `GEEWIKI_OPENAI_DEBUG` **默认在打诊断日志**，等于默认多一个日志出口。
-- **建议改法**：见任务三第 5 条——**本轮已把四者写进 README.md 与 docs/deployment.md 的变量表**
-  （`GEEWIKI_ADMIN_TOKEN` 标注为 break-glass + 风险）。
-- **验证方式**：`grep -c 'GEEWIKI_ADMIN_TOKEN\|GEEWIKI_STRICT_ROUTE_ACCESS\|GEEWIKI_BACKUP_DIR\|GEEWIKI_OPENAI_DEBUG' README.md docs/deployment.md` ⇒ 均 ≥ 4。
-- **风险与兼容性**：无（纯文档）。
-- **状态**：`本轮已修（文档）`（**本轮复核：上一轮标为「已修」时并未真正落地**——动手前
-  `grep -c 'GEEWIKI_ADMIN_TOKEN\|GEEWIKI_STRICT_ROUTE_ACCESS\|GEEWIKI_BACKUP_DIR\|GEEWIKI_OPENAI_DEBUG' README.md docs/deployment.md`
-  返回 `README.md:0`、`docs/deployment.md:0`；本轮才把四个变量真正写进两处表格）。
-  另注：本条表中 `GEEWIKI_ADMIN_TOKEN` 那行的「未配令牌时受保护端点返回 503」应读作
-  「**完全没有凭据来源**时才 503 `bootstrap_required`」（`judgeAccess` 的判据是
-  `credentialSourceAvailable`，P1 起还包含库里是否有可登录账号）；已有账号时未配 break-glass
-  令牌走正常 401/403，**不会** 503。**修好复核后请删除本条**。
-
-### F7 · `GEEWIKI_OPENAI_DEBUG` 默认开启诊断日志
-
-- **严重度**：**P1**（与 F6 同源，但这是**行为**问题，不随文档补齐而消失）
-- **违背**：「安全可控」的默认值取向（安全默认应当是「显式开启才多说话」）。
-- **现状事实**：`packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()` 实现为
-  `process.env['GEEWIKI_OPENAI_DEBUG'] !== '0'` —— 即**只有显式设成 `'0'` 才关闭**；
-  其它任何取值（含未设置）都在上游请求失败时输出诊断日志。
-- **影响**：上游错误日志可能包含请求上下文（模型名、上游 baseUrl、错误体）；
-  在共享日志聚合环境里属于「默认外泄面 > 预期」。
-- **建议改法（最小改动）**：把判据反转为默认关（`=!= '1'`），或在 README「接入模型」一节显著标注默认开
-  ——**取向由维护者定**，但「默认开 + 文档此前没写」这个组合必须先消掉（F6 已消掉文档部分）。
-- **验证方式**：默认环境（不设变量）触发一次上游 4xx，确认是否落日志与内容项；反转默认后单测
-  `configLogEnabled()` 的三种取值（未设置 / `'0'` / `'1'`）。
-- **风险与兼容性**：反转默认会让排障习惯改变（需要显式设 `=1`）⇒ 属**行为变更**，本轮**不做**，仅登记。
-- **状态**：`未处理`。
-
 ### F8 · 出厂配置模板写死私有端点与私有模型名
 
 - **严重度**：**P1**
@@ -544,7 +503,7 @@
 - **违背**：「事实只有一个真源」。
 - **现状事实**：`docs/plugin-platform.md` 已有一张「当前限制与风险」表，用「中/低」分级记录了
   路由默认 public、插件无隔离、`config/secrets.json` 明文（0600）、ESM 永不回收、`provide` 时序陷阱等
-  ——与 F1 / F2 / F7 / F22 / F23 **话题重合**。
+  ——与 F1 / F2 / F22 / F23 **话题重合**。
 - **建议改法**：确定分工——**plugin-platform 记「设计边界与有意不做」，本台账只记「未修的整改项 + 最小改法 +
   验证方式」**，并在两处互相加一行链接（本台账已在此条声明；plugin-platform 侧的指向行本轮已加）。
   条目修好后：plugin-platform 保留结论，本台账删除条目。
@@ -616,7 +575,7 @@
 
 - **严重度**：**P2**
 - **违背**：「事实真源」纪律（有码无表）。
-- **现状事实**：本轮全量枚举 `GEEWIKI_*` 并在补齐 F6 那 4 个变量之后，**唯一**仍「代码有读、
+- **现状事实**：本轮全量枚举 `GEEWIKI_*` 并补齐安全/运维变量文档之后，**唯一**仍「代码有读、
   README / `docs/deployment.md` 两处真源表都没有」的是
   `scripts/acceptance/search-mode/run.ts` 的 `if (process.env['GEEWIKI_KEEP_TMP'] === '1')`（唯一消费者）。
   另有刻意分层的前缀 `GEEWIKI_TEST_*` / `GEEWIKI_LLM_*` / `GEEWIKI_E2E_*`（测试与联调专用），
@@ -673,8 +632,6 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F2 | 插件权限纯声明、宿主不强制（无沙箱/无配额） | **P0** | 安全可控 | 未处理 |
 | F3 | `provides` 只是依赖图 token，谎报后功能静默失效 | **P0** | 安全可控 / 可预期 | 未处理 |
 | F5 | `geewiki.slots` 与 bundle `registerSlot` 不一致 ⇒ 静默空白 | P1 | 高可扩展 | 未处理 |
-| F6 | 4 个安全/运维环境变量此前查无文档 | P1 | 安全可控 | 本轮已修（文档） |
-| F7 | `GEEWIKI_OPENAI_DEBUG` 默认开启诊断日志 | P1 | 安全可控 | 未处理 |
 | F8 | 出厂模板写死私有端点与私有模型名 | P1 | 不绑厂商 | 本轮处理 |
 | F9 | `description` 仍写「Phase 0 骨架」、`0.1.0`、无根 CHANGELOG | P1 | 对外一致性 | 未处理 |
 | F10 | `docs/README.md` 文档地图漏登 4 篇 | P1 | 事实真源纪律 | 本轮已修（文档） |

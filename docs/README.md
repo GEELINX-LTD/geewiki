@@ -90,6 +90,7 @@ docs/
 | [adr/0010-write-preconditions-and-startup-readiness.md](adr/0010-write-preconditions-and-startup-readiness.md) | 页面保存前置条件、主体写入入口、标准部署必要服务与核心流程门禁的决策（状态 `accepted`） | 只记录取舍；保存契约以 core 为准，部署操作见 deployment，验收接线见 ci-cd |
 | [adr/0011-postgres-write-integration-gate.md](adr/0011-postgres-write-integration-gate.md) | 真实 PostgreSQL 并发写入进入既有 test 作业的决策（状态 `accepted`） | 只记录门禁取舍与代价；命令、环境和覆盖范围以 ci-cd 为准 |
 | [adr/0012-route-access-registration-validation.md](adr/0012-route-access-registration-validation.md) | 路由声明类型约束、注册期校验与旧 JavaScript 迁移窗口（状态 `accepted`） | 只记录安全与兼容取舍；契约以 core 为准，部署开关见 deployment |
+| [adr/0013-openai-diagnostics-opt-in.md](adr/0013-openai-diagnostics-opt-in.md) | 上游错误诊断改为显式开启的决策（状态 `accepted`） | 只记录默认值取舍与脱敏边界；变量用法以 deployment 为准 |
 | [design/ui-extension-platform.md](design/ui-extension-platform.md) | **界面扩展平台契约定稿**：可被替换 / 包裹 / 扩展的节点目录、三种模式语义、多插件共存裁决、主题令牌 | 界面扩展的**设计**真源。实际取值与允许模式以源码为凭：`packages/core/src/extensions.ts` 与 `packages/core/src/slots.ts`（见真源表） |
 | [design/block-attribution.md](design/block-attribution.md) | **块级归属**：谁最后改了哪一块——归属模型、写入时机、呈现方式 | 只管「归属」。权限判定在 [design/access-control.md](design/access-control.md)，别在这里找可见性规则 |
 | [design/dock-images.md](design/dock-images.md) | 输入条（dock）的**图片输入**：设计、现状、未做项 | 只管图片输入。dock 作为 AI 唯一对话入口的契约在 [plugin-platform.md](plugin-platform.md) 与 `packages/plugin-ai-assistant` |

@@ -5,8 +5,8 @@
  * 1. **零新增依赖**：用 Node 22 全局 `fetch` + 手写 SSE 切帧（见 `sse.ts`）。
  * 2. **绝不重试**：重试涉及退避/配额/幂等，属独立层职责（`@geewiki/llm` 契约明文规定）。
  *    在这里偷偷重试会让上层无法判断一次失败到底消耗了多少配额。
- * 3. **密钥绝不进日志**：任何要落地到日志的上游文本先过 `redact`；本模块也不把密钥
- *    放进请求之外的任何字符串（URL 里没有 key，只有 header）。
+ * 3. **上游错误诊断仅显式开启**：错误体落日志前过 `redact`（启发式，非完整保证）；
+ *    本模块不主动记录请求体，凭据只放在上游请求头。
  * 4. **本适配器不持有任何配置**（本批的产品裁决）：端点、模型、超时、思考强度等
  *    一律在每次请求时经 `settings()` **现读** `llm-service` 的统一配置。
  *    由此"改配置 → 立即生效"不需要重启，也不需要适配器参与热更新。
@@ -496,7 +496,7 @@ export function createOpenAiProvider(options: OpenAiProviderOptions): LlmProvide
   return { route: options.route, descriptor, stream }
 }
 
-/** 上游错误的诊断日志开关（默认开；设 GEEWIKI_OPENAI_DEBUG=0 可关闭） */
+/** 上游错误诊断默认关闭；仅精确的 GEEWIKI_OPENAI_DEBUG=1 开启（ADR-0013） */
 function configLogEnabled(): boolean {
-  return process.env['GEEWIKI_OPENAI_DEBUG'] !== '0'
+  return process.env['GEEWIKI_OPENAI_DEBUG'] === '1'
 }
