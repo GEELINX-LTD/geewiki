@@ -1433,6 +1433,8 @@ export interface ServerOptions {
   /** 外部插件目录（默认 GEEWIKI_PLUGINS_DIR 或仓库根下 plugins/；null = 不启用外部插件发现） */
   pluginsDir?: string | null
   registry?: RegisteredPlugin[]
+  /** 启动必须可用的服务；自定义注册表缺省不强制完整 Wiki 依赖。 */
+  requiredServices?: readonly string[]
 }
 
 /** startServer 传给 http 插件的启动期默认值（清单内未显式配置端口/地址时生效） */
@@ -1907,44 +1909,60 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
   // ——**在一个插件 apply 尚未结算时 provide 的服务，对它在此期间创建的子插件不可见**，
   // 而 boot() 恰恰是在管理器的 apply 内部激活插件。前移为独立插件后它的 apply 先结算，
   // 服务即对管理器及其 boot 出来的插件可见（与 db-sqlite / http 作为兄弟插件同理）。
-  await app.plugin(slotPlugin)
+  try {
+    await app.plugin(slotPlugin)
 
-  // ★ F9：能力服务插件**同样必须先于管理器装载**（理由与上一段逐字相同，实测同源）：
-  // 若由管理器在自己 apply 里 provide，插件 apply 期的 `ctx.get('capability-service')`
-  // 是 undefined，它的能力注册会被**静默跳过** —— 那是一道永远 403 的闸门 + 干净得可疑的日志。
-  await app.plugin(capabilityPlugin)
+    // ★ F9：能力服务插件**同样必须先于管理器装载**（理由与上一段逐字相同，实测同源）：
+    // 若由管理器在自己 apply 里 provide，插件 apply 期的 `ctx.get('capability-service')`
+    // 是 undefined，它的能力注册会被**静默跳过** —— 那是一道永远 403 的闸门 + 干净得可疑的日志。
+    await app.plugin(capabilityPlugin)
 
-  const managerFiber = await app.plugin(PluginManagerPlugin, {
-    registry: built.registry,
-    // 发现期问题（跳过的插件目录等）透出到 GET /api/plugins 的 issues 字段
-    discoveryIssues: built.issues,
-    // ★ F17：插件目录的解析规则在这里有唯一实现，故由组合根传给管理器（供完整性校验用）
-    pluginsDir: pluginsRoot,
-    // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
-    baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
-    sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
-    // `role: 'secret'` 字段（如模型 API 密钥）的落盘位置：与清单同目录，已被 .gitignore 忽略，
-    // 绝不写进入库的 plugins.*.json（见 packages/manager/src/secrets.ts 的文件头）
-    secretsFile: resolveProjectPath(join(configDir, 'secrets.json'), import.meta.url),
-    crashMarkerFile,
-    // 入口表的第二候选根（<pluginUiDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
-    webDist,
-    pluginUiDist,
-  })
+    const managerFiber = await app.plugin(PluginManagerPlugin, {
+      registry: built.registry,
+      // 发现期问题（跳过的插件目录等）透出到 GET /api/plugins 的 issues 字段
+      discoveryIssues: built.issues,
+      // ★ F17：插件目录的解析规则在这里有唯一实现，故由组合根传给管理器（供完整性校验用）
+      pluginsDir: pluginsRoot,
+      // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
+      baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
+      sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
+      // `role: 'secret'` 字段（如模型 API 密钥）的落盘位置：与清单同目录，已被 .gitignore 忽略，
+      // 绝不写进入库的 plugins.*.json（见 packages/manager/src/secrets.ts 的文件头）
+      secretsFile: resolveProjectPath(join(configDir, 'secrets.json'), import.meta.url),
+      crashMarkerFile,
+      // 入口表的第二候选根（<pluginUiDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
+      webDist,
+      pluginUiDist,
+    })
 
-  /*
-   * ★ F11：**全路由审计**必须在管理器结算之后跑 —— 路由是在各插件的 `apply` 里注册的，
-   * 而插件由管理器在这一步之前 boot 出来。放在更早的位置会审计到一张空表，
-   * 于是"审计通过"与"什么都没审计"变得无法区分（这正是审计类代码最容易变成摆设的方式）。
-   */
-  const routerForAudit = app.get('http') as HttpRouterServiceType | undefined
-  if (routerForAudit) auditRouteAccess(routerForAudit)
+    const requiredServices = options.requiredServices ?? (options.registry ? [] : [
+      'http', 'db', 'auth-service', 'policy-service', 'wiki-service',
+    ])
+    const missing = requiredServices.filter((name) => !app.get(name))
+    if (missing.length > 0) {
+      throw new Error(`[server] 必要服务未就绪: ${missing.join(', ')}；请检查插件清单与启动日志`)
+    }
 
-  return {
-    app,
-    dispose: async () => {
-      await managerFiber.dispose()
-    },
+    /*
+     * ★ F11：全路由审计必须在管理器结算之后执行，避免审计到尚未注册路由的空表。
+     */
+    const routerForAudit = app.get('http') as HttpRouterServiceType | undefined
+    if (routerForAudit) auditRouteAccess(routerForAudit)
+
+    return {
+      app,
+      dispose: async () => {
+        await managerFiber.dispose()
+        await app.fiber.dispose()
+      },
+    }
+  } catch (err) {
+    try {
+      await app.fiber.dispose()
+    } catch (cleanupErr) {
+      console.error('[server] 启动失败后的清理失败:', cleanupErr)
+    }
+    throw err
   }
 }
 

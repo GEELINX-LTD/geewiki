@@ -123,31 +123,6 @@
 - **风险与兼容性**：新增告警为**非阻断** ⇒ 兼容；若在解析阶段直接拒绝启动则会打断既有部署（不建议）。
 - **状态**：`未处理`。
 
-### F4 · 空 `config` 挂载 ⇒ 空清单 ⇒ HTTP 不监听 ⇒ 静默重启循环（退出码 0）
-
-- **严重度**：**P0**
-- **违背**：「极致轻量」不等于「静默失败」；Docker 部署的主要路径上有一个踩了就静默的坑。
-- **现状事实**：
-  - 触发条件（**已在 `docker-compose.yml` 的注释与 `docs/deployment.md` 中如实写明**）：
-    把 `GEEWIKI_CONFIG_DIR` 指向不存在/空目录（常见于把宿主空目录 bind 进 `/app/config` 遮蔽了镜像内置模板）。
-  - 症状（`docs/deployment.md` 原文记录）：日志里只剩一行
-    `[@geewiki/manager] http 路由服务不可用：REST API 未挂载`，**进程退出码 0**，
-    被 `restart: unless-stopped` 反复拉起 ⇒ 端口永不监听、无错误堆栈。
-  - 镜像内置真源：`/app/config/plugins.base.json`（当前默认启用 21 条，口径见 `config/plugins.base.example.json`）。
-- **影响**：容器状态显示 `Up`、健康检查失败但**没有任何一条日志说明原因**；
-  排障者会先怀疑网络/端口，而真因是「配置目录被遮蔽 ⇒ 清单为空 ⇒ manager 没有 http 服务」。
-- **建议改法（最小改动优先）**：
-  1. 启动期判定「清单为空**且**镜像/默认模板本应存在」⇒ 直接 **fail-fast**：打印明确原因并以非 0 退出，
-     让 `restart:` 策略在日志里暴露问题（改动集中在 manager 启动装配处）；
-  2. 更保守：至少把 `REST API 未挂载` 从 `logger.warn` 升级为带修复指引的 error（写明
-     「`GEEWIKI_CONFIG_DIR` 指向的目录没有清单文件；容器内请检查是否被空卷遮蔽，模板在 `/app/config/plugins.base.json`」）。
-- **验证方式**：`GEEWIKI_CONFIG_DIR=/tmp/nope pnpm run start` ⇒ 期望非 0 退出 + 一条含 `plugins.base.json`
-  字样的错误；compose 场景下 `docker compose ps` 应显示 restarting 而不是 `Up`。
-  可加守卫单测：空清单 + 无模板 ⇒ 启动结果带明确错误码（复用 `packages/manager/test/`）。
-- **风险与兼容性**：`plugins: []`（**有意**全关插件）是合法配置，**不能被误判为错误** ⇒
-  fail-fast 的判据必须是「清单文件缺失 / 目录不可读」，而不是「enabled 为空」。
-- **状态**：`未处理`（现状：文档已写明，行为仍静默）。
-
 ---
 
 ## P1
@@ -751,13 +726,13 @@ git log --all -S'TRUST_PROXY'                                                   
 
 ```bash
 docker compose ps                                    # healthy / unhealthy / restarting
-docker compose logs --tail=200 <service>             # 先看是否有 F4 的「REST API 未挂载」
+docker compose logs --tail=200 <service>             # 先核对必要服务未就绪与插件激活错误
 docker inspect --format '{{json .State.Health}}' <container> | head -c 2000   # 取最后一次探测输出
 docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_PORT||3000)+'/api/health').then(r=>r.json()).then(j=>console.log(JSON.stringify(j)))"
 # 期望 {"ok":true,"db":{"present":true,…}}；db.present=false ⇒ 迁移未落（见 docs/development.md §1 的轮询配方）
 ```
 
-- **状态**：`未能复现`（若上述运行时验证真的复现 unhealthy，请把结论按 F4 或新开条目登记）。
+- **状态**：`未能复现`（若上述运行时验证真的复现 unhealthy，请登记新条目）。
 
 ---
 
@@ -768,7 +743,6 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F1 | 路由 `access` 省略即 `public`（fail-open 默认） | **P0** | 安全可控 | 部分已缓解 |
 | F2 | 插件权限纯声明、宿主不强制（无沙箱/无配额） | **P0** | 安全可控 | 未处理 |
 | F3 | `provides` 只是依赖图 token，谎报后功能静默失效 | **P0** | 安全可控 / 可预期 | 未处理 |
-| F4 | 空 config 挂载 ⇒ 空清单 ⇒ 不监听 ⇒ 退出码 0 重启循环 | **P0** | 安全可控 / 可运维 | 未处理（文档已写明） |
 | F5 | `geewiki.slots` 与 bundle `registerSlot` 不一致 ⇒ 静默空白 | P1 | 高可扩展 | 未处理 |
 | F6 | 4 个安全/运维环境变量此前查无文档 | P1 | 安全可控 | 本轮已修（文档） |
 | F7 | `GEEWIKI_OPENAI_DEBUG` 默认开启诊断日志 | P1 | 安全可控 | 未处理 |
@@ -796,9 +770,4 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F29 | 「插件编辑器不能上传附件」的四处过期表述（F5 落地后未回收） | P2 | 事实真源纪律 | 部分已缓解（文档 1 处已改） |
 | F30 | `GEEWIKI_KEEP_TMP` 有码无表（验收脚本开关） | P2 | 事实真源纪律 | 未处理 |
 
-**分布（不含 F26）**：**P0 4 条 / P1 11 条 / P2 14 条，共 29 条**。
-其中本轮新增 4 条：F27 / F28（P1）、F29 / F30（P2）——F27+F28+F29 使分布为 4 / 11 / 13 = 28，
-F30 是按「有码无表一并登记」的要求追加的第 4 条（故 P2 到 14）。
-其中 `本轮已修（文档）` 4 条（F6 / F10 / F11 / F14）、`本轮处理`（他人，不在本代理范围）2 条（F12 / F13）、
-`本轮已加指向行 / conventions 层已规避` 2 条（F25 / F18）、**`未处理` 15 条**、
-其中 **3 条需要维护者决策或授权**（F17 是否顺手改文档、F19 措辞是否收紧、F21 发布策略）。
+条目数量、严重度和处理状态以上表为准；已修条目移出本台账，当前行为记入对应真源文档。

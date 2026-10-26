@@ -36,6 +36,8 @@ export interface FiberLike {
 
 declare module 'cordis' {
   interface Context {
+    /** 当前上下文的运行期句柄；根上下文也可通过它释放全部注册资源。 */
+    fiber: FiberLike
     /** `db` 服务：由 @geewiki/db-sqlite 提供；消费方插件需声明 inject: ['db'] */
     db: DatabaseAdapter
 

@@ -99,7 +99,12 @@ GEEWIKI_WEB_DIST=/app/packages/web/dist
 - **挂载目标必须是 `/app/plugins`**（只比 `/app` 深一层）：插件内的裸模块说明符（如 `import ... from 'cordis'`）要沿 `node_modules` 逐级上溯才能命中部署树 `/app/node_modules`，挂得更深就会 `ERR_MODULE_NOT_FOUND`。
 - **插件应自带扁平、可读的 `node_modules`**，不要使用指向宿主 pnpm store 的 symlink：pnpm 严格布局下顶层 `node_modules` 没有传递依赖的直接链接，插件若 `import` 传递依赖（例如 `better-sqlite3`）会解析失败（第 5 节热备份命令记录了同类实测：裸 `require('better-sqlite3')` 抛 `MODULE_NOT_FOUND`）。
 - 宿主 `./plugins` 的属主需与容器内用户一致（同 `./data`、`./config`，见第 3 节）。
-- 配置文件同理：镜像内**自带** `config/plugins.base.json`（默认基础层清单），但一旦把 `./config` 挂载到 `/app/config`，就以宿主目录为准 —— 宿主目录为空时应用会读到"空清单"，导致**没有任何插件被激活**：HTTP 不监听，进程以退出码 0 结束，再被 `restart: unless-stopped` 反复拉起，形成静默重启循环（见第 9 节）。
+- 配置目录挂载后以宿主内容为准，空目录会遮蔽镜像内的默认模板，使管理器读到空清单。
+  标准部署会在启动末尾检查必要服务；缺少 HTTP、数据库、认证、策略或 Wiki 服务时，
+  清理已启动资源并以非 0 退出，日志列出缺少的服务与清单检查提示（见第 9 节）。
+  该检查只保证启动时服务可用，运行期健康探针仍按既有语义执行。
+  嵌入式或测试宿主可通过 `ServerOptions.requiredServices` 明确声明所需服务；
+  自定义 `registry` 缺省不强制标准 Wiki 组合。
 
 ---
 
@@ -114,9 +119,8 @@ GEEWIKI_WEB_DIST=/app/packages/web/dist
 两种处理方式，任选其一：
 
 > ⚠️ **挂载会覆盖镜像里的默认清单模板**。镜像只带 `config/plugins.base.example.json`，而
-> `./config:/app/config` 这个绑定挂载会把它挡住：**宿主目录若为空，容器就读到空清单** ⇒ 没有任何插件
-> 被激活 ⇒ HTTP 不监听 ⇒ 进程以退出码 0 结束被 restart 策略反复拉起（日志里只剩「http 路由服务不可用：
-> REST API 未挂载」）。首次部署请让宿主 config 目录至少有一份清单：
+> `./config:/app/config` 这个绑定挂载会把它挡住：**宿主目录若为空，容器就读到空清单**。
+> 标准部署会报告「必要服务未就绪」，清理资源并以非 0 退出。首次部署请让宿主 config 目录至少有一份清单：
 > `mkdir -p config && cp config/plugins.base.example.json config/plugins.base.json`（或只留模板那份，
 > 运行期代码在 live 文件缺失时会回退读模板）。
 
@@ -402,8 +406,8 @@ compose 只会构建、不会拉取**（`image:` 仅作为构建产物的名字�
 | 现象 | 原因与处理 |
 | --- | --- |
 | 启动即退出，日志含 `[@geewiki/http] 监听失败:` | 宿主端口被占用（退出码 1，不写崩溃标记）。改 `GEEWIKI_HOST_PORT` 或释放端口：`ss -ltnp \| grep 3000` |
-| 服务在跑但页面接口全部 404；`/api/health` 里 `db.present` 为 `false`；插件列表中 `@geewiki/db-sqlite` 为 `state: error` | 数据目录不可写（SQLite 建不了库）。插件激活失败不影响主进程启动，因此接口照常响应：`/api/health` 仍返回 **HTTP 200** 但 `db.present:false`，业务接口全部 404；镜像 HEALTHCHECK 会据此把容器标为 **`unhealthy`**（间隔 30s × 3 次后）。按第 3 节 chown，或用 `GEEWIKI_UID/GID` 对齐宿主用户 |
-| 日志出现 `[@geewiki/manager] http 路由服务不可用：REST API 未挂载`，所有接口 404 | 配置目录中缺少 `plugins.base.json`（或其中 `enabled` 为空）→ 没有任何插件被激活。从仓库复制一份：`cp config/plugins.base.json <配置目录>/`。**容器内**注意两点：镜像已自带 `/app/config/plugins.base.json`，但你若把 `./config`（宿主空目录）挂到 `/app/config`，镜像内那份就被遮蔽了，必须自己放入该文件；反之完全不挂载 config 时（`docker run` 只挂 data）镜像自带的默认清单会生效，服务照常起来 |
+| 启动报 `[server] 必要服务未就绪: db`，此前日志含数据库打开或迁移失败 | 标准部署要求数据库可用，数据目录不可写或迁移失败会使启动失败。先按第 3 节修正目录属主，或用 `GEEWIKI_UID/GID` 对齐宿主用户；修复迁移错误后重启。自定义最小宿主与运行期停用数据库仍应检查 `/api/health` 的 `db.present`，不能只看 HTTP 200。 |
+| 日志出现 `[server] 必要服务未就绪`，启动后立即退出 | 检查日志列出的服务及插件激活错误。空配置目录会遮蔽镜像模板；确保目录中有可用的 `plugins.base.json` 或 `plugins.base.example.json`，并启用 HTTP、数据库、认证、策略与 Wiki 依赖。数据目录权限或迁移错误也会导致对应服务缺失。修复配置后重启；自定义最小宿主应显式指定 `requiredServices`。 |
 | 启用 `--profile production` 后 `postgres` 容器立即退出，日志含 `Error: Database is uninitialized and superuser password is not specified.` | 未提供 `DB_PASSWORD`。compose 中该变量写成 `${DB_PASSWORD:-}` 只是为了避免未启用 profile 时每条命令都告警；实际启用时为空串会被 postgres 官方镜像拒绝（安全失败，不会造出弱密码实例）。在 `.env` 中写入 `DB_PASSWORD=强密码` 后重试。未启用该 profile 时不会再出现该告警 |
 | 启动即退出，日志含 `Error: EACCES: permission denied, open '/app/package.json'` | pnpm deploy 生成的部署树中少量文件权限为 `600`（仅 root 可读），非 root 运行时读取 `package.json` 会被拒绝。镜像已在构建末尾用 `find` 只给**缺少全局读位/进入位**的条目补 `o+rX`（见 `Dockerfile` 的权限归一化步骤）；自行改写 Dockerfile 或更换基础镜像时请保留该步骤 |
 | 插件页「启用/持久化」报错 | `./config` 不可写（需要写 `plugins.session.json`），同上处理 |
@@ -458,7 +462,9 @@ docker compose stop && docker inspect -f '{{.State.ExitCode}}' $(docker compose 
 
 ### 外部插件与容器集成的复验（同一环境）
 
-- **未挂载 config 卷不再是"死壳"**：不挂 `./config` 直接 `docker run --rm -d -p 3100:3000 geewiki:bc` 时，`/api/health` 返回 `{"ok":true,...,"db":{"present":true}}`。镜像内的 `/app/config/plugins.base.json`（`node:node`；**内容即仓库根 `config/plugins.base.json`，当前默认启用 21 条内置插件**）由构建阶段的 `COPY --from=builder /src/config /app/config` 带入。**反证**：把配置目录指向不存在的路径（`-e GEEWIKI_CONFIG_DIR=/tmp/emptycfg`）时，日志只剩 `[@geewiki/manager] http 路由服务不可用：REST API 未挂载（@geewiki/http 未在清单中？）`，进程以**退出码 0** 结束（`status=exited exit=0`）、端口无监听，随后会被 `restart: unless-stopped` 反复拉起——静默重启循环，这正是镜像必须自带默认清单的原因。
+- **未挂载 config 卷不再是"死壳"**：镜像自带默认模板，不挂 config 卷时会按模板激活。
+  早期空配置目录曾导致退出码 0 的静默重启；该历史行为已由 ADR-0010 的标准部署必要服务检查取代。
+  当前空配置会清理资源并非 0 退出；镜像构建的历史验证不能替代当前启动测试。
 - **外部插件在容器内被发现并可热插拔**：挂载 `./plugins`、`./config` 与数据目录后启动，日志出现 `[server] 外部插件目录: /app/plugins` 与 `[manager:discovery] 已发现外部插件 @geewiki-plugin/hello@0.1.0（hello-geewiki）`；`/api/plugins` 列出全部内置插件 + 该外部插件（当前内置 25 注册 / 21 默认启用）；`POST /api/plugins/@geewiki-plugin%2Fhello/enable` 返回 `state:active, layer:session`，其自带路由 `GET /api/hello` 返回插件响应；`disable` 后该路由回到 404，宿主 `config/plugins.base.json` 与 `plugins.session.json` 的 md5 与操作前一致。
 - **工作目录无关性**：以 `--entrypoint tsx geewiki:bc /app/src/index.ts -w /tmp` 启动（即覆盖工作目录）时，镜像内置的 `GEEWIKI_PLUGINS_DIR=/app/plugins` 仍使发现根为 `/app/plugins`、发现 1 个外部插件；作为反证，显式传相对值 `-e GEEWIKI_PLUGINS_DIR=plugins` 时发现根变为 `/tmp/plugins`、发现 0 个插件且**不报任何错**（`/api/plugins` 只剩内置插件——当前 25 条）——这正是镜像内必须固化绝对路径的原因。
 

@@ -523,7 +523,7 @@ test('ServerOptions.port/host：默认注册表按启动选项绑定端口（不
       )}\n`,
       'utf8',
     )
-    handle = await startServer({ port, host: '127.0.0.1', configDir, webDist: null })
+    handle = await startServer({ port, host: '127.0.0.1', configDir, webDist: null, requiredServices: ['http', 'db', 'wiki-service'] })
     await waitForHealth(port)
     const res = await fetch(`http://127.0.0.1:${port}/api/health`)
     assert.equal(res.status, 200, `启动选项指定的端口 ${port} 应真的在服务`)

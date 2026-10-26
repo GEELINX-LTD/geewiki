@@ -409,6 +409,7 @@ async function startSplitRootFixture(withPluginUiDist: boolean): Promise<SplitRo
     port,
     host: '127.0.0.1',
     configDir,
+    requiredServices: ['http'], // 静态资源夹具有意只装载 HTTP 与 UI 插件。
     webDist: appRoot,
     pluginsDir: pluginsRoot,
     ...(withPluginUiDist ? { pluginUiDist: uiRoot } : {}),
