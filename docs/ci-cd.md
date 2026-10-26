@@ -102,6 +102,22 @@ node scripts/acceptance/run-plugin-ui-diagnostics.mjs --dev
 启动过早失败时可能只有进程日志，没有截图。核心流程仍执行 `pnpm acceptance:core` 并使用独立 artifact。
 门禁归属与取舍见 [ADR-0017](adr/0017-plugin-ui-browser-gate.md)。
 
+### 2.3 备份恢复验收
+
+备份恢复用例随普通 `pnpm test` 进入现有 `test` 作业，无需运行中的本机服务器。
+定向复现：
+
+```bash
+node --import tsx --test packages/manager/test/backup.test.ts packages/manager/test/backup-restore-safety.test.ts packages/server/test/backup-paths.test.ts
+```
+
+覆盖自定义目录的真实 CLI/HTTP 备份、在线 WAL 快照、完整预检、符号链接与目标冲突拒绝、
+暂存与提交故障、双目录回退和回退失败时的原状留底。
+集成用例在临时目录启动服务并写入页面，在线备份后停服、经 CLI 恢复，再启动并读取页面，
+核对历史、附件、配置和 SQLite 完整性。所有数据与密钥均为合成样本，结束后清理实例和目录。
+命令和操作边界以 [deployment.md](deployment.md) §5.1 为准，回退取舍见
+[ADR-0018](adr/0018-offline-restore-preflight-and-rollback.md)。
+
 ---
 
 ## 3. store 路径为什么必须是相对路径（重要）

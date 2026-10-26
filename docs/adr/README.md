@@ -81,6 +81,7 @@
 | 0015 | [插件界面声明与运行期注册的一致性诊断](./0015-plugin-ui-registration-diagnostics.md) | accepted | 已加载入口按真实 owner 核对生效声明，缺项提示随注册和注销自愈，排除按需等待与冲突抑制 |
 | 0016 | [插件界面异步入口等待上限与作用域撤销](./0016-plugin-ui-entry-timeout.md) | accepted | 显式入口等待最多 15 秒，超时或停用撤销旧宿主，迟到回调不得影响新代次 |
 | 0017 | [插件界面浏览器验收进入构建门禁](./0017-plugin-ui-browser-gate.md) | accepted | 在现有 build 作业验生产与开发两条路径，失败上传两边诊断产物 |
+| 0018 | [离线恢复的完整预检、暂存与双目录回退](./0018-offline-restore-preflight-and-rollback.md) | accepted | 写入前检查完整清单和目标，同级暂存后换入，异常回退数据与配置并保留可手工恢复的原状 |
 
 编号是**追加式**的，不复用、不插号。空号一旦出现就说明有文件被删了——本目录里已经发生过一次
 （编号缺位会留下死链，`scripts/docs-links.ts` 在 CI 里拒绝指向不存在文件的链接）。

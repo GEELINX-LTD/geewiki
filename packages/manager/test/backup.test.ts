@@ -269,6 +269,8 @@ test('★ F20：清单里的路径逃出仓库根时拒绝 —— 否则恢复�
       () => restoreBackup({ backupDir: dir, repoRoot: env.root, force: true }),
       /清单条目|不在仓库根之内/,
     )
+    assert.equal(readFileSync(join(env.root, 'data', 'geewiki.db'), 'utf8'), 'OLD DB BYTES', '拒绝后置非法路径前不能替换数据库')
+    assert.equal(readFileSync(join(env.root, 'config', 'secrets.json'), 'utf8'), '{"openai":{"apiKey":"sk-x"}}')
   } finally {
     env.cleanup()
   }

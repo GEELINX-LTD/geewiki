@@ -284,9 +284,19 @@ docker compose exec geewiki-app sh -lc 'node -e "const D=require(process.argv[1]
 CLI 读取 `GEEWIKI_DATA_DIR` 与 `GEEWIKI_CONFIG_DIR`，相对路径以仓库根（或 `--repo-root` 指定目录）为基准。
 备份包内部统一使用 `data/`、`config/`，不暴露部署机器的目录布局。
 
-恢复前停止服务器，先用 `pnpm restore /path/to/backup --dry-run` 检查，再运行
-`pnpm restore /path/to/backup`。目标目录同样由上述两个环境变量决定；已有数据库默认拒绝覆盖，
-确认替换时显式添加 `--force`。恢复包可包含明文密钥，产物和留底均应按密钥文件管理。
+恢复前停止服务器。`pnpm restore /path/to/backup --verify-only` 只检查备份结构、路径、源文件类型、大小与哈希；
+`pnpm restore /path/to/backup --dry-run --force` 会额外检查与实际恢复相同的目标与覆盖条件，且不写文件。
+确认后运行 `pnpm restore /path/to/backup --force`。目标目录同样由上述两个环境变量决定；
+覆盖已有文件或替换非空数据目录都要求显式 `--force`，全新且无冲突的目标可以省略。
+
+写入前会拒绝非法或重复逻辑路径、文件/目录冲突、链接、特殊文件、目标重叠以及与备份源重叠。
+全部内容先在两个目标的同级目录暂存并复核，再换入。含数据库时重建数据目录，不带旧 WAL/SHM；
+不含数据库的部分备份保留目标已有数据库，配置始终保留未列入清单的文件。
+成功后 CLI 报告原数据与原配置各自的 `.pre-restore-…` 留底路径，不自动删除。
+捕获到提交错误时会共同回退；若回退本身失败，错误会报告留底位置，需保持停服并手工移回。
+这是离线异常回退，不是跨目录崩溃原子事务：强杀、断电或并发修改可能仍需手工恢复。
+备份不证明来源可信，也不验证所有数据库或插件配置语义；取舍见 [ADR-0018](adr/0018-offline-restore-preflight-and-rollback.md)。
+恢复包、暂存及留底可包含明文密钥，均应按密钥文件管理；确认恢复和启动正常后再删除留底。
 
 管理台的 `POST /api/backup` 使用实际基础清单所在目录和宿主数据目录，
 所以 `startServer({ configDir })` 覆盖环境变量时，备份也使用该目录。
