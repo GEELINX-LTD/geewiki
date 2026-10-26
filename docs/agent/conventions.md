@@ -94,7 +94,7 @@
 | 测试文件放**各包自己的** `test/*.test.ts`，不散在根目录。 | `pnpm test` 靠 workspace 逐个跑；跨包共享夹具用相对路径引用，别靠魔法路径。 |
 | 需要起服务的端到端测试写成 shell：`packages/<包>/test/e2e-*.sh`，端口用 `PORT="${PORT:-<默认>}"` 允许外部覆盖。 | CI 不跑它们（`docs/ci-cd.md` §6），本地必须能一条命令复现。 |
 | **端口以各脚本 `PORT:-` 默认值为准，新增脚本前先 `grep` 避让**：`grep -rhoE 'PORT="\$\{PORT:-[0-9]+\}"' packages/*/test/*.sh`。 | `docs/development.md` §1 的分段表已被实际脚本突破（现存默认端口跨 3xxxx–5xxxx，PG 测试容器 55432），复述区间会腐化，见 `backlog.md` F18。 |
-| 浏览器/CDP 界面验收放 `scripts/acceptance/`，**刻意不进 `pnpm test`、不进 CI**。 | 理由与诚实清单见 `docs/ci-cd.md` §6；它们需要真实浏览器与运行中的实例。 |
+| 浏览器/CDP 界面验收放 `scripts/acceptance/`，不进 `pnpm test`；核心流程由 `build` 作业运行，其余仍需手动执行。 | 当前门禁范围以 `docs/ci-cd.md` §6 为准；本地核心流程命令见 `docs/development.md` §4.6。 |
 | 交付时的验证口径：`pnpm lint`（`eslint . --max-warnings 0`）+ `pnpm typecheck` + `pnpm test` + `pnpm build` 四条全绿。 | 这四条是分支保护的必需检查（`docs/ci-cd.md` §7）；**具体读数（多少测试/多少包）以命令输出为准**，不要抄进文档（纪律第 5 条）。 |
 | 每个包都得有 `test` 脚本与至少一个 `test/*.test.ts`（`plugin-echo`、`plugin-editor-plain` 目前是**反例**，已登记 `backlog.md` F16）。 | 空 `test` 脚本会让 `pnpm test` 静默跳过该包，缺陷被当成「测试通过」。 |
 

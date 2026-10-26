@@ -183,11 +183,11 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
 
 ## 6. 未纳入 CI 的部分（诚实清单）
 
-以下内容**刻意不进 CI**，避免把需要外部环境的东西混进主门禁：
+以下内容尚未纳入主门禁：
 
-- **`packages/plugin-auth/test/*.sh`、`packages/plugin-authz/test/*.sh`**：需要真实
-  PostgreSQL 的 e2e 脚本，不在 `pnpm test` 范围内。
-- **`scripts/acceptance/**`**：基于 CDP 的浏览器验收脚本，需要真实浏览器与运行中的服务。
+- **8 个 e2e shell**：独立于 `pnpm test`，仍需手动指定端口运行；
+  其中 PostgreSQL 场景还需要数据库实例。脚本入口见 `docs/development.md` §4.6。
+- **其他 `scripts/acceptance/**` 验收**：仅核心流程已进入现有 `build` 作业；其余仍需人工运行。
 - **Type-aware ESLint 规则**（`recommendedTypeChecked`）：需要为 28 个包建立
   project service，CI 时间成倍增长而收益有限，故未启用。副作用是
   `@typescript-eslint/require-await` 这类规则失效，代码中针对它的
@@ -196,6 +196,13 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
   `react-hooks/refs`、`react-hooks/immutability`）：在存量代码上会产生约 52 个 error，
   需要重构 UI 才能收敛。当前只启用经典子集：`rules-of-hooks` 报错、
   `exhaustive-deps` 警告（不阻断）。
+
+核心浏览器流程由 `pnpm acceptance:core` 执行：启动临时配置、数据库与自动分配的端口，
+用 runner 提供的 Chrome 验证登录、新建、编辑冲突、确认重试与历史恢复。
+它在 `build` 的 `pnpm build` 之后运行，失败会使原有 `build` 检查失败，作业名保持不变；
+失败截图、结果 JSON 与进程日志会上传为 `core-flow` artifact。
+本地开发模式再运行 `pnpm acceptance:core --dev`，验证 Vite 的模块加载路径。
+该流程使用 SQLite，不代表其他浏览器验收或 PostgreSQL e2e 已受门禁保护。
 
 ## 7. main 分支保护（已启用）
 

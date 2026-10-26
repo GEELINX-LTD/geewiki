@@ -16,6 +16,7 @@
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
     "docs:links": "tsx scripts/docs-links.ts",
+    "acceptance:core": "node scripts/acceptance/run-core-flow.mjs",
     "docs:conventions": "tsx scripts/docs-conventions.ts",
     "prepare": "husky",
     "new:plugin": "tsx scripts/create-plugin.ts",
