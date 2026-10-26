@@ -112,6 +112,7 @@ async function run(repoRoot: string, outDir: string | undefined): Promise<number
     const report = await createBackup({
       repoRoot,
       dataDir,
+      configDir: resolve(repoRoot, process.env['GEEWIKI_CONFIG_DIR'] ?? 'config'),
       outDir: outDir ?? join(repoRoot, 'backups'),
       ...(snapshotDatabase ? { snapshotDatabase } : { databaseNote }),
     })

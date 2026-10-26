@@ -186,7 +186,7 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `GEEWIKI_OIDC_TICKET_SECRET` | **未设置**（每进程随机） | **OIDC 登录票据的签名密钥**（`packages/plugin-auth/src/index.ts` 的 `ticketSecretEnv` / `ticketSecret`）。⚠️ **不是"设了就用"**：判据是 `ticketSecretEnv.length >= 16` ⇒ **短于 16 字符会静默回落成每进程随机的 `randomBytes(32)`，不报错也不告警**。票据 TTL 5 分钟，失败方向是关闭（票据作废，不是放行）。多实例部署、或希望重启后已签发票据仍有效时必须配置，且**长度 ≥16** |
 | `GEEWIKI_ADMIN_TOKEN` | **未设置**（= 整条通道禁用） | **break-glass 应急访问令牌**（`packages/server/src/index.ts` 的 `ADMIN_TOKEN_ENV` / `envAdminToken()`）。判据 `raw !== undefined && raw.length > 0` ⇒ **空串与未设置等价**，没有回退默认值。请求侧两种带法：`x-gw-admin-token: <令牌>` 或 `Authorization: Bearer <令牌>`（`presentedAdminToken()`）；比对走 `secretsMatch()`——两边各做 sha256 再 `timingSafeEqual`，防时序侧信道。**每次使用都留痕**：`auditBreakGlassUse()` 往 stdout 打 `[audit] action=access.break_glass actor=break-glass method=… path=… remote=… at=…`，并经 `onBreakGlassUse` 写 `audit_log` 表（`action: 'access.break_glass'`）。它是逃生门不是运维通道，生产不应常开 |
 | `GEEWIKI_STRICT_ROUTE_ACCESS` | **未设置**（旧 JS 省略声明时兼容默认公开） | 内置路由器在创建时读取，仅字面量 `1` 开启严格模式：`register()` 在加入路由表前拒绝遗漏 `access`，覆盖启动与插件热启用。所有模式均拒绝非法访问等级。core 类型要求第 4 参及 `access` 必填。启动末尾 `auditRouteAccess()` 会重抛注册失败并清理宿主资源，第三方路由器仍按可选 `routes()` 审计；非严格兼容路由保留启动聚合告警。迁移：补齐显式 `public` / `user` / `admin` 后设为 `1`；端口可能在启动审计前短暂监听 |
-| `GEEWIKI_BACKUP_DIR` | **未设置**（= `<进程工作目录>/backups`） | 备份的输出与枚举目录，唯一消费者是 `packages/manager/src/index.ts` 的 `createBackup()` 与 `listBackups()`，解析式 `opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')`，而 `repoRoot = resolve(opts.repoRoot ?? process.cwd())`。⚠️ **它是"相对路径以仓库根为基准"这条全局规则的唯一例外**（不走 `@geewiki/core` 的 `resolveProjectPath`）⇒ 换个目录启动就把备份写到别处。另两点边界：① `pnpm run backup`（`scripts/backup.ts`）**不读这个变量**，只认 `--out`，缺省 `<仓库根>/backups`；`scripts/restore.ts` 也不读它（备份目录是位置参数，它只读 `GEEWIKI_DATA_DIR`）；② **PostgreSQL 方言下备份包不含数据库**（清单里 `database.included = false`，提示改用 `pg_dump`），见 §5 |
+| `GEEWIKI_BACKUP_DIR` | **未设置**（= `<进程工作目录>/backups`） | 备份的输出与枚举目录，唯一消费者是 `packages/manager/src/index.ts` 的 `createBackup()` 与 `listBackups()`，解析式 `opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')`，而 `repoRoot = resolve(opts.repoRoot ?? process.cwd())`。⚠️ **它是"相对路径以仓库根为基准"这条全局规则的唯一例外**（不走 `@geewiki/core` 的 `resolveProjectPath`）⇒ 换个目录启动就把备份写到别处。另两点边界：① `pnpm run backup`（`scripts/backup.ts`）**不读这个变量**，只认 `--out`，缺省 `<仓库根>/backups`；`scripts/restore.ts` 也不读它（备份目录是位置参数，它读取 `GEEWIKI_DATA_DIR` 与 `GEEWIKI_CONFIG_DIR` 作为恢复目标）；② **PostgreSQL 方言下备份包不含数据库**（清单里 `database.included = false`，提示改用 `pg_dump`），见 §5 |
 | `GEEWIKI_OPENAI_DEBUG` | **未设置 = 关闭**；仅精确的 `1` 开启 | `@geewiki/openai` 上游错误诊断日志开关（`packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()`）。空串、`0`、`false`、`off` 及其他值均关闭；临时排障需显式设 `GEEWIKI_OPENAI_DEBUG=1`。只控制上游非 2xx 时的一条日志：路由、HTTP 状态和**错误响应体前 500 字符经 `redact()` 处理后的摘要**，不另行记录请求体。上游可能在错误体回显请求上下文，且脱敏是启发式，开启时仍须按敏感日志管理；错误码和客户端响应不受开关影响。默认值变更见 [ADR-0013](adr/0013-openai-diagnostics-opt-in.md) |
 
 > **本表不是穷举**。全量口径以代码为准：
@@ -277,6 +277,21 @@ docker compose exec geewiki-app sh -lc 'node -e "const D=require(process.argv[1]
 备份产物是**完整快照**（含 WAL 中已提交的数据，因此体积可能大于当前的 `geewiki.db`），落在同一个 `./data` 目录里；归档后建议移出该目录，避免与运行期文件混淆。
 
 冷备份（推荐，简单可靠）：`docker compose stop && cp -a data config /path/to/backup/ && docker compose start`。
+
+### 5.1 内置备份与恢复命令
+
+`pnpm backup --out /path/to/backups` 使用 SQLite 引擎快照并收集数据目录中的普通文件及配置目录中的 JSON。
+CLI 读取 `GEEWIKI_DATA_DIR` 与 `GEEWIKI_CONFIG_DIR`，相对路径以仓库根（或 `--repo-root` 指定目录）为基准。
+备份包内部统一使用 `data/`、`config/`，不暴露部署机器的目录布局。
+
+恢复前停止服务器，先用 `pnpm restore /path/to/backup --dry-run` 检查，再运行
+`pnpm restore /path/to/backup`。目标目录同样由上述两个环境变量决定；已有数据库默认拒绝覆盖，
+确认替换时显式添加 `--force`。恢复包可包含明文密钥，产物和留底均应按密钥文件管理。
+
+管理台的 `POST /api/backup` 使用实际基础清单所在目录和宿主数据目录，
+所以 `startServer({ configDir })` 覆盖环境变量时，备份也使用该目录。
+输出目录的规则见 `GEEWIKI_BACKUP_DIR` 表项，与输入目录的解析规则分开。
+
 
 ---
 

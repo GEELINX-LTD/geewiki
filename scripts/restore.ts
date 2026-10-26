@@ -139,6 +139,7 @@ function main(): number {
       repoRoot,
       force,
       dataDir: resolve(repoRoot, process.env['GEEWIKI_DATA_DIR'] ?? 'data'),
+      configDir: resolve(repoRoot, process.env['GEEWIKI_CONFIG_DIR'] ?? 'config'),
     })
     console.log(`\n✔ 已恢复 ${report.restored.length} 个文件到 ${repoRoot}`)
     if (report.setAside) {
