@@ -247,7 +247,7 @@ node scripts/acceptance/plugin-ui-cdp.mjs http://localhost:5173 9452     # dev�
 ### 6.4 前端行为不能用 curl 代替
 
 [docs/development.md](docs/development.md) 要求前端行为通过真实浏览器验证。
-核心流程已接入 CI，范围以 [docs/ci-cd.md](docs/ci-cd.md) §6 为准。
+核心流程与插件界面诊断已接入 CI，范围以 [docs/ci-cd.md](docs/ci-cd.md) §2.2/§6 为准。
 界面改动请用 §6.3 的脚本或手工浏览器验证，并在 PR 里说明验了什么、没验什么。
 
 ---

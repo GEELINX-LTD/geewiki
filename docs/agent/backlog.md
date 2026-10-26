@@ -237,26 +237,17 @@
     `packages/plugin-authz/test/e2e-p2.sh`、`packages/plugin-authz/test/e2e-p4.sh`、
     `packages/plugin-oidc/test/e2e-p15.sh`、`packages/plugin-org/test/e2e-p2-org.sh`、
     `packages/plugin-wiki/test/e2e-p3a.sh`、`packages/plugin-wiki/test/e2e-attachments.sh`、
-    `packages/plugin-wiki/test/e2e-version-meta.sh`。
-  - `scripts/acceptance/` 下有 `*_cdp.mjs`（block-attribution / editor-modes / plugin-ui /
-    theme-header / ui-extension）与多个 `pN-*/` 目录（需真实浏览器 + 运行中的服务）。
-  - `.github/workflows/ci.yml` 的 jobs 只有 `lint` / `typecheck` / `test` / `build` / `docker-build`(PR) /
-    `publish`——**不含任何 e2e 或 acceptance**。
-  - `docs/ci-cd.md` §6 已**如实登记**这一事实；`docs/development.md` §4.6/§4.8 也如实保留「真实浏览器交互从未验证」
-    （本轮在该处补了指向脚本位置的链接）。
-- **影响**：PG 路径、附件、版本元数据、OIDC 全流程、真实浏览器交互**没有门禁**，全靠人工跑。
+    `packages/plugin-wiki/test/e2e-version-meta.sh`，仍需按场景手动运行。
+  - 真实 PostgreSQL 写入、核心浏览器流程和插件界面生命周期诊断已进入门禁；
+    当前覆盖范围以 `docs/ci-cd.md` §2.1/§2.2/§6 为准。
+  - 编辑器模式、附件交互、触屏等其余 CDP 场景仍需人工验收。
+- **影响**：附件、版本元数据、OIDC 全流程与未列入门禁的真实浏览器交互仍可能只在手动验收时发现回归。
 - **建议改法（最小改动优先）**：
-  1. 先在 CI 加**一条** PG job（service container 起 `postgres:15-alpine`），跑 1~2 个最有代表性的 e2e
-     （建议 `e2e-p2.sh` + `e2e-attachments.sh`），验证端口/隔离配方在 CI 里成立；
-  2. acceptance 继续留在 CI 外（`docs/ci-cd.md` §6 的理由成立），但把「每个 release 前手工跑一遍并归档结果 JSON」
-     写进发布清单。
-- **验证方式**：CI 出现 e2e job 且绿色；`docs/ci-cd.md` §6 同步删除已进 CI 的条目。
-- **风险与兼容性**：e2e 需要固定端口与 PG 容器，**并发作业会互抢端口**（`docs/development.md` §1 已记录
-  「多实例必败」）⇒ 必须给每个 job 独立端口段或使用 `PORT` 注入。
-- **状态**：`部分收敛`。核心浏览器流程已接入现有 `build` 作业，使用临时 SQLite、
-  配置与端口验证登录、新建、保存冲突及历史恢复；本地生产与 Vite 开发模式均已验证。
-  上述清单为发现时记录，当前门禁范围以 `docs/ci-cd.md` §6 为准。
-  8 个 shell e2e、PG 与其余 CDP 验收仍不在 CI。
+  1. 按当前变更风险挑选剩余 e2e，先确认临时数据库、独立端口和认证夹具，再逐项接入；
+  2. 其他 CDP 场景保留明确的开发/生产复现命令和结果归档，避免把部分门禁表述为全部交互受保护。
+- **验证方式**：新增场景确实使现有 required check 失败，`docs/ci-cd.md` 同步登记覆盖范围与剩余盲区。
+- **风险与兼容性**：旧 e2e 有固定默认端口与外部数据库依赖，接入前须使用 `PORT` 等参数隔离运行环境。
+- **状态**：`部分收敛`；当前已受保护的范围、命令和产物策略统一见 `docs/ci-cd.md`，本条仅跟踪剩余覆盖缺口。
 
 ### F16 · 覆盖不均：两个包完全没有测试
 
@@ -620,7 +611,7 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F12 | 无 CONTRIBUTING / commitlint / hooks / formatter / 覆盖率门禁 | P1 | 规范可机器执行 | 本轮处理 |
 | F13 | 此前无任何面向 agent 的文档入口 | P1 | 规范可机器执行 | 本轮处理 |
 | F14 | plugin-platform 以「路径:行号」引用代码 30 处 | P2 | 事实真源纪律 | 本轮已修（文档） |
-| F15 | e2e 与浏览器门禁覆盖不完整 | P2 | 规范可机器执行 | 部分收敛（核心浏览器流程进入 build） |
+| F15 | e2e 与浏览器门禁覆盖不完整 | P2 | 规范可机器执行 | 部分收敛（PG 写入、核心流程与插件界面已进门禁） |
 | F16 | 覆盖不均：2 个包零测试、多包仅 1 个测试文件 | P2 | 规范可机器执行 | 未处理 |
 | F17 | development.md §2 迁移落点写的是不存在的路径 | P2 | 事实真源纪律 | 未处理（**待确认**） |
 | F18 | development.md §1 端口分段表已被实际脚本突破 | P2 | 事实真源纪律 | conventions 层已规避 |
