@@ -13,6 +13,7 @@
     "start": "tsx packages/server/src/index.ts",
     "typecheck": "pnpm -r --no-bail --if-present run typecheck && tsc --noEmit -p tsconfig.scripts.json",
     "test": "pnpm -r --no-bail --if-present run test",
+    "test:postgres": "node --import tsx --test packages/server/test/postgres-writes.integration.ts",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
     "docs:links": "tsx scripts/docs-links.ts",

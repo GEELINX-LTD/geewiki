@@ -51,11 +51,33 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: geewiki
+          POSTGRES_PASSWORD: geewiki_test
+          POSTGRES_DB: geewiki_acceptance
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U geewiki -d geewiki_acceptance"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - name: 单元测试（node:test，文件数与用例数以 `pnpm test` 输出为准）
         run: pnpm test
+      - name: PostgreSQL 并发写入与事务回滚（真实数据库）
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGUSER: geewiki
+          PGPASSWORD: geewiki_test
+          PGDATABASE: geewiki_acceptance
+        run: pnpm test:postgres
 
   build:
     name: build

@@ -14,7 +14,7 @@
 |---|---|---|
 | `lint` | `pnpm lint` —— ESLint 硬门禁，**警告即失败**（`--max-warnings 0`） | push main / push tag / PR |
 | `typecheck` | `pnpm typecheck` —— 28 个包 + `tsconfig.scripts.json` | 同上 |
-| `test` | `pnpm test` —— Node 内置测试运行器（文件数与用例数以 `pnpm test` 输出为准） | 同上 |
+| `test` | `pnpm test` + `pnpm test:postgres` —— 单元测试与真实 PostgreSQL 并发写入验收 | 同上 |
 | `build` | `pnpm build` —— 各包 `vite build` 等产物 | 同上 |
 | `docs` | `pnpm run docs:links`（**阻断**：死链直接红）+ `pnpm run docs:conventions`（只报告）—— 文档门禁 | 同上 |
 | `docker-build` | 构建镜像但**不推送**，验证 Dockerfile 未被破坏 | 仅 PR |
@@ -54,6 +54,30 @@ pnpm --filter @geewiki/web typecheck
 
 **`node_modules` 缺失时**（例如新克隆或新 worktree）必须先 `pnpm install --frozen-lockfile`，
 否则 typecheck / test 会因解析不到依赖而整体失败。
+
+### 2.1 PostgreSQL 写入门禁
+
+`test` 作业另起 PostgreSQL 17 服务容器，并在普通单测后执行 `pnpm test:postgres`。
+两步任一步失败都会使现有 `test` required check 失败。普通 `pnpm test` 无需外部数据库；
+专用验收没有跳过分支，缺少配置、连不上数据库或未形成锁竞争均直接失败。决策见
+[ADR-0011](adr/0011-postgres-write-integration-gate.md)。
+
+本地先准备可连接的 PostgreSQL 17 与有建库权限的测试账号，然后执行：
+
+```bash
+PGHOST=127.0.0.1 PGPORT=5432 PGUSER=geewiki PGDATABASE=postgres \
+  PGPASSWORD='<测试密码>' pnpm test:postgres
+```
+
+`PGHOST` / `PGPORT` / `PGUSER` 缺省分别为 `127.0.0.1` / `5432` / `geewiki`；
+`PGPASSWORD` 缺省为空，`PGDATABASE` 必须显式指定。它只作为控制连接的库，验收新建随机
+`gw_writes_` 前缀数据库，启动两个独立宿主及连接池，最后关闭宿主并删除新库。
+不会迁移或清空控制库中的业务表；强制终止时可能遗留测试库。
+
+覆盖：同基线更新只成功一次、同名创建冲突、删除重建使旧令牌失效、真实只读授权拒写、
+写出链失败时页面/历史/块一起回滚，以及失败后连接仍可继续保存。
+竞争前会等待两个 PostgreSQL 后端都进入锁等待，不靠请求时序碰运气。
+这条验收不覆盖 PostgreSQL 全文检索、全部手动 e2e 或多实例部署能力。
 
 ---
 
@@ -188,6 +212,9 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
 - **8 个 e2e shell**：独立于 `pnpm test`，仍需手动指定端口运行；
   其中 PostgreSQL 场景还需要数据库实例。脚本入口见 `docs/development.md` §4.6。
 - **其他 `scripts/acceptance/**` 验收**：仅核心流程已进入现有 `build` 作业；其余仍需人工运行。
+
+真实 PostgreSQL 页面写入已进入 `test` 作业，覆盖范围与本地命令见 §2.1；
+上面的手动 PostgreSQL e2e 仍需按各自场景运行。
 - **Type-aware ESLint 规则**（`recommendedTypeChecked`）：需要为 28 个包建立
   project service，CI 时间成倍增长而收益有限，故未启用。副作用是
   `@typescript-eslint/require-await` 这类规则失效，代码中针对它的
