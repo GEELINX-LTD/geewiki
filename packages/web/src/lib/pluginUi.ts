@@ -2,9 +2,11 @@ import {
   registerExtensionByName,
   registerSlotByName,
   unregisterSlotFrom,
+  subscribeSlotRegistry,
   type AnySlotComponent,
 } from './slots'
-import { registerRoute, unregisterRoutes, type PluginRouteProps } from './routes'
+import { registerRoute, unregisterRoutes, subscribeRouteRegistry, type PluginRouteProps } from './routes'
+import { diagnosePluginUiRegistration, type PluginUiRegistrationMismatch } from './pluginUiDiagnostics'
 import { registerClientTool, unregisterClientTools } from './clientTools'
 import { registerMarkdownExtension, unregisterMarkdownExtensions } from './markdownExt'
 import { registerTheme, unregisterThemes } from './pluginTheme'
@@ -457,6 +459,8 @@ export interface PluginUiState {
   loaded: readonly string[]
   /** 界面**加载失败**的插件（已排序）。此前只进 console，现由 SlotOutlet 渲染成可见提示条 */
   failed: readonly PluginUiFailure[]
+  /** 入口已完成，但生效声明当前尚未注册；与导入/执行失败分开。 */
+  mismatches: readonly PluginUiRegistrationMismatch[]
 }
 
 const stateListeners = new Set<() => void>()
@@ -465,6 +469,7 @@ let cachedState: PluginUiState = {
   skipped: EMPTY_SKIPPED,
   loaded: EMPTY_NAMES,
   failed: EMPTY_FAILURES,
+  mismatches: [],
 }
 
 /** 按当前内部状态构造一份快照 */
@@ -474,6 +479,12 @@ function snapshotState(): PluginUiState {
     skipped: lastSkipped,
     loaded: Object.freeze([...loaded.keys()].sort()),
     failed: failureSnapshot(),
+    mismatches: [...loaded].sort(([a], [b]) => a.localeCompare(b)).flatMap(([name, entry]) => {
+      const meta = desired[name]
+      if (!meta || meta.rev !== entry.rev) return []
+      const mismatch = diagnosePluginUiRegistration(name, meta, suppressedOwners)
+      return mismatch ? [mismatch] : []
+    }),
   }
 }
 
@@ -496,7 +507,7 @@ function sameState(a: PluginUiState, b: PluginUiState): boolean {
     const y = b.failed[i]
     if (x === undefined || y === undefined || x.name !== y.name || x.message !== y.message) return false
   }
-  return true
+  return JSON.stringify(a.mismatches) === JSON.stringify(b.mismatches)
 }
 
 /**
@@ -774,6 +785,8 @@ export function unloadPluginUi(name: string): boolean {
     if (hadFailure) emitState()
     return false
   }
+  // 先结束诊断，再回收真实注册，避免每次正常卸载短暂广播缺项。
+  loaded.delete(name)
   for (const off of entry.disposers.splice(0)) {
     try {
       off()
@@ -782,7 +795,6 @@ export function unloadPluginUi(name: string): boolean {
     }
   }
   entry.link?.remove()
-  loaded.delete(name)
   emitState()
   return true
 }
@@ -975,11 +987,15 @@ export function startPluginUiSync(options: PluginUiSyncOptions = {}): () => void
     if (!document.hidden) void syncPluginUi()
   }
   document.addEventListener('visibilitychange', onVisibility)
+  const stopSlots = subscribeSlotRegistry(emitState)
+  const stopRoutes = subscribeRouteRegistry(emitState)
   const timer = setInterval(() => {
     if (!document.hidden) void syncPluginUi()
   }, intervalMs)
   const stop = (): void => {
     document.removeEventListener('visibilitychange', onVisibility)
+    stopSlots()
+    stopRoutes()
     clearInterval(timer)
     stopSync = null
   }
@@ -994,9 +1010,11 @@ declare global {
     __GEEWIKI_PLUGIN_UI__?: {
       /** 做一次同步（等价于 sync，保留旧名以免破坏既有排障习惯） */
       refresh: () => Promise<void>
-      sync: () => Promise<void>
+      sync: (options?: PluginUiSyncRequest) => Promise<void>
       unload: (name: string) => boolean
       loaded: () => string[]
+      /** 已结算入口的声明缺项；读取同一界面快照，不另建注册账本。 */
+      diagnostics: () => readonly PluginUiRegistrationMismatch[]
       /** 最近一次成功解析的整表指纹（未成功过则为 undefined） */
       revision: () => string | undefined
       /** 插件名 → 界面目录 URL（非法名返回 undefined），供排障与测试断言 */
@@ -1022,6 +1040,7 @@ if (typeof window !== 'undefined') {
     sync: syncPluginUi,
     unload: unloadPluginUi,
     loaded: loadedPluginUi,
+    diagnostics: () => pluginUiState().mismatches,
     revision: pluginUiRevision,
     base: pluginUiBase,
     deferred: deferredPluginUi,

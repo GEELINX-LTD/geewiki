@@ -63,6 +63,9 @@ function emit(): void {
   for (const listener of [...listeners]) listener()
 }
 
+/** 宿主内部诊断与页面渲染共享注册表变更。 */
+export { subscribe as subscribeRouteRegistry }
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener)
   return () => {

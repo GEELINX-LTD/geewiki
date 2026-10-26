@@ -444,6 +444,17 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 入口作者接口见 [plugin/api-reference.md](plugin/api-reference.md) §8，取舍见
 [ADR-0014](adr/0014-plugin-ui-entry-settlement.md)。
 
+入口执行成功后，`diagnosePluginUiRegistration` 以真实插槽/扩展点和路由注册表的 owner
+核对入口表中已经生效的 `slots`、`extNodes`、`routes`。缺项进入
+`pluginUiState().mismatches`，管理台列出具体位置；它与入口失败分开，正常部分仍可使用，
+不回滚贡献、不自动重跑入口，也不改变服务端启用状态。
+
+只核对已经完成加载且版本仍匹配的入口；未加载的按需入口、等待中的 Promise 和被抑制的节点
+不告警。订阅注册表使延迟注册后提示自动消失，主动注销后重新出现，停用后清除。
+入口返回后才注册的插件会短暂显示「尚未就绪」；需要等待初始化时应返回 Promise。
+这是登记一致性诊断，组件渲染异常仍交现有错误边界。取舍见
+[ADR-0015](adr/0015-plugin-ui-registration-diagnostics.md)。
+
 ### 4.9 界面扩展平台（P4–P10）：插槽泛化为**宿主节点 + 三种模式**
 
 设计真源是 [design/ui-extension-platform.md](design/ui-extension-platform.md)，此处只记**契约要点与实现位置**。

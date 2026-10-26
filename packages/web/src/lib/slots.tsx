@@ -342,6 +342,9 @@ function emit(): void {
   for (const listener of [...listeners]) listener()
 }
 
+/** 宿主内部诊断复用同一注册表订阅，不增加浏览器 SDK 成员。 */
+export { subscribe as subscribeSlotRegistry }
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener)
   return () => {

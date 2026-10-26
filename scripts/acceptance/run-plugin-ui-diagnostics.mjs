@@ -31,6 +31,36 @@ await runBrowserFlow({
         s.counts.healthy = (s.counts.healthy ?? 0) + 1;
         host.registerSlot('app-header', () => host.React.createElement('span', { 'data-ui-fixture': 'healthy' }, 'healthy'));
       }`,
+      missing: `export function register(host) {
+        const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
+        s.counts.missing = (s.counts.missing ?? 0) + 1;
+        host.registerSlot('app-header', () => host.React.createElement('span', { 'data-ui-fixture': 'missing' }, 'partial'));
+      }`,
+      dynamic: `export function register(host) {
+        const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
+        s.registerDynamicRoute = () => { s.disposeDynamicRoute = host.registerRoute('fixture-dynamic', () => null); };
+        s.registerDynamic = () => {
+          const slot = host.registerSlot('app-header', () => null);
+          const ext = host.registerExtension('ui-card', () => null);
+          s.registerDynamicRoute();
+          s.disposeDynamic = () => { slot(); ext(); s.disposeDynamicRoute(); };
+        };
+      }`,
+      lazy: 'export function register() {}',
+      winner: `export function register(host) {
+        host.registerSlot('app-header', () => null);
+        host.registerSlot('editor', () => null);
+      }`,
+      suppressed: `export function register(host) {
+        host.registerSlot('app-header', () => null);
+        host.registerSlot('editor', () => null);
+      }`,
+      delayed: `export async function register(host) {
+        await Promise.resolve();
+        host.registerSlot('app-header', () => null);
+        host.registerExtension('ui-card', () => null);
+        host.registerRoute('fixture-delayed', () => null);
+      }`,
       late: `export async function register(host) {
         const s = globalThis.__uiFixture ??= { counts: {}, recover: {} };
         host.registerSlot('app-header', () => host.React.createElement('span', { 'data-ui-fixture': 'late' }, 'late'));
@@ -39,20 +69,28 @@ await runBrowserFlow({
         return () => { s.cleaned = (s.cleaned ?? 0) + 1; };
       }`,
     }
+    const declarations = {
+      missing: { slots: ['app-header', 'app-footer'], extensions: [{ node: 'ui-card', mode: 'extend' }], routes: [{ id: 'fixture-missing' }] },
+      dynamic: { slots: ['app-header'], extensions: [{ node: 'ui-card', mode: 'extend' }], routes: [{ id: 'fixture-dynamic' }] },
+      lazy: { slots: ['account-identities'] },
+      winner: { slots: ['app-header', 'editor'] },
+      suppressed: { slots: ['app-header', 'editor'] },
+      delayed: { slots: ['app-header'], extensions: [{ node: 'ui-card', mode: 'extend' }], routes: [{ id: 'fixture-delayed' }] },
+    }
     for (const [id, source] of Object.entries(sources)) {
       const directory = join(root, id)
       await mkdir(join(directory, 'dist'), { recursive: true })
       await writeFile(join(directory, 'package.json'), JSON.stringify({
         name: `@gw-test/ui-${id}`, version: '0.0.1', type: 'module',
         geewiki: { entry: 'index.js', client: { entry: 'client.js', css: 'client.css' },
-          slots: ['app-header'], runtime: { supportsHotReload: true, requiresCachePurge: false } },
+          slots: ['app-header'], ...declarations[id], runtime: { supportsHotReload: true, requiresCachePurge: false } },
       }))
       await writeFile(join(directory, 'index.js'), 'export default function apply() {}\n')
       await writeFile(join(directory, 'dist/client.js'), source)
       await writeFile(join(directory, 'dist/client.css'), '/* isolated UI fixture */\n')
     }
     return {
-      enabled: ['sync', 'async', 'top', 'healthy'].map(id => ({ name: `@gw-test/ui-${id}` })),
+      enabled: Object.keys(sources).filter(id => id !== 'late').map(id => ({ name: `@gw-test/ui-${id}` })),
       env: { GEEWIKI_UI_FIXTURE_DIR: root },
     }
   },

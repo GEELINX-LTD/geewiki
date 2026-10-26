@@ -90,7 +90,9 @@ node scripts/acceptance/run-plugin-ui-diagnostics.mjs --dev
 这是手动 CDP 浏览器验收，需要可执行的 `google-chrome`（可用 `CHROME_BIN` 指定）。
 脚本创建临时插件、数据库和配置，自动分配端口并清理进程，不使用本机运行实例。
 覆盖同步/异步入口与模块求值失败、部分注册回滚、失败版本去重、停用后重试、版本变化自愈、
-在途卸载与异步清理；开发模式另验 Vite 动态导入路径。
+在途卸载与异步清理；同时覆盖插槽/扩展点/页面缺项、真实注册和注销后的即时自愈、
+正常贡献保留、冲突抑制不误报、按需入口加载前后诊断以及等待中的异步入口不误报。
+开发模式另验 Vite 动态导入路径。
 结果和截图位于 `data/verify/plugin-ui-diagnostics-{prod,dev}/`。
 这些手动场景尚未接入 CI；核心浏览器门禁继续使用 `pnpm acceptance:core`。
 

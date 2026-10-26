@@ -101,25 +101,6 @@
 
 ## P1
 
-### F5 · `geewiki.slots` 声明与实际 `registerSlot` 不一致 ⇒ 界面静默空白
-
-- **严重度**：**P1**（触发需前端插件声明错误，但症状完全静默）
-- **违背**：「高可扩展」的可用性面 + 消灭静默失败。
-- **现状事实**：
-  - `packages/core/src/index.ts` 的 manifest 有 `slots?: SlotName[]`（供依赖图/管理台展示）。
-  - 前端产物侧另有 `registerSlot()` 声明；两侧一致性由 `packages/manager/src/slots.ts` 的
-    `effectiveSlotsByOwner` / `conflictsOf` 汇总，经 `GET /api/plugins/slots` 下发（**能查询，不等于会校验**）。
-  - 单占用插槽冲突时**激活顺序最早者胜出**，其余进 `conflicts` 列表（README 已写）。
-- **影响**：manifest 写了 `slots` 但 bundle 没 `registerSlot`（或名字拼错）⇒ 该位置**什么都不渲染、不报错**；
-  作者只能靠人肉翻管理台发现。
-- **建议改法（最小改动）**：入口表构建时（`packages/manager/src/plugin-ui.ts` 的 `buildPluginUiTable` 路径）
-  比对 manifest `slots` 与 bundle 侧收集到的 slot 名，差集写入 `skipped`/`conflicts` 附带原因，
-  复用既有的分级渲染（`classifyUiSkips` ⇒ attention 级 warning Card），**前端无需新增界面**。
-- **验证方式**：夹具插件声明 `slots: ['wiki.sidebar@1']` 但 bundle 不注册 ⇒
-  `GET /api/plugins/slots` 或入口表 `skipped` 必须出现该差集（当前：静默）。
-- **风险与兼容性**：只新增 skipped 原因项 ⇒ 低风险；注意别把「bundle 尚未加载完成」误报成不一致。
-- **状态**：`未处理`。
-
 ### F8 · 出厂配置模板写死私有端点与私有模型名
 
 - **严重度**：**P1**
@@ -568,7 +549,8 @@
 - **风险与兼容性**：零（纯注释/文档）。**唯一陷阱**：不要把 1/2 两处的结论整段删掉——
   「默认不启用 `@geewiki/editor-plain`」这个决定仍然有效，变的只是理由。
 - **状态**：`部分已缓解`——第 3 处本轮已改（文档）；第 1、2 处涉及 `.ts`/`.tsx` 注释，**待授权**；
-  第 4 处是行为，另案。交叉引用 **F5**（`geewiki.slots` 与 bundle 不一致）与
+  第 4 处是行为，另案。插件声明与注册的一致性诊断见
+  [plugin-platform.md](../plugin-platform.md) §4.8；另见
   `docs/plugin/anti-patterns.md`（该文档已按真相写法标注「注释待修」）。
 
 ### F30 · `GEEWIKI_KEEP_TMP` 有码无表（验收脚本专用开关，两处真源表都没有）
@@ -631,7 +613,6 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F1 | 旧 JavaScript 非严格路由省略 `access` 仍默认 `public` | **P0** | 安全可控 | 部分已缓解 |
 | F2 | 插件权限纯声明、宿主不强制（无沙箱/无配额） | **P0** | 安全可控 | 未处理 |
 | F3 | `provides` 只是依赖图 token，谎报后功能静默失效 | **P0** | 安全可控 / 可预期 | 未处理 |
-| F5 | `geewiki.slots` 与 bundle `registerSlot` 不一致 ⇒ 静默空白 | P1 | 高可扩展 | 未处理 |
 | F8 | 出厂模板写死私有端点与私有模型名 | P1 | 不绑厂商 | 本轮处理 |
 | F9 | `description` 仍写「Phase 0 骨架」、`0.1.0`、无根 CHANGELOG | P1 | 对外一致性 | 未处理 |
 | F10 | `docs/README.md` 文档地图漏登 4 篇 | P1 | 事实真源纪律 | 本轮已修（文档） |

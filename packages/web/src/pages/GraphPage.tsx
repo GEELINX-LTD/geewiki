@@ -863,6 +863,31 @@ export function GraphPage(): ReactNode {
         </Card>
       )}
 
+      {uiState.mismatches.length > 0 && (
+        <Card className="border-warn-line bg-warn-bg">
+          <CardHeader
+            as="h2"
+            title={`有 ${uiState.mismatches.length} 个插件的部分界面尚未就绪`}
+            description="这些插件的界面入口已执行，但部分声明尚未注册。其余功能仍可使用；可检查插件版本或联系维护者。延迟注册完成后提示会自动消失。"
+          />
+          <CardBody>
+            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              {uiState.mismatches.map((item) => (
+                <li key={item.name} data-plugin-ui-mismatch={item.name}>
+                  <span className="text-xs font-medium text-ink">{labelOf(item.name)}</span>
+                  <Badge tone="warn" className="ml-2">部分界面未就绪</Badge>
+                  <dl className="m-0">
+                    {item.slots.length > 0 && <DetailRow label="插槽">{item.slots.map(id => <Chip key={id}>{id}</Chip>)}</DetailRow>}
+                    {item.extNodes.length > 0 && <DetailRow label="扩展点">{item.extNodes.map(id => <Chip key={id}>{id}</Chip>)}</DetailRow>}
+                    {item.routes.length > 0 && <DetailRow label="页面">{item.routes.map(id => <Chip key={id}>{id}</Chip>)}</DetailRow>}
+                  </dl>
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      )}
+
       {/*
         ★ P10：主题贡献的对比度告警。
         与上面两块的区别：这里**不是故障**，是一个"能用但读起来费劲"的取舍——
