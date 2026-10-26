@@ -336,6 +336,8 @@ export interface WikiPageDetail {
    * 让受限段落静默变公开。故响应必须自己说清楚它是哪一种。
    */
   contentMode?: 'raw'
+  /** 原文状态令牌，仅有编辑权且请求原文时提供；保存时作为 expectedRevision。 */
+  revision?: string
   created_at: string
   updated_at: string
   version: number
@@ -419,6 +421,8 @@ export interface WikiPageDetail {
 export interface WikiSaveInput {
   title: string
   content: string
+  /** undefined：兼容既有调用；null：仅创建；字符串：只更新该原文状态。 */
+  expectedRevision?: string | null
   /**
    * 初始可见性档位。**只在创建分支生效**，且**只有跨插件服务路径能传**：
    * HTTP 的 `parseSaveBody` 对未知字段回 400，故"改可见性"仍然只有带
@@ -456,6 +460,17 @@ export interface ResyncReport {
   /** 是否**整个扇出抛错**（true 时 `resynced` 必然为 0，且必须处置） */
   failed: boolean
   error?: string
+}
+
+export class WikiWriteError extends Error {
+  constructor(
+    readonly code: 'unauthorized' | 'not_found' | 'forbidden' | 'edit_conflict',
+    message: string,
+    readonly current?: { revision: string; updatedAt: string },
+  ) {
+    super(`${code}: ${message}`)
+    this.name = 'WikiWriteError'
+  }
 }
 
 export interface WikiSaveResult {
@@ -546,10 +561,15 @@ export interface WikiService {
    */
   get(slug: string, principal: Principal, opts?: { rawContent?: boolean }): Promise<WikiPageDetail | undefined>
   /** 新建或更新（幂等 upsert）：标题与正文均未变化时 outcome='unchanged' 且不写历史。
-   * `input.visibility / published` 仅创建分支生效且仅服务路径可传（见 {@link WikiSaveInput}） */
+   * `input.visibility / published` 仅创建分支生效且仅服务路径可传（见 {@link WikiSaveInput}）。
+   * 受信系统入口：不做用户授权。用户请求必须使用 saveAs。 */
   save(slug: string, input: WikiSaveInput): Promise<WikiSaveResult>
-  /** 删除页面及其全部版本历史；返回是否确实删除（false 对应端点 404） */
+  /** 用户写入：服务内检查主体与 canEdit；不允许传系统创建专属的可见性字段。 */
+  saveAs(principal: Principal, slug: string, input: Pick<WikiSaveInput, 'title' | 'content' | 'expectedRevision'>): Promise<WikiSaveResult>
+  /** 受信系统入口：不做用户授权；用户请求必须使用 removeAs。 */
   remove(slug: string): Promise<boolean>
+  /** 用户删除：服务内检查主体与 canDelete，并记录触发者。 */
+  removeAs(principal: Principal, slug: string): Promise<boolean>
   /**
    * 该 slug 的页面行是否存在——**与可见性无关**的存在性探测。
    *

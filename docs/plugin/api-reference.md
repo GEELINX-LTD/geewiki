@@ -139,6 +139,13 @@ type GeeWikiPlugin = {
 
 出处：`packages/core/src/services.ts`（服务契约的**单一真源**，含 `SearchService` / `AuthService` / `WikiService` / `AttachmentService` / `EmbeddingService`；**非浏览器安全**，前端不要 import）。
 
+`WikiService` 的用户写入应调用 `saveAs(principal, slug, input)` / `removeAs(principal, slug)`，
+服务内检查登录主体与页面权限，并记录操作者；`save/remove` 是不做用户授权的受信系统入口。
+读取原文时，有编辑权的调用方可取得 `revision`；保存将其作为 `expectedRevision` 提交，
+只创建则传 `null`。状态变化返回 `WikiWriteError`（HTTP 为 `409 edit_conflict`），
+确认覆盖时也须使用冲突返回的当前状态重试，不能省略前置条件。未传条件的旧调用仍保持兼容。
+主体入口会重查权限，但不保证与并发 ACL 修改原子化，也不构成插件沙箱（ADR-0010）。
+
 ---
 
 ## 5. HTTP 路由面（`HttpRouterService`）

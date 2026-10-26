@@ -37,7 +37,7 @@ import {
   type PageSavedEvent,
   type Principal,
 } from '@geewiki/core'
-import { AuthzPlugin } from '@geewiki/authz'
+import { AuthzPlugin, type PolicyService } from '@geewiki/authz'
 import { SLUG_HINT, WikiPlugin, manifest, type WikiService } from '../src/index.js'
 
 /* ------------------------------ 夹具 ------------------------------ */
@@ -432,11 +432,153 @@ test('wiki-service：apply 后 ctx.get 拿得到，四个方法与 manifest 的 
     assert.equal(manifest.geewiki.provides, 'wiki-service', '前置：manifest 声明的 token 名')
     assert.ok(h.services.has('wiki-service'), 'provide 应把服务登记进 ctx')
     const svc = h.svc()
-    for (const m of ['list', 'get', 'save', 'remove'] as const) {
+    for (const m of ['list', 'get', 'save', 'saveAs', 'remove', 'removeAs'] as const) {
       assert.equal(typeof svc[m], 'function', `wiki-service.${m} 应是函数`)
     }
     assert.deepEqual((await svc.list(MEMBER)), [], '空库应返回空列表')
     assert.equal((await svc.get('nope', MEMBER)), undefined, '不存在的 slug 返回 undefined（对应端点 404）')
+  } finally {
+    h.dispose()
+  }
+})
+
+for (const asyncDb of [false, true]) {
+  test(`保存前置条件：并发编辑仅一个成功，冲突不写历史（asyncDb=${asyncDb}）`, async () => {
+    const h = await makeHarness({ asyncDb })
+    try {
+      const svc = h.svc()
+      await svc.saveAs(MEMBER, 'conflict', { title: '原始', content: '原文', expectedRevision: null })
+      const raw = await svc.get('conflict', MEMBER, { rawContent: true })
+      assert.match(raw?.revision ?? '', /^[a-f0-9]{64}$/)
+      assert.equal((await svc.get('conflict', MEMBER))?.revision, undefined, '投影读取不提供原文令牌')
+      const outcomes = await Promise.allSettled([
+        svc.saveAs(MEMBER, 'conflict', { title: '甲', content: '甲修改', expectedRevision: raw!.revision }),
+        svc.saveAs(MEMBER, 'conflict', { title: '乙', content: '乙修改', expectedRevision: raw!.revision }),
+      ])
+      assert.equal(outcomes.filter((r) => r.status === 'fulfilled').length, 1)
+      const rejected = outcomes.find((r) => r.status === 'rejected') as PromiseRejectedResult
+      assert.equal(rejected.reason.code, 'edit_conflict')
+      const latest = await svc.get('conflict', MEMBER, { rawContent: true })
+      assert.equal(latest?.version, 2)
+      assert.equal(latest?.versions.length, 1)
+      assert.equal(rejected.reason.current.revision, latest?.revision)
+      assert.equal(h.adapter.query<{ updated_by: number }>('SELECT updated_by FROM blocks WHERE page_id = (SELECT id FROM pages WHERE slug = ?)', ['conflict'])[0]?.updated_by, MEMBER.userId)
+      assert.equal(h.adapter.query<{ saved_by: number }>('SELECT saved_by FROM page_versions')[0]?.saved_by, MEMBER.userId)
+      // 即使提交正文恰好等于当前值，过期基线也须先拒绝。
+      await assert.rejects(svc.saveAs(MEMBER, 'conflict', {
+        title: latest!.title, content: latest!.content, expectedRevision: raw!.revision,
+      }), /edit_conflict/)
+    } finally {
+      h.dispose()
+    }
+  })
+
+  test(`同名创建竞争与删除后重建均不能覆盖旧基线（asyncDb=${asyncDb}）`, async () => {
+    const h = await makeHarness({ asyncDb })
+    try {
+      const svc = h.svc()
+      const input = { title: '同名', content: '原文', expectedRevision: null }
+      const outcomes = await Promise.allSettled([
+        svc.saveAs(MEMBER, 'create-race', input),
+        svc.saveAs(MEMBER, 'create-race', input),
+      ])
+      assert.equal(outcomes.filter((r) => r.status === 'fulfilled').length, 1)
+      const rejected = outcomes.find((r) => r.status === 'rejected') as PromiseRejectedResult
+      assert.equal(rejected.reason.code, 'edit_conflict')
+      const old = await svc.get('create-race', MEMBER, { rawContent: true })
+      await svc.removeAs(MEMBER, 'create-race')
+      await svc.saveAs(MEMBER, 'create-race', input)
+      const recreated = await svc.get('create-race', MEMBER, { rawContent: true })
+      assert.notEqual(recreated?.revision, old?.revision)
+      await assert.rejects(svc.saveAs(MEMBER, 'create-race', {
+        title: '旧页草稿', content: '不能覆盖重建页面', expectedRevision: old!.revision,
+      }), /edit_conflict/)
+      const latest = await svc.get('create-race', MEMBER)
+      assert.equal(latest?.content, '原文')
+      assert.equal(latest?.versions.length, 0)
+    } finally {
+      h.dispose()
+    }
+  })
+}
+
+test('REST 保存冲突可确认重试，再次修改仍拒绝；新建不覆盖同名页面', async () => {
+  const h = await makeHarness()
+  try {
+    await h.svc().save('conflict-http', { title: '初稿', content: '初稿' })
+    const raw = await h.svc().get('conflict-http', MEMBER, { rawContent: true })
+    await h.svc().save('conflict-http', { title: '他人修改', content: '他人修改' })
+    const stale = await h.call('PUT', '/api/pages/:slug', { slug: 'conflict-http' }, {
+      title: '我的草稿', content: '我的草稿', expectedRevision: raw!.revision,
+    })
+    assert.equal(stale.status, 409)
+    assert.equal(stale.body.error, 'edit_conflict')
+    const details = stale.body.details as { revision: string }
+    await h.svc().save('conflict-http', { title: '第三次', content: '第三次' })
+    const staleAgain = await h.call('PUT', '/api/pages/:slug', { slug: 'conflict-http' }, {
+      title: '我的草稿', content: '我的草稿', expectedRevision: details.revision,
+    })
+    assert.equal(staleAgain.status, 409)
+    const current = staleAgain.body.details as { revision: string }
+    assert.equal((await h.call('PUT', '/api/pages/:slug', { slug: 'conflict-http' }, {
+      title: '我的草稿', content: '我的草稿', expectedRevision: current.revision,
+    })).status, 200)
+    assert.equal((await h.call('PUT', '/api/pages/:slug', { slug: 'conflict-http' }, {
+      title: '同名新建', content: '不能覆盖', expectedRevision: null,
+    })).status, 409)
+    assert.equal((await h.svc().get('conflict-http', MEMBER))?.content, '我的草稿')
+    assert.equal((await h.call('PUT', '/api/pages/:slug', { slug: 'conflict-http' }, {
+      title: '无效', content: '无效', expectedRevision: 'bad-token',
+    })).status, 400)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('主体写服务：匿名拒绝、只读拒绝、权限撤回后拒绝且不产生副作用', async () => {
+  const h = await makeHarness()
+  try {
+    const svc = h.svc()
+    await assert.rejects(svc.saveAs(anonymousPrincipal(), 'actor', { title: '匿名', content: '匿名' }), /unauthorized/)
+    await assert.rejects(svc.removeAs(anonymousPrincipal(), 'actor'), /unauthorized/)
+    await svc.saveAs(MEMBER, 'actor', { title: '原稿', content: '原稿' })
+    const raw = await svc.get('actor', MEMBER, { rawContent: true })
+    // 真实策略的 viewer 授予可读但不可写。
+    h.adapter.run('UPDATE pages SET visibility = ?, inherit = 0 WHERE slug = ?', ['private', 'actor'])
+    h.adapter.run("INSERT INTO page_grants (page_slug, subject_kind, subject_id, role, granted_by, granted_at) VALUES (?, 'user', '1', 'viewer', 1, ?)", ['actor', new Date().toISOString()])
+    await assert.rejects(svc.saveAs(MEMBER, 'actor', { title: '越权', content: '越权', expectedRevision: raw!.revision }), /forbidden/)
+    await assert.rejects(svc.removeAs(MEMBER, 'actor'), /forbidden/)
+    assert.equal((await svc.get('actor', MEMBER, { rawContent: true }))?.revision, undefined)
+    h.adapter.run('DELETE FROM page_grants WHERE page_slug = ?', ['actor'])
+    await assert.rejects(svc.saveAs(MEMBER, 'actor', { title: '撤权后', content: '撤权后' }), /not_found/)
+    await assert.rejects(svc.removeAs(MEMBER, 'actor'), /not_found/)
+    assert.equal(h.adapter.query<{ content: string }>('SELECT content FROM pages WHERE slug = ?', ['actor'])[0]?.content, '原稿')
+    assert.equal(h.adapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM page_versions')[0]?.n, 0)
+  } finally {
+    h.dispose()
+  }
+})
+
+test('REST 删除在再次检查前被撤权时返回 404，页面仍保留', async () => {
+  const h = await makeHarness()
+  try {
+    await h.svc().saveAs(MEMBER, 'delete-revoked', { title: '保留', content: '不能删除' })
+    const policy = h.services.get('policy-service') as PolicyService
+    let checks = 0
+    h.services.set('policy-service', {
+      ...policy,
+      resolvePage: async (...args: Parameters<PolicyService['resolvePage']>) => {
+        const access = await policy.resolvePage(...args)
+        if (++checks === 1) {
+          h.adapter.run('UPDATE pages SET visibility = ?, inherit = 0 WHERE slug = ?', ['private', 'delete-revoked'])
+        }
+        return access
+      },
+    })
+    const result = await h.call('DELETE', '/api/pages/:slug', { slug: 'delete-revoked' })
+    assert.equal(result.status, 404)
+    assert.equal(result.body.error, 'not_found')
+    assert.equal(h.adapter.query<{ content: string }>('SELECT content FROM pages WHERE slug = ?', ['delete-revoked'])[0]?.content, '不能删除')
   } finally {
     h.dispose()
   }
