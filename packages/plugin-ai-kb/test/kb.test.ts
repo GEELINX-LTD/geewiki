@@ -83,6 +83,10 @@ function wikiStub(
     save: async () => {
       throw new Error('本测试不该调到 save')
     },
+    saveAs: async () => {
+      throw new Error('只读工具不该写入页面')
+    },
+    removeAs: async () => false,
     remove: async () => false,
     backlinks: async () => undefined,
     links: async () => undefined,

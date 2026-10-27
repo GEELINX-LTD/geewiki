@@ -2,14 +2,17 @@ import {
   registerExtensionByName,
   registerSlotByName,
   unregisterSlotFrom,
+  subscribeSlotRegistry,
   type AnySlotComponent,
 } from './slots'
-import { registerRoute, unregisterRoutes, type PluginRouteProps } from './routes'
+import { registerRoute, unregisterRoutes, subscribeRouteRegistry, type PluginRouteProps } from './routes'
+import { diagnosePluginUiRegistration, type PluginUiRegistrationMismatch } from './pluginUiDiagnostics'
 import { registerClientTool, unregisterClientTools } from './clientTools'
 import { registerMarkdownExtension, unregisterMarkdownExtensions } from './markdownExt'
 import { registerTheme, unregisterThemes } from './pluginTheme'
 import { hostSdk, type GeeWikiHostSdk } from './hostSdk'
 import { errorDetail } from './errorText'
+import { awaitPluginUiEntry, PluginUiEntryTimeoutError } from './pluginUiEntry'
 import type { ExtMode } from '@geewiki/core/extensions'
 import { isBuiltinSlotName } from '@geewiki/core/slots'
 import type { ComponentType } from 'react'
@@ -146,6 +149,8 @@ export interface PluginUiHostContext {
   readonly suppressed: SuppressedOwners
   /** 收集本插件注册产生的注销函数（卸载时统一执行） */
   readonly disposers: Array<() => void>
+  /** 已撤销代次的宿主不再注册或批量注销贡献；缺省用于直接构造宿主的兼容调用。 */
+  readonly isActive?: () => boolean
 }
 
 /**
@@ -167,6 +172,17 @@ export interface PluginUiHostContext {
  */
 export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
   const { name, sdk, meta, suppressed, disposers } = ctx
+  const isActive = ctx.isActive ?? (() => true)
+  const track = (dispose: () => void): (() => void) => {
+    let disposed = false
+    const off = (): void => {
+      if (disposed) return
+      disposed = true
+      dispose()
+    }
+    disposers.push(off)
+    return off
+  }
   /**
    * 越权判定：返回**告警文案**（该忽略这条注册）或 `null`（放行）。
    *
@@ -202,6 +218,7 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
    * 也不静默忽略：作者必须知道这条调用没生效）。
    */
   const scopedUnregister = (source: string, run: (owner: string) => void, api: string): void => {
+    if (!isActive()) return
     if (source !== name) {
       console.warn(
         `[geewiki-plugin-ui] 插件 ${name} 调用了 ${api}("${source}")，已忽略：作用域宿主只允许注销自己的来源。`,
@@ -221,16 +238,16 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
     ...sdk,
     pluginName: name,
     registerSlot: (slot, component) => {
+      if (!isActive()) return () => {}
       const reason = gate(slot, 'slot')
       if (reason !== null) {
         console.warn(reason)
         return () => {}
       }
-      const off = registerSlotByName(slot, component, name)
-      disposers.push(off)
-      return off
+      return track(registerSlotByName(slot, component, name))
     },
     registerExtension: (node, component, opts) => {
+      if (!isActive()) return () => {}
       // 空间由名字本身决定：内置插槽名走插槽字段，其余（宿主节点 / 自定义扩展点）走扩展节点字段。
       // 不能一律当扩展节点——`registerExtension('app-header', c)` 是合法用法（模式化注册插槽）。
       const reason = gate(node, isBuiltinSlotName(node) ? 'slot' : 'ext')
@@ -238,9 +255,7 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
         console.warn(reason)
         return () => {}
       }
-      const off = registerExtensionByName(node, component, name, opts?.mode ?? 'extend', opts?.shadow ?? false)
-      disposers.push(off)
-      return off
+      return track(registerExtensionByName(node, component, name, opts?.mode ?? 'extend', opts?.shadow ?? false))
     },
     /*
       以下三类在 P13 之前**只存在于全局 SDK**（来源写死 `'host-sdk'`）：插件用它们注册的东西
@@ -248,21 +263,19 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
       走同一条路——来源 = 插件名、注销函数收进 `disposers`、卸载时统一执行。
     */
     registerTool: (toolName, execute) => {
-      const off = registerClientTool(toolName, execute, name)
-      disposers.push(off)
-      return off
+      if (!isActive()) return () => {}
+      return track(registerClientTool(toolName, execute, name))
     },
     registerMarkdownExtension: (ext) => {
-      const off = registerMarkdownExtension(name, ext)
-      disposers.push(off)
-      return off
+      if (!isActive()) return () => {}
+      return track(registerMarkdownExtension(name, ext))
     },
     registerTheme: (contribution) => {
-      const off = registerTheme(name, contribution)
-      disposers.push(off)
-      return off
+      if (!isActive()) return () => {}
+      return track(registerTheme(name, contribution))
     },
     unregisterSlot: (slot, token) => {
+      if (!isActive()) return
       // 传了 token（通常就是上面返回的注销函数）就按那条精确注销，否则**只清自己的来源**。
       // 旧写法是直接转发全局 `unregisterSlot`：不带 token 时它会删掉该节点上所有插件的贡献。
       if (typeof token === 'function') {
@@ -273,6 +286,7 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
     },
     renderMarkdown: (markdown: string) => sdk.renderMarkdown(markdown),
     registerRoute: (id, component) => {
+      if (!isActive()) return () => {}
       const declared = meta.routes ?? []
       if (!declared.some((r) => r.id === id)) {
         console.warn(
@@ -282,9 +296,7 @@ export function createPluginUiHost(ctx: PluginUiHostContext): PluginUiHost {
         )
         return () => {}
       }
-      const off = registerRoute(id, component, name)
-      disposers.push(off)
-      return off
+      return track(registerRoute(id, component, name))
     },
     unregisterRoutes: (source) => scopedUnregister(source, unregisterRoutes, 'unregisterRoutes'),
     unregisterTools: (source) => scopedUnregister(source, unregisterClientTools, 'unregisterTools'),
@@ -300,9 +312,12 @@ interface LoadedUi {
   readonly rev: string
   readonly disposers: Array<() => void>
   readonly link?: HTMLLinkElement
+  /** 停用时先撤销旧宿主，再回收贡献，避免迟到回调追加注册或拆掉新代次。 */
+  readonly revoke: () => void
 }
 
 const loaded = new Map<string, LoadedUi>()
+const pendingLoads = new Map<string, { readonly revoke: () => void }>()
 /**
  * 每个插件的"代次"。卸载时自增，用于丢弃**在途**的加载：
  * `import()` 是异步的，卸载可能发生在它结算之前，若不检查就会把已卸载插件的 UI 又装回去。
@@ -337,12 +352,13 @@ const failed = new Map<string, string>()
  * 失败记录是**可自愈**的：reset（成功加载 / 卸载 / rev 变化后重试）时删除，
  * 故提示条不会在问题解决后残留。
  */
-const failedLoads = new Map<string, string>()
+const failedLoads = new Map<string, PluginUiFailure>()
 
-/** 一条"插件界面加载失败"（name 用于文案，message 只作排障线索，不进正文） */
+/** 一条加载失败（原始 message 只作排障线索，kind 用于固定中文提示）。 */
 export interface PluginUiFailure {
   readonly name: string
   readonly message: string
+  readonly kind: 'error' | 'timeout'
 }
 
 const EMPTY_FAILURES: readonly PluginUiFailure[] = Object.freeze([])
@@ -355,12 +371,11 @@ let cachedFailures: readonly PluginUiFailure[] = EMPTY_FAILURES
  * 否则每次读取都算"变了" ⇒ 无限重渲染。这里的比对按内容做，内容不变就复用上一次的数组。
  */
 function failureSnapshot(): readonly PluginUiFailure[] {
-  const next = [...failedLoads]
-    .map(([name, message]) => ({ name, message }))
+  const next = [...failedLoads.values()]
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   const same =
     next.length === cachedFailures.length &&
-    next.every((x, i) => x.name === cachedFailures[i]?.name && x.message === cachedFailures[i]?.message)
+    next.every((x, i) => x.name === cachedFailures[i]?.name && x.message === cachedFailures[i]?.message && x.kind === cachedFailures[i]?.kind)
   if (!same) cachedFailures = Object.freeze(next)
   return cachedFailures
 }
@@ -457,6 +472,8 @@ export interface PluginUiState {
   loaded: readonly string[]
   /** 界面**加载失败**的插件（已排序）。此前只进 console，现由 SlotOutlet 渲染成可见提示条 */
   failed: readonly PluginUiFailure[]
+  /** 入口已完成，但生效声明当前尚未注册；与导入/执行失败分开。 */
+  mismatches: readonly PluginUiRegistrationMismatch[]
 }
 
 const stateListeners = new Set<() => void>()
@@ -465,6 +482,7 @@ let cachedState: PluginUiState = {
   skipped: EMPTY_SKIPPED,
   loaded: EMPTY_NAMES,
   failed: EMPTY_FAILURES,
+  mismatches: [],
 }
 
 /** 按当前内部状态构造一份快照 */
@@ -474,6 +492,12 @@ function snapshotState(): PluginUiState {
     skipped: lastSkipped,
     loaded: Object.freeze([...loaded.keys()].sort()),
     failed: failureSnapshot(),
+    mismatches: [...loaded].sort(([a], [b]) => a.localeCompare(b)).flatMap(([name, entry]) => {
+      const meta = desired[name]
+      if (!meta || meta.rev !== entry.rev) return []
+      const mismatch = diagnosePluginUiRegistration(name, meta, suppressedOwners)
+      return mismatch ? [mismatch] : []
+    }),
   }
 }
 
@@ -494,9 +518,9 @@ function sameState(a: PluginUiState, b: PluginUiState): boolean {
   for (let i = 0; i < a.failed.length; i++) {
     const x = a.failed[i]
     const y = b.failed[i]
-    if (x === undefined || y === undefined || x.name !== y.name || x.message !== y.message) return false
+    if (x === undefined || y === undefined || x.name !== y.name || x.message !== y.message || x.kind !== y.kind) return false
   }
-  return true
+  return JSON.stringify(a.mismatches) === JSON.stringify(b.mismatches)
 }
 
 /**
@@ -687,8 +711,29 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
     不依赖作者写对哪一种。
   */
   const disposers: Array<() => void> = []
-  const host = createPluginUiHost({ name, sdk, meta, suppressed: suppressedOwners, disposers })
+  const controller = new AbortController()
+  let active = true
+  const host = createPluginUiHost({ name, sdk, meta, suppressed: suppressedOwners, disposers, isActive: () => active })
   const restoreScope = installPluginScope(host, sdk)
+  const revoke = (): void => {
+    if (!active) return
+    active = false
+    restoreScope()
+    controller.abort()
+    rollbackDisposers(disposers)
+  }
+  const pending = { revoke }
+  pendingLoads.set(name, pending)
+  const isCurrent = (): boolean =>
+    active && (epochs.get(name) ?? 0) === epoch && desired[name]?.rev === meta.rev && !loaded.has(name)
+  const fail = (err: unknown): void => {
+    const current = isCurrent()
+    revoke()
+    if (!current) return
+    failed.set(name, meta.rev)
+    failedLoads.set(name, { name, message: errorDetail(err), kind: err instanceof PluginUiEntryTimeoutError ? 'timeout' : 'error' })
+    emitState()
+  }
   try {
     let mod: PluginUiModule
     try {
@@ -697,25 +742,11 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
     } catch (err) {
       // 入口已声明却加载失败属于真实故障（作者漏发产物的典型症状），但不该打断宿主启动
       console.warn(`[geewiki-plugin-ui] 插件界面加载失败：${name}`, err instanceof Error ? err.message : err)
-      failed.set(name, meta.rev)
-      /*
-        记进**要给人看的那一份**并广播：否则界面上的表现只是"这块功能不见了"，
-        用户既不知道原因，也不知道该去插件管理里检查产物。emitState 必须显式调用 ——
-        失败路径上没有任何插槽注册发生，不广播就永远不会有订阅者重渲染。
-        存的是**排障摘要**（`errorDetail`），它只会落在 console 与 `data-*` 上：
-        给用户看的正文是 `slots.tsx` 里那句固定中文（原始串可能含英文/路径，不能直接展示）。
-      */
-      failedLoads.set(name, errorDetail(err))
-      emitState()
-      /*
-        模块求值期可能已经注册了一部分（顶层形态）：必须回滚，否则"加载失败"的插件会留下半截 UI。
-        装上作用域之前这不可能发生 —— 那批注册会落到全局 SDK 名下，只是更难发现而已。
-      */
-      rollbackDisposers(disposers)
+      fail(err)
       return
     }
     // 迟到检查：await 期间该插件可能已被卸载，或已不再被入口表需要（例如用户刚点了停用）
-    if ((epochs.get(name) ?? 0) !== epoch || !(name in desired) || loaded.has(name)) {
+    if (!isCurrent()) {
       console.debug(`[geewiki-plugin-ui] 丢弃迟到的插件界面加载：${name}`)
       // 同上：模块求值期的注册必须跟着这次作废的加载一起回滚
       rollbackDisposers(disposers)
@@ -736,24 +767,39 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
       console.debug(`[geewiki-plugin-ui] 插件 bundle 未导出 register(host)，按其模块顶层注册登记：${name}`)
     } else {
       try {
-        const cleanup = register(host)
-        if (typeof cleanup === 'function') disposers.push(cleanup as () => void)
+        const completion = Promise.resolve(register(host)).then(cleanup => {
+          if (typeof cleanup !== 'function') return
+          // 原 Promise 不会取消：晚到的清理函数仍要执行，但旧 host 已无注册/批量注销能力。
+          if (active) disposers.push(cleanup as () => void)
+          else rollbackDisposers([cleanup as () => void])
+        })
+        // 异步代码应持有参数 host；等待期间不再让全局 SDK 指向此插件。
+        restoreScope()
+        await awaitPluginUiEntry(completion, controller.signal)
       } catch (err) {
-        // 插件入口自身执行失败：回滚它已经注册的部分，避免留下半截 UI
-        console.warn(`[geewiki-plugin-ui] 插件 ${name} 的客户端入口执行失败，已回滚：`, err)
-        rollbackDisposers(disposers)
+        if (!controller.signal.aborted) {
+          console.warn(`[geewiki-plugin-ui] 插件 ${name} 的客户端入口执行失败，已回滚：`, err)
+        }
+        fail(err)
         return
       }
     }
+    // 显式入口同样可以等待异步工作；结算时必须再次复核，避免已停用插件迟到复活。
+    if (!isCurrent()) {
+      rollbackDisposers(disposers)
+      return
+    }
     const link = meta.css ? injectCss(name, `${base}/${meta.css}`) : undefined
-    loaded.set(name, { plugin: name, rev: meta.rev, disposers, link })
+    loaded.set(name, { plugin: name, rev: meta.rev, disposers, link, revoke })
     // 成功即自愈：清掉这个插件此前可能留下的失败记录，否则提示条会在问题已解决后继续挂着
+    failed.delete(name)
     failedLoads.delete(name)
     emitState()
     console.debug(`[geewiki-plugin-ui] 已加载插件界面：${name}`)
   } finally {
-    // 所有出口（含上面每个 return）都还原全局对象：作用域绝不能跨过本次加载存活
     restoreScope()
+    if (pendingLoads.get(name) === pending) pendingLoads.delete(name)
+    if (loaded.get(name)?.revoke !== revoke) revoke()
   }
 }
 
@@ -761,26 +807,24 @@ async function loadPluginUi(name: string, meta: UiTableEntry, sdk: GeeWikiHostSd
 export function unloadPluginUi(name: string): boolean {
   // 无论此前是否真的加载过，都要推进代次：可能有在途 import 尚未结算
   epochs.set(name, (epochs.get(name) ?? 0) + 1)
+  const pending = pendingLoads.get(name)
+  pending?.revoke()
   /*
     失败记录**先清**（且不看 loaded 里有没有）：插件被停用/移出入口表之后，
     "它的界面加载失败"这条提示就过期了 —— 留着会让用户对着一条无法处理的红字。
     若是 rev 变化导致的重试，紧接着的加载失败会重新写入，语义仍然正确。
   */
+  failed.delete(name)
   const hadFailure = failedLoads.delete(name)
   const entry = loaded.get(name)
   if (!entry) {
-    if (hadFailure) emitState()
-    return false
+    if (hadFailure || pending) emitState()
+    return pending !== undefined
   }
-  for (const off of entry.disposers.splice(0)) {
-    try {
-      off()
-    } catch (err) {
-      console.debug(`[geewiki-plugin-ui] 注销 ${name} 的插槽注册时出错：`, err)
-    }
-  }
-  entry.link?.remove()
+  // 先结束诊断，再撤销作用域和回收真实注册，避免正常卸载短暂广播缺项。
   loaded.delete(name)
+  entry.revoke()
+  entry.link?.remove()
   emitState()
   return true
 }
@@ -861,6 +905,10 @@ async function doSync(force: boolean): Promise<void> {
   }
   lastRevision = table.revision
   desired = table.entries
+  // 失败者从未进入 loaded，不能只靠 plan.unload 清理；停用或换版本也要结束其失败代次。
+  for (const [name, rev] of failed) {
+    if (desired[name]?.rev !== rev) unloadPluginUi(name)
+  }
   lastSkipped = Object.freeze(table.skipped)
   // 路由快照紧随入口表重建（F2）：导航项来自声明，必须在 bundle 加载**之前**就可见
   rebuildRoutes()
@@ -969,11 +1017,15 @@ export function startPluginUiSync(options: PluginUiSyncOptions = {}): () => void
     if (!document.hidden) void syncPluginUi()
   }
   document.addEventListener('visibilitychange', onVisibility)
+  const stopSlots = subscribeSlotRegistry(emitState)
+  const stopRoutes = subscribeRouteRegistry(emitState)
   const timer = setInterval(() => {
     if (!document.hidden) void syncPluginUi()
   }, intervalMs)
   const stop = (): void => {
     document.removeEventListener('visibilitychange', onVisibility)
+    stopSlots()
+    stopRoutes()
     clearInterval(timer)
     stopSync = null
   }
@@ -988,9 +1040,11 @@ declare global {
     __GEEWIKI_PLUGIN_UI__?: {
       /** 做一次同步（等价于 sync，保留旧名以免破坏既有排障习惯） */
       refresh: () => Promise<void>
-      sync: () => Promise<void>
+      sync: (options?: PluginUiSyncRequest) => Promise<void>
       unload: (name: string) => boolean
       loaded: () => string[]
+      /** 已结算入口的声明缺项；读取同一界面快照，不另建注册账本。 */
+      diagnostics: () => readonly PluginUiRegistrationMismatch[]
       /** 最近一次成功解析的整表指纹（未成功过则为 undefined） */
       revision: () => string | undefined
       /** 插件名 → 界面目录 URL（非法名返回 undefined），供排障与测试断言 */
@@ -1016,6 +1070,7 @@ if (typeof window !== 'undefined') {
     sync: syncPluginUi,
     unload: unloadPluginUi,
     loaded: loadedPluginUi,
+    diagnostics: () => pluginUiState().mismatches,
     revision: pluginUiRevision,
     base: pluginUiBase,
     deferred: deferredPluginUi,

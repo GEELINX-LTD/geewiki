@@ -134,7 +134,7 @@
 | INV-1 | 插件包**不得** import `@geewiki/server` / `@geewiki/manager` / db 插件的内部实现 | 高可扩展（能换实现）、安全可控 | 仅评审 + 注释自觉 | 🟡 口头 |
 | INV-2 | `@geewiki/core` **不得**依赖任何 `@geewiki/*` 包 | 万物皆插件（被所有人依赖、自己不依赖业务） | 事实上成立；无机器检查 | 🟡 口头 |
 | INV-3 | `packages/core/src/slots.ts` / `extensions.ts` 必须**浏览器安全**（零 `node:*`、零 cordis） | 极致轻量、高可扩展 | `packages/core/test/slots-browser-safe.test.ts` | 🟢 机器 |
-| INV-4 | 注册路由**必须显式写 `access`**——见下面的醒目警告 | 安全可控 | 启动期审计告警 + `GEEWIKI_STRICT_ROUTE_ACCESS=1` 可拒启；`packages/server/test/route-access-audit.test.ts` | 🟠 半强制 |
+| INV-4 | 注册路由**必须显式写 `access`**——见下面的醒目警告 | 安全可控 | core 必填类型；严格模式注册期拒绝（含热启用）；`route-access-audit` / `route-access-registration` 测试 | 🟠 非严格 JS 仍兼容 |
 | INV-5 | 用了 SQLite 专有语法的迁移，必须有**文件名一一对应**的 `migrations-postgres/` 版本，或登记为 SQLite 专有（登记不等于免检，必须配套运行期拒接非 sqlite 方言）。**注意：“SQLite 禁用 `ADD COLUMN`”是误传**——它是重放策略的分类器，不是禁令（见 ADR-0003） | 极致轻量（默认零外部依赖）、不锁死 | `packages/manager/test/migrations-dialect.test.ts`（`★ F19` 那条）、`packages/manager/test/db-dual-track.test.ts`、`packages/server/test/builtin-migrations.test.ts` | 🟢 机器 |
 | INV-6 | `pnpm-workspace.yaml` 的 `storeDir` / `cacheDir` **必须相对路径** | 极致轻量（开箱即用不破） | 仅评审；违反的后果是 CI / Docker / Dependabot 一起坏 | 🟡 口头 |
 | INV-7 | `editor` 插槽替换有**红线**（见 §6） | 安全可控、万物皆插件 | 部分机器（props 契约守卫）+ 大量注释 + 默认清单不含编辑器 | 🟠 半强制 |
@@ -146,25 +146,21 @@
 
 强度图例：🟢 有守卫测试（改错就红）· 🟠 有一半机器手段，另一半靠人 · 🟡 **纯靠自觉与评审**。
 
-### 4.1 ⚠️ INV-4 展开：路由默认 `access: 'public'`，漏写就是匿名可调
+### 4.1 ⚠️ INV-4 展开：显式声明与旧 JavaScript 兼容边界
 
-> **这是本仓库最危险的一条默认值。**
-> `HttpRouterService.register(method, path, handler, opts?)` 的第 4 参**可省略**，
-> 省略等价于 `{ access: 'public' }`（注释原文见 `packages/core/src/index.ts` 的
-> `RouteAccessOptions`：「省略等价于 `{ access: 'public' }`」）。
-> 于是"作者忘了写"与"作者故意公开"在运行期**完全等价**，源码里长得一模一样。
+`HttpRouterService.register(method, path, handler, opts)` 的第 4 参及 `opts.access` 必填。
+调用方必须选择 `public`、`user` 或 `admin`；迁移决策见
+[ADR-0012](docs/adr/0012-route-access-registration-validation.md)。
 
-现有缓解（都不是硬强制）：
+- 内置路由器在创建时读取 `GEEWIKI_STRICT_ROUTE_ACCESS`，仅字面量 `1` 开启严格模式。
+  严格模式在注册前拒绝遗漏，覆盖启动和插件热启用；所有模式拒绝 `null`、拼写错误等非法值。
+- 启动审计会重抛注册校验失败，避免失败插件未留下路由而导致空表通过；启动失败会清理资源。
+- 非严格模式的旧 JavaScript 调用仍默认 `public`（匿名可调），并保留启动聚合告警。
+  `HttpRouteInfo.explicit` 与 `unauditedRoutes(routes)` 继续区分显式公开与兼容默认值。
+- 覆盖：`packages/server/test/route-access-audit.test.ts`、
+  `packages/server/test/route-access-registration.test.ts`。
 
-- `HttpRouteInfo.explicit` 字段区分两者：`access: 'public'` + `explicit: false`
-  = "作者没想过这件事"。
-- `unauditedRoutes(routes)`（`packages/core/src/index.ts` 导出的纯函数）过滤出未显式声明的路由；
-  `packages/server/src/index.ts` 在启动时把它们聚合成**一条**告警。
-- 设 `GEEWIKI_STRICT_ROUTE_ACCESS=1`（常量 `STRICT_ROUTE_ACCESS_ENV`）则**直接拒启**。
-  默认不设，因为历史上存量太多。
-- 覆盖审计：`packages/server/test/route-access-audit.test.ts`。
-
-三条容易误解的语义，改动前先读：
+四条容易误解的语义，改动前先读：
 
 1. `access` 是**粗粒度**闸门（public / user / admin），**不能替代逐对象判定**——后者归
    policy-service（`docs/design/access-control.md`）。
@@ -232,7 +228,7 @@
 | 不变量 | 目标形态 | 为什么现在没做 |
 | --- | --- | --- |
 | INV-1 / INV-2 / INV-12 | `dependency-cruiser` 的 `forbidden` 规则（`packages/plugin-*/src/**` → 禁 `@geewiki/server`、`@geewiki/manager`、db 插件内部路径；`packages/core/src/**` → 禁 `@geewiki/plugin-*`），或 `eslint-plugin-boundaries` 的 element types + 允许的依赖矩阵 | 引入新工具要过 CI 时间预算这道账；且 §3.1 那批合法的插件间依赖需要先写成 allowlist，否则首跑就是一屏 error（**同 ADR-0004 的教训**：全量硬门禁必须配清零方案） |
-| INV-4（默认 public） | 单测级守卫：扫源码找 `register(` 三实参调用点，或让 `route-access-audit` 从告警升级为 CI 失败 | 存量调用点多；仓库先例是"告警 + 可选拒启"（`GEEWIKI_STRICT_ROUTE_ACCESS`）而非直接红 |
+| INV-4（旧 JavaScript 默认 public） | 未来收紧非严格兼容窗口的默认行为；现已有类型约束与严格模式注册校验 | 需先完成外部插件迁移；取舍见 ADR-0012 |
 | INV-6 | 一条读 `pnpm-workspace.yaml` 文本的守卫测试（断言两键是相对路径） | 没写；成本极低，**建议优先补** |
 | INV-7 | 契约部分已有守卫；"宿主职责不外移"无法静态检查，只能靠 ADR + Review | —— |
 | INV-10 | 不在仓库能力范围内（GitHub ruleset 状态） | 已在 [docs/ci-cd.md](docs/ci-cd.md) 记录 required checks 清单 |

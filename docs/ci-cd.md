@@ -14,8 +14,8 @@
 |---|---|---|
 | `lint` | `pnpm lint` —— ESLint 硬门禁，**警告即失败**（`--max-warnings 0`） | push main / push tag / PR |
 | `typecheck` | `pnpm typecheck` —— 28 个包 + `tsconfig.scripts.json` | 同上 |
-| `test` | `pnpm test` —— Node 内置测试运行器（文件数与用例数以 `pnpm test` 输出为准） | 同上 |
-| `build` | `pnpm build` —— 各包 `vite build` 等产物 | 同上 |
+| `test` | `pnpm test` + `pnpm test:postgres` —— 单元测试与真实 PostgreSQL 并发写入验收 | 同上 |
+| `build` | `pnpm build` + 核心流程与插件界面浏览器验收（插件界面覆盖生产和 Vite 开发模式） | 同上 |
 | `docs` | `pnpm run docs:links`（**阻断**：死链直接红）+ `pnpm run docs:conventions`（只报告）—— 文档门禁 | 同上 |
 | `docker-build` | 构建镜像但**不推送**，验证 Dockerfile 未被破坏 | 仅 PR |
 | `publish` | 构建多阶段镜像并推送到 GHCR；tag 推送时另建 GitHub Release | push main / push tag `v*` |
@@ -54,6 +54,69 @@ pnpm --filter @geewiki/web typecheck
 
 **`node_modules` 缺失时**（例如新克隆或新 worktree）必须先 `pnpm install --frozen-lockfile`，
 否则 typecheck / test 会因解析不到依赖而整体失败。
+
+### 2.1 PostgreSQL 写入门禁
+
+`test` 作业另起 PostgreSQL 17 服务容器，并在普通单测后执行 `pnpm test:postgres`。
+两步任一步失败都会使现有 `test` required check 失败。普通 `pnpm test` 无需外部数据库；
+专用验收没有跳过分支，缺少配置、连不上数据库或未形成锁竞争均直接失败。决策见
+[ADR-0011](adr/0011-postgres-write-integration-gate.md)。
+
+本地先准备可连接的 PostgreSQL 17 与有建库权限的测试账号，然后执行：
+
+```bash
+PGHOST=127.0.0.1 PGPORT=5432 PGUSER=geewiki PGDATABASE=postgres \
+  PGPASSWORD='<测试密码>' pnpm test:postgres
+```
+
+`PGHOST` / `PGPORT` / `PGUSER` 缺省分别为 `127.0.0.1` / `5432` / `geewiki`；
+`PGPASSWORD` 缺省为空，`PGDATABASE` 必须显式指定。它只作为控制连接的库，验收新建随机
+`gw_writes_` 前缀数据库，启动两个独立宿主及连接池，最后关闭宿主并删除新库。
+不会迁移或清空控制库中的业务表；强制终止时可能遗留测试库。
+
+覆盖：同基线更新只成功一次、同名创建冲突、删除重建使旧令牌失效、真实只读授权拒写、
+写出链失败时页面/历史/块一起回滚，以及失败后连接仍可继续保存。
+竞争前会等待两个 PostgreSQL 后端都进入锁等待，不靠请求时序碰运气。
+这条验收不覆盖 PostgreSQL 全文检索、全部手动 e2e 或多实例部署能力。
+
+### 2.2 插件界面入口验收
+
+```bash
+pnpm build
+node scripts/acceptance/run-plugin-ui-diagnostics.mjs
+node scripts/acceptance/run-plugin-ui-diagnostics.mjs --dev
+```
+
+这是 CI `build` 作业中的 CDP 浏览器门禁，也可用上述命令本地复现。
+需要可执行的 `google-chrome`（可用 `CHROME_BIN` 指定）。
+脚本创建临时插件、数据库和配置，自动分配端口并清理进程，不使用本机运行实例。
+覆盖同步/异步入口与模块求值失败、部分注册回滚、失败版本去重、停用后重试、版本变化自愈、
+在途卸载立即结束等待、显式入口超时后的继续加载、旧宿主迟到注册/注销不影响新代次、
+迟到清理与拒绝的消费；同时覆盖插槽/扩展点/页面缺项、真实注册和注销后的即时自愈、
+正常贡献保留、冲突抑制不误报、按需入口加载前后诊断以及等待中的异步入口不误报。
+开发模式另验 Vite 动态导入路径。
+结果、截图及各进程日志位于 `data/verify/plugin-ui-diagnostics-{prod,dev}/`。
+产物构建成功且作业未取消时，两种模式分别执行，即使核心流程或前一种模式失败也继续取得结果；
+每种模式最多运行 5 分钟，任意失败都会使现有 `build` 检查失败。
+作业失败时，两模式目录上传为 `plugin-ui-diagnostics` artifact，保留 7 天；
+启动过早失败时可能只有进程日志，没有截图。核心流程仍执行 `pnpm acceptance:core` 并使用独立 artifact。
+门禁归属与取舍见 [ADR-0017](adr/0017-plugin-ui-browser-gate.md)。
+
+### 2.3 备份恢复验收
+
+备份恢复用例随普通 `pnpm test` 进入现有 `test` 作业，无需运行中的本机服务器。
+定向复现：
+
+```bash
+node --import tsx --test packages/manager/test/backup.test.ts packages/manager/test/backup-restore-safety.test.ts packages/server/test/backup-paths.test.ts
+```
+
+覆盖自定义目录的真实 CLI/HTTP 备份、在线 WAL 快照、完整预检、符号链接与目标冲突拒绝、
+暂存与提交故障、双目录回退和回退失败时的原状留底。
+集成用例在临时目录启动服务并写入页面，在线备份后停服、经 CLI 恢复，再启动并读取页面，
+核对历史、附件、配置和 SQLite 完整性。所有数据与密钥均为合成样本，结束后清理实例和目录。
+命令和操作边界以 [deployment.md](deployment.md) §5.1 为准，回退取舍见
+[ADR-0018](adr/0018-offline-restore-preflight-and-rollback.md)。
 
 ---
 
@@ -183,11 +246,14 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
 
 ## 6. 未纳入 CI 的部分（诚实清单）
 
-以下内容**刻意不进 CI**，避免把需要外部环境的东西混进主门禁：
+以下内容尚未纳入主门禁：
 
-- **`packages/plugin-auth/test/*.sh`、`packages/plugin-authz/test/*.sh`**：需要真实
-  PostgreSQL 的 e2e 脚本，不在 `pnpm test` 范围内。
-- **`scripts/acceptance/**`**：基于 CDP 的浏览器验收脚本，需要真实浏览器与运行中的服务。
+- **8 个 e2e shell**：独立于 `pnpm test`，仍需手动指定端口运行；
+  其中 PostgreSQL 场景还需要数据库实例。脚本入口见 `docs/development.md` §4.6。
+- **其他 `scripts/acceptance/**` 验收**：核心流程及 §2.2 的插件界面生命周期与诊断已进入现有 `build` 作业；其余仍需人工运行。
+
+真实 PostgreSQL 页面写入已进入 `test` 作业，覆盖范围与本地命令见 §2.1；
+上面的手动 PostgreSQL e2e 仍需按各自场景运行。
 - **Type-aware ESLint 规则**（`recommendedTypeChecked`）：需要为 28 个包建立
   project service，CI 时间成倍增长而收益有限，故未启用。副作用是
   `@typescript-eslint/require-await` 这类规则失效，代码中针对它的
@@ -196,6 +262,14 @@ docker pull ghcr.io/geelinx-ltd/geewiki:latest
   `react-hooks/refs`、`react-hooks/immutability`）：在存量代码上会产生约 52 个 error，
   需要重构 UI 才能收敛。当前只启用经典子集：`rules-of-hooks` 报错、
   `exhaustive-deps` 警告（不阻断）。
+
+核心浏览器流程由 `pnpm acceptance:core` 执行：启动临时配置、数据库与自动分配的端口，
+用 runner 提供的 Chrome 验证登录、新建、编辑冲突、确认重试与历史恢复。
+它在 `build` 的 `pnpm build` 之后运行，失败会使原有 `build` 检查失败，作业名保持不变；
+失败截图、结果 JSON 与进程日志会上传为 `core-flow` artifact。
+本地开发模式再运行 `pnpm acceptance:core --dev`，验证 Vite 的模块加载路径。
+该流程使用 SQLite，不代表其余浏览器验收或 PostgreSQL e2e 已受门禁保护；
+另有插件界面门禁，覆盖范围和两模式命令见 §2.2。
 
 ## 7. main 分支保护（已启用）
 

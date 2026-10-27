@@ -49,7 +49,7 @@ curl -s localhost:3000/api/plugins/slots | jq '{slots, extensions, conflicts}'
 
 - [ ] 全插件内**每一次** `http.register(...)` 都传了第 4 参 `{ access: '...' }`，包括看起来"只是查个状态"的 GET。
 
-**为什么**：`HttpRouterService.register(method, path, handler, opts?)` 的 `opts.access` **默认 `'public'`**（`packages/core/src/index.ts`）——省略第 4 参与"我故意做成匿名可调"在源码里长得**一模一样**：评审看不出来，运行期也毫无痕迹，启动只聚合成一条告警（`STRICT_ROUTE_ACCESS_ENV = 'GEEWIKI_STRICT_ROUTE_ACCESS'`，`packages/server/src/index.ts`，设 `=1` 才拒启）。这与"安全可控"理念正面冲突，且后果落在部署者身上：数据匿名可读。`access` 本身也只是粗粒度等级，**逐对象判定仍要你在处理器里做**。
+**为什么**：`HttpRouterService.register(method, path, handler, opts)` 的第 4 参及 `opts.access` 必填。内置路由器在 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 时于注册前拒绝遗漏（含热启用），所有模式拒绝非法访问等级。旧 JavaScript 非严格调用仍可能默认公开，因此评审仍须检查每个声明及其选择；迁移见 ADR-0012。`access` 只是粗粒度等级，**逐对象判定仍要在处理器里做**。
 
 **如何验证**：
 

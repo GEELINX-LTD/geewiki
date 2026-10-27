@@ -50,6 +50,7 @@ import {
   type PluginHealthReport,
   type PluginHealth,
   DEFAULT_DATA_DIR,
+  resolveProjectPath,
   DEFAULT_DB_FILENAME,
   DEFAULT_LOCALE,
   isLocaleCode,
@@ -585,6 +586,15 @@ export class GeeWikiManager {
   ): Promise<import('./backup.js').BackupReport> {
     const repoRoot = resolve(opts.repoRoot ?? process.cwd())
     const outDir = opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')
+    // 输出目录保留工作目录语义；输入必须与宿主实际清单、数据目录一致。
+    const paths = {
+      repoRoot,
+      outDir,
+      configDir: dirname(resolve(this.config.baseFile)),
+      dataDir: opts.repoRoot === undefined
+        ? resolveProjectPath(process.env['GEEWIKI_DATA_DIR'] ?? DEFAULT_DATA_DIR, import.meta.url)
+        : resolve(repoRoot, process.env['GEEWIKI_DATA_DIR'] ?? DEFAULT_DATA_DIR),
+    }
     // 迁移控制器处已有同款取法（`this.ctx.get('db') as AnyDatabaseAdapter | undefined`）
     const db = this.ctx.get('db') as AnyDatabaseAdapter | undefined
     const dialect = db?.dialect ?? 'sqlite'
@@ -592,19 +602,17 @@ export class GeeWikiManager {
     const databaseRelPath = join(DEFAULT_DATA_DIR, DEFAULT_DB_FILENAME)
     if (db !== undefined && dialect === 'sqlite') {
       return createBackup({
-        repoRoot,
-        outDir,
+        ...paths,
         databaseRelPath,
         ...snapshot,
         snapshotDatabase: async (dest: string) => {
           // 目标文件必须不存在：`VACUUM INTO` 拒绝覆盖已存在的文件（这正好是我们的意图）
-          db.run('VACUUM INTO ?', [dest])
+          await db.run('VACUUM INTO ?', [dest])
         },
       })
     }
     return createBackup({
-      repoRoot,
-      outDir,
+      ...paths,
       databaseRelPath,
       ...snapshot,
       databaseNote:

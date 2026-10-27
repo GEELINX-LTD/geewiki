@@ -72,7 +72,8 @@ pnpm dev                                         # ③
 | `pnpm build` | 递归跑各包的 `build` | 实际只有 `@geewiki/web` 会构建；**不含**插件 UI 的 `build:fixtures` |
 | `pnpm start` | 用 tsx 直跑 `packages/server/src/index.ts` | 生产镜像里也是 tsx，服务端包**没有构建步骤** |
 | `pnpm typecheck` | 递归 `typecheck` + `tsc --noEmit -p tsconfig.scripts.json` | `--no-bail` 会跑完所有包再失败，别只看最后一行 |
-| `pnpm test` | 递归各包 `test` | 只跑无浏览器、无网络的单测，见 §6 |
+| `pnpm test` | 递归各包 `test` | 只跑无浏览器、无外部数据库依赖的测试，见 §6 |
+| `pnpm test:postgres` | 真实 PostgreSQL 并发写入与回滚验收 | 需数据库及建库权限；环境和覆盖范围见 [docs/ci-cd.md](docs/ci-cd.md) §2.1 |
 | `pnpm lint` | `eslint . --max-warnings 0` | **警告即失败**（`ba47fb9 fix(lint): 9 条警告清零，并把 lint 从"警告照过"改成硬门禁`） |
 | `pnpm run lint:fix` | `eslint . --fix` | |
 | `pnpm run new:plugin <名>` | 生成插件脚手架（`scripts/create-plugin.ts`） | 加 `--ui` 同时生成界面产物链；`--dry-run` 只看落点 |
@@ -170,6 +171,7 @@ node --import tsx --test test/*.test.ts
 
 - 测试文件放各包的 `test/*.test.ts`。
 - 跑全包：`pnpm test`（`--no-bail`，会跑完所有包）。
+- 真实 PostgreSQL 集成验收另跑 `pnpm test:postgres`；配置与 CI 覆盖范围见 [docs/ci-cd.md](docs/ci-cd.md) §2.1。
 - 跑单包：`pnpm --filter @geewiki/manager test`。
 - **跑单文件**：进到包目录里直接 `node --import tsx --test test/<你的文件>.test.ts`。
 - 少数包只有 `typecheck` 没有 `test`（`@geewiki/echo`、`@geewiki/editor-plain`）。
@@ -244,7 +246,8 @@ node scripts/acceptance/plugin-ui-cdp.mjs http://localhost:5173 9452     # dev�
 
 ### 6.4 前端行为不能用 curl 代替
 
-[docs/development.md](docs/development.md) 明写这条纪律：**真实浏览器交互从未被自动验证覆盖**。
+[docs/development.md](docs/development.md) 要求前端行为通过真实浏览器验证。
+核心流程与插件界面诊断已接入 CI，范围以 [docs/ci-cd.md](docs/ci-cd.md) §2.2/§6 为准。
 界面改动请用 §6.3 的脚本或手工浏览器验证，并在 PR 里说明验了什么、没验什么。
 
 ---

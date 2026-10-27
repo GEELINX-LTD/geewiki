@@ -139,20 +139,27 @@ type GeeWikiPlugin = {
 
 出处：`packages/core/src/services.ts`（服务契约的**单一真源**，含 `SearchService` / `AuthService` / `WikiService` / `AttachmentService` / `EmbeddingService`；**非浏览器安全**，前端不要 import）。
 
+`WikiService` 的用户写入应调用 `saveAs(principal, slug, input)` / `removeAs(principal, slug)`，
+服务内检查登录主体与页面权限，并记录操作者；`save/remove` 是不做用户授权的受信系统入口。
+读取原文时，有编辑权的调用方可取得 `revision`；保存将其作为 `expectedRevision` 提交，
+只创建则传 `null`。状态变化返回 `WikiWriteError`（HTTP 为 `409 edit_conflict`），
+确认覆盖时也须使用冲突返回的当前状态重试，不能省略前置条件。未传条件的旧调用仍保持兼容。
+主体入口会重查权限，但不保证与并发 ACL 修改原子化，也不构成插件沙箱（ADR-0010）。
+
 ---
 
 ## 5. HTTP 路由面（`HttpRouterService`）
 
 ```ts
 register(method: 'GET'|'POST'|'PUT'|'DELETE'|'PATCH', path: string,
-         handler: RouteHandler, opts?: RouteAccessOptions): () => void   // ★ 第 4 参可省 ⇒ access:'public'
+         handler: RouteHandler, opts: RouteAccessOptions): () => void   // 第 4 参及 access 必填
 ```
 
 | 成员（`?` = 可选，向后兼容） | 签名 | 语义 / 陷阱 |
 | --- | --- | --- |
 | `register` | 见上 | `path` 支持 `:param`；返回注销函数；`opts.owner` 是**可观测性字段，非安全边界**（AP-06） |
 | `use?(hook)` | `(hook: RequestHook) => () => void` | 串行、任一 `ok:false` 短路；**不得自己写响应**；抛错视同 500；返回形态非法按**拒绝**处理；★**只对匹配到的路由执行** ⇒ 不构成全局鉴权（AP-06） |
-| `routes?()` | `() => readonly HttpRouteInfo[]` | `HttpRouteInfo { method; path; access; capability?; explicit: boolean; owner? }`；`explicit` 区分"作者写了 public"与"作者什么都没写"；`unauditedRoutes()` 挑 `!explicit`；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时启动**拒启** |
+| `routes?()` | `() => readonly HttpRouteInfo[]` | `HttpRouteInfo { method; path; access; capability?; explicit: boolean; owner? }`；`explicit` 区分显式公开与旧 JS 非严格兼容的默认值；`unauditedRoutes()` 挑 `!explicit`；严格模式在注册前拒绝遗漏，启动审计保留 |
 | `ownerStats?()` | `() => readonly RouteOwnerStats[]` | 只统计登记了 `owner` 的路由；未归因的不出现（**错误归因比没有归因更危险**） |
 | `stats()` / `inflight()` / `pending()` | — | 看门狗探针数据源；长连接**不计入** |
 | `drain(timeoutMs)` | `(ms: number) => Promise<boolean>` | 全站语义；`false` = 仍有请求在执行；插件粒度排空未实现 |
@@ -160,7 +167,10 @@ register(method: 'GET'|'POST'|'PUT'|'DELETE'|'PATCH', path: string,
 | `closeStreams?(owner?)` | `(owner?: string) => void` | 不传关全部；管理器卸载单插件时按 owner 收 |
 | `noteStreamRejected?()` | `() => void` | 并发上限是**持有者的策略**，被拒时自行上报 |
 
-`RouteAccess = 'public' | 'user' | 'admin'`（**默认 `public`**，AP-01）；`RouteAccessOptions { access?; capability?; owner? }`——`access` 与 `capability` 是**两层**（身份 vs 能力），都通过才放行。
+`RouteAccess = 'public' | 'user' | 'admin'`；`RouteAccessOptions { access; capability?; owner? }`。
+`access` 与 `capability` 是**两层**（身份 vs 能力），都通过才放行。内置路由器创建时读取严格开关，
+仅 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏（含热启用）；所有模式拒绝非法值。
+旧 JavaScript 仅在非严格模式保留默认 `public` 与启动聚合告警，迁移见 ADR-0012（AP-01）。
 `RouteHandlerContext { req; res; url: URL; params: Record<string,string>; json(status, body); noteStatus?(status); principal? }`——读 `principal` **必须失败关闭**（拿不到按匿名处理）；`noteStatus` 只记指标、不结束响应。
 `Principal { kind: 'anonymous'|'user'|'break-glass'; userId; orgId; orgRole: 'owner'|'admin'|'member'|'viewer'|null; groupIds; sessionId }`；`breakGlassPrincipal()` 受 `GEEWIKI_ADMIN_TOKEN` 控制（**未设置则完全禁用**，无默认令牌；`orgRole` 刻意 `null` ⇒ 按 `orgRole` 授权的下游默认拒绝）。
 
@@ -250,6 +260,22 @@ export function register(host): () => void          // 推荐：宿主注入作�
 ```
 
 作用域宿主类型 `PluginUiHost`（`packages/web/src/lib/pluginUi.ts`）= 完整 SDK + **`readonly pluginName: string`**（全局 SDK 上没有这个字段，可用于自检归属，见 `packages/web/fixtures/src/index.tsx`）+ 过闸门的 `registerSlot`/`registerExtension`。
+显式 `register(host)` 或默认导出入口可返回 Promise；宿主最多等待 15 秒，完成后标记界面已加载并注入 CSS。
+返回（或 Promise 结算为）卸载函数时，宿主会在停用或替换时调用它。
+同步异常、异步拒绝和超时都会回收已登记贡献，并在页面及「插件管理」提示界面不可用或初始化超时；
+同一失败版本不会随轮询重复执行，版本变化或停用后重新启用会重试。
+停用立即结束显式入口等待；撤销后的旧宿主不能再注册或批量注销贡献，迟到的清理函数仍执行一次。
+异步代码必须持有 `host` 参数或已经取得的作用域引用：入口开始等待返回值时已恢复全局 SDK，
+不能依赖之后重新读取全局对象取得插件归属。
+Promise、未经过宿主登记的计时器、网络请求等副作用仍由插件负责清理。
+模块下载、ESM 顶层 await 和同步死循环不在这项等待上限的抢占范围内；本机制不是插件沙箱。
+取舍见 [ADR-0016](../adr/0016-plugin-ui-entry-timeout.md)。
+入口结算后，宿主按真实注册表核对当前生效的插槽、扩展点和页面声明；
+缺项只在管理台提示「尚未就绪」，不会回滚正常贡献或重跑入口。
+异步初始化应返回 Promise；若在入口返回后才延迟注册，提示会在真正注册后自动消失，
+注销后再次出现。未加载的按需入口和被冲突仲裁抑制的声明不参与检查。
+该检查只确认组件及归属已登记，不保证组件渲染成功。运行诊断见
+[plugin-platform.md](../plugin-platform.md) §4.8。
 现算 SDK 版本：`grep -n HOST_SDK_VERSION packages/web/src/lib/hostSdk.ts`（本文件不写死读数）。
 
 | SDK 成员 | 首个可用版本 | 签名与要点 |
@@ -327,13 +353,13 @@ UI 产物构建：外部插件的 UI 根被硬编码为 `<插件目录>/dist`（
 
 | 参考 | 值得抄什么 | 值得**避开**什么 |
 | --- | --- | --- |
-| `plugins/ui-demo/`（`package.json` + `src/index.ts` + `dist/` 产物） | 外部插件完整形态：`requires: ['http-service']`、`client: {entry:'client.js',css:'client.css'}`、`slots: ['app-header','app-footer']`、`extensions: [{node:'shell-brand-text',mode:'wrap'}]`、`apply(ctx)` 里 `ctx.get('http')` 缺失即 `throw`、**返回注销函数** | ① `provides: 'ui-demo-service'` 但代码里没有 `ctx.provide` ⇒ **AP-08**；② `RouterLike.register` 只声明 3 参 ⇒ 生成的路由匿名可调 ⇒ **AP-01**；③ `dist/` 不入库 ⇒ 干净检出需先 `build:fixtures` ⇒ **AP-15** |
-| `plugins/hello-geewiki/`（`index.ts` + `README.md`） | 零依赖最小后端：`entry: 'index.ts'`、config `greeting`/`uppercase`、未声明 `configSchema` ⇒ 管理台只给 JSON 原文编辑框；README 给了带编码插件名的 curl 与"需要第三方库须自带 `node_modules`"的口径 | 同样是 3 参注册（AP-01） |
+| `plugins/ui-demo/`（`package.json` + `src/index.ts` + `dist/` 产物） | 外部插件完整形态：`requires: ['http-service']`、`client: {entry:'client.js',css:'client.css'}`、`slots: ['app-header','app-footer']`、`extensions: [{node:'shell-brand-text',mode:'wrap'}]`、`ctx.get('http')` 缺失即 `throw`、返回注销函数；只注册路由，省略 `provides`，显式声明 `access: 'public'` 与 `owner` | `dist/` 不入库 ⇒ 干净检出需先 `build:fixtures`（AP-15） |
+| `plugins/hello-geewiki/`（`index.ts` + `README.md`） | 零依赖最小后端：`entry: 'index.ts'`、config `greeting`/`uppercase`、未声明 `configSchema` ⇒ 管理台只给 JSON 原文编辑框；README 给了带编码插件名的 curl 与依赖说明；省略 `provides`，显式声明 `access` 与 `owner` | — |
 | `packages/web/fixtures/src/index.tsx` | 前端产物的**真实源码**：`export function register(host): () => void`、特性探测 `host.registerExtension?.(...)`、顶层形态用 `hostAtEval?.pluginName` 判身份、自带最小 `PluginUiHost` 声明（不依赖宿主源码路径）、`CounterWidget` 证同一 React 实例、`ThrowerWidget` 验错误边界 | — |
 | `packages/plugin-echo/src/index.ts` | **`provides` 的正确处理**：刻意撤销 `provides`，注释写清"谎报的 token"后果；`runtime: {supportsHotReload: true, requiresCachePurge: false, drainTimeout: 5}`；`requires: ['@geewiki/http']` | — |
 | `packages/plugin-search/src/index.ts` | `ctx.provide('search-service', svc)` + 注销 + 导出契约类型；`requires: ['wiki-service','llm-service']`；`conflictGroup: "search-provider"`；`migrations: { default: 'migrations', postgres: 'migrations/postgres' }`（**FTS5 依赖 SQLite ⇒ postgres 方言下无迁移，由插件在 apply 里显式拒绝**） | — |
 | `packages/plugin-openai/src/index.ts` | provider 的正确形态：**注册进 `llm-service` 的"路由"**而不是自建 provider；端点/模型名全部来自配置（默认值一律用 `https://api.example.com/v1` 这类占位，**不要沿用仓库里那个私有端点**） | — |
-| `packages/manager/src/scaffold.ts` | 脚手架生成物即"最小契约"：`package.json` + `index.ts` + `dist/client.js` + `dist/client.css`(仅 `--ui`) + `README.md`；`gitignoreLinesFor(name)` 给出该加的两行例外 | 生成的清单与代码**同时**继承 AP-01 与 AP-08 |
+| `packages/manager/src/scaffold.ts` | 脚手架生成物即最小契约：`package.json` + `index.ts` + `dist/client.js` + `dist/client.css`（仅 `--ui`）+ `README.md`；省略未实现的 `provides`，路由显式声明 `access` / `owner`；`gitignoreLinesFor(name)` 给出该加的两行例外 | — |
 
 内置清单的两个真源：可启用集合看 `defaultRegistry()`（`packages/server/src/index.ts`），默认启用集合看 `config/plugins.base.example.json` 的 `enabled`（同目录 `plugins.base.json` 是本机现状，**不可当口径**）。二者数量**不相等**：已注册未写入默认基础层的至少有 `@geewiki/postgres`、`@geewiki/editor-plain`、`@geewiki/oidc`、`@geewiki/echo`。数量与全集一律现算，勿写死。
 

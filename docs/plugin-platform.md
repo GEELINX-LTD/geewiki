@@ -430,6 +430,35 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 后端 `409 has_dependents`（`details.dependents` 为依赖方名单）现被管理台捕获并弹出**专门说明块**（`packages/web/src/pages/GraphPage.tsx` 中 `GraphPage()` 内由 `blockedDisable` 状态驱动的 `{blockedDisable && ( … )}` 渲染块，标题行文本「无法停用「{labelOf(blockedDisable.name)}」：还有插件在依赖它」）——标题「无法停用「X」：还有插件在依赖它」+ 列出依赖方 + **两段可操作指引**（① 先在上表逐个停用依赖方再回来停用目标；② 若它是被同冲突组其它插件顶替，可在目标插件那行点「启用」走**冲突组替换**，会连同依赖方一起安全接管）。`dependentNamesOf()`（`packages/web/src/pages/GraphPage.tsx` 的 `function dependentNamesOf(details: unknown): string[]`；在停用动作内 `err instanceof ApiError && err.code === 'has_dependents'` 分支经 `setBlockedDisable({ name: p.name, dependents: dependentNamesOf(err.details) })` 调用）**防御性**读取 `details`：形状不符退回空数组 → 走兜底文案，**不显示 `undefined`**。**刻意未实现自动级联停用**（破坏性操作）。
 
+### 4.8 浏览器入口执行失败
+
+模块导入、顶层求值、显式 `register(host)` / 默认入口执行失败，均由
+`packages/web/src/lib/pluginUi.ts` 的 `loadPluginUi` 回收本次注册并记录到
+`pluginUiState().failed`。显式入口返回 Promise 时最多等待 15 秒；在完成前不标记成功或注入 CSS。
+超时以 `kind: 'timeout'` 记录并继续后续加载，其余异常为 `kind: 'error'`；页面与管理台显示不同的固定中文提示。
+原始错误摘要仅保留在控制台和诊断数据属性，不作为正文展示。
+这与服务端入口表的 `skipped`、发现期的 `issues` 分属不同阶段。
+
+同一失败版本不随轮询重复执行；版本变化或停用后重新启用会重试，成功后提示消失。
+失败项不在已加载集合中，因此同步入口表时也会专门清理停用、换版本的失败代次。
+停用立即中止宿主对显式入口的等待，超时、失败或停用均撤销旧作用域并回收其贡献。
+旧宿主随后不能新增或批量注销注册，迟到结果不再写入成功或失败状态；晚到清理函数仍执行一次。
+模块求值和显式入口同步调用期间安装全局作用域，等待返回值期间恢复基础 SDK，异步代码必须保留 `host` 引用。
+上限不能取消原 Promise、抢占同步死循环或终止模块导入，重新取得全局 SDK 也不受旧引用撤销约束，
+因此不是插件沙箱。作者接口见 [plugin/api-reference.md](plugin/api-reference.md) §8，取舍见
+[ADR-0014](adr/0014-plugin-ui-entry-settlement.md) 与 [ADR-0016](adr/0016-plugin-ui-entry-timeout.md)。
+
+入口执行成功后，`diagnosePluginUiRegistration` 以真实插槽/扩展点和路由注册表的 owner
+核对入口表中已经生效的 `slots`、`extNodes`、`routes`。缺项进入
+`pluginUiState().mismatches`，管理台列出具体位置；它与入口失败分开，正常部分仍可使用，
+不回滚贡献、不自动重跑入口，也不改变服务端启用状态。
+
+只核对已经完成加载且版本仍匹配的入口；未加载的按需入口、等待中的 Promise 和被抑制的节点
+不告警。订阅注册表使延迟注册后提示自动消失，主动注销后重新出现，停用后清除。
+入口返回后才注册的插件会短暂显示「尚未就绪」；需要等待初始化时应返回 Promise。
+这是登记一致性诊断，组件渲染异常仍交现有错误边界。取舍见
+[ADR-0015](adr/0015-plugin-ui-registration-diagnostics.md)。
+
 ### 4.9 界面扩展平台（P4–P10）：插槽泛化为**宿主节点 + 三种模式**
 
 设计真源是 [design/ui-extension-platform.md](design/ui-extension-platform.md)，此处只记**契约要点与实现位置**。
@@ -503,7 +532,7 @@ D-4 的全部结论仍然成立（放弃 Module Federation、不裸加载、exte
 
 | 级别 | 问题 | 证据 | 现状 / 建议 |
 | --- | --- | --- | --- |
-| **中** | **路由访问等级默认 `public`**：`register()` 第 4 参可省，省略即匿名可调；全仓 50+ 个 `.register(...)` 调用点全靠作者自觉 | `packages/core/src/index.ts` 的 `export interface RouteAccessOptions`（字段 `access?: RouteAccess`，注释「省略等价于 `{ access: 'public' }`」） | **F11 审计钩子已落地并在工作**：启动时把未显式声明 `access` 的路由聚合成一条告警——当前实跑仍可见 `[geewiki] 1/18 条路由未显式声明访问等级，正按默认 'public'（匿名可调）运行：`；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时**拒绝启动**（`packages/server/src/index.ts` 的 `export function auditRouteAccess(router: HttpRouterServiceType, env: NodeJS.ProcessEnv = process.env): void` 与开关常量 `export const STRICT_ROUTE_ACCESS_ENV = 'GEEWIKI_STRICT_ROUTE_ACCESS'`）。**仍建议**① 长期把默认改为 `user`，`public` 必须显式写 |
+| **中** | **旧 JavaScript 非严格路由仍默认 `public`**：兼容调用遗漏声明时匿名可调 | `packages/core/src/index.ts` 的 `HttpRouterService.register` / `RouteAccessOptions`；`packages/server/src/index.ts` 的 `HttpRouter` / `auditRouteAccess` | core 类型已要求显式声明；严格模式在注册前拒绝遗漏，覆盖热启用，所有模式拒绝非法访问等级。非严格旧 JS 保留默认公开与启动告警，后续默认收紧需迁移评估（ADR-0012）；部署开关以 `docs/deployment.md` 为准 |
 | **中** | **插件进程内无隔离、无资源配额**：插件与宿主同进程、同权限，可任意读写文件系统 / 发网络请求 / 死循环 / OOM。一个坏插件能拖垮整站 | 设计自认「插件平台内的插件本就能执行任意代码」（`packages/core/src/index.ts` 插槽服务文档注释中谈 `HttpRouterService.trackStream(res, owner)` 的 owner 契约的一段：“插件平台内的插件本就能执行任意代码，故 owner 不是安全边界”） | F14 已做 `runtime.applyTimeout`（缺省 30s + 晚到 fiber 回收）；F10 已做 `permissions` 清单 + 激活提示 + 快照下发 + 「用法 ⇒ 必须声明」守卫；**剩余风险收缩为「同进程同权限」这一条架构前提**——一个拿到 `fs:write` 的插件仍能改写宿主文件，那不是配置能解决的，只能靠进程边界。worker / 子进程隔离模式**有意后置**（§5.4） |
 | **中** | **外部插件无发布者签名**：装进来的代码即得以全权限运行 | F17 已落地「安装 + 完整性校验」：`pnpm run install-plugin <目录\|.tgz\|https URL>` + `--verify`、`GET /api/plugins/integrity`（admin） | **仍缺远端注册表与发布者签名**。注意 `--verify` 的结果有三种，其中 `unsigned`（没有基线 ⇒ 无法判断）**刻意与 `ok` 分开**——把"无法判断"报成"通过"正是这类设施最容易退化成"看起来在防护、实际什么都没防"的方式 |
 | **低** | 普通配置字段在 `GET /api/plugins/:name/config` **明文返回**（密钥字段已妥善处理：`role:'secret'` + 0600 + 不回显） | `packages/manager/src/secrets.ts`（头部注释明确边界）；§5.3 L-20 | 已充分记档，属可接受的产品取舍；若未来接多租户再收紧 |

@@ -98,8 +98,8 @@ test('★ F21：生成的 package.json 能被 parsePluginManifest 真正接受�
   assert.equal(manifest.name, packageNameOf('demo-notes'))
   assert.equal(manifest.version, '0.1.0')
   assert.equal(manifest.geewiki.entry, 'index.ts')
-  // `provides` 是**依赖图 token**，不是 cordis 服务名；http 路由服务的 token 是 http-service
-  assert.equal(manifest.geewiki.provides, 'demo-notes-service')
+  // 本模板只注册路由，不对外提供 cordis 服务。
+  assert.equal(manifest.geewiki.provides, undefined)
   assert.deepEqual(manifest.geewiki.requires, ['http-service'])
   assert.equal(manifest.geewiki.runtime?.supportsHotReload, true)
   assert.equal(manifest.geewiki.runtime?.drainTimeout, 5)

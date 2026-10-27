@@ -21,7 +21,7 @@ import { describeRoot, hasDynamicOptions, type FieldDescriptor } from '../lib/co
 import { describeError, errorLine } from '../lib/errorText'
 import { resolveAreaState } from '../lib/areaState'
 import { useSlowHint } from '../lib/useSlowHint'
-import { syncPluginUi, subscribePluginUiState, pluginUiState } from '../lib/pluginUi'
+import { syncPluginUi, subscribePluginUiState, pluginUiState, unloadPluginUi } from '../lib/pluginUi'
 import { Ext } from '../lib/slots'
 import { themeContrastIssues } from '../lib/pluginTheme'
 import { AA_TEXT_MIN } from '../lib/contrastPlan'
@@ -416,6 +416,8 @@ export function GraphPage(): ReactNode {
       setBlockedDisable(null)
       try {
         await api.disable(p.name)
+        // 入口可能仍在 await；先推进其代次，不能等排队的整表同步才回收。
+        unloadPluginUi(p.name)
         /*
          * 两种层的后果不同，提示必须分开说：会话层插件停用是**真的写了会话清单**（"已保存"成立）；
          * 基础层插件停用**什么都没写**（进程内登记，重启即恢复），继续沿用旧文案会让人以为已经持久化。
@@ -834,6 +836,51 @@ export function GraphPage(): ReactNode {
                     {UI_SKIP_LABEL[item.reason]}
                   </Badge>
                   <div className="text-xs text-muted">{UI_SKIP_HELP[item.reason]}</div>
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      )}
+
+      {uiState.failed.length > 0 && (
+        <Card className="border-warn-line bg-warn-bg">
+          <CardHeader
+            as="h2"
+            title={`有 ${uiState.failed.length} 个插件的界面加载或初始化失败`}
+            description="相关界面暂时不可用。可停用后重新启用，或联系插件作者检查；插件的其他服务不受这条提示影响。"
+          />
+          <CardBody>
+            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              {uiState.failed.map((item) => (
+                <li key={item.name} data-plugin-ui-entry-failed={item.name} data-error={item.message} data-error-kind={item.kind}>
+                  <span className="text-xs font-medium text-ink">{labelOf(item.name)}</span>
+                  <Badge tone="warn" className="ml-2">{item.kind === 'timeout' ? '初始化超时' : '界面不可用'}</Badge>
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      )}
+
+      {uiState.mismatches.length > 0 && (
+        <Card className="border-warn-line bg-warn-bg">
+          <CardHeader
+            as="h2"
+            title={`有 ${uiState.mismatches.length} 个插件的部分界面尚未就绪`}
+            description="这些插件的界面入口已执行，但部分声明尚未注册。其余功能仍可使用；可检查插件版本或联系维护者。延迟注册完成后提示会自动消失。"
+          />
+          <CardBody>
+            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              {uiState.mismatches.map((item) => (
+                <li key={item.name} data-plugin-ui-mismatch={item.name}>
+                  <span className="text-xs font-medium text-ink">{labelOf(item.name)}</span>
+                  <Badge tone="warn" className="ml-2">部分界面未就绪</Badge>
+                  <dl className="m-0">
+                    {item.slots.length > 0 && <DetailRow label="插槽">{item.slots.map(id => <Chip key={id}>{id}</Chip>)}</DetailRow>}
+                    {item.extNodes.length > 0 && <DetailRow label="扩展点">{item.extNodes.map(id => <Chip key={id}>{id}</Chip>)}</DetailRow>}
+                    {item.routes.length > 0 && <DetailRow label="页面">{item.routes.map(id => <Chip key={id}>{id}</Chip>)}</DetailRow>}
+                  </dl>
                 </li>
               ))}
             </ul>

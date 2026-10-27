@@ -2812,8 +2812,11 @@ function WikiEdit(props: {
     () => (editPages === null ? null : new Map(editPages.map((p) => [p.slug, p.title] as const))),
     [editPages],
   )
-  /** 保存冲突：服务端的 updated_at 与本页加载时不同 */
+  /** 保存冲突：由服务端返回的最新状态。 */
   const [conflictAt, setConflictAt] = useState<string | null>(null)
+  const conflictRevision = useRef<string | null>(null)
+  const serverRevision = useRef<string | null>(null)
+  const saveInFlight = useRef(false)
   const [origSlug, setOrigSlug] = useState('')
   /**
    * 附件上传的可见提示（M4）。
@@ -2866,7 +2869,7 @@ function WikiEdit(props: {
 
   /** 加载时的基线（脏值比较用 state 而非 ref：比较结果要参与渲染） */
   const [original, setOriginal] = useState<PageDraft>({ title: '', content: '', slugInput: slug })
-  /** 本页加载时服务端的 updated_at；保存前用它检测"别人改过了" */
+  /** 草稿基线的服务端更新时间；写入前置条件使用独立的 revision。 */
   const serverUpdatedAt = useRef<string | null>(null)
 
   const dirty = isDirty(original, { title, content, slugInput })
@@ -2976,6 +2979,9 @@ function WikiEdit(props: {
   const load = useCallback((): void => {
     setErr('')
     setFieldErrors({})
+    serverRevision.current = null
+    serverUpdatedAt.current = null
+    setConflictAt(null)
     if (newMode) {
       // 预填 slug 时基线里的 slugInput 用预填值：否则 slug 一进页面就被判成"有改动"
       const base: PageDraft = { title: '', content: '', slugInput: prefillSlug ?? '' }
@@ -2998,6 +3004,7 @@ function WikiEdit(props: {
         setContent(p.content)
         setOrigSlug(p.slug)
         serverUpdatedAt.current = p.updated_at
+        serverRevision.current = p.revision ?? null
         setOriginal({ title: p.title, content: p.content, slugInput: slug })
         /*
           档位**用这一次响应**填上，不额外发请求 —— 它只用于编辑器里"块档位不能比页面更宽"
@@ -3171,30 +3178,20 @@ function WikiEdit(props: {
         return
       }
 
-      /*
-       * 冲突检测（仅编辑既有页面）：保存前取一次服务端状态，比对 `updated_at`。
-       *
-       * 目的：**不静默覆盖别人更新的内容**。若期间有人（或另一个标签页）保存过，
-       * 就先让用户知道，由他决定是否覆盖——而不是无声地把对方的工作顶掉。
-       * 代价是每次保存多一次 GET；对本应用的数据规模（单页几百 KB 以内）可接受，
-       * 换来的是"丢内容"这种不可逆事故的避免。
-       */
-      if (!newMode && opts.force !== true) {
-        try {
-          const fresh = await api.page(slug)
-          if (serverUpdatedAt.current !== null && fresh.updated_at !== serverUpdatedAt.current) {
-            setConflictAt(fresh.updated_at)
-            return
-          }
-        } catch (e) {
-          // 拿不到最新状态时**不阻塞保存**：网络抖动不该让用户存不了东西
-          console.debug('[geewiki-wiki] 保存前冲突检测跳过：', e instanceof Error ? e.message : e)
-        }
+      if (saveInFlight.current) return
+      // 只接受原文读取附带的基线；缺失时保留编辑内容并要求重新加载。
+      if (!newMode && serverRevision.current === null) {
+        setErr('未取得页面的原文状态，请保留草稿后重新加载页面再保存')
+        return
       }
-
+      saveInFlight.current = true
       setSaving(true)
       try {
-        const r = await api.savePage(target, { title: title.trim(), content })
+        const r = await api.savePage(target, {
+          title: title.trim(),
+          content,
+          expectedRevision: opts.force === true ? conflictRevision.current : serverRevision.current,
+        })
         // 保存成功 ⇒ 草稿使命结束（连同新建页的哨兵键一起清）
         removeDraft(slug)
         if (newMode) removeDraft(prefillSlug ?? '')
@@ -3217,8 +3214,16 @@ function WikiEdit(props: {
         }
         onDone(newMode ? r.slug : slug)
       } catch (e) {
-        setErr(errorLine(e))
+        if (e instanceof ApiError && e.code === 'edit_conflict') {
+          const details = e.details as { revision?: unknown; updatedAt?: unknown } | undefined
+          conflictRevision.current = typeof details?.revision === 'string' ? details.revision : null
+          setConflictAt(typeof details?.updatedAt === 'string' ? details.updatedAt : '')
+        } else {
+          setErr(errorLine(e))
+        }
         setSaving(false)
+      } finally {
+        saveInFlight.current = false
       }
     },
     [content, createHomeMode, newMode, slug, slugInput, title, onDone, prefillSlug],
@@ -3246,6 +3251,8 @@ function WikiEdit(props: {
 
   const applyDraft = (): void => {
     if (pendingDraft === null) return
+    // 旧草稿不以刚读取的最新状态冒充基线：首次保存必须进入服务端冲突确认。
+    if (draftIsStale(pendingDraft, serverUpdatedAt.current)) serverRevision.current = '0'.repeat(64)
     setTitle(pendingDraft.title)
     setContent(pendingDraft.content)
     setPendingDraft(null)
@@ -3815,7 +3822,7 @@ function WikiEdit(props: {
       <Dialog open={conflictAt !== null} onOpenChange={(open) => !open && setConflictAt(null)}>
         <DialogContent
           title="服务端内容已被更新"
-          description={conflictAt === null ? undefined : `服务端最近更新于 ${fmtTime(conflictAt)}。`}
+          description={conflictAt === null ? undefined : conflictAt === '' ? '页面已被删除，或该地址刚被占用。' : `服务端最近更新于 ${fmtTime(conflictAt)}。`}
           footer={
             <>
               <DialogClose asChild>
@@ -3825,7 +3832,7 @@ function WikiEdit(props: {
                 variant="danger"
                 onClick={() => {
                   setConflictAt(null)
-                  // 用户明确选择覆盖：跳过冲突检测再存一次
+                  // 按本次冲突返回的状态重试；期间再次修改仍会被服务端拒绝。
                   void save({ force: true })
                 }}
               >
@@ -3835,9 +3842,9 @@ function WikiEdit(props: {
           }
         >
           <p className="m-0">
-            你打开这一页之后，服务端的内容被改过（可能是另一个标签页或其他人）。
-            继续保存会覆盖那些改动；被你覆盖掉的那一版会作为历史快照保留在版本历史里，
-            因此事后仍可从历史里找回。
+            你打开这一页之后，服务端的内容被改过，或页面已被删除、重新创建。
+            继续保存会覆盖当前内容；已有页面被覆盖前会保留历史快照。
+            你的编辑内容仍保留在当前编辑器中。
           </p>
         </DialogContent>
       </Dialog>

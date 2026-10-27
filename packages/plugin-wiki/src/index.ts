@@ -30,6 +30,7 @@ import {
   PAGE_SAVED_EVENT,
   resolveProjectPath,
   writeAuditLog,
+  WikiWriteError,
   type AnyDatabaseAdapter,
   type AttachmentUploadedEvent,
   type DatabaseExecutor,
@@ -476,17 +477,29 @@ function normalizeSaveFields(title: unknown, content: unknown): WikiSaveInput {
   return { title: trimmed, content: body }
 }
 
-/** 从请求体提取 { title, content }：白名单字段，未知字段/超限一律 400 */
+function revisionOf(page: PageRow): string {
+  return sha256Hex(JSON.stringify([page.id, page.title, page.content, page.updated_at]))
+}
+
+function normalizeExpectedRevision(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return value
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error('invalid_body: expectedRevision 须为原文状态令牌或 null')
+  }
+  return value
+}
+
+/** 从请求体提取保存字段：未知字段/超限一律拒绝。 */
 function parseSaveBody(body: unknown): WikiSaveInput {
   const b = (body ?? {}) as Record<string, unknown>
   if (typeof b !== 'object' || Array.isArray(b)) {
     throw new Error('invalid_body: 请求体须为 JSON 对象')
   }
-  const unknown = Object.keys(b).filter((k) => k !== 'title' && k !== 'content')
+  const unknown = Object.keys(b).filter((k) => k !== 'title' && k !== 'content' && k !== 'expectedRevision')
   if (unknown.length > 0) {
     throw new Error(`invalid_body: 未知字段: ${unknown.join(', ')}`)
   }
-  return normalizeSaveFields(b.title, b.content)
+  return { ...normalizeSaveFields(b.title, b.content), expectedRevision: normalizeExpectedRevision(b.expectedRevision) }
 }
 
 /**
@@ -1099,7 +1112,7 @@ export const WikiPlugin = {
               })),
             }),
         // 响应自述正文口径：拿到 `'raw'` 的调用方**不得**把它当读者可见的内容渲染
-        ...(wantRaw ? { contentMode: 'raw' as const } : {}),
+        ...(wantRaw ? { contentMode: 'raw' as const, revision: revisionOf(page) } : {}),
         created_at: page.created_at,
         updated_at: page.updated_at,
         // **必须 Number() 强转**：`pg` 把 `COUNT(*)`（bigint）作为**字符串**返回以避免精度丢失，
@@ -1495,6 +1508,37 @@ export const WikiPlugin = {
     // 无条件跑：没有待回填的行时那条查询是空的，代价可忽略；有则必须补上（见上方理由）
     await backfillBlocks()
 
+    // 同步 SQLite 适配器只有一条连接；本插件的内容写入不能交错 BEGIN。
+    let writeTail = Promise.resolve()
+    const writeTransaction = async <T,>(fn: (tx: DatabaseExecutor) => Promise<T>): Promise<T> => {
+      if (adb.dialect !== 'sqlite') return adb.transaction(fn)
+      const previous = writeTail
+      let release!: () => void
+      writeTail = new Promise<void>((resolveWrite) => { release = resolveWrite })
+      await previous
+      try {
+        return await adb.transaction(fn)
+      } finally {
+        release()
+      }
+    }
+
+    const requireWriter = async (
+      principal: Principal | undefined,
+      slug: string,
+      exists: boolean,
+      cap: 'canEdit' | 'canDelete',
+    ): Promise<Principal> => {
+      if (!principal || principal.kind === 'anonymous') {
+        throw new WikiWriteError('unauthorized', '缺少已登录主体，无法写入页面')
+      }
+      if (!exists && cap === 'canEdit') return principal
+      const access = await policy().resolvePage(principal, slug)
+      if (access.level === 'none') throw new WikiWriteError('not_found', '页面不存在或不可访问')
+      if (!access[cap]) throw new WikiWriteError('forbidden', '没有修改该页面的权限')
+      return principal
+    }
+
     /**
      * upsert：保存前把旧正文快照进 page_versions（版本即历史）。
      * 幂等：标题与正文均未变化时既不更新 updated_at、也不写历史。
@@ -1512,10 +1556,21 @@ export const WikiPlugin = {
        * 比编一个假 id 诚实；界面据 `null` 显示「未知」而不是「某个人」。
        */
       actorId?: number | null,
+      principal?: Principal,
     ): Promise<WikiSaveResult> => {
       const now = new Date().toISOString()
-      const outcome = await adb.transaction(async (tx): Promise<'created' | 'updated' | 'unchanged'> => {
-        const existing = (await tx.query<PageRow>('SELECT id, title, content FROM pages WHERE slug = ?', [slug]))[0]
+      const outcome = await writeTransaction(async (tx): Promise<'created' | 'updated' | 'unchanged'> => {
+        const existing = (await tx.query<PageRow>(
+          `SELECT * FROM pages WHERE slug = ?${adb.dialect === 'postgres' ? ' FOR UPDATE' : ''}`,
+          [slug],
+        ))[0]
+        if (principal) await requireWriter(principal, slug, Boolean(existing), 'canEdit')
+        if (input.expectedRevision !== undefined && (
+          existing ? input.expectedRevision !== revisionOf(existing) : input.expectedRevision !== null
+        )) {
+          throw new WikiWriteError('edit_conflict', '页面已被其他操作修改，请核对最新内容后再保存',
+            existing ? { revision: revisionOf(existing), updatedAt: existing.updated_at } : undefined)
+        }
         if (!existing) {
           /*
            * ★ **两层默认值的应用层那一半**（设计文档 §3.3 v5 说明 / D8）：
@@ -1539,9 +1594,10 @@ export const WikiPlugin = {
              * 见 `packages/db-postgres/src/index.ts:237-238`。
              */
             `INSERT INTO pages (slug, title, content, created_at, updated_at, visibility, inherit, published_at, acl_revision, content_hash)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, ?) RETURNING id`,
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, ?) ON CONFLICT (slug) DO NOTHING RETURNING id`,
             [slug, input.title, input.content, now, now, vis, publishedAt, sha256Hex(input.content)],
           )
+          if (ins.changes === 0) throw new WikiWriteError('edit_conflict', '该地址刚刚被创建，请重新加载页面')
           const pageId = Number(ins.lastInsertRowid)
           /*
            * ★ P3a：块与块索引的**唯一写入路径**（§9 R12），与 pages 行**同事务**。
@@ -1747,11 +1803,12 @@ export const WikiPlugin = {
     const deletePage = async (
       slug: string,
       actorId: number | null = null,
+      principal?: Principal,
     ): Promise<
       | false
       | { title: string; versions: number; bytes: number; createdAt: string; contentHash: string | null }
     > => {
-      const deleted = await adb.transaction(async (tx) => {
+      const deleted = await writeTransaction(async (tx) => {
         const page = (
           await tx.query<{
             id: number
@@ -1760,10 +1817,11 @@ export const WikiPlugin = {
             content_hash: string | null
             bytes: number
           }>(
-            `SELECT id, title, created_at, content_hash, LENGTH(content) AS bytes FROM pages WHERE slug = ?`,
+            `SELECT id, title, created_at, content_hash, LENGTH(content) AS bytes FROM pages WHERE slug = ?${adb.dialect === 'postgres' ? ' FOR UPDATE' : ''}`,
             [slug],
           )
         )[0]
+        if (principal) await requireWriter(principal, slug, Boolean(page), 'canDelete')
         if (!page) return false
         // 摘要与删除同事务取出：事后（甚至并发删除后）再查就会拿到 null 或别人的数据
         const versionCount = (
@@ -1893,6 +1951,7 @@ export const WikiPlugin = {
         assertLive()
         assertValidSlug(slug)
         const fields = normalizeSaveFields(input?.title, input?.content)
+        fields.expectedRevision = normalizeExpectedRevision(input?.expectedRevision)
         /*
          * 两个可选字段（`visibility` / `published`）**只在这条服务路径上透传**：
          * HTTP 侧 `parseSaveBody` 的白名单不含它们（未知字段 400），所以"用户能改
@@ -1913,6 +1972,21 @@ export const WikiPlugin = {
           fields.published = input.published
         }
         return savePage(slug, fields)
+      },
+      saveAs: async (principal, slug, input) => {
+        assertLive()
+        assertValidSlug(slug)
+        await requireWriter(principal, slug, false, 'canEdit')
+        // 显式选择字段，JS 调用方也不能经用户入口传 visibility/published。
+        const fields = normalizeSaveFields(input?.title, input?.content)
+        fields.expectedRevision = normalizeExpectedRevision(input?.expectedRevision)
+        return savePage(slug, fields, principal.userId, principal)
+      },
+      removeAs: async (principal, slug) => {
+        assertLive()
+        assertValidSlug(slug)
+        await requireWriter(principal, slug, false, 'canEdit')
+        return (await deletePage(slug, principal.userId, principal)) !== false
       },
       remove: async (slug) => {
         assertLive()
@@ -3133,7 +3207,6 @@ export const WikiPlugin = {
          * 它对无权者一律返回 none，拿"看不见"当"不存在"会让 admin 也建不了同名页之前先误伤，
          * 反过来"看不见但存在"时放行创建又会撞 UNIQUE。
          */
-        if ((await pageExists(slug)) && (await requireCap(h, slug, 'canEdit')) === null) return
         let result: WikiSaveResult
         try {
           /*
@@ -3141,7 +3214,7 @@ export const WikiPlugin = {
            * 也就是界面里「谁改的」那一列的来源。不传的话这列永远是 NULL。
            * （`wiki-service.save()` 那条路径刻意不传 —— 跨插件调用没有可归属的主体。）
            */
-          result = await savePage(slug, save, h.principal?.userId ?? null)
+          result = await svc.saveAs(h.principal!, slug, save)
           /*
            * ★ **保存也写审计**（T5）。
            *
@@ -3184,6 +3257,11 @@ export const WikiPlugin = {
            * 一句中文；③ 而"显式拒绝"的价值恰恰在于作者能立刻知道**为什么**被拒。
            * `BlockParseError.code` 就是为此存在的（沿用仓库"消息前缀即错误码"的约定）。
            */
+          if (err instanceof WikiWriteError) {
+            const status = { unauthorized: 401, not_found: 404, forbidden: 403, edit_conflict: 409 }[err.code]
+            h.json(status, { ok: false, error: err.code, message: err.message, ...(err.current ? { details: err.current } : {}) })
+            return
+          }
           if (err instanceof BlockParseError) {
             h.json(400, { ok: false, error: err.code, message: err.message })
             return
@@ -3258,8 +3336,17 @@ export const WikiPlugin = {
          * 不存在的页走 `resolvePage` ⇒ none ⇒ 404，与原本"删不到才 404"同一状态码，
          * 行为对用户不变、对越权者关门。
          */
-        if ((await requireCap(h, slug, 'canDelete')) === null) return
-        const removed = await deletePage(slug, h.principal?.userId ?? null)
+        // 与用户服务入口共用删除事务中的主体检查，拒绝结果保留 HTTP 语义。
+        let removed: Awaited<ReturnType<typeof deletePage>>
+        try {
+          if ((await requireCap(h, slug, 'canDelete')) === null) return
+          removed = await deletePage(slug, h.principal?.userId ?? null, h.principal)
+        } catch (err) {
+          if (!(err instanceof WikiWriteError)) throw err
+          const status = { unauthorized: 401, not_found: 404, forbidden: 403, edit_conflict: 409 }[err.code]
+          h.json(status, { ok: false, error: err.code, message: err.message })
+          return
+        }
         if (removed === false) {
           h.json(404, { ok: false, error: 'not_found', message: `页面不存在: ${slug}` })
           return

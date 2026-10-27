@@ -73,6 +73,15 @@
 | 0007 | [清单两层 + 看门狗回滚](./0007-two-layer-manifest-and-watchdog.md) | accepted | JSON 说「这是什么」、TS 说「怎么跑」；代价是 JSON 那半层带不动 schemastery |
 | 0008 | [不引入代码格式化器](./0008-no-code-formatter.md) | proposed | 格式交给 `.editorconfig` 与 review；28 包一次性重排的代价是永久污染 blame |
 | 0009 | [单进程与 SQLite 最小部署](./0009-single-process-sqlite-minimal-deployment.md) | accepted | 默认形态是一个进程一个实例的 SQLite，用 crash marker 兜住「插件把宿主拖挂」；水平扩展明确划到范围外 |
+| 0010 | [写入前置条件、主体授权与部署启动检查](./0010-write-preconditions-and-startup-readiness.md) | accepted | 写事务验证页面状态，用户入口重查权限，标准部署检查必要服务，核心验收接入 build 作业 |
+| 0011 | [PostgreSQL 并发写入进入测试门禁](./0011-postgres-write-integration-gate.md) | accepted | 在现有 test 作业运行真实 PostgreSQL 竞争与回滚验收，普通单测保持无需外部数据库 |
+| 0012 | [路由声明在注册期校验](./0012-route-access-registration-validation.md) | accepted | core 要求显式 access，严格模式覆盖热启用，旧 JS 非严格调用保留迁移窗口 |
+| 0013 | [上游错误诊断日志仅显式开启](./0013-openai-diagnostics-opt-in.md) | accepted | 默认关闭上游错误体摘要，仅精确的 1 开启，保留错误码与启发式脱敏边界 |
+| 0014 | [插件界面入口结算与失败诊断](./0014-plugin-ui-entry-settlement.md) | accepted | 等待异步入口，统一失败回滚和版本去重，迟到结果不得复活已卸载界面 |
+| 0015 | [插件界面声明与运行期注册的一致性诊断](./0015-plugin-ui-registration-diagnostics.md) | accepted | 已加载入口按真实 owner 核对生效声明，缺项提示随注册和注销自愈，排除按需等待与冲突抑制 |
+| 0016 | [插件界面异步入口等待上限与作用域撤销](./0016-plugin-ui-entry-timeout.md) | accepted | 显式入口等待最多 15 秒，超时或停用撤销旧宿主，迟到回调不得影响新代次 |
+| 0017 | [插件界面浏览器验收进入构建门禁](./0017-plugin-ui-browser-gate.md) | accepted | 在现有 build 作业验生产与开发两条路径，失败上传两边诊断产物 |
+| 0018 | [离线恢复的完整预检、暂存与双目录回退](./0018-offline-restore-preflight-and-rollback.md) | accepted | 写入前检查完整清单和目标，同级暂存后换入，异常回退数据与配置并保留可手工恢复的原状 |
 
 编号是**追加式**的，不复用、不插号。空号一旦出现就说明有文件被删了——本目录里已经发生过一次
 （编号缺位会留下死链，`scripts/docs-links.ts` 在 CI 里拒绝指向不存在文件的链接）。

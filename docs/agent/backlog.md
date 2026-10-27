@@ -24,51 +24,25 @@
 
 ## P0
 
-### F1 · 路由访问等级默认 `public`（fail-open 默认值）
+### F1 · 旧 JavaScript 非严格路由仍默认 `public`
 
-- **严重度**：**P0**
-- **违背**：「安全可控」——默认值把「忘记写权限」变成「匿名可调用」，而不是失败。
-- **现状事实**：
-  - 类型声明：`packages/core/src/index.ts` 的 `RouteAccess = 'public' | 'user' | 'admin'`，
-    以及 `RouteAccessOptions.access?`（可选）——注释自己写明「**省略等价于 `{ access: 'public' }`**」
-    （截至 `64ff6fa` 约在第 805 / 809 行，会漂移）。
-  - 落地实现：`packages/server/src/index.ts` 注册路由处 `access: opts?.access ?? 'public'`，
-    并带一条注释说明「默认 public：只传 3 个实参的既有调用点（以及全部现存插件）行为完全不变」——
-    即这是**为兼容性刻意保留的 fail-open**。
-  - **已有强制机制（本轮复核结论：不是「零强制」，而是「半强制」）**：
-    - `packages/core/src/index.ts` 的 `HttpRouteInfo` 带 `access` / `explicit` / `owner` 三字段，
-      其中 `explicit` 的注释本身就是判据原文：「`access: 'public'` + `explicit: false` =
-      "作者没想过这件事"，需要被点名；`explicit: true` = "作者明确选择了公开"」。
-    - 同文件 `export function unauditedRoutes(routes: readonly HttpRouteInfo[]): readonly HttpRouteInfo[]`
-      —— 把「未点名」抽成可复用判据，而不是散落在告警文案里。
-    - `packages/server/src/index.ts` 的 `auditRouteAccess(router, env)` 在启动时把这些路由聚合成
-      **一条告警**（文案 `[geewiki] N/M 条路由未显式声明访问等级，正按默认 'public'（匿名可调）运行：`），
-      并在 `env[STRICT_ROUTE_ACCESS_ENV] === '1'`（即 `GEEWIKI_STRICT_ROUTE_ACCESS`）**抛错拒绝启动**；
-      组合根无条件调用 `auditRouteAccess(routerForAudit)`。
-    - 守卫：`packages/server/test/route-access-audit.test.ts` 存在（直接用 `unauditedRoutes()` 断言越界清单）。
-  - **但默认值一行未改**：`access: opts?.access ?? 'public'` 仍是 fail-open ⇒ 上面四件全部是
-    **事后审计 + 运维可选开关**，没有一件能在「作者漏写第 4 参」的当下阻止危险路由上线。
-- **严重度依据（本轮改写，原写法「完全没有强制」不准确）**：保留 **P0**，但依据改为
-  「**默认值 fail-open 未变，强制只存在于事后可审计与运维可选开关**」——默认部署不会设
-  `GEEWIKI_STRICT_ROUTE_ACCESS=1`，此时漏写权限的路径确实匿名可调，仍符合 P0 定义
-  「生产环境会静默失去访问控制保护」；缓解机制降低的是「无人发现」的概率，不是失守本身。
-- **影响**：新增路由的作者只要漏写第 4 参，该路由就**匿名可调**；单靠一条启动告警极易被忽略。
-  写操作类路由（`POST` / `PUT` / `DELETE`）一旦 fail-open，等于直接对外暴露写接口。
-- **建议改法（最小改动优先）**：
-  1. **先做只读审计**：在 `auditRouteAccess()` 里把「未显式声明」按 **HTTP 方法**与 **owner 包**分组，
-     输出「写操作里有几条匿名可调」——先量化影响面，再谈默认值。
-  2. **默认值改 fail-closed**（`?? 'user'`），并保留 `GEEWIKI_STRICT_ROUTE_ACCESS` 之外的过渡开关；
-     影响面评估口径：内置注册条目 **25 条**（`grep -c "source: 'builtin'" packages/server/src/index.ts`）、
-     默认启用 **21 条**（`config/plugins.base.example.json` 的 `enabled`），全仓 `.register(` 调用点上百处
-     （`grep -rn "router\.register(" packages/*/src`）——**逐条标注 `public` 是必要成本**。
-  3. 更便宜的中间态：只把**写方法**（非 `GET`/`HEAD`）的默认值改成 `user`，读路由维持现状。
-- **验证方式**：临时设 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 启动一次，`[geewiki] N/M 条路由未显式声明…`
-  里的 **N 必须为 0**；再跑 `packages/plugin-auth/test/e2e-p1.sh`（匿名访问受保护路由须 401/403）。
-  改默认值后需补守卫单测：断言 `register()` 省略 `access` 时解析结果不是 `public`。
-- **风险与兼容性**：**破坏性**。所有未显式声明的既有路由（含全部现存插件与只传 3 个实参的调用点）
-  行为改变 ⇒ 匿名读接口可能对未登录用户返回 401。必须配套一次性全仓标注 + 迁移说明（`docs/deployment.md` 排障节）。
-- **状态**：`部分已缓解`（F11 审计 + STRICT 开关 = **半强制**已落地；默认值未改 ⇒ 问题主体仍在）。
-  另见 `docs/plugin-platform.md`「当前限制与风险」表中同一问题（记为「中」）。
+- **严重度**：**P0**，触发条件缩小为未开启严格模式的旧 JavaScript 调用。
+- **复核日期**：2026-10-26；迁移决策见 [ADR-0012](../adr/0012-route-access-registration-validation.md)。
+- **违背**：「安全可控」——兼容窗口仍把漏写访问等级变成匿名可调用。
+- **当前事实**：
+  - `packages/core/src/index.ts` 的 `HttpRouterService.register` 第 4 参及
+    `RouteAccessOptions.access` 已必填，TypeScript 作者遗漏会在类型检查失败。
+  - `packages/server/src/index.ts` 的内置 `HttpRouter` 创建时读取严格开关，
+    `GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏，覆盖启动与插件热启用。
+  - 所有模式拒绝非法访问等级；启动审计重新抛出已被插件管理器接住的注册校验失败，避免空表通过。
+  - 旧 JavaScript 在非严格模式仍保留 `access: access ?? 'public'`；启动聚合告警继续存在。
+    这条兼容分支仍可能使漏写声明的读写端点匿名可调。
+- **剩余工作**：完成外部插件迁移评估，再决定是否默认严格或移除旧 JavaScript 的隐式公开分支。
+  不应仅把默认值改成 `user` 而不说明匿名读接口的兼容影响。
+- **现有验证**：`packages/server/test/route-access-audit.test.ts` 审计内置路由；
+  `packages/server/test/route-access-registration.test.ts` 验证严格启动、热启用拒绝、合法启停、
+  非法值拒绝、失败后端口释放及非严格兼容分支。
+- **状态**：`部分已缓解`；剩余边界与部署开关见 `docs/deployment.md` 环境变量表。
 
 ### F2 · 插件权限是纯声明，宿主完全不强制
 
@@ -123,94 +97,9 @@
 - **风险与兼容性**：新增告警为**非阻断** ⇒ 兼容；若在解析阶段直接拒绝启动则会打断既有部署（不建议）。
 - **状态**：`未处理`。
 
-### F4 · 空 `config` 挂载 ⇒ 空清单 ⇒ HTTP 不监听 ⇒ 静默重启循环（退出码 0）
-
-- **严重度**：**P0**
-- **违背**：「极致轻量」不等于「静默失败」；Docker 部署的主要路径上有一个踩了就静默的坑。
-- **现状事实**：
-  - 触发条件（**已在 `docker-compose.yml` 的注释与 `docs/deployment.md` 中如实写明**）：
-    把 `GEEWIKI_CONFIG_DIR` 指向不存在/空目录（常见于把宿主空目录 bind 进 `/app/config` 遮蔽了镜像内置模板）。
-  - 症状（`docs/deployment.md` 原文记录）：日志里只剩一行
-    `[@geewiki/manager] http 路由服务不可用：REST API 未挂载`，**进程退出码 0**，
-    被 `restart: unless-stopped` 反复拉起 ⇒ 端口永不监听、无错误堆栈。
-  - 镜像内置真源：`/app/config/plugins.base.json`（当前默认启用 21 条，口径见 `config/plugins.base.example.json`）。
-- **影响**：容器状态显示 `Up`、健康检查失败但**没有任何一条日志说明原因**；
-  排障者会先怀疑网络/端口，而真因是「配置目录被遮蔽 ⇒ 清单为空 ⇒ manager 没有 http 服务」。
-- **建议改法（最小改动优先）**：
-  1. 启动期判定「清单为空**且**镜像/默认模板本应存在」⇒ 直接 **fail-fast**：打印明确原因并以非 0 退出，
-     让 `restart:` 策略在日志里暴露问题（改动集中在 manager 启动装配处）；
-  2. 更保守：至少把 `REST API 未挂载` 从 `logger.warn` 升级为带修复指引的 error（写明
-     「`GEEWIKI_CONFIG_DIR` 指向的目录没有清单文件；容器内请检查是否被空卷遮蔽，模板在 `/app/config/plugins.base.json`」）。
-- **验证方式**：`GEEWIKI_CONFIG_DIR=/tmp/nope pnpm run start` ⇒ 期望非 0 退出 + 一条含 `plugins.base.json`
-  字样的错误；compose 场景下 `docker compose ps` 应显示 restarting 而不是 `Up`。
-  可加守卫单测：空清单 + 无模板 ⇒ 启动结果带明确错误码（复用 `packages/manager/test/`）。
-- **风险与兼容性**：`plugins: []`（**有意**全关插件）是合法配置，**不能被误判为错误** ⇒
-  fail-fast 的判据必须是「清单文件缺失 / 目录不可读」，而不是「enabled 为空」。
-- **状态**：`未处理`（现状：文档已写明，行为仍静默）。
-
 ---
 
 ## P1
-
-### F5 · `geewiki.slots` 声明与实际 `registerSlot` 不一致 ⇒ 界面静默空白
-
-- **严重度**：**P1**（触发需前端插件声明错误，但症状完全静默）
-- **违背**：「高可扩展」的可用性面 + 消灭静默失败。
-- **现状事实**：
-  - `packages/core/src/index.ts` 的 manifest 有 `slots?: SlotName[]`（供依赖图/管理台展示）。
-  - 前端产物侧另有 `registerSlot()` 声明；两侧一致性由 `packages/manager/src/slots.ts` 的
-    `effectiveSlotsByOwner` / `conflictsOf` 汇总，经 `GET /api/plugins/slots` 下发（**能查询，不等于会校验**）。
-  - 单占用插槽冲突时**激活顺序最早者胜出**，其余进 `conflicts` 列表（README 已写）。
-- **影响**：manifest 写了 `slots` 但 bundle 没 `registerSlot`（或名字拼错）⇒ 该位置**什么都不渲染、不报错**；
-  作者只能靠人肉翻管理台发现。
-- **建议改法（最小改动）**：入口表构建时（`packages/manager/src/plugin-ui.ts` 的 `buildPluginUiTable` 路径）
-  比对 manifest `slots` 与 bundle 侧收集到的 slot 名，差集写入 `skipped`/`conflicts` 附带原因，
-  复用既有的分级渲染（`classifyUiSkips` ⇒ attention 级 warning Card），**前端无需新增界面**。
-- **验证方式**：夹具插件声明 `slots: ['wiki.sidebar@1']` 但 bundle 不注册 ⇒
-  `GET /api/plugins/slots` 或入口表 `skipped` 必须出现该差集（当前：静默）。
-- **风险与兼容性**：只新增 skipped 原因项 ⇒ 低风险；注意别把「bundle 尚未加载完成」误报成不一致。
-- **状态**：`未处理`。
-
-### F6 · 4 个安全/运维相关环境变量此前查无文档
-
-- **严重度**：**P1**（本轮已补文档，行为未变）
-- **违背**：「安全可控」依赖「可配置且可发现」；文档纪律要求配置项有唯一权威出处。
-- **现状事实**（语义均已回源码核实；**核实前 README.md 与 docs/deployment.md 的环境变量表里都没有这四个**）：
-  | 变量 | 消费者（符号） | 语义 | 默认 |
-  | --- | --- | --- | --- |
-  | `GEEWIKI_ADMIN_TOKEN` | `packages/server/src/index.ts` 的 `ADMIN_TOKEN_ENV` / `envAdminToken()` | break-glass 令牌；头 `x-gw-admin-token` 或 `Authorization: Bearer <token>`；**未设置 = 整条通道禁用**（无回退值，空串也算未启用）；每次使用打 stdout 结构化行 + `writeAuditLog({ action: 'access.break_glass' })`；未配令牌时受保护端点返回 **503 `bootstrap_required`**（不是 401） | 未设置（禁用） |
-  | `GEEWIKI_STRICT_ROUTE_ACCESS` | 同文件 `STRICT_ROUTE_ACCESS_ENV` + `auditRouteAccess()` | `1` ⇒ 存在未显式声明 `access` 的路由时**拒绝启动** | 未设置（只告警） |
-  | `GEEWIKI_BACKUP_DIR` | `packages/manager/src/index.ts` 的 `createBackup()`（restore 路径同样读一次） | 备份/恢复的默认输出目录 | `<仓库根>/backups` |
-  | `GEEWIKI_OPENAI_DEBUG` | `packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()` | **默认开启**；设为 `0` 才关闭上游错误诊断日志 | 开启 |
-- **影响**：运维不知道有 break-glass 通道（既可能漏配，也可能配了不知道有审计）；
-  不知道 `GEEWIKI_OPENAI_DEBUG` **默认在打诊断日志**，等于默认多一个日志出口。
-- **建议改法**：见任务三第 5 条——**本轮已把四者写进 README.md 与 docs/deployment.md 的变量表**
-  （`GEEWIKI_ADMIN_TOKEN` 标注为 break-glass + 风险）。
-- **验证方式**：`grep -c 'GEEWIKI_ADMIN_TOKEN\|GEEWIKI_STRICT_ROUTE_ACCESS\|GEEWIKI_BACKUP_DIR\|GEEWIKI_OPENAI_DEBUG' README.md docs/deployment.md` ⇒ 均 ≥ 4。
-- **风险与兼容性**：无（纯文档）。
-- **状态**：`本轮已修（文档）`（**本轮复核：上一轮标为「已修」时并未真正落地**——动手前
-  `grep -c 'GEEWIKI_ADMIN_TOKEN\|GEEWIKI_STRICT_ROUTE_ACCESS\|GEEWIKI_BACKUP_DIR\|GEEWIKI_OPENAI_DEBUG' README.md docs/deployment.md`
-  返回 `README.md:0`、`docs/deployment.md:0`；本轮才把四个变量真正写进两处表格）。
-  另注：本条表中 `GEEWIKI_ADMIN_TOKEN` 那行的「未配令牌时受保护端点返回 503」应读作
-  「**完全没有凭据来源**时才 503 `bootstrap_required`」（`judgeAccess` 的判据是
-  `credentialSourceAvailable`，P1 起还包含库里是否有可登录账号）；已有账号时未配 break-glass
-  令牌走正常 401/403，**不会** 503。**修好复核后请删除本条**。
-
-### F7 · `GEEWIKI_OPENAI_DEBUG` 默认开启诊断日志
-
-- **严重度**：**P1**（与 F6 同源，但这是**行为**问题，不随文档补齐而消失）
-- **违背**：「安全可控」的默认值取向（安全默认应当是「显式开启才多说话」）。
-- **现状事实**：`packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()` 实现为
-  `process.env['GEEWIKI_OPENAI_DEBUG'] !== '0'` —— 即**只有显式设成 `'0'` 才关闭**；
-  其它任何取值（含未设置）都在上游请求失败时输出诊断日志。
-- **影响**：上游错误日志可能包含请求上下文（模型名、上游 baseUrl、错误体）；
-  在共享日志聚合环境里属于「默认外泄面 > 预期」。
-- **建议改法（最小改动）**：把判据反转为默认关（`=!= '1'`），或在 README「接入模型」一节显著标注默认开
-  ——**取向由维护者定**，但「默认开 + 文档此前没写」这个组合必须先消掉（F6 已消掉文档部分）。
-- **验证方式**：默认环境（不设变量）触发一次上游 4xx，确认是否落日志与内容项；反转默认后单测
-  `configLogEnabled()` 的三种取值（未设置 / `'0'` / `'1'`）。
-- **风险与兼容性**：反转默认会让排障习惯改变（需要显式设 `=1`）⇒ 属**行为变更**，本轮**不做**，仅登记。
-- **状态**：`未处理`。
 
 ### F8 · 出厂配置模板写死私有端点与私有模型名
 
@@ -339,7 +228,7 @@
 - **风险与兼容性**：低；但改写时必须逐条确认符号名真实存在（本轮已回源码核对）。
 - **状态**：`本轮已修（文档）`。
 
-### F15 · 8 个 e2e shell 与 CDP 界面验收完全不在 CI
+### F15 · e2e 与浏览器门禁覆盖不完整（部分收敛）
 
 - **严重度**：**P2**
 - **违背**：「规范可机器执行」。
@@ -348,23 +237,17 @@
     `packages/plugin-authz/test/e2e-p2.sh`、`packages/plugin-authz/test/e2e-p4.sh`、
     `packages/plugin-oidc/test/e2e-p15.sh`、`packages/plugin-org/test/e2e-p2-org.sh`、
     `packages/plugin-wiki/test/e2e-p3a.sh`、`packages/plugin-wiki/test/e2e-attachments.sh`、
-    `packages/plugin-wiki/test/e2e-version-meta.sh`。
-  - `scripts/acceptance/` 下有 `*_cdp.mjs`（block-attribution / editor-modes / plugin-ui /
-    theme-header / ui-extension）与多个 `pN-*/` 目录（需真实浏览器 + 运行中的服务）。
-  - `.github/workflows/ci.yml` 的 jobs 只有 `lint` / `typecheck` / `test` / `build` / `docker-build`(PR) /
-    `publish`——**不含任何 e2e 或 acceptance**。
-  - `docs/ci-cd.md` §6 已**如实登记**这一事实；`docs/development.md` §4.6/§4.8 也如实保留「真实浏览器交互从未验证」
-    （本轮在该处补了指向脚本位置的链接）。
-- **影响**：PG 路径、附件、版本元数据、OIDC 全流程、真实浏览器交互**没有门禁**，全靠人工跑。
+    `packages/plugin-wiki/test/e2e-version-meta.sh`，仍需按场景手动运行。
+  - 真实 PostgreSQL 写入、核心浏览器流程和插件界面生命周期诊断已进入门禁；
+    当前覆盖范围以 `docs/ci-cd.md` §2.1/§2.2/§6 为准。
+  - 编辑器模式、附件交互、触屏等其余 CDP 场景仍需人工验收。
+- **影响**：附件、版本元数据、OIDC 全流程与未列入门禁的真实浏览器交互仍可能只在手动验收时发现回归。
 - **建议改法（最小改动优先）**：
-  1. 先在 CI 加**一条** PG job（service container 起 `postgres:15-alpine`），跑 1~2 个最有代表性的 e2e
-     （建议 `e2e-p2.sh` + `e2e-attachments.sh`），验证端口/隔离配方在 CI 里成立；
-  2. acceptance 继续留在 CI 外（`docs/ci-cd.md` §6 的理由成立），但把「每个 release 前手工跑一遍并归档结果 JSON」
-     写进发布清单。
-- **验证方式**：CI 出现 e2e job 且绿色；`docs/ci-cd.md` §6 同步删除已进 CI 的条目。
-- **风险与兼容性**：e2e 需要固定端口与 PG 容器，**并发作业会互抢端口**（`docs/development.md` §1 已记录
-  「多实例必败」）⇒ 必须给每个 job 独立端口段或使用 `PORT` 注入。
-- **状态**：`未处理`。
+  1. 按当前变更风险挑选剩余 e2e，先确认临时数据库、独立端口和认证夹具，再逐项接入；
+  2. 其他 CDP 场景保留明确的开发/生产复现命令和结果归档，避免把部分门禁表述为全部交互受保护。
+- **验证方式**：新增场景确实使现有 required check 失败，`docs/ci-cd.md` 同步登记覆盖范围与剩余盲区。
+- **风险与兼容性**：旧 e2e 有固定默认端口与外部数据库依赖，接入前须使用 `PORT` 等参数隔离运行环境。
+- **状态**：`部分收敛`；当前已受保护的范围、命令和产物策略统一见 `docs/ci-cd.md`，本条仅跟踪剩余覆盖缺口。
 
 ### F16 · 覆盖不均：两个包完全没有测试
 
@@ -472,54 +355,6 @@
   `revert` PR 或临时开 bypass。属 GitHub 端仓库设置变更，**不在本仓库代码/文档范围内**，
   本轮**不擅自**调用 `gh api -X PATCH`。
 - **状态**：`未处理`（**需 GitHub 端操作，本仓库改不到**；本轮只把事实、复核命令与两种最小改法写清）。
-
-### F28 · 脚手架与两个官方示例自己谎报 `provides`（F3 的作者侧传播渠道）
-
-- **严重度**：**P1**（它本身不是安全失守，但它是 F3（P0）的**教学级传播渠道**：
-  新插件几乎全部从脚手架或示例起步，照抄即静默失效）
-- **违背**：「万物皆插件」的可信度——示例与脚手架是平台的事实文档，它们示范了「清单可以说谎」。
-- **现状事实**（`provide` 的每一处命中逐个核对，命令见「验证方式」）：
-  - 脚手架：`packages/manager/src/scaffold.ts` 的 `manifestJson()` 固定生成
-    ``provides: `${spec.name}-service` ``（它上一行注释还专门解释「依赖图的 token 不是 cordis 服务名：
-    `http-service` 是 `@geewiki/http` 的 provides 值」），而模板生成的 `apply(ctx, config)` 只做
-    `ctx.get('http')` + `router.register('GET', '/api/<name>', …)` + 返回 `unregister`——
-    **没有 `ctx.provide`**；该文件里 `provide` 的唯一命中是给 `RouterLike` 的那句注释
-    （「`@geewiki/http` 经 `ctx.provide('http', …)` 提供」）。
-  - `plugins/hello-geewiki/package.json`：`"provides": "hello-service"` + `"requires": ["http-service"]`；
-    该插件**没有 `src/` 目录**，入口是 `plugins/hello-geewiki/index.ts`，其中 `provide` 的唯一命中也是注释。
-  - `plugins/ui-demo/package.json`：`"provides": "ui-demo-service"`；`plugins/ui-demo/src/index.ts`
-    同样只有注释命中（`registerSlot("app-header"/"app-footer")` 只出现在前端产物
-    `plugins/ui-demo/dist/client.js` 里，与 `provides` 无关）。
-  - 为什么是「谎报」而非「多余声明」：依赖解析按 `packages/manager/src/deps.ts` 的
-    `const providers = registry.filter((p) => p.manifest.geewiki.provides === dep)` 判等——
-    **`provides` 只参与依赖图匹配，不创建任何 cordis 服务** ⇒ 声明了 `x-service` 而
-    `ctx.get('x-service')` 仍是 `undefined`。
-  - **正对照**（同一仓库里已有正确做法）：`packages/plugin-echo/src/index.ts` 注释写明
-    「这里**刻意不声明 `provides`**（曾写 `provides: 'echo-service'`，已撤销）」、
-    「本插件从未 `ctx.provide('echo-service', …)`，所以那是一个**谎报的 token**」、
-    「将来若确需对外提供能力：按 @geewiki/search 的范式补 `ctx.provide(...)` + dispose 注销 +
-    导出服务契约类型，再恢复 provides」——**同一个坑内置示例插件已经踩过并写死了教训，
-    但脚手架和 `plugins/` 下两个示例仍留在坑里。**
-- **影响**：任何照 `pnpm run new:plugin` 产物或照 `plugins/ui-demo` 抄的作者都会得到
-  「清单声称提供 `x-service`、实际没人提供」的插件；第三方若 `requires: ["x-service"]`，
-  依赖图判定其已满足、`ctx.get` 拿到 `undefined` ⇒ 静默 no-op（F3 正是这条链路的 P0 版本）。
-  同时它把「清单是契约」悄悄削弱成「清单是愿望」。
-- **建议改法（最小改动优先）**：三处各删一行 `provides`（`scaffold.ts` 的 `manifestJson()`、
-  `plugins/hello-geewiki/package.json`、`plugins/ui-demo/package.json`）——两个示例都只消费 `http`，
-  没有对外提供服务的需求，**删比补更诚实**（补 `ctx.provide` 必须按 `@geewiki/echo` 注释里那三件事
-  做齐：`ctx.provide` + dispose 注销 + 导出契约类型，才有资格声明 `provides`）。
-  若确要保留，脚手架模板就必须真的示范 `ctx.provide(…)` + 卸载注销，否则注释教的是
-  「不 provide 也能声明」。
-- **验证方式**：改前 `grep -n 'ctx\.provide' packages/manager/src/scaffold.ts plugins/hello-geewiki/index.ts plugins/ui-demo/src/index.ts`
-  应只剩注释命中；改后 `grep -rn '"provides"' plugins/*/package.json packages/manager/src/scaffold.ts`
-  的每个命中都必须能在同插件源码里找到对应的真实 `ctx.provide(`。回归：`pnpm --filter @geewiki/manager test`。
-- **风险与兼容性**：删 `provides` 会让任何以 `requires: ["hello-service"]` / `["ui-demo-service"]`
-  声明依赖的外部插件在装载时报「依赖找不到」——这是**把静默失效变成显式失败**，方向正确但属行为变更；
-  `plugins/*` 是对外示例，改清单要同步 `docs/plugin/api-reference.md` 的对照表
-  （该行现已把「`provides: 'ui-demo-service'` 但代码里没有 `ctx.provide`」标注为反模式 AP-08，
-  `docs/plugin/anti-patterns.md` 亦已点名）。
-- **状态**：`未处理`（**待授权**：涉及 `packages/manager/src/scaffold.ts` 与两个 `package.json`）。
-  **交叉引用 F3**（同一机制的权威描述与 P0 定级理由；本条只记「示例与脚手架在传播它」）。
 
 ---
 
@@ -640,7 +475,7 @@
 - **违背**：「事实只有一个真源」。
 - **现状事实**：`docs/plugin-platform.md` 已有一张「当前限制与风险」表，用「中/低」分级记录了
   路由默认 public、插件无隔离、`config/secrets.json` 明文（0600）、ESM 永不回收、`provide` 时序陷阱等
-  ——与 F1 / F2 / F7 / F22 / F23 **话题重合**。
+  ——与 F1 / F2 / F22 / F23 **话题重合**。
 - **建议改法**：确定分工——**plugin-platform 记「设计边界与有意不做」，本台账只记「未修的整改项 + 最小改法 +
   验证方式」**，并在两处互相加一行链接（本台账已在此条声明；plugin-platform 侧的指向行本轮已加）。
   条目修好后：plugin-platform 保留结论，本台账删除条目。
@@ -705,14 +540,15 @@
 - **风险与兼容性**：零（纯注释/文档）。**唯一陷阱**：不要把 1/2 两处的结论整段删掉——
   「默认不启用 `@geewiki/editor-plain`」这个决定仍然有效，变的只是理由。
 - **状态**：`部分已缓解`——第 3 处本轮已改（文档）；第 1、2 处涉及 `.ts`/`.tsx` 注释，**待授权**；
-  第 4 处是行为，另案。交叉引用 **F5**（`geewiki.slots` 与 bundle 不一致）与
+  第 4 处是行为，另案。插件声明与注册的一致性诊断见
+  [plugin-platform.md](../plugin-platform.md) §4.8；另见
   `docs/plugin/anti-patterns.md`（该文档已按真相写法标注「注释待修」）。
 
 ### F30 · `GEEWIKI_KEEP_TMP` 有码无表（验收脚本专用开关，两处真源表都没有）
 
 - **严重度**：**P2**
 - **违背**：「事实真源」纪律（有码无表）。
-- **现状事实**：本轮全量枚举 `GEEWIKI_*` 并在补齐 F6 那 4 个变量之后，**唯一**仍「代码有读、
+- **现状事实**：本轮全量枚举 `GEEWIKI_*` 并补齐安全/运维变量文档之后，**唯一**仍「代码有读、
   README / `docs/deployment.md` 两处真源表都没有」的是
   `scripts/acceptance/search-mode/run.ts` 的 `if (process.env['GEEWIKI_KEEP_TMP'] === '1')`（唯一消费者）。
   另有刻意分层的前缀 `GEEWIKI_TEST_*` / `GEEWIKI_LLM_*` / `GEEWIKI_E2E_*`（测试与联调专用），
@@ -751,13 +587,13 @@ git log --all -S'TRUST_PROXY'                                                   
 
 ```bash
 docker compose ps                                    # healthy / unhealthy / restarting
-docker compose logs --tail=200 <service>             # 先看是否有 F4 的「REST API 未挂载」
+docker compose logs --tail=200 <service>             # 先核对必要服务未就绪与插件激活错误
 docker inspect --format '{{json .State.Health}}' <container> | head -c 2000   # 取最后一次探测输出
 docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_PORT||3000)+'/api/health').then(r=>r.json()).then(j=>console.log(JSON.stringify(j)))"
 # 期望 {"ok":true,"db":{"present":true,…}}；db.present=false ⇒ 迁移未落（见 docs/development.md §1 的轮询配方）
 ```
 
-- **状态**：`未能复现`（若上述运行时验证真的复现 unhealthy，请把结论按 F4 或新开条目登记）。
+- **状态**：`未能复现`（若上述运行时验证真的复现 unhealthy，请登记新条目）。
 
 ---
 
@@ -765,13 +601,9 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 
 | 编号 | 一句话 | 严重度 | 违背理念 | 状态 |
 | --- | --- | --- | --- | --- |
-| F1 | 路由 `access` 省略即 `public`（fail-open 默认） | **P0** | 安全可控 | 部分已缓解 |
+| F1 | 旧 JavaScript 非严格路由省略 `access` 仍默认 `public` | **P0** | 安全可控 | 部分已缓解 |
 | F2 | 插件权限纯声明、宿主不强制（无沙箱/无配额） | **P0** | 安全可控 | 未处理 |
 | F3 | `provides` 只是依赖图 token，谎报后功能静默失效 | **P0** | 安全可控 / 可预期 | 未处理 |
-| F4 | 空 config 挂载 ⇒ 空清单 ⇒ 不监听 ⇒ 退出码 0 重启循环 | **P0** | 安全可控 / 可运维 | 未处理（文档已写明） |
-| F5 | `geewiki.slots` 与 bundle `registerSlot` 不一致 ⇒ 静默空白 | P1 | 高可扩展 | 未处理 |
-| F6 | 4 个安全/运维环境变量此前查无文档 | P1 | 安全可控 | 本轮已修（文档） |
-| F7 | `GEEWIKI_OPENAI_DEBUG` 默认开启诊断日志 | P1 | 安全可控 | 未处理 |
 | F8 | 出厂模板写死私有端点与私有模型名 | P1 | 不绑厂商 | 本轮处理 |
 | F9 | `description` 仍写「Phase 0 骨架」、`0.1.0`、无根 CHANGELOG | P1 | 对外一致性 | 未处理 |
 | F10 | `docs/README.md` 文档地图漏登 4 篇 | P1 | 事实真源纪律 | 本轮已修（文档） |
@@ -779,7 +611,7 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F12 | 无 CONTRIBUTING / commitlint / hooks / formatter / 覆盖率门禁 | P1 | 规范可机器执行 | 本轮处理 |
 | F13 | 此前无任何面向 agent 的文档入口 | P1 | 规范可机器执行 | 本轮处理 |
 | F14 | plugin-platform 以「路径:行号」引用代码 30 处 | P2 | 事实真源纪律 | 本轮已修（文档） |
-| F15 | 8 个 e2e shell 与 CDP 界面验收完全不在 CI | P2 | 规范可机器执行 | 未处理 |
+| F15 | e2e 与浏览器门禁覆盖不完整 | P2 | 规范可机器执行 | 部分收敛（PG 写入、核心流程与插件界面已进门禁） |
 | F16 | 覆盖不均：2 个包零测试、多包仅 1 个测试文件 | P2 | 规范可机器执行 | 未处理 |
 | F17 | development.md §2 迁移落点写的是不存在的路径 | P2 | 事实真源纪律 | 未处理（**待确认**） |
 | F18 | development.md §1 端口分段表已被实际脚本突破 | P2 | 事实真源纪律 | conventions 层已规避 |
@@ -792,13 +624,7 @@ docker exec <container> node -e "fetch('http://127.0.0.1:'+(process.env.GEEWIKI_
 | F25 | plugin-platform 风险表与本台账职责重叠 | P2 | 事实真源纪律 | 本轮已加指向行 |
 | F26 | `GEEWIKI_TRUST_PROXY` 残留 ⇒ **未能复现** | — | — | 未能复现 |
 | F27 | ruleset `main-protection` 给 admin 开 `bypass_mode: always` 后门 | P1 | 安全可控 | 未处理（**需 GitHub 端操作**） |
-| F28 | 脚手架 + 两个官方示例自己谎报 `provides`（传播 F3） | P1 | 安全可控 / 可预期 | 未处理（**待授权**） |
 | F29 | 「插件编辑器不能上传附件」的四处过期表述（F5 落地后未回收） | P2 | 事实真源纪律 | 部分已缓解（文档 1 处已改） |
 | F30 | `GEEWIKI_KEEP_TMP` 有码无表（验收脚本开关） | P2 | 事实真源纪律 | 未处理 |
 
-**分布（不含 F26）**：**P0 4 条 / P1 11 条 / P2 14 条，共 29 条**。
-其中本轮新增 4 条：F27 / F28（P1）、F29 / F30（P2）——F27+F28+F29 使分布为 4 / 11 / 13 = 28，
-F30 是按「有码无表一并登记」的要求追加的第 4 条（故 P2 到 14）。
-其中 `本轮已修（文档）` 4 条（F6 / F10 / F11 / F14）、`本轮处理`（他人，不在本代理范围）2 条（F12 / F13）、
-`本轮已加指向行 / conventions 层已规避` 2 条（F25 / F18）、**`未处理` 15 条**、
-其中 **3 条需要维护者决策或授权**（F17 是否顺手改文档、F19 措辞是否收紧、F21 发布策略）。
+条目数量、严重度和处理状态以上表为准；已修条目移出本台账，当前行为记入对应真源文档。

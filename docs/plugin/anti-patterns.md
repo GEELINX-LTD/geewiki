@@ -71,11 +71,11 @@ const unregister = router.register(
 )
 ```
 
-**为什么**：`RouteAccess` 的取值是 `'public' | 'user' | 'admin'`，而 **`'public'` 是默认值**——`RouteAccessOptions` 的注释原文是"省略等价于 `{ access: 'public' }`"。这是 fail-open：忘记思考 = 公开。宿主只做**事后审计**（`unauditedRoutes()` 挑出 `explicit === false` 的路由，启动时聚合成**一条**告警；`GEEWIKI_STRICT_ROUTE_ACCESS=1` 时直接拒启），不会替你堵口。审计判据是 `HttpRouteInfo.explicit`——它区分的正是"作者写了 `access:'public'`"与"作者什么都没写"。
+**为什么**：core 要求第 4 参和 `access` 必填，内置路由器在严格模式下还会在注册前拒绝遗漏（含热启用），所有模式拒绝非法值。旧 JavaScript 在非严格模式省略声明仍默认 `'public'`：忘记思考就可能公开。启动审计用 `HttpRouteInfo.explicit` / `unauditedRoutes()` 区分显式公开和兼容默认值，聚合告警；迁移方式是补齐声明并开启 `GEEWIKI_STRICT_ROUTE_ACCESS=1`，见 ADR-0012。
 
 同时声明 `owner`：`HttpRouterService.ownerStats?()` 只统计登记了 `owner` 的路由，出问题时运维才能定位到你，而不是"未归因"。
 
-> ⚠️ **本仓库的示例代码自身违规**：脚手架模板（`packages/manager/src/scaffold.ts`）生成的调用是 `router.register('GET', '/api/<name>', handler)`——因为模板里手写的 `RouterLike` 接口**只声明了 3 个形参**，写作者照着接口写就永远传不出第 4 参。`plugins/ui-demo/src/index.ts` 与 `plugins/hello-geewiki/index.ts` 同样是 3 参。也就是说：`pnpm run new:plugin` 生成的第一个端点就是匿名可调的。**照抄示例前先改掉这一处**；把默认改成 fail-closed 属于平台待办（台账见 `docs/agent/backlog.md`，该文件由并行任务落地，若尚不存在请以 `docs/plugin-platform.md` §5.1 的安全表为准）。
+> 脚手架模板（`packages/manager/src/scaffold.ts`）及 `plugins/ui-demo/`、`plugins/hello-geewiki/` 已显式传入 `{ access: 'public', owner: '<插件包名>' }`，本地 `RouterLike.register` 也要求第 4 参。示例接口保持公开；新增敏感接口时按用途选择 `'user'` / `'admin'`。平台默认值仍是 `'public'`，见 `docs/agent/backlog.md` F1。
 
 **权威出处**：`packages/core/src/index.ts` 的 `RouteAccess` / `RouteAccessOptions` / `HttpRouterService.register` / `HttpRouteInfo.explicit` / `unauditedRoutes`；`packages/manager/src/scaffold.ts` 的模板字符串与 `RouterLike`。
 
@@ -276,7 +276,7 @@ export function apply(ctx, config) {
 
 **为什么**：`provides` **只是依赖图谱里的 token，不会创建任何 cordis 服务**。谎报之后，任何 `requires: ['my-note-service']` 的插件都会被解析成"依赖已满足"，然后 `ctx.get('my-note-service')` 拿到 `undefined` 并**静默跳过**——功能不可用，全程不报错。正确范式是"先补 `ctx.provide(...)` + 注销 + 导出契约类型，**再**恢复 `provides`"，参考 `packages/plugin-search/src/index.ts` 的 `ctx.provide('search-service', svc)`。
 
-> ⚠️ **本仓库的示例代码自身违规（已核实）**：`plugins/ui-demo/package.json` 声明 `"provides": "ui-demo-service"`，而 `plugins/ui-demo/src/index.ts` 里**没有任何 `ctx.provide` 调用**（该文件唯一提到 `provide` 的地方是一句注释，讲的是 `@geewiki/http` 提供 `'http'`）；脚手架模板 `packages/manager/src/scaffold.ts` 生成的清单同样带 `provides: "<name>-service"` 而模板代码里不 `provide`。**正确做法请看 `packages/plugin-echo/src/index.ts`**：它曾经声明 `provides: 'echo-service'`，后来**刻意撤销**，注释里把"谎报的 token"这个后果写得很清楚。所以照抄 `ui-demo` / 脚手架清单时会继承这个反模式——照抄前请把 `provides` 删掉，或补上 `provide`。
+> 脚手架及 `plugins/ui-demo/`、`plugins/hello-geewiki/` 只注册路由，清单不声明 `provides`。`packages/plugin-echo/src/index.ts` 也采用此做法；需要真实服务时参考 `packages/plugin-search/src/index.ts`。
 
 **权威出处**：`packages/plugin-echo/src/index.ts`（撤销 provides 的注记）、`packages/plugin-search/src/index.ts` 的 `apply`、`packages/core/src/index.ts` 的 `GeeWikiMeta.provides`。
 

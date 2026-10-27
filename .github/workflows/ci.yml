@@ -51,11 +51,33 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: geewiki
+          POSTGRES_PASSWORD: geewiki_test
+          POSTGRES_DB: geewiki_acceptance
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U geewiki -d geewiki_acceptance"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - name: 单元测试（node:test，文件数与用例数以 `pnpm test` 输出为准）
         run: pnpm test
+      - name: PostgreSQL 并发写入与事务回滚（真实数据库）
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports['5432'] }}
+          PGUSER: geewiki
+          PGPASSWORD: geewiki_test
+          PGDATABASE: geewiki_acceptance
+        run: pnpm test:postgres
 
   build:
     name: build
@@ -65,7 +87,41 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - name: 构建全部产物（vite build）
+        id: assets
         run: pnpm build
+      - name: 核心浏览器流程（临时数据库与生产产物）
+        env:
+          CHROME_BIN: google-chrome
+        run: pnpm acceptance:core
+      # 两个模式独立结算：构建成功后，即使另一条浏览器验收失败，也运行本模式。
+      - name: 插件界面生命周期与诊断（生产产物）
+        if: ${{ !cancelled() && steps.assets.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          CHROME_BIN: google-chrome
+        run: node scripts/acceptance/run-plugin-ui-diagnostics.mjs
+      - name: 插件界面生命周期与诊断（Vite 开发模式）
+        if: ${{ !cancelled() && steps.assets.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          CHROME_BIN: google-chrome
+        run: node scripts/acceptance/run-plugin-ui-diagnostics.mjs --dev
+      - name: 保存核心验收日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-flow
+          path: data/verify/core-flow-prod/
+          retention-days: 7
+      - name: 保存插件界面验收日志与截图
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-ui-diagnostics
+          path: |
+            data/verify/plugin-ui-diagnostics-prod/
+            data/verify/plugin-ui-diagnostics-dev/
+          retention-days: 7
 
   # 文档门禁：只读扫 markdown，不依赖构建产物，也不参与 publish 的 needs 链。
   # 故意不加入 publish.needs：分支保护的「必需状态检查」集合变更需人工在 GitHub 端确认。

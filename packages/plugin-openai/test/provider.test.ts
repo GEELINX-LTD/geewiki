@@ -440,11 +440,12 @@ test('坏帧容忍：非 JSON、注释、非 data 字段混入仍能产出可解
   }
 })
 
-test('密钥不泄漏：上游在错误体里回显密钥时，chunk 与日志都不得出现该串', async () => {
+test('上游错误诊断仅精确的 1 开启；默认关闭，错误码不变，开启后密钥仍脱敏', async (t) => {
   const name = freshEnvName()
   const secret = 'sk-proj-ABCDEFGHIJKLMNOPQRSTUVWX'
+  const originalDebug = process.env['GEEWIKI_OPENAI_DEBUG']
   process.env[name] = secret
-  // 上游把收到的 Authorization 原样回显进错误体（真实网关的常见行为）
+  // 使用真实 HTTP 错误响应，避免只验证开关函数却没有覆盖实际日志出口。
   const mock = await startMock({
     status: 500,
     body: JSON.stringify({ error: { message: `upstream failure, authorization: Bearer ${secret}` } }),
@@ -455,18 +456,30 @@ test('密钥不泄漏：上游在错误体里回显密钥时，chunk 与日志�
   console.warn = (...args: unknown[]) => {
     warnings.push(args.map((a) => String(a)).join(' '))
   }
+  const values = [undefined, '', '0', 'false', 'off', 'true', 'yes', ' 1 ', '1'] as const
   try {
-    const chunks = await collect(makeProvider(mock.baseUrl, { apiKeyEnv: name }))
-    const serialized = JSON.stringify(chunks)
-    assert.equal(serialized.includes(secret), false, 'chunk 里不得出现密钥')
-    assert.equal(warnings.join('\n').includes(secret), false, '日志里不得出现密钥')
-    // error chunk 结构上就没有 message 字段，从源头杜绝上游文本外泄
-    for (const chunk of chunks) {
-      if (chunk.type === 'error') assert.equal('message' in chunk, false, 'error chunk 不得携带 message')
+    // 同一 provider 逐请求读取开关；最后开启可检出把初始默认值缓存住的错误。
+    const provider = makeProvider(mock.baseUrl, { apiKeyEnv: name })
+    for (const value of values) {
+      await t.test(value === undefined ? '未设置' : `值 ${JSON.stringify(value)}`, async () => {
+        if (value === undefined) delete process.env['GEEWIKI_OPENAI_DEBUG']
+        else process.env['GEEWIKI_OPENAI_DEBUG'] = value
+        warnings.length = 0
+        assert.deepEqual(await collect(provider), [{ type: 'error', code: 'PROVIDER_ERROR' }],
+          '开关不改变错误码，也不把上游消息带回 chunk')
+        assert.equal(warnings.length, value === '1' ? 1 : 0)
+        if (value === '1') {
+          assert.equal(warnings[0]!.includes(secret), false, '开启诊断也不得回显该密钥')
+          assert.match(warnings[0]!, /openai-test.*500/, '保留路由和 HTTP 状态便于排障')
+          assert.match(warnings[0]!, /\*\*\*/, '必须真正走过脱敏日志路径')
+        }
+      })
     }
-    assert.ok(warnings.length > 0, '应记录了脱敏后的诊断日志（证明这条路径真的被走到）')
+    assert.equal(mock.requests.length, values.length, '关闭日志仍须执行上游请求与错误归一化')
   } finally {
     console.warn = originalWarn
+    if (originalDebug === undefined) delete process.env['GEEWIKI_OPENAI_DEBUG']
+    else process.env['GEEWIKI_OPENAI_DEBUG'] = originalDebug
     delete process.env[name]
     await mock.close()
   }

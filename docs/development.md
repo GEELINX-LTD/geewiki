@@ -108,12 +108,13 @@
 
 ### 4.6 前端与浏览器行为
 
-- **前端行为不能用 curl 代替**：仓库明确记录 **"真实浏览器交互从未验证"** —— 常规端到端都是 curl，前端只有类型检查、守卫测试与 SSR 测试 ⇒ 任何前端交互结论都必须标注"**未在真实浏览器验证**"。
+- **前端行为需要真实浏览器验证**：类型检查、守卫测试与 SSR 不能证明交互成立。
+  已接入 CI 的浏览器范围以 `docs/ci-cd.md` §2.2/§6 为准；其他交互结论仍须说明实际运行的验收范围。
   - **这些验收脚本在哪**：需要真实服务的 shell 端到端在 `packages/*/test/e2e-*.sh`（共 8 个）；
     需要真实浏览器的 CDP 界面验收在 `scripts/acceptance/`（`*-cdp.mjs` 与按批次分目录的
     `ai-split-e2e/`、`p0-tools/`…`p6-summary/`，共用夹具 `scripts/acceptance/lib/`）。
-    **两者都不在 CI 里**（见 `docs/ci-cd.md` §6），所以本节的口径是「**门禁没覆盖 ⇒ 结论默认未验证**」；
-    差距与收敛建议见 `docs/agent/backlog.md` F15。
+    **8 个 shell e2e 与未列入门禁的浏览器验收仍需手动运行**（范围见 `docs/ci-cd.md` §2.2/§6）；
+    尚未覆盖的交互与端到端场景见 `docs/agent/backlog.md` F15。
 - **CDP 里发 ⌘Z 必须用 Ctrl（modifiers 2）**：CodeMirror 的 `Mod-` 在非 macOS 上就是 Ctrl，发 Meta 在 Linux 上**什么都不会发生**，而"撤销后正文没变"很容易被读成"符合预期"。
 - **用状态行判断"有没有未保存改动"会骗人**：草稿自动保存（900ms 防抖）之后，文案从「有未保存的改动」被换成「草稿已自动保存（…）」⇒ "脏"与"已保存"在文本上不可区分；判据改成**看正文**（探针字符串在不在、原文有没有回来）。
 
@@ -124,6 +125,8 @@ pnpm install --frozen-lockfile        # 主工作树默认没有 node_modules
 pnpm typecheck                        # 预期 exit 0（包数以 ls -d packages/*/ 为准）
 pnpm test                             # 各包单测（不含 e2e）；用例数以其输出为准
 pnpm build                            # 预期 exit 0
+pnpm acceptance:core                  # 临时库 + 真实浏览器 + 生产产物
+pnpm acceptance:core --dev            # 临时库 + Vite 开发加载路径
 
 # e2e（真实起服务 + 真实 curl，pnpm test 不包含它们）
 # 端口以各脚本自身的 PORT:- 默认值为准；与别的实例并存时用 PORT=<端口> 覆盖（见 §1）
@@ -154,13 +157,12 @@ ls packages/*/test/e2e-*.sh | wc -l                                     # e2e �
 grep -rhoE 'PORT="\$\{PORT:-[0-9]+\}"' packages/*/test/*.sh | sort -n   # 各 e2e 默认端口，避免撞车
 ```
 
-> 起服务后**必须轮询 `/api/health` 到 `"present":true`** 再开始验收（见 §1）。
-> 上述 e2e 与 `scripts/acceptance/` 的 CDP 界面验收**都不进 CI**（`docs/ci-cd.md` §6 的诚实清单），
-> 把它拉进门禁的建议见 `docs/agent/backlog.md` F15。
+> 核心流程验收使用自己的临时实例与就绪轮询；手动运行旧脚本时，先核对其健康检查条件。
+> 8 个 shell e2e 与未列入门禁的 CDP 验收仍需手动运行，当前范围见 `docs/ci-cd.md` §2.2/§6。
 
 ### 4.8 已声明的验证盲区（诚实清单）
 
-- **真实浏览器交互从未验证**（见 §4.6）。
+- **真实浏览器门禁仍未覆盖全部交互**（当前范围见 `docs/ci-cd.md` §2.2/§6），编辑器视觉、触屏与其他编辑模式仍需单独验收。
 - **PG 上新端点的运行时端到端只覆盖了部分**：审计闭环、两视图分离、会话列表在 PG 上验过；`grants/purge` 未在 PG 上跑；`e2e-p3a` 的 G/H/I/K 阶段在 PG 下整体跳过，只有**阶段 L** 方言中立。
 - **AI 两条端点的端到端不泄漏未验**（需要 LLM 配置；单测层面已覆盖主体透传与 SSE 建连时取主体）。
 - **D8 存量回填没有真实对象可验**（e2e 库是空的，回填无对象可作用）。

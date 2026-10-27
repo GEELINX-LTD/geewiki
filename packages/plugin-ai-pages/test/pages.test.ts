@@ -76,13 +76,16 @@ async function makeHarness(): Promise<Harness> {
        */
       return Promise.resolve(
         opts?.rawContent === true && state.canEdit && state.rawAvailable
-          ? { ...page, contentMode: 'raw' as const }
+          ? { ...page, contentMode: 'raw' as const, revision: JSON.stringify(page) }
           : { ...page },
       )
     },
-    save: (slug: string, input: { title: string; content: string }) => {
-      saveCalls.push({ slug, ...input })
-      pages.set(slug, input)
+    saveAs: (principal: Principal, slug: string, input: { title: string; content: string; expectedRevision: string }) => {
+      assert.equal(principal.kind, 'user')
+      assert.equal(input.expectedRevision, JSON.stringify(pages.get(slug)))
+      const saved = { title: input.title, content: input.content }
+      saveCalls.push({ slug, ...saved })
+      pages.set(slug, saved)
       return Promise.resolve({ outcome: 'saved' })
     },
   })

@@ -19,7 +19,8 @@ export default defineConfig({
     host: '::',
     port: devPort,
     proxy: {
-      '/api': apiTarget,
+      // 保留浏览器访问的 Host，使后端 CSRF 的 Origin/Host 校验在开发代理下成立。
+      '/api': { target: apiTarget, changeOrigin: false },
       // 插件 UI 资产也交给后端：产物可能来自 `<插件目录>/dist`（在 publicDir 之外），且
       // 「内置插件 UI 资产根」与「前端产物根」是两个独立配置项，只有后端知道该按哪个根提供。
       // dev 下 `pnpm dev` 设 GEEWIKI_PLUGIN_UI_DIST=packages/web/public（内置夹具免构建即可用），

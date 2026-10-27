@@ -94,8 +94,8 @@ function manifestJson(spec: ScaffoldSpec): string {
   const geewiki: Record<string, unknown> = {
     displayName: spec.displayName,
     description: spec.description,
-    // 依赖图的 token 不是 cordis 服务名：`http-service` 是 `@geewiki/http` 的 provides 值
-    provides: `${spec.name}-service`,
+    // 本模板只消费 HTTP，不对外提供服务，因此不声明 provides。
+    // `http-service` 是依赖图 token，取真实服务仍用 ctx.get('http')。
     requires: ['http-service'],
     runtime: {
       supportsHotReload: spec.hotReload,
@@ -150,7 +150,10 @@ function indexTs(spec: ScaffoldSpec): string {
 
 /** 宿主注入的 HTTP 路由服务（\`@geewiki/http\` 经 \`ctx.provide('http', …)\` 提供） */
 interface RouterLike {
-  register(method: string, path: string, handler: (h: RouteContextLike) => void): () => void
+  register(
+    method: string, path: string, handler: (h: RouteContextLike) => void,
+    options: { access: 'public' | 'user' | 'admin'; owner: string },
+  ): () => void
 }
 
 interface RouteContextLike {
@@ -186,7 +189,7 @@ const plugin = {
         greeting: config.greeting ?? 'hello from ${spec.name}',
         timestamp: new Date().toISOString(),
       })
-    })
+    }, { access: 'public', owner: '${pkg}' })
 
     console.log('[${spec.name}] 已激活: GET /api/${spec.name}')
 

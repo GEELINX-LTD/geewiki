@@ -117,7 +117,6 @@ pnpm --filter @geewiki/web run build:fixtures
   "geewiki": {
     "displayName": "my-note",
     "description": "…",
-    "provides": "my-note-service",     // ⚠️ 模板这一处照抄即错，见 §1.5
     "requires": ["http-service"],      // 依赖图 token，不是 ctx.get 的服务名！见下
     "runtime": {                       // 三个值都是显式写出的，语义见 §6
       "supportsHotReload": true,
@@ -137,38 +136,35 @@ pnpm --filter @geewiki/web run build:fixtures
 2. **模板刻意不写 `permissions`**。`geewiki.permissions` 的语义是"我要碰哪些跨界能力"（`node:fs` / `process.env` / 网络…，取值见 `packages/core/src/domain.ts` 的 `PLUGIN_PERMISSIONS`）。模板零依赖所以零声明——**用不到却写上，就是一份不诚实的清单**；真用了 Node 内置就得补上。另外要知道：宿主**不做拦截**，这份清单是"可评审"而不是"被强制"（见 [`index.md` §7](index.md)）。
 3. **`slots` 与 bundle 里的 `registerSlot(...)` 必须一致**。声明了却不注册 ⇒ 该插槽永远空着**且无人报错**；注册了却没声明 ⇒ 宿主按需加载的判定看不到它（换成 `editor` 一类按需插槽就是"界面永远不加载"）。提交前用 `GET /api/plugins/slots` 与 `GET /api/plugins/ui` 自查（§5）。
 
-### 1.5 ⚠️ 模板里有两处"照抄即错"，必须自己改
+### 1.5 扩展模板时保留的两条约束
 
-**A. `provides: '<插件名>-service'` 是谎报的 token —— 照抄即错。**
+**A. 只有真实提供服务时才声明 `provides`。**
 
-已逐文件核实：脚手架模板 `manifestJson` 会声明 `provides: '<n>-service'`，而模板生成的 `index.ts`（`indexTs`）的 `apply()` **从未调用 `ctx.provide()`**。两个示例插件同样如此：`plugins/ui-demo/package.json` 声明 `ui-demo-service`、`plugins/hello-geewiki/package.json` 声明 `hello-service`，而它们的 `apply()` 都没有 provide。
+脚手架与 `plugins/hello-geewiki/`、`plugins/ui-demo/` 都只消费 HTTP 并注册路由，
+因此清单不声明 `provides`。它只是依赖图 token，不会创建 cordis 服务。
+要对外提供服务时，应先实现 `ctx.provide(...)`、卸载注销与服务契约，再声明对应 token；
+范式见 `packages/plugin-search/src/index.ts` 的 `apply`。
 
-为什么这很糟：清单的 `provides` **只是依赖图 token，不会创建任何 cordis 服务**。谎报之后，任何按 `requires: ['my-note-service']` 依赖你的插件都会被解析成"依赖已满足"，而它实际 `ctx.get('my-note-service')` 恒为 `undefined` —— 症状是**功能静默不可用，不报错**。仓内正确的口径写在 `packages/plugin-echo/src/index.ts` 的清单注释里（该插件曾写 `provides: 'echo-service'`，**已刻意撤销**）。
+旧清单若依赖示例中曾声明的 `hello-service` 或 `ui-demo-service`，现在会报告依赖缺失；
+这些示例从未提供这两个服务。仅要求插件激活顺序时，可按真实插件名声明依赖。
 
-二选一，别留半成品：
+**B. 每条路由显式声明访问等级和归属。**
 
-```ts
-// ✅ 方案一：不需要对外提供能力 ⇒ 删掉清单里的 provides（推荐，绝大多数插件属于此类）
-
-// ✅ 方案二：确实要对外提供 ⇒ 真 provide，并在 dispose 里注销；两边名字必须完全一致
-apply(ctx) {
-  const disposeRouter = /* … router.register(…) */
-  ctx.provide('my-note-service', myApi)      // 名字 == 清单 provides
-  return () => { disposeRouter(); /* 同时撤销服务 */ }
-}
-```
-
-自查：`curl -s localhost:3000/api/plugins/graph | jq` 看依赖图里你的 token 是否真的有 provider；更硬的办法是在依赖方 `ctx.get(...)` 后打印类型。
-
-**B. 模板的路由注册漏了访问等级 ⇒ 匿名可调。**
-
-模板生成的是 `router.register('GET', '/api/my-note', handler)` ——**没有第 4 参**。`router.register()` 的访问等级**默认 `'public'`**（`RouteAccess`，`packages/core/src/index.ts`），也就是匿名可调，启动时只聚合成一条告警（只有设 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 才拒启）。两个示例插件的 `register` 同样漏了这一参，**别照抄**。显式补上，取值按接口性质定（管理类接口用 `'admin'`）：
+模板与两个示例都显式使用 `{ access: 'public', owner: '<插件包名>' }`，
+演示接口仍可匿名访问。模板的 `RouterLike.register` 要求传入第 4 参，
+便于扩展时继续明确访问等级；管理接口应使用 `'admin'`，逐对象授权仍由处理器负责。
 
 ```ts
-const unregister = router.register('GET', '/api/my-note', handler, { access: 'admin' })
+const unregister = router.register('GET', '/api/my-note', handler, {
+  access: 'admin', owner: '@geewiki-plugin/my-note',
+})
 ```
 
-除此之外，模板这几处是对的、值得照抄：`apply()` 里**逐次 `ctx.get`**（缓存到模块级变量会把"服务晚到"永久固化成 undefined）、**缺服务立刻抛错**（静默降级会让插件"看起来在跑、实际什么也没做"）、**返回卸载函数并撤销路由**（不撤销的话插件停用后端点仍然存在）。
+core 类型同样要求第 4 参及 `access` 必填。旧 JavaScript 仅在非严格模式保留默认 `'public'`；
+`GEEWIKI_STRICT_ROUTE_ACCESS=1` 在注册前拒绝遗漏，覆盖启动与热启用。
+模板与示例已通过严格模式下的真实启动与 HTTP 回归。
+
+模板还示范了：`apply()` 里逐次 `ctx.get`、缺服务立刻抛错、返回卸载函数并撤销路由。
 
 ---
 
@@ -451,7 +447,7 @@ plugins/my-note/
 | Docker 下 **HTTP 不监听** / 反复重启却对外不服务 | 空的 `./config` 挂载遮蔽了镜像内模板 ⇒ 空清单 ⇒ 无插件激活 ⇒ 进程退出码 0 + `restart` 循环（§3.2） | 把 `plugins.base.example.json` 复制成挂载目录里的 `plugins.base.json`；同时确认 `GEEWIKI_PLUGINS_DIR` 是绝对路径、`./plugins` 挂载非空（`../deployment.md`） |
 | **干净检出 / `git clean -fdx` 后 UI 产物丢失** | 全局 `dist/` 忽略规则（§1.3） | 加逐插件 `.gitignore` 例外；示例插件的产物用 `pnpm --filter @geewiki/web run build:fixtures` 重新产出 |
 | 配置**改不动 / 改了零校验**（表单是 JSON 原文） | 走的是 `geewiki.manifest.json`，无法承载 `configSchema`（§2） | 改回 `package.json#geewiki` 并声明 `configSchema`；注意无 schema 时宿主只校验"必须是 JSON 对象"，其余字段原样透传 |
-| 依赖方 `ctx.get('xxx-service')` 恒为 `undefined`，却"依赖已满足" | 上游只写了清单 `provides`、从没 `ctx.provide()`（§1.5 A；脚手架模板与两个示例插件都是这样） | 删掉谎报的 token，或真 provide + dispose 注销、两边同名 |
+| 依赖方 `ctx.get('xxx-service')` 恒为 `undefined`，却"依赖已满足" | 上游只写了清单 `provides`、从没 `ctx.provide()`（§1.5 A） | 删掉谎报的 token，或真 provide + dispose 注销、两边同名 |
 | 我的接口**匿名就能访问** | `router.register()` 漏写第 4 参 ⇒ `access: 'public'`（§1.5 B） | 每条路由显式写 `access`；用 `GEEWIKI_STRICT_ROUTE_ACCESS=1` 让漏写在开发期就拒启 |
 | 装了 `node_modules` 却 `Cannot find module` | 外部插件不是 workspace 包，pnpm 严格布局下不会向上解析宿主依赖 | 在该插件目录内自带 `node_modules`；或干脆只用 Node 内置 + `ctx` 服务（推荐） |
 | 界面 bundle 里 React 报 hook / portal 怪错 | bundle 自带了第二份 `react` | 删掉自带 React：宿主 import map 已把 `react` / `react/jsx-runtime` / `react-dom` 映射到宿主实例；没有 JSX 就用 `host.React.createElement` |

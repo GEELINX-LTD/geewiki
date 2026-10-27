@@ -270,29 +270,30 @@ export interface RouterIdentityDeps {
   capabilityProbe?: (name: CapabilityName, principal: Principal) => boolean
 }
 
-/** ★ F11：严格模式的开关环境变量。设为 `1` 时，存在未显式声明访问等级的路由即**拒绝启动**。 */
+/** 严格模式开关：内置路由器在注册前拒绝遗漏访问等级，启动审计也拒绝遗漏。 */
 export const STRICT_ROUTE_ACCESS_ENV = 'GEEWIKI_STRICT_ROUTE_ACCESS'
 
 /**
  * ★ F11：启动期**全路由访问等级审计**。
  *
  * ## 审计的是"有没有人做过这个决定"，不是"公开对不对"
- * `register()` 的第 4 参可省，省略即 `access: 'public'`（匿名可调）。于是全仓几十个调用点
- * 全靠作者自觉 —— 而"**忘了写**"与"**故意公开**"在源码里长得一模一样：两种情况的 `access`
- * 都是 `'public'`，运行期也毫无痕迹。评审看不见风险，出事也追不到"这是谁定的"。
+ * TypeScript 契约要求显式声明；旧 JavaScript 在非严格模式省略声明仍为 `public`。
+ * 这里继续审计兼容调用及第三方路由器，用 `explicit` 区分隐式公开与作者明确选择。
  *
  * 所以这里点名的是 `explicit === false` 的那些，也就是"**没人明确负责**的公开"。
  * 公开本身不是问题（登录、健康检查、匿名可读的接口都该公开），**没被声明过**才是。
  *
  * ## 两种模式
  * - 默认：把清单聚合成**一条**告警（不是每条一行 —— 噪声会把告警训练成背景音）。
- * - `GEEWIKI_STRICT_ROUTE_ACCESS=1`：**拒绝启动**。给"不受信插件/合规环境"用：
- *   一个带着默认 public 上线的新端点会让进程直接起不来，而不是悄悄暴露。
+ * - `GEEWIKI_STRICT_ROUTE_ACCESS=1`：内置路由器在注册前拒绝遗漏声明；本审计
+ *   重抛启动期间的注册失败，并检查第三方路由器已登记的遗漏。
  *
  * `router.routes` 是可选方法（第三方实现可以不提供），拿不到就静默跳过 ——
  * 审计是增强，不该让不提供它的实现无法工作。
  */
 export function auditRouteAccess(router: HttpRouterServiceType, env: NodeJS.ProcessEnv = process.env): void {
+  // 插件管理器会记录 apply 失败后继续 boot；不能因失败路由未入表就空集通过。
+  if (router instanceof HttpRouter) router.assertRouteAccessRegistrations()
   const routes = router.routes?.()
   if (routes === undefined) return
   const unaudited = unauditedRoutes(routes)
@@ -372,6 +373,10 @@ function verdictDenial(raw: unknown): AccessDenial | null {
 class HttpRouter implements HttpRouterService {
   /** 已注册路由表。字段名刻意与 `routes()` 方法区分：后者是给审计用的**快照**。 */
   private readonly routeTable: RouteEntry[] = []
+  /** 固定本路由器的运行模式，热启用与启动遵守同一约束。 */
+  private readonly strictRouteAccess = process.env[STRICT_ROUTE_ACCESS_ENV] === '1'
+  /** 保留首个失败，让启动审计识别已被插件管理器接住的加载错误。 */
+  private routeAccessRegistrationError: Error | undefined
   /** ★ F12：owner → 命中其路由的请求数（进程内累计，不落盘、重启即清零） */
   private readonly ownerRequests = new Map<string, number>()
   /**
@@ -425,13 +430,23 @@ class HttpRouter implements HttpRouterService {
     handler: RouteHandler,
     opts?: RouteAccessOptions,
   ): () => void {
+    const access = opts?.access
+    const missing = access === undefined
+    const invalid = !missing && access !== 'public' && access !== 'user' && access !== 'admin'
+    if ((missing && this.strictRouteAccess) || invalid) {
+      const reason = missing ? '未显式声明 access' : 'access 必须为 public、user 或 admin'
+      const mode = this.strictRouteAccess ? `[${STRICT_ROUTE_ACCESS_ENV}=1] ` : ''
+      const error = new Error(`${mode}${method} ${path} ${reason}，拒绝注册`)
+      this.routeAccessRegistrationError ??= error
+      throw error
+    }
     const entry: RouteEntry = {
       method,
       path,
       segments: path.split('/').filter(Boolean),
       handler,
-      // 默认 public：只传 3 个实参的既有调用点（以及全部现存插件）行为完全不变
-      access: opts?.access ?? 'public',
+      // 非严格模式为旧 JavaScript 调用保留迁移窗口；core 类型已要求显式声明。
+      access: access ?? 'public',
       // ★ F11：记下"这是显式声明的还是吃了默认值"
       explicit: opts?.access !== undefined,
       // ★ F9：缺省即"不额外要求能力"——既有调用点行为完全不变
@@ -447,6 +462,11 @@ class HttpRouter implements HttpRouterService {
       const idx = this.routeTable.indexOf(entry)
       if (idx >= 0) this.routeTable.splice(idx, 1)
     }
+  }
+
+  /** 组合根启动审计使用；不属于插件可依赖的 HttpRouterService 契约。 */
+  assertRouteAccessRegistrations(): void {
+    if (this.routeAccessRegistrationError) throw this.routeAccessRegistrationError
   }
 
   /** 注册请求前置钩子；返回注销函数（幂等）。契约见 @geewiki/core 的 RequestHook。 */
@@ -1433,6 +1453,8 @@ export interface ServerOptions {
   /** 外部插件目录（默认 GEEWIKI_PLUGINS_DIR 或仓库根下 plugins/；null = 不启用外部插件发现） */
   pluginsDir?: string | null
   registry?: RegisteredPlugin[]
+  /** 启动必须可用的服务；自定义注册表缺省不强制完整 Wiki 依赖。 */
+  requiredServices?: readonly string[]
 }
 
 /** startServer 传给 http 插件的启动期默认值（清单内未显式配置端口/地址时生效） */
@@ -1907,44 +1929,60 @@ export async function startServer(options: ServerOptions = {}): Promise<{ app: C
   // ——**在一个插件 apply 尚未结算时 provide 的服务，对它在此期间创建的子插件不可见**，
   // 而 boot() 恰恰是在管理器的 apply 内部激活插件。前移为独立插件后它的 apply 先结算，
   // 服务即对管理器及其 boot 出来的插件可见（与 db-sqlite / http 作为兄弟插件同理）。
-  await app.plugin(slotPlugin)
+  try {
+    await app.plugin(slotPlugin)
 
-  // ★ F9：能力服务插件**同样必须先于管理器装载**（理由与上一段逐字相同，实测同源）：
-  // 若由管理器在自己 apply 里 provide，插件 apply 期的 `ctx.get('capability-service')`
-  // 是 undefined，它的能力注册会被**静默跳过** —— 那是一道永远 403 的闸门 + 干净得可疑的日志。
-  await app.plugin(capabilityPlugin)
+    // ★ F9：能力服务插件**同样必须先于管理器装载**（理由与上一段逐字相同，实测同源）：
+    // 若由管理器在自己 apply 里 provide，插件 apply 期的 `ctx.get('capability-service')`
+    // 是 undefined，它的能力注册会被**静默跳过** —— 那是一道永远 403 的闸门 + 干净得可疑的日志。
+    await app.plugin(capabilityPlugin)
 
-  const managerFiber = await app.plugin(PluginManagerPlugin, {
-    registry: built.registry,
-    // 发现期问题（跳过的插件目录等）透出到 GET /api/plugins 的 issues 字段
-    discoveryIssues: built.issues,
-    // ★ F17：插件目录的解析规则在这里有唯一实现，故由组合根传给管理器（供完整性校验用）
-    pluginsDir: pluginsRoot,
-    // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
-    baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
-    sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
-    // `role: 'secret'` 字段（如模型 API 密钥）的落盘位置：与清单同目录，已被 .gitignore 忽略，
-    // 绝不写进入库的 plugins.*.json（见 packages/manager/src/secrets.ts 的文件头）
-    secretsFile: resolveProjectPath(join(configDir, 'secrets.json'), import.meta.url),
-    crashMarkerFile,
-    // 入口表的第二候选根（<pluginUiDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
-    webDist,
-    pluginUiDist,
-  })
+    const managerFiber = await app.plugin(PluginManagerPlugin, {
+      registry: built.registry,
+      // 发现期问题（跳过的插件目录等）透出到 GET /api/plugins 的 issues 字段
+      discoveryIssues: built.issues,
+      // ★ F17：插件目录的解析规则在这里有唯一实现，故由组合根传给管理器（供完整性校验用）
+      pluginsDir: pluginsRoot,
+      // 清单路径以仓库根为基准（与进程工作目录无关，见 resolveProjectPath）
+      baseFile: resolveProjectPath(join(configDir, 'plugins.base.json'), import.meta.url),
+      sessionFile: resolveProjectPath(join(configDir, 'plugins.session.json'), import.meta.url),
+      // `role: 'secret'` 字段（如模型 API 密钥）的落盘位置：与清单同目录，已被 .gitignore 忽略，
+      // 绝不写进入库的 plugins.*.json（见 packages/manager/src/secrets.ts 的文件头）
+      secretsFile: resolveProjectPath(join(configDir, 'secrets.json'), import.meta.url),
+      crashMarkerFile,
+      // 入口表的第二候选根（<pluginUiDist>/plugins-ui/<名>）；第一候选根是插件自带的 <dir>/dist
+      webDist,
+      pluginUiDist,
+    })
 
-  /*
-   * ★ F11：**全路由审计**必须在管理器结算之后跑 —— 路由是在各插件的 `apply` 里注册的，
-   * 而插件由管理器在这一步之前 boot 出来。放在更早的位置会审计到一张空表，
-   * 于是"审计通过"与"什么都没审计"变得无法区分（这正是审计类代码最容易变成摆设的方式）。
-   */
-  const routerForAudit = app.get('http') as HttpRouterServiceType | undefined
-  if (routerForAudit) auditRouteAccess(routerForAudit)
+    const requiredServices = options.requiredServices ?? (options.registry ? [] : [
+      'http', 'db', 'auth-service', 'policy-service', 'wiki-service',
+    ])
+    const missing = requiredServices.filter((name) => !app.get(name))
+    if (missing.length > 0) {
+      throw new Error(`[server] 必要服务未就绪: ${missing.join(', ')}；请检查插件清单与启动日志`)
+    }
 
-  return {
-    app,
-    dispose: async () => {
-      await managerFiber.dispose()
-    },
+    /*
+     * ★ F11：全路由审计必须在管理器结算之后执行，避免审计到尚未注册路由的空表。
+     */
+    const routerForAudit = app.get('http') as HttpRouterServiceType | undefined
+    if (routerForAudit) auditRouteAccess(routerForAudit)
+
+    return {
+      app,
+      dispose: async () => {
+        await managerFiber.dispose()
+        await app.fiber.dispose()
+      },
+    }
+  } catch (err) {
+    try {
+      await app.fiber.dispose()
+    } catch (cleanupErr) {
+      console.error('[server] 启动失败后的清理失败:', cleanupErr)
+    }
+    throw err
   }
 }
 

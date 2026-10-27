@@ -25,19 +25,24 @@
  * 恢复要在服务器**正拿着库和附件读写**的时候替换文件，等价于"边跑边换引擎"。
  * 故恢复不进 HTTP、不做热恢复，并要求调用方确认服务已停（见 `scripts/restore.ts`）。
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   copyFileSync,
+  cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { MaintenanceError } from './maintenance.js'
 
 /** 清单格式版本。将来改结构时**必须**升它，恢复端据此拒绝不认识的包 */
@@ -104,7 +109,7 @@ export interface CreateBackupOptions {
    * 为什么需要它：本部署可以用 `GEEWIKI_DATA_DIR` 把数据放到别处；若这里仍写死
    * `<repoRoot>/data`，就会出现"库快照取自真实数据目录，而其余文件扫的是另一个目录"
    * ——备份看起来成功、内容却自相矛盾。两者**必须**来自同一个来源。
-   * 二者都要求落在 `repoRoot` 之内（清单键是仓库相对路径，见 `safeRelPath`）。
+   * 根目录可位于仓库之外；备份包只记录规范的 `data/…`、`config/…` 逻辑键。
    */
   readonly dataDir?: string
   readonly configDir?: string
@@ -122,14 +127,14 @@ const sha256Of = (path: string): string => createHash('sha256').update(readFileS
 /** `child` 是否在 `parent` 之内（用 relative 而非 startsWith：`/a-evil` 会通过 `startsWith('/a')`） */
 function isInside(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child))
-  return rel !== '' && !rel.startsWith('..') && !rel.split(sep).includes('..')
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
 }
 const toPosix = (p: string): string => p.split(sep).join('/')
 
 /** 相对仓库根、且**必须留在仓库内**的路径（恢复端据此拒绝清单里的穿越路径） */
 function safeRelPath(repoRoot: string, path: string, what: string): string {
   const rel = relative(resolve(repoRoot), resolve(path))
-  if (rel === '' || rel.startsWith('..') || rel.split(sep).includes('..')) {
+  if (!isInside(repoRoot, path)) {
     throw new MaintenanceError(`拒绝操作：${what} 不在仓库根之内（${path}）`)
   }
   return rel
@@ -256,133 +261,286 @@ export async function createBackup(options: CreateBackupOptions): Promise<Backup
   return { dir, manifest, totalBytes: entries.reduce((s, e) => s + e.bytes, 0) }
 }
 
-/** 读清单。**没有清单就抛错**：半成品目录必须被拒绝，而不是被当成"空备份"恢复 */
-export function readBackupManifest(dir: string): BackupManifest {
-  const file = join(dir, BACKUP_MANIFEST_FILE)
-  if (!existsSync(file)) {
-    throw new MaintenanceError(
-      `不是备份目录（缺少 ${BACKUP_MANIFEST_FILE}）：${dir}\n` +
-        '该文件在备份**最后**才写入，故缺它多半意味着那次备份中途失败了。',
-    )
+/** 读取不跟随链接的普通源文件，路径已由清单结构检查或常量保证规范。 */
+function sourceFile(root: string, path: string): string {
+  const parts = path.split('/')
+  let full = root
+  for (const [index, part] of parts.entries()) {
+    full = join(full, part)
+    const stat = lstatSync(full)
+    if (stat.isSymbolicLink() || (index === parts.length - 1 ? !stat.isFile() : !stat.isDirectory())) {
+      throw new MaintenanceError(`清单条目不是普通文件或经过符号链接：${path}`)
+    }
   }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(readFileSync(file, 'utf8'))
-  } catch (err) {
-    throw new MaintenanceError(`清单不是合法 JSON（${file}）：${(err as Error).message}`)
-  }
-  const m = parsed as Partial<BackupManifest>
-  if (m.formatVersion !== BACKUP_FORMAT_VERSION) {
-    throw new MaintenanceError(
-      `清单格式版本不匹配：期望 ${BACKUP_FORMAT_VERSION}，文件里是 ${String(m.formatVersion)}`,
-    )
-  }
-  if (!Array.isArray(m.files)) throw new MaintenanceError(`清单缺少 files 数组（${file}）`)
-  return m as BackupManifest
+  return full
 }
 
-/**
- * 校验备份完整性：每个条目**存在且 sha256 一致**。
- * 恢复前必须先跑这一步——一个损坏的备份恢复出来比不恢复更糟（原数据已被覆盖）。
- */
-export function verifyBackup(dir: string): { ok: boolean; issues: string[] } {
-  const manifest = readBackupManifest(dir)
-  const issues: string[] = []
-  for (const e of manifest.files) {
-    const full = join(dir, e.path)
-    if (!existsSync(full)) {
-      issues.push(`缺失：${e.path}`)
-      continue
-    }
-    const actual = sha256Of(full)
-    if (actual !== e.sha256) issues.push(`哈希不符：${e.path}（期望 ${e.sha256.slice(0, 12)}…，实际 ${actual.slice(0, 12)}…）`)
+function backupRoot(dir: string): string {
+  const root = resolve(dir)
+  const stat = lstatSync(root)
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new MaintenanceError(`备份目录不是普通目录：${root}`)
+  return realpathSync(root)
+}
+
+const recordObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+
+/** 清单先完整验形；任何条目都不能借后续校验失败让前面的文件先被恢复。 */
+export function readBackupManifest(dir: string): BackupManifest {
+  const root = backupRoot(dir)
+  const file = join(root, BACKUP_MANIFEST_FILE)
+  if (!existsSync(file)) {
+    throw new MaintenanceError(`不是备份目录（缺少 ${BACKUP_MANIFEST_FILE}）：${dir}\n该文件在备份最后才写入，缺少时拒绝恢复半成品。`)
   }
+  sourceFile(root, BACKUP_MANIFEST_FILE)
+  let parsed: unknown
+  try { parsed = JSON.parse(readFileSync(file, 'utf8')) }
+  catch (err) { throw new MaintenanceError(`清单不是合法 JSON（${file}）：${(err as Error).message}`) }
+  if (!recordObject(parsed)) throw new MaintenanceError('清单必须是对象')
+  if (parsed['formatVersion'] !== BACKUP_FORMAT_VERSION) {
+    throw new MaintenanceError(`清单格式版本不匹配：期望 ${BACKUP_FORMAT_VERSION}，文件里是 ${String(parsed['formatVersion'])}`)
+  }
+  const database = parsed['database']
+  if (typeof parsed['createdAt'] !== 'string' || !Number.isFinite(Date.parse(parsed['createdAt'])) ||
+    typeof parsed['secretsIncluded'] !== 'boolean' || !recordObject(database) ||
+    typeof database['included'] !== 'boolean' ||
+    database['engine'] !== (database['included'] ? 'sqlite' : 'none') ||
+    (database['note'] !== undefined && typeof database['note'] !== 'string') ||
+    (!database['included'] && (typeof database['note'] !== 'string' || database['note'].length === 0))) {
+    throw new MaintenanceError('清单创建时间、数据库或密钥标记不合法')
+  }
+  if (!Array.isArray(parsed['files'])) throw new MaintenanceError(`清单缺少 files 数组（${file}）`)
+  const files: BackupFileEntry[] = []
+  const names = new Set<string>()
+  for (const entry of parsed['files'] as unknown[]) {
+    if (!recordObject(entry) || typeof entry['path'] !== 'string' ||
+      !Number.isSafeInteger(entry['bytes']) || (entry['bytes'] as number) < 0 ||
+      typeof entry['sha256'] !== 'string' || !/^[a-f\d]{64}$/i.test(entry['sha256'])) {
+      throw new MaintenanceError('清单条目必须包含规范路径、非负整数大小与 SHA-256')
+    }
+    const path = entry['path']
+    const parts = path.split('/')
+    if (parts.length < 2 || !['data', 'config'].includes(parts[0]!) ||
+      parts.some((part) => part === '' || part === '.' || part === '..' || part.includes('\0') || /[\\:]/.test(part)) ||
+      (parts[0] === 'config' && (parts.length !== 2 || !path.endsWith('.json'))) ||
+      (parts[0] === 'data' && /(?:-(?:wal|shm|journal)|\.tmp)$/.test(path))) {
+      throw new MaintenanceError(`清单条目路径不合法：${path}`)
+    }
+    const key = path.toLowerCase()
+    if (names.has(key)) throw new MaintenanceError(`清单条目重复或大小写冲突：${path}`)
+    names.add(key)
+    files.push({ path, bytes: entry['bytes'] as number, sha256: entry['sha256'].toLowerCase() })
+  }
+  for (const { path } of files) {
+    const parts = path.toLowerCase().split('/')
+    for (let i = 1; i < parts.length; i++) {
+      if (names.has(parts.slice(0, i).join('/'))) throw new MaintenanceError(`清单条目文件与目录冲突：${path}`)
+    }
+  }
+  if (parsed['secretsIncluded'] !== files.some(({ path }) => path === 'config/secrets.json') ||
+    (database['included'] && !files.some(({ path }) => path.startsWith('data/')))) {
+    throw new MaintenanceError('清单数据库或密钥标记与文件列表不一致')
+  }
+  return {
+    formatVersion: BACKUP_FORMAT_VERSION,
+    createdAt: parsed['createdAt'],
+    database: { included: database['included'], engine: database['included'] ? 'sqlite' : 'none', ...(typeof database['note'] === 'string' ? { note: database['note'] } : {}) },
+    secretsIncluded: parsed['secretsIncluded'],
+    files,
+  }
+}
+
+function verifyFiles(root: string, files: readonly BackupFileEntry[]): string[] {
+  const issues: string[] = []
+  for (const entry of files) {
+    try {
+      const full = sourceFile(root, entry.path)
+      const actual = sha256Of(full)
+      if (actual !== entry.sha256) issues.push(`哈希不符：${entry.path}（期望 ${entry.sha256.slice(0, 12)}…，实际 ${actual.slice(0, 12)}…）`)
+      else if (lstatSync(full).size !== entry.bytes) issues.push(`大小不符：${entry.path}`)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') issues.push(`缺失：${entry.path}`)
+      else issues.push(`清单条目 ${entry.path} 读取失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return issues
+}
+
+/** 校验完整结构、源文件类型、大小与哈希；不写入文件。 */
+export function verifyBackup(dir: string): { ok: boolean; issues: string[] } {
+  const root = backupRoot(dir)
+  const manifest = readBackupManifest(root)
+  const issues = verifyFiles(root, manifest.files)
   return { ok: issues.length === 0, issues }
 }
 
 export interface RestoreReport {
   readonly restored: readonly string[]
-  /** 被移到一边的原数据目录（若有）——出问题时可据此手工回退 */
+  /** 成功换入后保留的原数据目录。 */
   readonly setAside?: string
+  /** 与数据一同保留的原配置目录（可能包含密钥）。 */
+  readonly configSetAside?: string
 }
 
 export interface RestoreOptions {
   readonly backupDir: string
   readonly repoRoot: string
-  /** 目标已存在数据时是否允许覆盖。缺省 false（拒绝），符合"破坏性操作要显式" */
+  /** 覆盖已有文件或替换非空数据目录必须显式允许。 */
   readonly force?: boolean
-  /**
-   * `data/` 与 `config/` 的实际落点（缺省 `<repoRoot>/data`、`<repoRoot>/config`）。
-   *
-   * 与 `CreateBackupOptions` 里的同名项**必须**成对使用：清单里的键是仓库相对路径
-   * （`data/geewiki.db`），若恢复端把它一律展开到 `<repoRoot>/data`，那么一个用
-   * `GEEWIKI_DATA_DIR` 把数据放到别处的部署，恢复后会把文件写到**服务根本不读的地方**
-   * ——"恢复成功"而数据没回来，是最难排查的一类失败。
-   */
   readonly dataDir?: string
   readonly configDir?: string
 }
 
-/**
- * 恢复一个备份。
- *
- * 三条安全性质：
- * 1. **先校验再动手**：哈希不符直接拒绝（覆盖了就回不去了）；
- * 2. **清单里的路径必须落在仓库内** —— 清单是文件，可能被改过；`../../etc/passwd` 这类
- *    路径如果被信任，恢复就成了任意写；
- * 3. **覆盖前先把原数据移到一边**（`data.pre-restore-<ts>/`），**不删**。
- *    恢复这个动作本身就会让事情变好或变坏，留一份原状是唯一能救回来的东西。
- */
-export function restoreBackup(options: RestoreOptions): RestoreReport {
-  const repoRoot = resolve(options.repoRoot)
-  const backupDir = resolve(options.backupDir)
-  const { ok, issues } = verifyBackup(backupDir)
-  if (!ok) {
-    throw new MaintenanceError(
-      `备份校验失败，拒绝恢复（共 ${issues.length} 处问题）：\n  - ${issues.slice(0, 10).join('\n  - ')}` +
-        (issues.length > 10 ? `\n  …另有 ${issues.length - 10} 处` : ''),
-    )
+function maybeStat(path: string): ReturnType<typeof lstatSync> | undefined {
+  try { return lstatSync(path) }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new MaintenanceError(`无法检查恢复目标 ${path}：${err instanceof Error ? err.message : String(err)}`)
   }
+}
+
+/** 根目录由操作者指定，可在仓库外；规范化现有父目录别名，拒绝根本身是链接。 */
+function targetRoot(path: string): string {
+  const full = resolve(path)
+  let ancestor = full
+  let stat = maybeStat(ancestor)
+  if (stat?.isSymbolicLink()) throw new MaintenanceError(`恢复目标不能是符号链接：${full}`)
+  while (!stat) {
+    ancestor = dirname(ancestor)
+    stat = maybeStat(ancestor)
+  }
+  if (!statSync(ancestor).isDirectory()) throw new MaintenanceError(`恢复目标不是目录：${full}`)
+  return resolve(realpathSync(ancestor), relative(ancestor, full))
+}
+
+function checkTree(root: string): void {
+  const stat = maybeStat(root)
+  if (!stat) return
+  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new MaintenanceError(`恢复目录包含符号链接或特殊文件：${root}`)
+  if (stat.isDirectory()) for (const name of readdirSync(root)) checkTree(join(root, name))
+}
+
+/** 已有中间层必须是目录，已有最终条目必须是普通文件。 */
+function checkDestination(root: string, path: string): boolean {
+  const parts = path.split('/')
+  let full = root
+  for (const [index, part] of parts.entries()) {
+    full = join(full, part)
+    const stat = maybeStat(full)
+    if (!stat) return false
+    if (stat.isSymbolicLink() || (index === parts.length - 1 ? !stat.isFile() : !stat.isDirectory())) {
+      throw new MaintenanceError(`恢复目标文件或目录冲突：${full}`)
+    }
+  }
+  return true
+}
+
+interface RestoreRoot {
+  readonly kind: 'data' | 'config'
+  readonly target: string
+  readonly entries: readonly BackupFileEntry[]
+  readonly merge: boolean
+}
+
+function restorePlan(options: RestoreOptions): { backupDir: string; manifest: BackupManifest; roots: RestoreRoot[] } {
+  const backupDir = backupRoot(options.backupDir)
   const manifest = readBackupManifest(backupDir)
-
-  // 清单键 → 实际落点。带 `data/`、`config/` 前缀的走可注入目录，其余按仓库相对。
-  const dataDir = resolve(options.dataDir ?? join(repoRoot, 'data'))
-  const configDir = resolve(options.configDir ?? join(repoRoot, 'config'))
-  const destOf = (rel: string): string => {
-    const posix = toPosix(rel)
-    if (posix === 'data' || posix.startsWith('data/')) return join(dataDir, posix.slice('data'.length + 1))
-    if (posix === 'config' || posix.startsWith('config/')) return join(configDir, posix.slice('config'.length + 1))
-    return join(repoRoot, rel)
+  const issues = verifyFiles(backupDir, manifest.files)
+  if (issues.length > 0) throw new MaintenanceError(`备份校验失败，拒绝恢复（共 ${issues.length} 处问题）：\n  - ${issues.slice(0, 10).join('\n  - ')}`)
+  const repoRoot = targetRoot(options.repoRoot)
+  const dataDir = targetRoot(options.dataDir ?? join(repoRoot, 'data'))
+  const configDir = targetRoot(options.configDir ?? join(repoRoot, 'config'))
+  const overlaps = (a: string, b: string): boolean => a === b || isInside(a, b) || isInside(b, a)
+  if (overlaps(dataDir, configDir)) throw new MaintenanceError('数据与配置恢复目标不能重叠')
+  for (const target of [dataDir, configDir]) {
+    if (target === repoRoot || isInside(target, repoRoot) || target === dirname(target) || overlaps(target, backupDir)) {
+      throw new MaintenanceError(`恢复目标不能覆盖仓库根、包含备份源或与其重叠：${target}`)
+    }
   }
-
-  // 目标冲突判定：只看"有没有数据库"，因为附件目录存在是常态
-  const dbRel = manifest.files.find((f) => /(^|\/)data\/[^/]+\.db$/.test(f.path))?.path
-  const dbExists = dbRel !== undefined && existsSync(destOf(dbRel))
-  if (dbExists && !options.force) {
-    throw new MaintenanceError(
-      `目标已存在数据库（${dbRel}），拒绝覆盖。确认要覆盖请加 --force；` +
-        '原数据会被移到 data.pre-restore-<时间戳>/ 而不是删除。',
-    )
+  const roots: RestoreRoot[] = []
+  for (const kind of ['data', 'config'] as const) {
+    const entries = manifest.files.filter(({ path }) => path.startsWith(`${kind}/`))
+    if (entries.length === 0) continue
+    const target = kind === 'data' ? dataDir : configDir
+    const merge = kind === 'config' || !manifest.database.included
+    checkTree(target)
+    for (const entry of entries) {
+      if (checkDestination(target, entry.path.slice(kind.length + 1)) && !options.force) {
+        throw new MaintenanceError(`目标已存在文件（${entry.path}），拒绝覆盖。确认替换请加 --force；原数据和配置均保留同级留底。`)
+      }
+    }
+    if (!merge && !options.force && existsSync(target) && readdirSync(target).length > 0) {
+      throw new MaintenanceError(`目标已存在数据库或其他数据，拒绝覆盖。确认替换请加 --force：${target}`)
+    }
+    roots.push({ kind, target, entries, merge })
   }
+  return { backupDir, manifest, roots }
+}
 
-  let setAside: string | undefined
-  if (dbExists && options.force && existsSync(dataDir)) {
+/** 与实际恢复相同的完整预检，不建目录、不写文件。供 CLI --dry-run 使用。 */
+export function validateRestore(options: RestoreOptions): void { restorePlan(options) }
+
+/** 暂存成功后再换入；捕获的提交异常回退两个目录，进程崩溃仍需按留底手工恢复。 */
+export function restoreBackup(options: RestoreOptions): RestoreReport {
+  const { backupDir, manifest, roots } = restorePlan(options)
+  type Staged = RestoreRoot & { stage: string; aside?: string; installed: boolean }
+  const staged: Staged[] = []
+  const parents: string[] = []
+  try {
+    for (const root of roots) {
+      const missing: string[] = []
+      for (let dir = dirname(root.target); !existsSync(dir); dir = dirname(dir)) missing.push(dir)
+      for (const dir of missing.reverse()) { mkdirSync(dir); parents.push(dir) }
+      const stage = mkdtempSync(join(dirname(root.target), `.${basename(root.target)}.restore-stage-`))
+      staged.push({ ...root, stage, installed: false })
+      if (root.merge && existsSync(root.target)) cpSync(root.target, stage, { recursive: true })
+      checkTree(stage)
+      for (const entry of root.entries) {
+        const rel = entry.path.slice(root.kind.length + 1)
+        checkDestination(stage, rel)
+        const dest = join(stage, rel)
+        mkdirSync(dirname(dest), { recursive: true })
+        copyFileSync(sourceFile(backupDir, entry.path), dest)
+        if (lstatSync(dest).size !== entry.bytes || sha256Of(dest) !== entry.sha256) {
+          throw new MaintenanceError(`暂存文件校验失败：${entry.path}`)
+        }
+      }
+      checkTree(stage)
+    }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    // 移到数据目录的**同级**（而不是永远移到 repoRoot）：数据目录可被 GEEWIKI_DATA_DIR 改到别处
-    setAside = join(dirname(dataDir), `${basename(dataDir)}.pre-restore-${stamp}`)
-    renameSync(dataDir, setAside)
+    for (const root of staged) {
+      if (existsSync(root.target)) {
+        const aside = join(dirname(root.target), `${basename(root.target)}.pre-restore-${stamp}-${randomUUID()}`)
+        renameSync(root.target, aside)
+        root.aside = aside
+      }
+      renameSync(root.stage, root.target)
+      root.installed = true
+    }
+  } catch (err) {
+    const rollbackIssues: string[] = []
+    for (const root of [...staged].reverse()) {
+      try {
+        if (root.installed) rmSync(root.target, { recursive: true, force: true })
+        if (root.aside) renameSync(root.aside, root.target)
+      } catch (rollbackError) {
+        rollbackIssues.push(`${root.target}（原目录留底 ${root.aside ?? '无'}）：${String(rollbackError)}`)
+      }
+      try { rmSync(root.stage, { recursive: true, force: true }) }
+      catch (cleanupError) { rollbackIssues.push(`暂存目录未清理 ${root.stage}：${String(cleanupError)}`) }
+    }
+    for (const dir of parents.reverse()) {
+      try { rmdirSync(dir) } catch { /* 只清理本次新建且为空的父目录，不碰已回退的目录。 */ }
+    }
+    const detail = err instanceof Error ? err.message : String(err)
+    if (rollbackIssues.length > 0) throw new MaintenanceError(`恢复失败，回退未完成，请按留底手工恢复：${detail}\n${rollbackIssues.join('\n')}`)
+    throw new MaintenanceError(`恢复失败，已回退原数据和配置：${detail}`)
   }
-
-  const restored: string[] = []
-  for (const e of manifest.files) {
-    // 清单是普通文件、可能被改过：逐一确认展开后的落点没逃出其基准目录
-    const dest = destOf(e.path)
-    safeRelPath(e.path.startsWith('data/') ? dataDir : e.path.startsWith('config/') ? configDir : repoRoot, dest, `清单条目 ${e.path}`)
-    mkdirSync(dirname(dest), { recursive: true })
-    copyFileSync(join(backupDir, e.path), dest)
-    restored.push(e.path)
+  return {
+    restored: manifest.files.map(({ path }) => path),
+    setAside: staged.find(({ kind }) => kind === 'data')?.aside,
+    configSetAside: staged.find(({ kind }) => kind === 'config')?.aside,
   }
-  return { restored, setAside }
 }
 
 /** 汇总文案（把"含了什么、没含什么"讲清楚，尤其是密钥与数据库） */

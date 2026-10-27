@@ -87,6 +87,15 @@ docs/
 | [adr/README.md](adr/README.md) | ADR 目录索引与格式约定（MADR 精简式；两条硬规矩：不锚定 commit hash / 行号，负面后果不许省略）。想知道某个不可逆决定的背景与代价时读 | 只记「为什么这么定」，**不描述当前实现**。当前实现看 [architecture.md](architecture.md) 与代码；ADR 与代码不符时以代码为准并**补一条新 ADR**，不回头改旧文件 |
 | [adr/0003-sqlite-fts5-primary-postgres-dual-track.md](adr/0003-sqlite-fts5-primary-postgres-dual-track.md) | 以 SQLite + FTS5 为主库、Postgres 走双轨兼容层的决策（回填，状态 `proposed`）。改检索或加 SQL 前必读 | 决策与其代价。检索的实际 SQL 在 `packages/plugin-search/src/index.ts`，没有 SQL 抽象层 |
 | [adr/0009-single-process-sqlite-minimal-deployment.md](adr/0009-single-process-sqlite-minimal-deployment.md) | 极简部署形态：单进程 + SQLite 默认 + `pnpm deploy` 部署树（状态 `accepted`）。动部署形态、进程边界、打包前读 | 部署形态的决策依据；操作手册在 [deployment.md](deployment.md)，流水线在 [ci-cd.md](ci-cd.md) |
+| [adr/0010-write-preconditions-and-startup-readiness.md](adr/0010-write-preconditions-and-startup-readiness.md) | 页面保存前置条件、主体写入入口、标准部署必要服务与核心流程门禁的决策（状态 `accepted`） | 只记录取舍；保存契约以 core 为准，部署操作见 deployment，验收接线见 ci-cd |
+| [adr/0011-postgres-write-integration-gate.md](adr/0011-postgres-write-integration-gate.md) | 真实 PostgreSQL 并发写入进入既有 test 作业的决策（状态 `accepted`） | 只记录门禁取舍与代价；命令、环境和覆盖范围以 ci-cd 为准 |
+| [adr/0012-route-access-registration-validation.md](adr/0012-route-access-registration-validation.md) | 路由声明类型约束、注册期校验与旧 JavaScript 迁移窗口（状态 `accepted`） | 只记录安全与兼容取舍；契约以 core 为准，部署开关见 deployment |
+| [adr/0013-openai-diagnostics-opt-in.md](adr/0013-openai-diagnostics-opt-in.md) | 上游错误诊断改为显式开启的决策（状态 `accepted`） | 只记录默认值取舍与脱敏边界；变量用法以 deployment 为准 |
+| [adr/0014-plugin-ui-entry-settlement.md](adr/0014-plugin-ui-entry-settlement.md) | 插件界面入口结算、失败重试与迟到回收的决策（状态 `accepted`） | 只记录生命周期取舍；作者接口见 plugin/api-reference，运行诊断见 plugin-platform |
+| [adr/0015-plugin-ui-registration-diagnostics.md](adr/0015-plugin-ui-registration-diagnostics.md) | 插件界面生效声明与实际注册的一致性诊断（状态 `accepted`） | 只记录诊断时机、事实来源与代价；作者接口见 plugin/api-reference，运行诊断见 plugin-platform |
+| [adr/0016-plugin-ui-entry-timeout.md](adr/0016-plugin-ui-entry-timeout.md) | 插件界面显式入口等待上限与作用域撤销（状态 `accepted`） | 只记录生命周期取舍和不隔离的边界；作者接口见 plugin/api-reference，运行诊断见 plugin-platform |
+| [adr/0017-plugin-ui-browser-gate.md](adr/0017-plugin-ui-browser-gate.md) | 插件界面生产与开发浏览器验收进入构建门禁（状态 `accepted`） | 只记录门禁归属、执行与产物保留策略；覆盖范围与复现命令见 ci-cd |
+| [adr/0018-offline-restore-preflight-and-rollback.md](adr/0018-offline-restore-preflight-and-rollback.md) | 离线恢复的预检、暂存与失败回退（状态 `accepted`） | 只记录覆盖与回退语义及崩溃边界；操作命令与留底管理见 deployment |
 | [design/ui-extension-platform.md](design/ui-extension-platform.md) | **界面扩展平台契约定稿**：可被替换 / 包裹 / 扩展的节点目录、三种模式语义、多插件共存裁决、主题令牌 | 界面扩展的**设计**真源。实际取值与允许模式以源码为凭：`packages/core/src/extensions.ts` 与 `packages/core/src/slots.ts`（见真源表） |
 | [design/block-attribution.md](design/block-attribution.md) | **块级归属**：谁最后改了哪一块——归属模型、写入时机、呈现方式 | 只管「归属」。权限判定在 [design/access-control.md](design/access-control.md)，别在这里找可见性规则 |
 | [design/dock-images.md](design/dock-images.md) | 输入条（dock）的**图片输入**：设计、现状、未做项 | 只管图片输入。dock 作为 AI 唯一对话入口的契约在 [plugin-platform.md](plugin-platform.md) 与 `packages/plugin-ai-assistant` |

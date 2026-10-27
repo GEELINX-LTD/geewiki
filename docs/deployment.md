@@ -99,7 +99,12 @@ GEEWIKI_WEB_DIST=/app/packages/web/dist
 - **挂载目标必须是 `/app/plugins`**（只比 `/app` 深一层）：插件内的裸模块说明符（如 `import ... from 'cordis'`）要沿 `node_modules` 逐级上溯才能命中部署树 `/app/node_modules`，挂得更深就会 `ERR_MODULE_NOT_FOUND`。
 - **插件应自带扁平、可读的 `node_modules`**，不要使用指向宿主 pnpm store 的 symlink：pnpm 严格布局下顶层 `node_modules` 没有传递依赖的直接链接，插件若 `import` 传递依赖（例如 `better-sqlite3`）会解析失败（第 5 节热备份命令记录了同类实测：裸 `require('better-sqlite3')` 抛 `MODULE_NOT_FOUND`）。
 - 宿主 `./plugins` 的属主需与容器内用户一致（同 `./data`、`./config`，见第 3 节）。
-- 配置文件同理：镜像内**自带** `config/plugins.base.json`（默认基础层清单），但一旦把 `./config` 挂载到 `/app/config`，就以宿主目录为准 —— 宿主目录为空时应用会读到"空清单"，导致**没有任何插件被激活**：HTTP 不监听，进程以退出码 0 结束，再被 `restart: unless-stopped` 反复拉起，形成静默重启循环（见第 9 节）。
+- 配置目录挂载后以宿主内容为准，空目录会遮蔽镜像内的默认模板，使管理器读到空清单。
+  标准部署会在启动末尾检查必要服务；缺少 HTTP、数据库、认证、策略或 Wiki 服务时，
+  清理已启动资源并以非 0 退出，日志列出缺少的服务与清单检查提示（见第 9 节）。
+  该检查只保证启动时服务可用，运行期健康探针仍按既有语义执行。
+  嵌入式或测试宿主可通过 `ServerOptions.requiredServices` 明确声明所需服务；
+  自定义 `registry` 缺省不强制标准 Wiki 组合。
 
 ---
 
@@ -114,9 +119,8 @@ GEEWIKI_WEB_DIST=/app/packages/web/dist
 两种处理方式，任选其一：
 
 > ⚠️ **挂载会覆盖镜像里的默认清单模板**。镜像只带 `config/plugins.base.example.json`，而
-> `./config:/app/config` 这个绑定挂载会把它挡住：**宿主目录若为空，容器就读到空清单** ⇒ 没有任何插件
-> 被激活 ⇒ HTTP 不监听 ⇒ 进程以退出码 0 结束被 restart 策略反复拉起（日志里只剩「http 路由服务不可用：
-> REST API 未挂载」）。首次部署请让宿主 config 目录至少有一份清单：
+> `./config:/app/config` 这个绑定挂载会把它挡住：**宿主目录若为空，容器就读到空清单**。
+> 标准部署会报告「必要服务未就绪」，清理资源并以非 0 退出。首次部署请让宿主 config 目录至少有一份清单：
 > `mkdir -p config && cp config/plugins.base.example.json config/plugins.base.json`（或只留模板那份，
 > 运行期代码在 live 文件缺失时会回退读模板）。
 
@@ -181,9 +185,9 @@ Compose 层变量（写入 `.env` 或命令行前缀即可）：
 | `GEEWIKI_HOST` | `0.0.0.0` | 后端**监听地址**（`packages/server/src/index.ts` 的 `startServer()`：`options.host ?? process.env.GEEWIKI_HOST ?? '0.0.0.0'`）。容器内保持默认即可；只绑 `127.0.0.1` 会让端口映射失效 |
 | `GEEWIKI_OIDC_TICKET_SECRET` | **未设置**（每进程随机） | **OIDC 登录票据的签名密钥**（`packages/plugin-auth/src/index.ts` 的 `ticketSecretEnv` / `ticketSecret`）。⚠️ **不是"设了就用"**：判据是 `ticketSecretEnv.length >= 16` ⇒ **短于 16 字符会静默回落成每进程随机的 `randomBytes(32)`，不报错也不告警**。票据 TTL 5 分钟，失败方向是关闭（票据作废，不是放行）。多实例部署、或希望重启后已签发票据仍有效时必须配置，且**长度 ≥16** |
 | `GEEWIKI_ADMIN_TOKEN` | **未设置**（= 整条通道禁用） | **break-glass 应急访问令牌**（`packages/server/src/index.ts` 的 `ADMIN_TOKEN_ENV` / `envAdminToken()`）。判据 `raw !== undefined && raw.length > 0` ⇒ **空串与未设置等价**，没有回退默认值。请求侧两种带法：`x-gw-admin-token: <令牌>` 或 `Authorization: Bearer <令牌>`（`presentedAdminToken()`）；比对走 `secretsMatch()`——两边各做 sha256 再 `timingSafeEqual`，防时序侧信道。**每次使用都留痕**：`auditBreakGlassUse()` 往 stdout 打 `[audit] action=access.break_glass actor=break-glass method=… path=… remote=… at=…`，并经 `onBreakGlassUse` 写 `audit_log` 表（`action: 'access.break_glass'`）。它是逃生门不是运维通道，生产不应常开 |
-| `GEEWIKI_STRICT_ROUTE_ACCESS` | **未设置**（= 只告警） | 路由访问等级门禁（`packages/server/src/index.ts` 的 `STRICT_ROUTE_ACCESS_ENV` / `auditRouteAccess()`）。它点名的是 `register()` 省略第 4 个参数、从而吃到默认 `access: 'public'` 的路由（`unauditedRoutes()`）。**默认动作是把所有未声明路由合并成一条 `console.warn` 聚合告警**；**只有设成字面量 `1` 才抛错拒启**（判据 `=== '1'`，写 `true` / `yes` 一律只告警）。注意调用点在 `startServer()` 尾部（插件 boot 之后），**晚于 `server.listen()`** ⇒ 拒启表现为"端口刚起来进程就退出"，不是启动前预检 |
-| `GEEWIKI_BACKUP_DIR` | **未设置**（= `<进程工作目录>/backups`） | 备份的输出与枚举目录，唯一消费者是 `packages/manager/src/index.ts` 的 `createBackup()` 与 `listBackups()`，解析式 `opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')`，而 `repoRoot = resolve(opts.repoRoot ?? process.cwd())`。⚠️ **它是"相对路径以仓库根为基准"这条全局规则的唯一例外**（不走 `@geewiki/core` 的 `resolveProjectPath`）⇒ 换个目录启动就把备份写到别处。另两点边界：① `pnpm run backup`（`scripts/backup.ts`）**不读这个变量**，只认 `--out`，缺省 `<仓库根>/backups`；`scripts/restore.ts` 也不读它（备份目录是位置参数，它只读 `GEEWIKI_DATA_DIR`）；② **PostgreSQL 方言下备份包不含数据库**（清单里 `database.included = false`，提示改用 `pg_dump`），见 §5 |
-| `GEEWIKI_OPENAI_DEBUG` | **未设置 = 开启**（判据 `!== '0'`） | `@geewiki/openai` 的上游错误诊断日志开关（`packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()`）⇒ **只有显式设成 `0` 才关**，写 `false` / `off` 无效。它 gate 的只有一条日志：上游返回非 2xx 时的 `console.warn('[geewiki/openai] 路由 … 上游返回 <status>（已脱敏）: …')`，内容是**上游错误响应体的前 500 字符**（经 `packages/plugin-llm/src/redact.ts` 的 `redact()`），**不含请求体**。但"默认开着"本身与「敏感数据不出本机」的产品理念相冲，且 `redact` 是启发式的 ⇒ **生产建议显式 `GEEWIKI_OPENAI_DEBUG=0`**；把默认方向改成"显式开"的整改登记在 `docs/agent/backlog.md` **F7** |
+| `GEEWIKI_STRICT_ROUTE_ACCESS` | **未设置**（旧 JS 省略声明时兼容默认公开） | 内置路由器在创建时读取，仅字面量 `1` 开启严格模式：`register()` 在加入路由表前拒绝遗漏 `access`，覆盖启动与插件热启用。所有模式均拒绝非法访问等级。core 类型要求第 4 参及 `access` 必填。启动末尾 `auditRouteAccess()` 会重抛注册失败并清理宿主资源，第三方路由器仍按可选 `routes()` 审计；非严格兼容路由保留启动聚合告警。迁移：补齐显式 `public` / `user` / `admin` 后设为 `1`；端口可能在启动审计前短暂监听 |
+| `GEEWIKI_BACKUP_DIR` | **未设置**（= `<进程工作目录>/backups`） | 备份的输出与枚举目录，唯一消费者是 `packages/manager/src/index.ts` 的 `createBackup()` 与 `listBackups()`，解析式 `opts.outDir ?? process.env['GEEWIKI_BACKUP_DIR'] ?? join(repoRoot, 'backups')`，而 `repoRoot = resolve(opts.repoRoot ?? process.cwd())`。⚠️ **它是"相对路径以仓库根为基准"这条全局规则的唯一例外**（不走 `@geewiki/core` 的 `resolveProjectPath`）⇒ 换个目录启动就把备份写到别处。另两点边界：① `pnpm run backup`（`scripts/backup.ts`）**不读这个变量**，只认 `--out`，缺省 `<仓库根>/backups`；`scripts/restore.ts` 也不读它（备份目录是位置参数，它读取 `GEEWIKI_DATA_DIR` 与 `GEEWIKI_CONFIG_DIR` 作为恢复目标）；② **PostgreSQL 方言下备份包不含数据库**（清单里 `database.included = false`，提示改用 `pg_dump`），见 §5 |
+| `GEEWIKI_OPENAI_DEBUG` | **未设置 = 关闭**；仅精确的 `1` 开启 | `@geewiki/openai` 上游错误诊断日志开关（`packages/plugin-openai/src/provider.ts` 的 `configLogEnabled()`）。空串、`0`、`false`、`off` 及其他值均关闭；临时排障需显式设 `GEEWIKI_OPENAI_DEBUG=1`。只控制上游非 2xx 时的一条日志：路由、HTTP 状态和**错误响应体前 500 字符经 `redact()` 处理后的摘要**，不另行记录请求体。上游可能在错误体回显请求上下文，且脱敏是启发式，开启时仍须按敏感日志管理；错误码和客户端响应不受开关影响。默认值变更见 [ADR-0013](adr/0013-openai-diagnostics-opt-in.md) |
 
 > **本表不是穷举**。全量口径以代码为准：
 > `cd /root/dev/geewiki && grep -rhoE "(GEEWIKI|GW)_[A-Z0-9_]+" packages/*/src scripts | sort -u`
@@ -273,6 +277,31 @@ docker compose exec geewiki-app sh -lc 'node -e "const D=require(process.argv[1]
 备份产物是**完整快照**（含 WAL 中已提交的数据，因此体积可能大于当前的 `geewiki.db`），落在同一个 `./data` 目录里；归档后建议移出该目录，避免与运行期文件混淆。
 
 冷备份（推荐，简单可靠）：`docker compose stop && cp -a data config /path/to/backup/ && docker compose start`。
+
+### 5.1 内置备份与恢复命令
+
+`pnpm backup --out /path/to/backups` 使用 SQLite 引擎快照并收集数据目录中的普通文件及配置目录中的 JSON。
+CLI 读取 `GEEWIKI_DATA_DIR` 与 `GEEWIKI_CONFIG_DIR`，相对路径以仓库根（或 `--repo-root` 指定目录）为基准。
+备份包内部统一使用 `data/`、`config/`，不暴露部署机器的目录布局。
+
+恢复前停止服务器。`pnpm restore /path/to/backup --verify-only` 只检查备份结构、路径、源文件类型、大小与哈希；
+`pnpm restore /path/to/backup --dry-run --force` 会额外检查与实际恢复相同的目标与覆盖条件，且不写文件。
+确认后运行 `pnpm restore /path/to/backup --force`。目标目录同样由上述两个环境变量决定；
+覆盖已有文件或替换非空数据目录都要求显式 `--force`，全新且无冲突的目标可以省略。
+
+写入前会拒绝非法或重复逻辑路径、文件/目录冲突、链接、特殊文件、目标重叠以及与备份源重叠。
+全部内容先在两个目标的同级目录暂存并复核，再换入。含数据库时重建数据目录，不带旧 WAL/SHM；
+不含数据库的部分备份保留目标已有数据库，配置始终保留未列入清单的文件。
+成功后 CLI 报告原数据与原配置各自的 `.pre-restore-…` 留底路径，不自动删除。
+捕获到提交错误时会共同回退；若回退本身失败，错误会报告留底位置，需保持停服并手工移回。
+这是离线异常回退，不是跨目录崩溃原子事务：强杀、断电或并发修改可能仍需手工恢复。
+备份不证明来源可信，也不验证所有数据库或插件配置语义；取舍见 [ADR-0018](adr/0018-offline-restore-preflight-and-rollback.md)。
+恢复包、暂存及留底可包含明文密钥，均应按密钥文件管理；确认恢复和启动正常后再删除留底。
+
+管理台的 `POST /api/backup` 使用实际基础清单所在目录和宿主数据目录，
+所以 `startServer({ configDir })` 覆盖环境变量时，备份也使用该目录。
+输出目录的规则见 `GEEWIKI_BACKUP_DIR` 表项，与输入目录的解析规则分开。
+
 
 ---
 
@@ -402,8 +431,8 @@ compose 只会构建、不会拉取**（`image:` 仅作为构建产物的名字�
 | 现象 | 原因与处理 |
 | --- | --- |
 | 启动即退出，日志含 `[@geewiki/http] 监听失败:` | 宿主端口被占用（退出码 1，不写崩溃标记）。改 `GEEWIKI_HOST_PORT` 或释放端口：`ss -ltnp \| grep 3000` |
-| 服务在跑但页面接口全部 404；`/api/health` 里 `db.present` 为 `false`；插件列表中 `@geewiki/db-sqlite` 为 `state: error` | 数据目录不可写（SQLite 建不了库）。插件激活失败不影响主进程启动，因此接口照常响应：`/api/health` 仍返回 **HTTP 200** 但 `db.present:false`，业务接口全部 404；镜像 HEALTHCHECK 会据此把容器标为 **`unhealthy`**（间隔 30s × 3 次后）。按第 3 节 chown，或用 `GEEWIKI_UID/GID` 对齐宿主用户 |
-| 日志出现 `[@geewiki/manager] http 路由服务不可用：REST API 未挂载`，所有接口 404 | 配置目录中缺少 `plugins.base.json`（或其中 `enabled` 为空）→ 没有任何插件被激活。从仓库复制一份：`cp config/plugins.base.json <配置目录>/`。**容器内**注意两点：镜像已自带 `/app/config/plugins.base.json`，但你若把 `./config`（宿主空目录）挂到 `/app/config`，镜像内那份就被遮蔽了，必须自己放入该文件；反之完全不挂载 config 时（`docker run` 只挂 data）镜像自带的默认清单会生效，服务照常起来 |
+| 启动报 `[server] 必要服务未就绪: db`，此前日志含数据库打开或迁移失败 | 标准部署要求数据库可用，数据目录不可写或迁移失败会使启动失败。先按第 3 节修正目录属主，或用 `GEEWIKI_UID/GID` 对齐宿主用户；修复迁移错误后重启。自定义最小宿主与运行期停用数据库仍应检查 `/api/health` 的 `db.present`，不能只看 HTTP 200。 |
+| 日志出现 `[server] 必要服务未就绪`，启动后立即退出 | 检查日志列出的服务及插件激活错误。空配置目录会遮蔽镜像模板；确保目录中有可用的 `plugins.base.json` 或 `plugins.base.example.json`，并启用 HTTP、数据库、认证、策略与 Wiki 依赖。数据目录权限或迁移错误也会导致对应服务缺失。修复配置后重启；自定义最小宿主应显式指定 `requiredServices`。 |
 | 启用 `--profile production` 后 `postgres` 容器立即退出，日志含 `Error: Database is uninitialized and superuser password is not specified.` | 未提供 `DB_PASSWORD`。compose 中该变量写成 `${DB_PASSWORD:-}` 只是为了避免未启用 profile 时每条命令都告警；实际启用时为空串会被 postgres 官方镜像拒绝（安全失败，不会造出弱密码实例）。在 `.env` 中写入 `DB_PASSWORD=强密码` 后重试。未启用该 profile 时不会再出现该告警 |
 | 启动即退出，日志含 `Error: EACCES: permission denied, open '/app/package.json'` | pnpm deploy 生成的部署树中少量文件权限为 `600`（仅 root 可读），非 root 运行时读取 `package.json` 会被拒绝。镜像已在构建末尾用 `find` 只给**缺少全局读位/进入位**的条目补 `o+rX`（见 `Dockerfile` 的权限归一化步骤）；自行改写 Dockerfile 或更换基础镜像时请保留该步骤 |
 | 插件页「启用/持久化」报错 | `./config` 不可写（需要写 `plugins.session.json`），同上处理 |
@@ -458,7 +487,9 @@ docker compose stop && docker inspect -f '{{.State.ExitCode}}' $(docker compose 
 
 ### 外部插件与容器集成的复验（同一环境）
 
-- **未挂载 config 卷不再是"死壳"**：不挂 `./config` 直接 `docker run --rm -d -p 3100:3000 geewiki:bc` 时，`/api/health` 返回 `{"ok":true,...,"db":{"present":true}}`。镜像内的 `/app/config/plugins.base.json`（`node:node`；**内容即仓库根 `config/plugins.base.json`，当前默认启用 21 条内置插件**）由构建阶段的 `COPY --from=builder /src/config /app/config` 带入。**反证**：把配置目录指向不存在的路径（`-e GEEWIKI_CONFIG_DIR=/tmp/emptycfg`）时，日志只剩 `[@geewiki/manager] http 路由服务不可用：REST API 未挂载（@geewiki/http 未在清单中？）`，进程以**退出码 0** 结束（`status=exited exit=0`）、端口无监听，随后会被 `restart: unless-stopped` 反复拉起——静默重启循环，这正是镜像必须自带默认清单的原因。
+- **未挂载 config 卷不再是"死壳"**：镜像自带默认模板，不挂 config 卷时会按模板激活。
+  早期空配置目录曾导致退出码 0 的静默重启；该历史行为已由 ADR-0010 的标准部署必要服务检查取代。
+  当前空配置会清理资源并非 0 退出；镜像构建的历史验证不能替代当前启动测试。
 - **外部插件在容器内被发现并可热插拔**：挂载 `./plugins`、`./config` 与数据目录后启动，日志出现 `[server] 外部插件目录: /app/plugins` 与 `[manager:discovery] 已发现外部插件 @geewiki-plugin/hello@0.1.0（hello-geewiki）`；`/api/plugins` 列出全部内置插件 + 该外部插件（当前内置 25 注册 / 21 默认启用）；`POST /api/plugins/@geewiki-plugin%2Fhello/enable` 返回 `state:active, layer:session`，其自带路由 `GET /api/hello` 返回插件响应；`disable` 后该路由回到 404，宿主 `config/plugins.base.json` 与 `plugins.session.json` 的 md5 与操作前一致。
 - **工作目录无关性**：以 `--entrypoint tsx geewiki:bc /app/src/index.ts -w /tmp` 启动（即覆盖工作目录）时，镜像内置的 `GEEWIKI_PLUGINS_DIR=/app/plugins` 仍使发现根为 `/app/plugins`、发现 1 个外部插件；作为反证，显式传相对值 `-e GEEWIKI_PLUGINS_DIR=plugins` 时发现根变为 `/tmp/plugins`、发现 0 个插件且**不报任何错**（`/api/plugins` 只剩内置插件——当前 25 条）——这正是镜像内必须固化绝对路径的原因。
 

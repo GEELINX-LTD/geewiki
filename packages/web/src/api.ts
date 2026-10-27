@@ -589,6 +589,8 @@ export interface PageDetail extends PageSummary {
    * 的 `WikiEdit.load()` 与 `plugin-wiki` 的路由注释）。
    */
   contentMode?: 'raw'
+  /** 原文状态令牌：作为 expectedRevision 随保存提交。 */
+  revision?: string
   /**
    * ★ 0024：**块级归属**（阅读页逐段的「最后由 X 编辑 · 时间」）。
    *
@@ -1040,7 +1042,7 @@ export const api = {
       'GET',
       `/api/pages/${encodeURIComponent(slug)}${opts?.raw === true ? '?content=raw' : ''}`,
     ),
-  savePage: (slug: string, body: { title: string; content: string }) =>
+  savePage: (slug: string, body: { title: string; content: string; expectedRevision: string | null }) =>
     request<SaveResult>('PUT', `/api/pages/${encodeURIComponent(slug)}`, body),
   deletePage: (slug: string) => request<{ ok: true }>('DELETE', `/api/pages/${encodeURIComponent(slug)}`),
   /**

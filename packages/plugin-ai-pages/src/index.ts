@@ -16,25 +16,15 @@
  * ## 写工具的三条硬纪律
  * 1. **必须记日志**（决策 3）：所以 `requires` 里有 `ai-journal-service`。
  *    日志缺席时不注册这条工具——一条不能被回退的写操作，是"AI 可以随便改你的东西"。
- * 2. **必须自己判权限**。这是本包最关键、也最容易写错的一点，见下。
+ * 2. **必须先判权限，写入时再由服务检查**，见下。
  * 3. **必须报出"改之前是什么"**：`before` 是回退的全部依据，拿不到它就不能改。
  *
- * ## ⚠️ 权限：`wiki-service.save()` **没有 principal 参数**
- * `WikiService` 的四个读方法都显式要求主体（P2 的刻意设计），但 `save(slug, input)`
- * 不带主体——授权发生在 HTTP 处理器里（`packages/plugin-wiki/src/index.ts:4082`
- * 用 `policy-service` 的 `access.canEdit` 判定）。
- *
- * 于是**直接调 `save()` 等于绕过整个权限体系**。本包的做法是：改之前先向
- * `policy-service` 要一次 `resolvePage(principal, slug).canEdit` —— 注意这不是
- * "又写了一份判据"，`policy-service` 就是那份判据的**唯一出口**，HTTP 路径用的是同一个它。
- * 本包之所以必须 `requires: ['policy-service']`，就是为了让"拿不到判据"变成启动失败，
- * 而不是一次静默的无授权写入。
- *
- * **仍存在的结构性风险（记档，未修）**：判据与写入是两个先后调用，中间存在竞态窗口
- * （判完到写完之间权限被收回）。彻底修法是给 `wiki-service` 加一个接主体的写方法
- * （`saveAs(principal, slug, input)`），让授权与写入在同一个服务调用里。
- * 那是一次触及 wiki 核心的契约变更，不属于本批；此处不做，但**必须写下来**，
- * 否则下一个人会以为"这里已经安全了"。
+ * ## 权限与保存基线
+ * 工具先向 `policy-service` 查询 canEdit，再读取带 revision 的原文。
+ * 写入与回退均调用 `wiki-service.saveAs(principal, slug, input)`：服务重查用户权限，
+ * 并在写事务内比较 expectedRevision，避免读取正文后他人改动被静默覆盖。
+ * `save/remove` 只保留给受信系统插件；同进程插件并无隔离。
+ * 服务内重查不保证与并发 ACL 修改原子化，见 ADR-0010。
  */
 import type { Context } from 'cordis'
 import type { GeeWikiManifest, Principal } from '@geewiki/core'
@@ -90,8 +80,8 @@ interface WikiServiceLike {
     slug: string,
     principal: Principal,
     opts?: { rawContent?: boolean },
-  ): Promise<{ title: string; content: string; contentMode?: 'raw' } | undefined>
-  save(slug: string, input: { title: string; content: string }): Promise<unknown>
+  ): Promise<{ title: string; content: string; contentMode?: 'raw'; revision?: string } | undefined>
+  saveAs(principal: Principal, slug: string, input: { title: string; content: string; expectedRevision: string }): Promise<unknown>
 }
 
 const MAX_CONTENT_CHARS = 200_000
@@ -259,9 +249,14 @@ export const AiPagesPlugin = {
       const access = await policy().resolvePage(principal, record.target)
       if (access.level === 'none') return { ok: false, detail: `页面 ${record.target} 已不存在或你看不到它` }
       if (!access.canEdit) return { ok: false, detail: `你没有编辑 ${record.target} 的权限，无法回退它` }
-      const current = await wiki().get(record.target, principal)
+      const current = await wiki().get(record.target, principal, { rawContent: true })
       if (current === undefined) return { ok: false, detail: `读取 ${record.target} 失败（可能已被删除）` }
-      await wiki().save(record.target, { title: current.title, content: record.before })
+      if (current.contentMode !== 'raw' || current.revision === undefined) {
+        return { ok: false, detail: '未取得原文状态，无法安全回退' }
+      }
+      await wiki().saveAs(principal, record.target, {
+        title: current.title, content: record.before, expectedRevision: current.revision,
+      })
       return { ok: true, detail: `已把 ${record.target} 的正文还原到这一轮之前的样子` }
     }
 
@@ -411,7 +406,10 @@ export const AiPagesPlugin = {
           return { content: `${slug} 的正文与给定内容一致，无需修改（未写入、未记录）。` }
         }
 
-        await wiki().save(slug, { title: source.title, content })
+        if (source.revision === undefined) {
+          return { content: '未取得页面的原文状态，请重新读取页面后再修改。', data: { refused: 'raw_content_unavailable' } }
+        }
+        await wiki().saveAs(principal, slug, { title: source.title, content, expectedRevision: source.revision })
 
         /*
          * 日志在**写入成功之后**记。反过来（先记后写）会在写入失败时留下一条

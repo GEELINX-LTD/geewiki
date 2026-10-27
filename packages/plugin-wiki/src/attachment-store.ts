@@ -21,6 +21,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
+import { once } from 'node:events'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { mkdir, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -238,6 +239,30 @@ export async function storeStream(
   } catch (err) {
     src.destroy()
     ws.destroy()
+    /*
+     * ★ **必须等写流完全关闭再 unlink**（flaky 根因，勿删）：`createWriteStream` 的 `open()`
+     * 在 libuv 线程池异步排队，超限抛出时 open 可能还没执行。若此刻直接 `rm`，随后的 open
+     * 会把 0 字节的 `.tmp` **重建**出来（unlink 一个不存在的路径是静默的），残留文件让
+     * 用例 finally 的递归 `rm` 撞 `ENOTEMPTY`。destroy 且 open 已成功（或流已关闭）时
+     * `'close'` 必发（pending open 完成、fd 关闭之后），等它就保证了 rm 落在 open **之后**。
+     * 已经关闭（正常 end 路径）就跳过；once 在流报错时可能 reject，错误另由上面的
+     * `ws.on('error')` 归集到 writeError，这里吞掉即可。
+     *
+     * ★ **有界等待，不挂死错误路径**：若版本语义漂移（如 Node ≥23 上出现“close 已发但
+     * `closed` 仍为 false”一类形态），无条件 `await once` 会在 413/4xx 路径永久挂住
+     * （连接不结束、在途计数不归零）。race 一个 1s 定时器兜底：正常路径 close 毫秒级先到，
+     * race 无开销；仅病理情况 1s 后放行 rm——此时竞态窗口理论上重开，但概率与后果
+     * （残留一个 0 字节 `.tmp`）均可接受。兜底定时器 `unref?.()`：它只是“放行兜底”，
+     * 不该成为阻止进程退出的理由（同 `core/src/sse.ts` 兜底定时器的既有惯例）。
+     */
+    if (!ws.closed) {
+      await Promise.race([
+        once(ws, 'close').catch(() => {}),
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 1000).unref?.()
+        }),
+      ])
+    }
     await discardTmp()
     throw asStoreError(err, '写入临时文件失败')
   }
