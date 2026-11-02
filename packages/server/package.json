@@ -40,6 +40,6 @@
     "@geewiki/postgres": "workspace:*",
     "@geewiki/search": "workspace:*",
     "@geewiki/wiki": "workspace:*",
-    "cordis": "^4.0.0-rc.10"
+    "cordis": "^4.0.0-rc.12"
   }
 }
