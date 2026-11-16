@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@geewiki/core": "workspace:*",
-    "better-sqlite3": "^13.0.3",
+    "better-sqlite3": "^13.1.1",
     "cordis": "^4.0.0-rc.10"
   },
   "devDependencies": {
